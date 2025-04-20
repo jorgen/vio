@@ -11,6 +11,7 @@ add_executable(vio_tests
     test_basic.cpp
     test_task_and_sleep.cpp
     test_file.cpp
+    test_tcp.cpp
 )
 
 target_link_libraries(vio_tests PRIVATE vio)
