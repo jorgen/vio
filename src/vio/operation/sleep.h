@@ -33,9 +33,9 @@
 namespace vio
 {
 
-uv_coro_awaitable<uv_timer_t, void> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds)
+future<uv_timer_t, void> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds)
 {
-  uv_coro_awaitable<uv_timer_t, void> ret;
+  future<uv_timer_t, void> ret;
   uv_timer_init(event_loop.loop(), &(ret.state->req));
   auto copy = ret.state;
   ret.state->req.data = copy.release_to_raw();

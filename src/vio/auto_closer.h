@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2025 Jørgen Lind
+Copyright (c) 2025 Jørgen Lind
 
   Permission is hereby granted, free of charge, to any person obtaining a copy of
   this software and associated documentation files (the "Software"), to deal in
@@ -21,67 +21,73 @@
 */
 
 #pragma once
-#include <expected>
-#include <coroutine>
-
-#include "ref_ptr.h"
 
 namespace vio
 {
-
-struct error_t {
-  int code;
-  std::string msg;
-};
-
-template <typename REQUEST, typename RESULT>
-struct uv_coro_state
+template <typename T, typename Closer>
+class auto_close_t
 {
-  uv_coro_state()
-    : req({})
+public:
+  explicit auto_close_t(T &&value, Closer closer) noexcept
+    : m_value(std::move(value))
+    , m_closer(closer)
+    , m_close(true)
   {
   }
 
-  REQUEST req = {};
-  std::expected<RESULT, error_t> result;
-  bool done = false;
-  std::coroutine_handle<> continuation;
-};
+  auto_close_t(const auto_close_t &) = delete;
+  auto_close_t &operator=(const auto_close_t &) = delete;
 
-template <typename RESULT>
-struct uv_coro_state<void, RESULT>
-{
-  std::expected<RESULT, error_t> result;
-  bool done = false;
-  std::coroutine_handle<> continuation;
-};
-
-template <typename REQUEST, typename RESULT>
-struct future
-{
-  ref_ptr_t<uv_coro_state<REQUEST, RESULT>> state = make_ref_ptr<uv_coro_state<REQUEST, RESULT>>();
-
-  bool await_ready() noexcept
+  auto_close_t(auto_close_t &&other) noexcept
+    : m_value(std::move(other.m_value))
+    , m_closer(std::move(other.m_closer))
+    , m_close(other.m_close)
   {
-    return state->done;
+    other.m_close = false;
   }
 
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  auto_close_t &operator=(auto_close_t &&other) noexcept
   {
-    if (state->done)
+    if (this != &other)
     {
-      continuation.resume();
+      if (m_close)
+        m_closer(&m_value);
+      m_value = std::move(other.m_value);
+      m_closer = std::move(other.m_closer);
+      m_close = other.m_close;
+      other.m_close = false;
     }
-    else
-    {
-      state->continuation = continuation;
-    }
+    return *this;
   }
 
-  std::expected<RESULT, error_t> await_resume() noexcept
+  ~auto_close_t()
   {
-    return state->result;
+    if (m_close)
+      m_closer(&m_value);
   }
+
+  T *operator->()
+  {
+    return &m_value;
+  }
+  const T *operator->() const
+  {
+    return &m_value;
+  }
+
+  T &operator*()
+  {
+    return m_value;
+  }
+  const T &operator*() const
+  {
+    return m_value;
+  }
+
+private:
+  T m_value;
+  Closer m_closer;
+  bool m_close;
 };
 
 } // namespace vio

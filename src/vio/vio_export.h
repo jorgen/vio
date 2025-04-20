@@ -22,7 +22,7 @@
 #endif
 
 #ifndef VIO_DEPRECATED
-#  define VIO_DEPRECATED __attribute__ ((__deprecated__))
+#  define VIO_DEPRECATED __declspec(deprecated)
 #endif
 
 #ifndef VIO_DEPRECATED_EXPORT
