@@ -62,7 +62,7 @@ struct listen_state_t
 
 inline void close_tcp(tcp_t *tcp)
 {
-  if (tcp && !uv_is_closing(reinterpret_cast<uv_handle_t *>(tcp->handle.get())))
+  if (tcp && tcp->handle && !uv_is_closing(reinterpret_cast<uv_handle_t *>(tcp->get_handle())))
   {
     uv_close(tcp->get_handle(), nullptr);
   }
@@ -248,34 +248,39 @@ struct tcp_read_buffer_t
   size_t size;
 };
 
+// Default allocation callback for TCP reads
+inline void default_tcp_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
+{
+  // Allocate memory with new[]
+  auto *data = new uint8_t[suggested_size];
+
+  *buf = uv_buf_init(reinterpret_cast<char *>(data), static_cast<unsigned int>(suggested_size));
+}
+
 // The reader needs to be a template to handle the custom deleter
 template <typename Deleter = std::default_delete<uint8_t[]>>
 class tcp_reader_t
 {
 public:
-  // Constructor takes tcp, allocation callback (libuv style), and a deleter
-  tcp_reader_t(tcp_t &tcp, uv_alloc_cb alloc_cb, Deleter deleter = Deleter{})
+  // Constructor with default parameters directly included
+  tcp_reader_t(tcp_t &tcp, uv_alloc_cb alloc_cb = default_tcp_alloc_cb, Deleter deleter = Deleter{})
     : tcp_(&tcp)
     , alloc_cb_(alloc_cb)
     , deleter_(std::move(deleter))
   {
   }
 
-  // Initialize method that can fail and returns error information
   error_t initialize()
   {
     if (is_initialized_)
-      return error_t{0, ""}; // Already initialized successfully
+      return error_t{0, ""};
 
-    // Register our read callback and store the reader in the tcp handle's data field
     tcp_->get_stream()->data = this;
 
-    // Start the read operation using libuv style
     int r = uv_read_start(tcp_->get_stream(),
-                          alloc_cb_, // Use the libuv style alloc callback directly
+                          alloc_cb_,
                           &tcp_reader_t::read_cb);
 
-    // Check for errors
     if (r < 0)
     {
       return error_t{r, uv_strerror(r)};
@@ -287,31 +292,27 @@ public:
 
   ~tcp_reader_t()
   {
-    if (is_initialized_ && tcp_ && !uv_is_closing(tcp_->get_handle()))
+    if (is_initialized_ && tcp_ && tcp_->handle && !uv_is_closing(tcp_->get_handle()))
     {
       uv_read_stop(tcp_->get_stream());
       tcp_->get_stream()->data = nullptr;
     }
   }
 
-  // Check if the reader was initialized correctly
   [[nodiscard]] bool is_initialized() const
   {
     return is_initialized_;
   }
 
-  // Cancel any pending read operation
   void cancel()
   {
     if (is_cancelled_)
-      return; // Already cancelled
+      return;
 
     is_cancelled_ = true;
 
-    // Add a cancellation error to the queue
     buffer_queue_.emplace_back(std::unexpected(error_t{UV_ECANCELED, "Operation was cancelled"}));
 
-    // If there's a waiting coroutine, resume it so it can handle the cancellation
     if (waiting_coroutine_)
     {
       auto handle = waiting_coroutine_;
@@ -341,17 +342,14 @@ public:
 
     std::expected<tcp_read_buffer_t<Deleter>, error_t> await_resume()
     {
-      // Check for cancellation first (if queue is empty but cancelled)
       if (reader->is_cancelled_ && reader->buffer_queue_.empty())
       {
         return std::unexpected(error_t{UV_ECANCELED, "Operation was cancelled"});
       }
 
-      // Get the first item from the queue
       auto result = std::move(reader->buffer_queue_.front());
       reader->buffer_queue_.erase(reader->buffer_queue_.begin());
 
-      // Simply return the expected (which may contain value or error)
       return result;
     }
   };
@@ -383,18 +381,14 @@ private:
 
       self->buffer_queue_.emplace_back(std::move(read_buffer));
     }
-    else if (nread < 0)
+    else if (nread <= 0)
     {
-      auto error = std::unexpected(error_t{static_cast<int>(nread), uv_strerror(static_cast<int>(nread))});
+      int code = UV_EOF;
+      if (nread < 0)
+        code = static_cast<int>(nread);
+      auto error = std::unexpected(error_t{code , uv_strerror(static_cast<int>(nread))});
       self->buffer_queue_.emplace_back(std::move(error));
 
-      if (buf && buf->base)
-        self->deleter_(reinterpret_cast<uint8_t *>(buf->base));
-    }
-    else
-    {
-      // nread == 0, EOF or empty read
-      // Clean up buffer
       if (buf && buf->base)
         self->deleter_(reinterpret_cast<uint8_t *>(buf->base));
     }
@@ -416,27 +410,5 @@ private:
   bool is_cancelled_{false};
   bool is_initialized_{false};
 };
-
-inline void default_tcp_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
-{
-  // Allocate memory with new[]
-  auto *data = new uint8_t[suggested_size];
-
-  *buf = uv_buf_init(reinterpret_cast<char *>(data), static_cast<unsigned int>(suggested_size));
-}
-
-template <typename Deleter = std::default_delete<uint8_t[]>>
-inline std::expected<tcp_reader_t<Deleter>, error_t> create_tcp_reader(tcp_t &tcp, uv_alloc_cb alloc_cb = default_tcp_alloc_cb, Deleter deleter = Deleter{})
-{
-  tcp_reader_t<Deleter> reader(tcp, alloc_cb, std::move(deleter));
-
-  error_t err = reader.initialize();
-  if (err.code != 0)
-  {
-    return std::unexpected(err);
-  }
-
-  return std::expected<tcp_reader_t<Deleter>, error_t>(std::move(reader));
-}
 
 } // namespace vio

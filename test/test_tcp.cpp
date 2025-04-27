@@ -30,6 +30,7 @@ vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t serv
   auto read_result = co_await reader;
   REQUIRE_EXPECTED(read_result);
 
+  fprintf(stderr, "Server Read operation succeeded\n");
   serverGotData = true;
 
   // Echo a message back, e.g. "hello from server"
@@ -37,6 +38,10 @@ vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t serv
   auto writeResult = co_await vio::write_tcp(event_loop, *client, reinterpret_cast<const uint8_t *>(reply.data()), reply.size());
   REQUIRE_EXPECTED(writeResult);
   serverWroteMsg = true;
+  fprintf(stderr, "Server Write operation succeeded\n");
+
+  read_result = co_await reader;
+  REQUIRE(!read_result.has_value());
 };
 
 // A client task that connects to the server, writes a message, and reads the server's reply
@@ -55,22 +60,6 @@ vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int serverPort,
   auto connectResult = co_await vio::tcp_connect(event_loop, client, reinterpret_cast<const sockaddr *>(&serverAddrOrErr.value()));
   REQUIRE_EXPECTED(connectResult);
 
-  // auto reader = vio::create_tcp_reader(client);
-  // REQUIRE_EXPECTED(reader);
-  vio::tcp_reader_t<> reader(client, vio::default_tcp_alloc_cb, std::default_delete<uint8_t[]>());
-  auto reader_2 = std::move(reader);
-  REQUIRE(reader_2.initialize().code == 0);
-  auto read_result = co_await reader_2;
-  REQUIRE_EXPECTED(read_result);
-  auto &read_data = read_result.value();
-  std::string_view sv(reinterpret_cast<const char *>(read_data.data.get()), static_cast<size_t>(read_data.size));
-  // If the server wrote "Hello from server", let's check that
-  if (sv.find("Hello from server") != std::string_view::npos)
-  {
-    clientGotServerReply = true;
-  }
-
-  // Write a message from client -> server
   std::string clientMessage = "Hello TCP server";
   auto writeResult = co_await vio::write_tcp(event_loop, client, reinterpret_cast<const uint8_t *>(clientMessage.data()), clientMessage.size());
   if (!writeResult.has_value())
@@ -78,12 +67,18 @@ vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int serverPort,
     fprintf(stderr, "Write operation failed: %s\n", writeResult.error().msg.c_str());
   }
   REQUIRE_EXPECTED(writeResult);
-
-  // The client can remain open just long enough for us to see the server's response
-  // We'll wait a little bit for the server to respond if needed
-  // but for demonstration, we simply co_return here and rely on the
-  // readStart callback to set clientGotServerReply as soon as data arrives.
-  co_return;
+  fprintf(stderr, "Write operation succeeded\n");
+  vio::tcp_reader_t<> reader(client);
+  REQUIRE(reader.initialize().code == 0);
+  auto read_result = co_await reader;
+  REQUIRE_EXPECTED(read_result);
+  auto &read_data = read_result.value();
+  std::string_view sv(reinterpret_cast<const char *>(read_data.data.get()), static_cast<size_t>(read_data.size));
+  if (sv.find("Hello from server") != std::string_view::npos)
+  {
+    clientGotServerReply = true;
+  }
+  fprintf(stderr, "Read operation succeeded\n");
 }
 
 #define PROPAGATE_ERROR(x)                                                                                                                                                                                                 \
@@ -134,6 +129,7 @@ TEST_CASE("test basic tcp")
       auto server = test_tcp_server(event_loop, std::move(server_tcp_pair->first), server_tcp_pair->second, serverGotData, serverWroteMsg);
       co_await test_tcp_client(event_loop, server_tcp_pair->second, clientGotServerReply);
       co_await std::move(server);
+      event_loop.stop();
     });
 
   // Run the event loop
