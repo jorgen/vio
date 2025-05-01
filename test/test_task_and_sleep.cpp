@@ -1,10 +1,10 @@
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
-#include <vio/task.h>
 #include <vio/operation/sleep.h>
+#include <vio/task.h>
 
-auto DELAY = std::chrono::milliseconds(10);
+auto DELAY = std::chrono::milliseconds(100);
 
 vio::task_t<int> sleep_task_2(vio::event_loop_t &event_loop)
 {
@@ -26,7 +26,7 @@ vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
   auto to_wait = vio::sleep(event_loop, DELAY);
   co_await to_wait;
   auto end_time = std::chrono::high_resolution_clock::now();
-  CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time)> DELAY);
+  CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) > DELAY);
 
   start_time = std::chrono::high_resolution_clock::now();
   auto to_wait2 = vio::sleep(event_loop, DELAY * 2);
@@ -55,5 +55,5 @@ TEST_CASE("test sleep and task basics")
   event_loop.run_in_loop([&event_loop] { sleep_task(event_loop); });
   event_loop.run();
   auto end_time = std::chrono::high_resolution_clock::now();
-  CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time)> DELAY * 5);
+  CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) > DELAY * 5);
 }

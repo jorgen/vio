@@ -22,41 +22,75 @@
 
 #pragma once
 
-#include <uv.h>
-#include <coroutine>
-#include <chrono>
-
-#include "vio/ref_ptr.h"
+#include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/ref_ptr.h"
 #include "vio/uv_coro.h"
+
+#include <chrono>
+#include <coroutine>
+#include <expected>
+#include <uv.h>
 
 namespace vio
 {
 
-future<uv_timer_t, void> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds)
+struct sleep_state_t
 {
-  future<uv_timer_t, void> ret;
-  uv_timer_init(event_loop.loop(), &(ret.state->req));
-  auto copy = ret.state;
-  ret.state->req.data = copy.release_to_raw();
+  uv_timer_t timer = {};
+  std::expected<void, error_t> result = {};
+  std::coroutine_handle<> continuation = {};
+  bool done = false;
+
+  bool await_ready() noexcept
+  {
+    return done;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    if (done)
+    {
+      continuation.resume();
+    }
+    else
+    {
+      this->continuation = continuation;
+    }
+  }
+
+  auto await_resume() noexcept
+  {
+    return std::move(result);
+  }
+};
+
+inline future<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds)
+{
+  using ret_t = decltype(sleep(event_loop, milliseconds));
+  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
+  ret_t ret;
+  uv_timer_init(event_loop.loop(), &ret.state.timer);
+  auto copy = ret.state_ptr;
+  ret.state.timer.data = copy.release_to_raw();
   auto callback = [](uv_timer_t *timer)
   {
     uv_timer_stop(timer);
-    auto timer_state = ref_ptr_t<uv_coro_state<uv_timer_t,void>>::from_raw(timer->data);
+    auto timer_state = future_ref_ptr_t::from_raw(timer->data);
     timer_state->done = true;
     auto to_callback = timer_state;
     timer->data = to_callback.release_to_raw();
-    auto close_callback = [](uv_handle_t *handle) { auto timer_state = ref_ptr_t<uv_coro_state<uv_timer_t,void>>::from_raw(handle->data); };
+    auto close_callback = [](uv_handle_t *handle) { auto timer_state = future_ref_ptr_t::from_raw(handle->data); };
     uv_close((uv_handle_t *)timer, close_callback);
     if (timer_state->continuation)
       timer_state->continuation.resume();
   };
-  auto r = uv_timer_start(&ret.state->req, callback, milliseconds.count(), 0);
+  auto r = uv_timer_start(&ret.state.timer, callback, milliseconds.count(), 0);
   if (r < 0)
   {
     // Mark as done right away and set the error.
-    ret.state->done = true;
-    ret.state->result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->done = true;
+    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
   }
   return ret;
 }

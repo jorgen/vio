@@ -84,7 +84,22 @@ public:
     alloc_ptr_ = new refcounted_allocation_t<T>(std::move(obj));
   }
 
+  template <typename... Args>
+  explicit ref_ptr_t(Args &&...args)
+  {
+    alloc_ptr_ = new refcounted_allocation_t<T>(std::forward<Args>(args)...);
+  }
+
   ref_ptr_t(const ref_ptr_t &other)
+  {
+    alloc_ptr_ = other.alloc_ptr_;
+    if (alloc_ptr_ != nullptr)
+    {
+      alloc_ptr_->ref();
+    }
+  }
+
+  ref_ptr_t(ref_ptr_t &other)
   {
     alloc_ptr_ = other.alloc_ptr_;
     if (alloc_ptr_ != nullptr)

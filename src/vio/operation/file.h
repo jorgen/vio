@@ -26,11 +26,12 @@
 
 #include "vio/bit_mask.h"
 
+#include "vio/auto_closer.h"
+#include "vio/error.h"
 #include "vio/ref_ptr.h"
 #include "vio/uv_coro.h"
-#include "vio/auto_closer.h"
 
-
+#include <coroutine>
 #include <expected>
 
 namespace vio
@@ -128,16 +129,46 @@ inline std::expected<std::pair<auto_close_file_t, std::string>, error_t> mkstemp
   return std::make_pair(make_auto_close_file(std::move(file)), generatedPath);
 }
 
-
-
-inline future<uv_fs_t, std::size_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset)
+struct file_io_state_t
 {
-  future<uv_fs_t, std::size_t> ret;
+  uv_fs_t req;
+  std::expected<std::size_t, error_t> result;
+  std::coroutine_handle<> continuation = {};
+  bool done = false;
+
+  bool await_ready() noexcept
+  {
+    return done;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    if (done)
+    {
+      continuation.resume();
+    }
+    else
+    {
+      this->continuation = continuation;
+    }
+  }
+
+  auto await_resume() noexcept
+  {
+    return std::move(result);
+  }
+};
+
+inline future<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset)
+{
+  using ret_t = decltype(write_file(event_loop, file, data, length, offset));
+  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
+  ret_t ret;
   uv_buf_t buf = uv_buf_init(std::bit_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
 
   auto callback = [](uv_fs_t *reqPtr)
   {
-    auto stateRef = ref_ptr_t<uv_coro_state<uv_fs_t, std::size_t>>::from_raw(reqPtr->data);
+    auto stateRef = future_ref_ptr_t::from_raw(reqPtr->data);
 
     auto result = reqPtr->result;
     if (result < 0)
@@ -156,30 +187,29 @@ inline future<uv_fs_t, std::size_t> write_file(event_loop_t &event_loop, file_t 
       stateRef->continuation.resume();
   };
 
-  auto copy = ret.state;
-  ret.state->req.data = copy.release_to_raw();
+  auto copy = ret.state_ptr;
+  ret.state.req.data = copy.release_to_raw();
 
-  int r = uv_fs_write(event_loop.loop(), &ret.state->req, file.handle, &buf, 1, offset, callback);
-
-  if (r < 0)
+  if (int r = uv_fs_write(event_loop.loop(), &ret.state.req, file.handle, &buf, 1, offset, callback); r < 0)
   {
-    ret.state->done = true;
-    ret.state->result = std::unexpected(error_t{r, uv_strerror(r)});
-    ref_ptr_t<uv_coro_state<uv_fs_t, std::size_t>>::from_raw(ret.state->req.data);
+    future_ref_ptr_t::from_raw(ret.state.req.data);
+    ret.state_ptr->done = true;
+    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
   }
 
   return ret;
 }
 
-inline future<uv_fs_t, std::size_t> read_file(event_loop_t &event_loop, file_t &file, uint8_t *buffer, std::size_t length, std::int64_t offset)
+inline future<file_io_state_t> read_file(event_loop_t &event_loop, file_t &file, uint8_t *buffer, std::size_t length, std::int64_t offset)
 {
-  future<uv_fs_t, std::size_t> ret;
-
+  using ret_t = decltype(read_file(event_loop, file, buffer, length, offset));
+  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
+  ret_t ret;
   uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(buffer), static_cast<unsigned int>(length));
 
   auto callback = [](uv_fs_t *reqPtr)
   {
-    auto stateRef = ref_ptr_t<uv_coro_state<uv_fs_t, std::size_t>>::from_raw(reqPtr->data);
+    auto stateRef = future_ref_ptr_t::from_raw(reqPtr->data);
 
     auto result = reqPtr->result;
     if (result < 0)
@@ -197,15 +227,16 @@ inline future<uv_fs_t, std::size_t> read_file(event_loop_t &event_loop, file_t &
       stateRef->continuation.resume();
   };
 
-  auto copy = ret.state; // Copy the ref_ptr to keep a strong reference
-  ret.state->req.data = copy.release_to_raw();
+  auto copy = ret.state_ptr; // Copy the ref_ptr to keep a strong reference
+  ret.state.req.data = copy.release_to_raw();
 
-  int r = uv_fs_read(event_loop.loop(), &ret.state->req, file.handle, &buf, 1, offset, callback);
+  int r = uv_fs_read(event_loop.loop(), &ret.state.req, file.handle, &buf, 1, offset, callback);
 
   if (r < 0)
   {
-    ret.state->done = true;
-    ret.state->result = std::unexpected(error_t{r, uv_strerror(r)});
+    auto stateRef = future_ref_ptr_t::from_raw(ret.state.req.data);
+    ret.state_ptr->done = true;
+    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
   }
 
   return ret;
@@ -291,13 +322,15 @@ inline std::expected<std::string, error_t> mkdtemp_path(event_loop_t &loop, cons
   return path;
 }
 
-inline future<uv_fs_t, std::size_t> send_file(event_loop_t &loop, file_t &outFile, file_t &inFile, std::int64_t inOffset, std::size_t length)
+inline future<file_io_state_t> send_file(event_loop_t &loop, file_t &outFile, file_t &inFile, std::int64_t inOffset, std::size_t length)
 {
-  future<uv_fs_t, std::size_t> ret;
+  using ret_t = decltype(send_file(loop, outFile, inFile, inOffset, length));
+  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
+  ret_t ret;
 
   auto callback = [](uv_fs_t *reqPtr)
   {
-    auto stateRef = ref_ptr_t<uv_coro_state<uv_fs_t, std::size_t>>::from_raw(reqPtr->data);
+    auto stateRef = future_ref_ptr_t::from_raw(reqPtr->data);
     auto result = reqPtr->result;
 
     if (result < 0)
@@ -311,14 +344,15 @@ inline future<uv_fs_t, std::size_t> send_file(event_loop_t &loop, file_t &outFil
       stateRef->continuation.resume();
   };
 
-  auto copy = ret.state;
-  ret.state->req.data = copy.release_to_raw();
-  const int callResult = uv_fs_sendfile(loop.loop(), &ret.state->req, outFile.handle, inFile.handle, inOffset, length, callback);
+  auto copy = ret.state_ptr;
+  ret.state.req.data = copy.release_to_raw();
+  const int callResult = uv_fs_sendfile(loop.loop(), &ret.state.req, outFile.handle, inFile.handle, inOffset, length, callback);
 
   if (callResult < 0)
   {
-    ret.state->done = true;
-    ret.state->result = std::unexpected(error_t{callResult, uv_strerror(callResult)});
+    auto stateRef = future_ref_ptr_t::from_raw(ret.state.req.data);
+    ret.state_ptr->done = true;
+    ret.state.result = std::unexpected(error_t{callResult, uv_strerror(callResult)});
   }
 
   return ret;

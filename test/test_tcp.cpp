@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 #include <string>
 #include <string_view>
+#include <vio/error.h>
 #include <vio/event_loop.h>
 #include <vio/operation/tcp.h>
 #include <vio/task.h>
@@ -11,37 +12,41 @@
 namespace
 {
 
-// A simple task that creates a TCP server, binds it to localhost:0 (ephemeral port),
-// listens for a connection, accepts it, then reads any incoming data into a buffer,
-// and finally writes a response back.
+//// A simple task that creates a TCP server, binds it to localhost:0 (ephemeral port),
+//// listens for a connection, accepts it, then reads any incoming data into a buffer,
+//// and finally writes a response back.
 vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t server, int port, std::atomic<bool> &serverGotData, std::atomic<bool> &serverWroteMsg)
 {
   fprintf(stderr, "Listening on port %d\n", port);
-  auto listen_reply = co_await vio::tcp_listen(event_loop, server, 10);
+  auto listen_reply = co_await vio::tcp_listen(server, 10);
   REQUIRE_EXPECTED(listen_reply);
   fprintf(stderr, "Accepted connection\n");
   auto clientOrErr = vio::tcp_accept(server);
   REQUIRE_EXPECTED(clientOrErr);
   auto client = std::move(clientOrErr.value());
 
-  // auto reader = vio::create_tcp_reader(*client);
-  vio::tcp_reader_t<> reader(*client, vio::default_tcp_alloc_cb, std::default_delete<uint8_t[]>());
-  REQUIRE(reader.initialize().code == 0);
-  auto read_result = co_await reader;
-  REQUIRE_EXPECTED(read_result);
-
+  {
+    auto readerOrError = vio::tcp_create_reader(client);
+    REQUIRE_EXPECTED(readerOrError);
+    auto reader = std::move(readerOrError.value());
+    auto read_result = co_await reader;
+    REQUIRE_EXPECTED(read_result);
+  }
   fprintf(stderr, "Server Read operation succeeded\n");
   serverGotData = true;
 
   // Echo a message back, e.g. "hello from server"
   const std::string reply = "Hello from server";
-  auto writeResult = co_await vio::write_tcp(event_loop, *client, reinterpret_cast<const uint8_t *>(reply.data()), reply.size());
+  auto writeResult = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(reply.data()), reply.size());
   REQUIRE_EXPECTED(writeResult);
   serverWroteMsg = true;
   fprintf(stderr, "Server Write operation succeeded\n");
 
-  read_result = co_await reader;
-  REQUIRE(!read_result.has_value());
+  {
+    auto reader = vio::tcp_create_reader(client);
+    auto read_result = co_await reader.value();
+    REQUIRE(!read_result.has_value());
+  }
 };
 
 // A client task that connects to the server, writes a message, and reads the server's reply
@@ -50,30 +55,30 @@ vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int serverPort,
   // Create client TCP
   auto clientOrErr = vio::create_tcp(event_loop);
   REQUIRE_EXPECTED(clientOrErr);
-  auto client = std::move(clientOrErr.value());
+  auto client_raw = std::move(clientOrErr.value());
 
   // Prepare server address
   auto serverAddrOrErr = vio::ip4_addr("127.0.0.1", serverPort);
   REQUIRE_EXPECTED(serverAddrOrErr);
 
   fprintf(stderr, "Connecting to server with port %d\n", serverPort);
-  auto connectResult = co_await vio::tcp_connect(event_loop, client, reinterpret_cast<const sockaddr *>(&serverAddrOrErr.value()));
+  auto connectResult = co_await vio::tcp_connect(client_raw, reinterpret_cast<const sockaddr *>(&serverAddrOrErr.value()));
   REQUIRE_EXPECTED(connectResult);
 
   std::string clientMessage = "Hello TCP server";
-  auto writeResult = co_await vio::write_tcp(event_loop, client, reinterpret_cast<const uint8_t *>(clientMessage.data()), clientMessage.size());
+  auto writeResult = co_await vio::write_tcp(client_raw, reinterpret_cast<const uint8_t *>(clientMessage.data()), clientMessage.size());
   if (!writeResult.has_value())
   {
     fprintf(stderr, "Write operation failed: %s\n", writeResult.error().msg.c_str());
   }
   REQUIRE_EXPECTED(writeResult);
   fprintf(stderr, "Write operation succeeded\n");
-  vio::tcp_reader_t<> reader(client);
-  REQUIRE(reader.initialize().code == 0);
-  auto read_result = co_await reader;
+  auto reader = vio::tcp_create_reader(client_raw);
+  REQUIRE_EXPECTED(reader);
+  auto read_result = co_await reader.value();
   REQUIRE_EXPECTED(read_result);
   auto &read_data = read_result.value();
-  std::string_view sv(reinterpret_cast<const char *>(read_data.data.get()), static_cast<size_t>(read_data.size));
+  std::string_view sv(reinterpret_cast<const char *>(read_data.data.get()), read_data.size);
   if (sv.find("Hello from server") != std::string_view::npos)
   {
     clientGotServerReply = true;
@@ -96,7 +101,7 @@ std::expected<std::pair<vio::tcp_t, int>, vio::error_t> get_ephemeral_port(vio::
 
   sockaddr_storage saStorage;
   int namelen = sizeof(saStorage);
-  uv_tcp_getsockname(tmp_tcp.value().handle.get(), reinterpret_cast<sockaddr *>(&saStorage), &namelen);
+  uv_tcp_getsockname(tmp_tcp.value().get_tcp(), reinterpret_cast<sockaddr *>(&saStorage), &namelen);
   auto *sa_in = reinterpret_cast<sockaddr_in *>(&saStorage);
   return std::make_pair(std::move(tmp_tcp.value()), int(ntohs(sa_in->sin_port)));
 }
@@ -117,12 +122,9 @@ TEST_CASE("test basic tcp")
   serverWroteMsg = false;
   clientGotServerReply = false;
 
-  // Start the server in our loop
-  // We'll get a port, then run the client after the server is ready
   event_loop.run_in_loop(
     [&event_loop]() -> vio::task_t<void>
     {
-      // Start the server
       auto server_tcp_pair = get_ephemeral_port(event_loop);
       REQUIRE_EXPECTED(server_tcp_pair);
 
@@ -132,14 +134,10 @@ TEST_CASE("test basic tcp")
       event_loop.stop();
     });
 
-  // Run the event loop
   event_loop.run();
 
-  // Check the flags after the loop finishes
-  // Real usage would have the server and client using a real port from the ephemeral server's bind.
-  // This snippet is meant as an illustrative example, so some logic for the port might be incomplete.
-  REQUIRE(serverGotData.load());        // We expected the server to receive data
-  REQUIRE(serverWroteMsg.load());       // We expected the server to write a response
-  REQUIRE(clientGotServerReply.load()); // We expected the client to receive that response
+  REQUIRE(serverGotData.load());
+  REQUIRE(serverWroteMsg.load());
+  REQUIRE(clientGotServerReply.load());
 }
 } // namespace

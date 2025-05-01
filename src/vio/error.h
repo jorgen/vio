@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2025 Jørgen Lind
+Copyright (c) 2025 Jørgen Lind
 
   Permission is hereby granted, free of charge, to any person obtaining a copy of
   this software and associated documentation files (the "Software"), to deal in
@@ -21,21 +21,11 @@
 */
 
 #pragma once
-#include "ref_ptr.h"
-
 namespace vio
 {
-template <typename STATE>
-struct future
+struct error_t
 {
-  using future_ref_ptr_t = ref_ptr_t<STATE>;
-  future_ref_ptr_t state_ptr = make_ref_ptr<STATE>();
-  STATE &state = *state_ptr.ptr();
-
-  auto &operator co_await() noexcept
-  {
-    return state;
-  }
+  int code;
+  std::string msg;
 };
-
 } // namespace vio

@@ -28,6 +28,13 @@ template <typename T, typename Closer>
 class auto_close_t
 {
 public:
+  auto_close_t() noexcept
+    : m_value()
+    , m_closer(nullptr)
+    , m_close(false)
+  {
+  }
+
   explicit auto_close_t(T &&value, Closer closer) noexcept
     : m_value(std::move(value))
     , m_closer(closer)
