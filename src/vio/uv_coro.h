@@ -26,7 +26,7 @@
 namespace vio
 {
 template <typename STATE>
-struct future
+struct future_t
 {
   using future_ref_ptr_t = ref_ptr_t<STATE>;
   future_ref_ptr_t state_ptr = make_ref_ptr<STATE>();

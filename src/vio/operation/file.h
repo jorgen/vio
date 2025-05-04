@@ -159,13 +159,10 @@ struct file_io_state_t
   }
 };
 
-inline future<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset)
+inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset)
 {
   using ret_t = decltype(write_file(event_loop, file, data, length, offset));
-  auto closer = [](ref_ptr_t<file_io_state_t> &state)
-  {
-    auto copy = state;
-  };
+  auto closer = [](ref_ptr_t<file_io_state_t> &state) { auto copy = state; };
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
   uv_buf_t buf = uv_buf_init(std::bit_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
@@ -204,7 +201,7 @@ inline future<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file
   return ret;
 }
 
-inline future<file_io_state_t> read_file(event_loop_t &event_loop, file_t &file, uint8_t *buffer, std::size_t length, std::int64_t offset)
+inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &file, uint8_t *buffer, std::size_t length, std::int64_t offset)
 {
   using ret_t = decltype(read_file(event_loop, file, buffer, length, offset));
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
@@ -326,7 +323,7 @@ inline std::expected<std::string, error_t> mkdtemp_path(event_loop_t &loop, cons
   return path;
 }
 
-inline future<file_io_state_t> send_file(event_loop_t &loop, file_t &outFile, file_t &inFile, std::int64_t inOffset, std::size_t length)
+inline future_t<file_io_state_t> send_file(event_loop_t &loop, file_t &outFile, file_t &inFile, std::int64_t inOffset, std::size_t length)
 {
   using ret_t = decltype(send_file(loop, outFile, inFile, inOffset, length));
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;

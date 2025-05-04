@@ -1,8 +1,40 @@
 HeaderFilterRegex: "^(?!.*3rdparty).*$"
 InheritParentConfig: false
-WarningsAsErrors:
 CheckOptions:
-User:
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.GlobalVariableCase
+    value: lower_case
+  - key: readability-identifier-naming.LocalVariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.MemberCase
+    value: lower_case
+
+  - key: readability-identifier-naming.ClassSuffix
+    value: _t
+  - key: readability-identifier-naming.StructSuffix
+    value: _t
+  - key: readability-identifier-naming.EnumSuffix
+    value: _t
+  - key: readability-identifier-naming.TypedefSuffix
+    value: _t
+  - key: readability-identifier-naming.TypeAliasSuffix
+    value: _t
+  - key: readability-identifier-naming.ClassCase
+    value: lower_case
+  - key: readability-identifier-naming.StructCase
+    value: lower_case
+  - key: readability-identifier-naming.EnumCase
+    value: lower_case
+  - key: readability-identifier-naming.TypedefCase
+    value: lower_case
+  - key: readability-identifier-naming.TypeAliasCase
+    value: lower_case
 FormatStyle: none
 Checks: '-*,
 bugprone-argument-comment,
@@ -147,4 +179,5 @@ readability-static-accessed-through-instance,
 readability-static-definition-in-anonymous-namespace,
 readability-string-compare,
 readability-uniqueptr-delete-release,
+readability-identifier-naming,
 readability-use-anyofallof'

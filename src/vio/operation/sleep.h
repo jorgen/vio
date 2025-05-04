@@ -65,7 +65,7 @@ struct sleep_state_t
   }
 };
 
-inline future<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds)
+inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds)
 {
   using ret_t = decltype(sleep(event_loop, milliseconds));
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
