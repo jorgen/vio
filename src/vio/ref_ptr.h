@@ -26,27 +26,37 @@
 #include <utility>
 
 template <typename T>
-struct refcounted_allocation_t
+struct ref_ptr_t;
+
+template <typename T>
+using close_guard = void (*)(ref_ptr_t<T> &);
+
+template <typename T>
+struct ref_counted_allocation_t
 {
   std::atomic<int> refcount;
   T object;
+  close_guard<T> close_guard;
 
   template <typename... Args>
-  explicit refcounted_allocation_t(Args &&...args)
+  explicit ref_counted_allocation_t(Args &&...args)
     : refcount(1)
     , object(std::forward<Args>(args)...)
+    , close_guard(nullptr)
   {
   }
 
-  explicit refcounted_allocation_t(const T &obj)
+  explicit ref_counted_allocation_t(const T &obj)
     : refcount(1)
     , object(obj)
+    , close_guard(nullptr)
   {
   }
 
-  explicit refcounted_allocation_t(T &&obj)
+  explicit ref_counted_allocation_t(T &&obj)
     : refcount(1)
     , object(std::move(obj))
+    , close_guard(nullptr)
   {
   }
 
@@ -55,20 +65,32 @@ struct refcounted_allocation_t
     refcount.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void unref()
+  void unref(ref_ptr_t<T> &ref_ptr)
   {
     if (refcount.fetch_sub(1, std::memory_order_acquire) == 1)
     {
-      std::atomic_thread_fence(std::memory_order_release);
-      delete this;
+      if (close_guard != nullptr)
+      {
+        fprintf(stderr, "close guard %p -  %p\n",this, close_guard);
+        auto tmp_close_guard = close_guard;
+        close_guard = nullptr;
+        tmp_close_guard(ref_ptr);
+        if (refcount.load(std::memory_order_relaxed) == 0)
+        {
+          delete this;
+        }
+      }
+      else
+      {
+        delete this;
+      }
     }
   }
 };
 
 template <typename T>
-class ref_ptr_t
+struct ref_ptr_t
 {
-public:
   ref_ptr_t()
     : alloc_ptr_(nullptr)
   {
@@ -76,18 +98,18 @@ public:
 
   explicit ref_ptr_t(const T &obj)
   {
-    alloc_ptr_ = new refcounted_allocation_t<T>(obj);
+    alloc_ptr_ = new ref_counted_allocation_t<T>(obj);
   }
 
   explicit ref_ptr_t(T &&obj)
   {
-    alloc_ptr_ = new refcounted_allocation_t<T>(std::move(obj));
+    alloc_ptr_ = new ref_counted_allocation_t<T>(std::move(obj));
   }
 
   template <typename... Args>
   explicit ref_ptr_t(Args &&...args)
   {
-    alloc_ptr_ = new refcounted_allocation_t<T>(std::forward<Args>(args)...);
+    alloc_ptr_ = new ref_counted_allocation_t<T>(std::forward<Args>(args)...);
   }
 
   ref_ptr_t(const ref_ptr_t &other)
@@ -118,7 +140,7 @@ public:
   {
     if (alloc_ptr_ != nullptr)
     {
-      alloc_ptr_->unref();
+      alloc_ptr_->unref(*this);
     }
   }
 
@@ -128,7 +150,7 @@ public:
     {
       if (alloc_ptr_ != nullptr)
       {
-        alloc_ptr_->unref();
+        alloc_ptr_->unref(*this);
       }
       alloc_ptr_ = other.alloc_ptr_;
       if (alloc_ptr_ != nullptr)
@@ -145,7 +167,7 @@ public:
     {
       if (alloc_ptr_ != nullptr)
       {
-        alloc_ptr_->unref();
+        alloc_ptr_->unref(*this);
       }
       alloc_ptr_ = other.alloc_ptr_;
       other.alloc_ptr_ = nullptr;
@@ -185,7 +207,7 @@ public:
 
   void *release_to_raw()
   {
-    refcounted_allocation_t<T> *temp = alloc_ptr_;
+    ref_counted_allocation_t<T> *temp = alloc_ptr_;
     alloc_ptr_ = nullptr;
     return temp;
   }
@@ -193,7 +215,7 @@ public:
   static ref_ptr_t from_raw(void *raw_ptr)
   {
     ref_ptr_t tmp;
-    tmp.alloc_ptr_ = static_cast<refcounted_allocation_t<T> *>(raw_ptr);
+    tmp.alloc_ptr_ = static_cast<ref_counted_allocation_t<T> *>(raw_ptr);
     return tmp;
   }
 
@@ -201,12 +223,18 @@ public:
   ref_ptr_t make_ref_ptr(Args &&...args)
   {
     ref_ptr_t tmp;
-    tmp.alloc_ptr_ = new refcounted_allocation_t<T>(std::forward<Args>(args)...);
+    tmp.alloc_ptr_ = new ref_counted_allocation_t<T>(std::forward<Args>(args)...);
     return tmp;
   }
 
+  void set_close_guard(close_guard<T> guard)
+  {
+    if (alloc_ptr_)
+      alloc_ptr_->close_guard = guard;
+  }
+
 private:
-  refcounted_allocation_t<T> *alloc_ptr_;
+  ref_counted_allocation_t<T> *alloc_ptr_;
 };
 
 template <typename T, typename... Args>

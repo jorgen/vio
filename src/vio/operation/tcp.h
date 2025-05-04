@@ -22,7 +22,6 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
-#include "vio/auto_closer.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/uv_coro.h"
@@ -131,14 +130,6 @@ struct listen_state_t
   event_loop_t &event_loop;
 };
 
-inline void close_tcp(tcp_t &tcp)
-{
-  if (tcp.handle.ptr() && !uv_is_closing(tcp.get_handle()))
-  {
-    uv_close(tcp.get_handle(), nullptr);
-  }
-}
-
 inline std::expected<sockaddr_in, error_t> ip4_addr(const std::string &ip, int port)
 {
   sockaddr_in addr;
@@ -168,6 +159,25 @@ inline std::expected<tcp_t, error_t> create_tcp(event_loop_t &loop)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
+  auto to_close = [](ref_ptr_t<tcp_state_t> &handle)
+  {
+    if (!handle.ptr())
+      return;
+    auto copy = handle;
+    handle->get_handle()->data = copy.release_to_raw();
+    auto close_cb = [](uv_handle_t *handle)
+    {
+      if (handle->data)
+      {
+        auto stateRef = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
+      }
+      handle->data = nullptr;
+
+    };
+    uv_close(handle->get_handle(), close_cb);
+  };
+  tcp.handle.set_close_guard(to_close);
+  fprintf(stderr, "created tcp %p\n", tcp.get_tcp());
   return tcp;
 }
 
@@ -228,7 +238,9 @@ inline tcp_listen_future_t tcp_listen(tcp_t &tcp, int backlog)
     stateRef->listen_done = true;
     if (stateRef->listen_continuation)
     {
-      stateRef->listen_continuation.resume();
+      auto continuation = stateRef->listen_continuation;
+      stateRef->listen_continuation = {};
+      continuation.resume();
     }
   };
 
@@ -262,7 +274,7 @@ inline std::expected<tcp_t, error_t> tcp_accept(tcp_t &server)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
-  return client;
+  return std::move(client);
 }
 
 struct tcp_connect_future_t
@@ -318,7 +330,9 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
 
     if (state_ref->connect_continuation)
     {
-      state_ref->connect_continuation.resume();
+      auto continuation = state_ref->connect_continuation;
+      state_ref->connect_continuation = {};
+      continuation.resume();
     }
   };
   auto copy = ret.handle;
@@ -377,7 +391,11 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
     }
     state_ref->write_done = true;
     if (state_ref->write_continuation)
-      state_ref->write_continuation.resume();
+    {
+      auto continuation = state_ref->write_continuation;
+      state_ref->write_continuation = {};
+      continuation.resume();
+    }
   };
 
   auto copy = ret.handle;
@@ -425,6 +443,8 @@ public:
     {
       auto state = ref_ptr_t<tcp_state_t>::from_raw(handle->get_stream()->data);
       uv_read_stop(handle->get_stream());
+      state->reader_started = false;
+      state->reader_active = false;
     }
   }
 

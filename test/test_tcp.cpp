@@ -15,8 +15,9 @@ namespace
 //// A simple task that creates a TCP server, binds it to localhost:0 (ephemeral port),
 //// listens for a connection, accepts it, then reads any incoming data into a buffer,
 //// and finally writes a response back.
-vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t server, int port, std::atomic<bool> &serverGotData, std::atomic<bool> &serverWroteMsg)
+vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t &&s, int port, bool &serverGotData, bool &serverWroteMsg)
 {
+  auto server = std::move(s);
   fprintf(stderr, "Listening on port %d\n", port);
   auto listen_reply = co_await vio::tcp_listen(server, 10);
   REQUIRE_EXPECTED(listen_reply);
@@ -24,6 +25,7 @@ vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t serv
   auto clientOrErr = vio::tcp_accept(server);
   REQUIRE_EXPECTED(clientOrErr);
   auto client = std::move(clientOrErr.value());
+  fprintf(stderr, "Created server client %p\n", client.get_handle());
 
   {
     auto readerOrError = vio::tcp_create_reader(client);
@@ -44,20 +46,20 @@ vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t serv
 
   {
     auto reader = vio::tcp_create_reader(client);
+    REQUIRE_EXPECTED(reader);
     auto read_result = co_await reader.value();
     REQUIRE(!read_result.has_value());
   }
 };
 
 // A client task that connects to the server, writes a message, and reads the server's reply
-vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int serverPort, std::atomic<bool> &clientGotServerReply)
+vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int serverPort, bool &clientGotServerReply)
 {
-  // Create client TCP
   auto clientOrErr = vio::create_tcp(event_loop);
   REQUIRE_EXPECTED(clientOrErr);
   auto client_raw = std::move(clientOrErr.value());
+  fprintf(stderr, "Created client %p\n", client_raw.get_handle());
 
-  // Prepare server address
   auto serverAddrOrErr = vio::ip4_addr("127.0.0.1", serverPort);
   REQUIRE_EXPECTED(serverAddrOrErr);
 
@@ -95,6 +97,7 @@ std::expected<std::pair<vio::tcp_t, int>, vio::error_t> get_ephemeral_port(vio::
   auto addrOrErr = vio::ip4_addr("127.0.0.1", 0);
   PROPAGATE_ERROR(addrOrErr);
   auto tmp_tcp = vio::create_tcp(event_loop);
+  fprintf(stderr, "created tcp server %p\n", tmp_tcp->get_handle());
   PROPAGATE_ERROR(tmp_tcp);
   auto bindRes = vio::tcp_bind(tmp_tcp.value(), reinterpret_cast<const sockaddr *>(&addrOrErr.value()));
   PROPAGATE_ERROR(bindRes);
@@ -114,9 +117,9 @@ TEST_CASE("test basic tcp")
   vio::event_loop_t event_loop;
 
   // We'll use these flags to check we got the data
-  static std::atomic<bool> serverGotData{false};
-  static std::atomic<bool> serverWroteMsg{false};
-  static std::atomic<bool> clientGotServerReply{false};
+  bool serverGotData = false;
+  bool serverWroteMsg = false;
+  bool clientGotServerReply = false;
 
   serverGotData = false;
   serverWroteMsg = false;
@@ -125,19 +128,21 @@ TEST_CASE("test basic tcp")
   event_loop.run_in_loop(
     [&event_loop]() -> vio::task_t<void>
     {
-      auto server_tcp_pair = get_ephemeral_port(event_loop);
+      auto ev = &event_loop;
+      auto server_tcp_pair = get_ephemeral_port(*ev);
       REQUIRE_EXPECTED(server_tcp_pair);
 
-      auto server = test_tcp_server(event_loop, std::move(server_tcp_pair->first), server_tcp_pair->second, serverGotData, serverWroteMsg);
-      co_await test_tcp_client(event_loop, server_tcp_pair->second, clientGotServerReply);
+      auto server = test_tcp_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, serverGotData, serverWroteMsg);
+      co_await test_tcp_client(*ev, server_tcp_pair->second, clientGotServerReply);
       co_await std::move(server);
-      event_loop.stop();
+
+      ev->stop();
     });
 
   event_loop.run();
 
-  REQUIRE(serverGotData.load());
-  REQUIRE(serverWroteMsg.load());
-  REQUIRE(clientGotServerReply.load());
+  REQUIRE(serverGotData);
+  REQUIRE(serverWroteMsg);
+  REQUIRE(clientGotServerReply);
 }
 } // namespace
