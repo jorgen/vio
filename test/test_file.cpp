@@ -2,33 +2,34 @@
 
 #include <chrono>
 #include <doctest/doctest.h>
+#include <print>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
 #include <vio/operation/file.h>
 #include <vio/task.h>
 
-vio::task_t<void> write_a_test_file(vio::event_loop_t &event_loop)
+static vio::task_t<void> write_a_test_file(vio::event_loop_t &event_loop)
 {
   auto tmp_file = vio::mkstemp_file(event_loop, "test_write_then_read_XXXXXX");
   REQUIRE(tmp_file.has_value());
   auto file = std::move(tmp_file.value().first);
   auto path = std::move(tmp_file.value().second);
   std::string to_write = "Hello world";
-  auto write_result = co_await vio::write_file(event_loop, *file, (uint8_t *)to_write.data(), to_write.size(), 0);
+  auto write_result = co_await vio::write_file(event_loop, *file, reinterpret_cast<uint8_t *>(to_write.data()), to_write.size(), 0);
   if (!write_result.has_value())
   {
-    fprintf(stderr, "Write operation failed: %s\n", write_result.error().msg.c_str());
+    std::println(stderr, "Write operation failed: {}", write_result.error().msg);
   }
   REQUIRE(write_result.has_value());
   REQUIRE(write_result.value() == to_write.size());
 
-  file = vio::make_auto_close_file({&event_loop, -1});
+  file = vio::make_auto_close_file({.event_loop = &event_loop, .handle = -1});
 
   auto opened_file = vio::open_file(event_loop, path, vio::file_open_flag_t::rdonly, 0);
   REQUIRE(opened_file.has_value());
   file = std::move(opened_file.value());
   std::string buffer(to_write.size(), '\0');
-  auto read_result = co_await vio::read_file(event_loop, *file, (uint8_t *)buffer.data(), to_write.size(), 0);
+  auto read_result = co_await vio::read_file(event_loop, *file, reinterpret_cast<uint8_t *>(buffer.data()), to_write.size(), 0);
   REQUIRE(read_result.has_value());
   REQUIRE(read_result.value() == to_write.size());
   REQUIRE(buffer == to_write);
@@ -41,13 +42,13 @@ TEST_CASE("test basic file")
   event_loop.run_in_loop([&event_loop] { write_a_test_file(event_loop); });
   event_loop.run();
 }
-vio::task_t<void> test_sync_file_ops(vio::event_loop_t &event_loop)
+
+static vio::task_t<void> test_sync_file_ops(vio::event_loop_t &event_loop)
 {
   auto tmp = vio::mkstemp_file(event_loop, "test_sync_file_ops_XXXXXX");
   REQUIRE(tmp.has_value());
   auto file_handle = std::move(tmp.value().first);
   auto source_path = std::move(tmp.value().second);
-
   {
     std::string text = "Some test data";
     auto write_result = co_await vio::write_file(event_loop, *file_handle, reinterpret_cast<const uint8_t *>(text.data()), text.size(), 0);
@@ -55,22 +56,19 @@ vio::task_t<void> test_sync_file_ops(vio::event_loop_t &event_loop)
     REQUIRE(write_result.value() == text.size());
   }
 
-  file_handle = vio::make_auto_close_file({&event_loop, -1});
+  file_handle = vio::make_auto_close_file({.event_loop = &event_loop, .handle = -1});
 
-  std::string new_path = source_path + "_renamed";
-
+  const std::string new_path = source_path + "_renamed";
   {
     auto rename_result = vio::rename_file(event_loop, source_path, new_path);
     REQUIRE(rename_result.has_value());
   }
-
   {
     auto stat_result = vio::stat_file(event_loop, new_path);
     REQUIRE(stat_result.has_value());
     // Optionally check if file size is bigger than 0
     REQUIRE(stat_result->st_size > 0);
   }
-
   {
     auto unlink_result = vio::unlink_file(event_loop, new_path);
     REQUIRE(unlink_result.has_value());
@@ -80,13 +78,12 @@ vio::task_t<void> test_sync_file_ops(vio::event_loop_t &event_loop)
   co_return;
 }
 
-vio::task_t<void> test_mkdir_rmdir(vio::event_loop_t &event_loop)
+static vio::task_t<void> test_mkdir_rmdir(vio::event_loop_t &event_loop)
 {
   char dir_template[] = "test_mkdir_rmdir_XXXXXX";
   auto dir_name_result = vio::mkdtemp_path(event_loop, dir_template);
   REQUIRE(dir_name_result.has_value());
   const std::string &dir_name = dir_name_result.value();
-
   {
     auto rmdir_result = vio::rmdir_path(event_loop, dir_name);
     REQUIRE(rmdir_result.has_value());
@@ -94,13 +91,11 @@ vio::task_t<void> test_mkdir_rmdir(vio::event_loop_t &event_loop)
 
   auto mkdir_result = vio::mkdir_path(event_loop, dir_name, 0700);
   REQUIRE(mkdir_result.has_value());
-
   {
     auto stat_result = vio::stat_file(event_loop, dir_name);
     REQUIRE(stat_result.has_value());
     REQUIRE((stat_result->st_mode & S_IFDIR) != 0);
   }
-
   {
     auto rmdir_result = vio::rmdir_path(event_loop, dir_name);
     REQUIRE(rmdir_result.has_value());
@@ -110,7 +105,7 @@ vio::task_t<void> test_mkdir_rmdir(vio::event_loop_t &event_loop)
   co_return;
 }
 
-vio::task_t<void> test_send_file(vio::event_loop_t &event_loop)
+static vio::task_t<void> test_send_file(vio::event_loop_t &event_loop)
 {
   auto source = vio::mkstemp_file(event_loop, "test_send_file_src_XXXXXX");
   REQUIRE(source.has_value());
@@ -128,15 +123,13 @@ vio::task_t<void> test_send_file(vio::event_loop_t &event_loop)
   REQUIRE(dest.has_value());
   auto dst_file = std::move(dest.value().first);
   auto dest_path = std::move(dest.value().second);
-
   {
     auto send_result = co_await vio::send_file(event_loop, *dst_file, *src_file, 0, test_data.size());
     REQUIRE(send_result.has_value());
     REQUIRE(send_result.value() == test_data.size());
   }
-
   {
-    dst_file = vio::make_auto_close_file({&event_loop, -1});
+    dst_file = vio::make_auto_close_file({.event_loop = &event_loop, .handle = -1});
     auto opened_dst = vio::open_file(event_loop, dest_path, vio::file_open_flag_t::rdonly, 0);
     REQUIRE(opened_dst.has_value());
     dst_file = std::move(opened_dst.value());
@@ -148,8 +141,8 @@ vio::task_t<void> test_send_file(vio::event_loop_t &event_loop)
     REQUIRE(buffer == test_data);
   }
 
-  src_file = vio::make_auto_close_file({&event_loop, -1});
-  dst_file = vio::make_auto_close_file({&event_loop, -1});
+  src_file = vio::make_auto_close_file({.event_loop = &event_loop, .handle = -1});
+  dst_file = vio::make_auto_close_file({.event_loop = &event_loop, .handle = -1});
   auto unlink_source_path = vio::unlink_file(event_loop, source_path);
   REQUIRE_EXPECTED(unlink_source_path);
   auto unlink_dest_path = vio::unlink_file(event_loop, dest_path);

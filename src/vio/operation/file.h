@@ -79,7 +79,9 @@ inline void close_file(file_t *file)
     uv_fs_close(file->event_loop->loop(), &request, file->handle, nullptr);
   }
 }
+
 using auto_close_file_t = auto_close_t<file_t, decltype(&close_file)>;
+
 inline auto_close_file_t make_auto_close_file(file_t &&file)
 {
   return auto_close_file_t(std::forward<file_t>(file), &close_file);
@@ -162,7 +164,10 @@ struct file_io_state_t
 inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset)
 {
   using ret_t = decltype(write_file(event_loop, file, data, length, offset));
-  auto closer = [](ref_ptr_t<file_io_state_t> &state) { auto copy = state; };
+  auto closer = [](ref_ptr_t<file_io_state_t> &state)
+  {
+    auto copy = state;
+  };
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
   uv_buf_t buf = uv_buf_init(std::bit_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));

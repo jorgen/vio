@@ -22,10 +22,13 @@
 
 #include "vio/event_loop.h"
 #include "vio/event_pipe.h"
-#include "vio/worker.h"
-#include "vio/thread_pool.h"
 #include "vio/operation/sleep.h"
+#include "vio/thread_pool.h"
+#include "vio/worker.h"
+#include <tls.h>
 int function()
-    {
-     return 0;
-  }
+{
+  auto config = tls_config_new();
+  tls_config_free(config);
+  return 0;
+}

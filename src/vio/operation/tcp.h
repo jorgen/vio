@@ -172,12 +172,10 @@ inline std::expected<tcp_t, error_t> create_tcp(event_loop_t &loop)
         auto stateRef = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
       }
       handle->data = nullptr;
-
     };
     uv_close(handle->get_handle(), close_cb);
   };
   tcp.handle.set_close_guard(to_close);
-  fprintf(stderr, "created tcp %p\n", tcp.get_tcp());
   return tcp;
 }
 

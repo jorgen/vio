@@ -85,10 +85,10 @@ std::expected<std::pair<vio::tcp_t, int>, vio::error_t> get_ephemeral_port(vio::
   PROPAGATE_ERROR(bind_res);
 
   sockaddr_storage sa_storage{};
-  int namelen = sizeof(sa_storage);
-  uv_tcp_getsockname(tmp_tcp.value().get_tcp(), reinterpret_cast<sockaddr *>(&sa_storage), &namelen);
-  auto *sa_in = reinterpret_cast<sockaddr_in *>(&sa_storage);
-  return std::make_pair(std::move(tmp_tcp.value()), int(ntohs(sa_in->sin_port)));
+  int name_len = sizeof(sa_storage);
+  uv_tcp_getsockname(tmp_tcp.value().get_tcp(), reinterpret_cast<sockaddr *>(&sa_storage), &name_len);
+  const auto *sa_in = reinterpret_cast<sockaddr_in *>(&sa_storage);
+  return std::make_pair(std::move(tmp_tcp.value()), static_cast<int>(ntohs(sa_in->sin_port)));
 }
 
 TEST_CASE("test basic tcp")
