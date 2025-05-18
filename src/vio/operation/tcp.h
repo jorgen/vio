@@ -568,7 +568,7 @@ private:
   bool is_valid = false;
 };
 
-std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
+inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
 {
   if (tcp.handle.ptr() == nullptr)
   {
