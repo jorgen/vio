@@ -44,6 +44,7 @@ Checks: >
   performance-*,
   portability-*,
   readability-*,
+  cppcoreguidelines-*,
   -google-readability-namespace-comments,
   -google-runtime-int,
   -google-runtime-references,

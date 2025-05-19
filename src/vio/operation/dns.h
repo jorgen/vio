@@ -38,18 +38,17 @@ class address_info_t
 {
 public:
   int flags;
-  pe;
-  ocol;
-  t addrlen;
-  ::vector<char> addr;
+  int family;
+  int socktype;
+  int protocol;
   std::string canonname;
+  std::vector<uint8_t> addr;
 
   address_info_t()
     : flags(0)
     , family(0)
     , socktype(0)
     , protocol(0)
-    , addrlen(0)
   {
   }
 
@@ -58,7 +57,6 @@ public:
     , family(info.ai_family)
     , socktype(info.ai_socktype)
     , protocol(info.ai_protocol)
-    , addrlen(info.ai_addrlen)
   {
     if (info.ai_addr != nullptr && info.ai_addrlen > 0)
     {
@@ -92,8 +90,6 @@ inline addrinfo convert_to_addrinfo(const address_info_t &info)
   result.ai_family = info.family;
   result.ai_socktype = info.socktype;
   result.ai_protocol = info.protocol;
-  result.ai_addrlen = info.addrlen;
-  result.ai_addr = info.get_sockaddr();
   result.ai_canonname = info.canonname.empty() ? nullptr : const_cast<char *>(info.canonname.c_str());
   return result;
 }
@@ -116,7 +112,7 @@ struct get_addrinfo_state_t
   std::string host;
   uv_getaddrinfo_t req;
   std::expected<address_info_list_t, error_t> result;
-  std::coroutine_handle<> continuation = {};
+  std::coroutine_handle<> continuation;
   bool done = false;
 
   bool await_ready() noexcept
@@ -155,19 +151,19 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   {
     auto state = future_ref_ptr_t::from_raw(req->data);
     state->done = true;
-    auto to_callback = state;
-    req->data = to_callback.release_to_raw();
-    auto close_callback = [](uv_handle_t *handle) { auto state = future_ref_ptr_t::from_raw(handle->data); };
-    uv_close((uv_handle_t *)req, close_callback);
     if (status < 0)
     {
-      state->result = std::unexpected(error_t{status, uv_strerror(status)});
+      std::string msg(uv_strerror(status));
+      error_t err = {status, msg};
+      state->result = std::unexpected(err);
     }
     else
     {
       state->result = convert_addrinfo_list(res);
-      uv_freeaddrinfo(res);
     }
+
+    uv_freeaddrinfo(res);
+
     if (state->continuation)
       state->continuation.resume();
   };
@@ -175,6 +171,76 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   if (r < 0)
   {
     // Mark as done right away and set the error.
+    ret.state_ptr->done = true;
+    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
+  }
+  return ret;
+}
+
+struct name_info_result_t
+{
+  std::string host;
+  std::string service;
+};
+struct getnameinfo_state_t
+{
+  uv_getnameinfo_t req;
+  std::expected<name_info_result_t, error_t> result;
+  std::coroutine_handle<> continuation;
+  bool done = false;
+
+  bool await_ready() noexcept
+  {
+    return done;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    if (done)
+    {
+      continuation.resume();
+    }
+    else
+    {
+      this->continuation = continuation;
+    }
+  }
+
+  auto await_resume() noexcept
+  {
+    return std::move(result);
+  }
+};
+
+inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, const address_info_t &addr, int hints = NI_NUMERICHOST | NI_NUMERICSERV)
+{
+  using ret_t = future_t<getnameinfo_state_t>;
+  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
+  ret_t ret;
+  auto req = &ret.state.req;
+  auto copy = ret.state_ptr;
+  req->data = copy.release_to_raw();
+  auto callback = [](uv_getnameinfo_t *req, int status, const char *hostname, const char *service)
+  {
+    auto state = future_ref_ptr_t::from_raw(req->data);
+    state->done = true;
+    if (status < 0)
+    {
+      std::string msg(uv_strerror(status));
+      error_t err = {status, msg};
+      state->result = std::unexpected(err);
+    }
+    else
+    {
+      state->result = {std::string(hostname), std::string(service)};
+    }
+
+    if (state->continuation)
+      state->continuation.resume();
+  };
+  auto r = uv_getnameinfo(event_loop.loop(), req, callback, addr.get_sockaddr(), hints);
+  if (r < 0)
+  {
     ret.state_ptr->done = true;
     ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
   }

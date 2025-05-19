@@ -21,6 +21,7 @@ Copyright (c) 2025 Jørgen Lind
 */
 
 #pragma once
+#include <string>
 namespace vio
 {
 struct error_t

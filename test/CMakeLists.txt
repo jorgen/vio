@@ -5,6 +5,7 @@ add_executable(vio_tests
     test_file.cpp
     test_tcp.cpp
     test_ssl.cpp
+    test_dns.cpp
 )
 
 target_link_libraries(vio_tests PRIVATE vio)
