@@ -5,7 +5,7 @@ add_library(vio STATIC
 
 )
 
-BuildExternalTargetLinkLibrary(vio PUBLIC LibreSSL::TLS)
+BuildExternalTargetLinkLibrary(vio PUBLIC LibreSSL::TLS ada)
 
 target_include_directories(vio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
