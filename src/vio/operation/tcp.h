@@ -107,7 +107,39 @@ struct tcp_state_t
   tcp_connect_state_t connect;
   tcp_write_state_t write;
   tcp_read_state_t read;
+};
 
+template <typename State>
+struct tcp_future_t
+{
+  ref_ptr_t<tcp_state_t> handle;
+  State &state;
+  tcp_future_t(ref_ptr_t<tcp_state_t> handle, State &state)
+    : handle(std::move(handle))
+    , state(state)
+  {
+  }
+  bool await_ready() noexcept
+  {
+    return state.done;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    if (state.done)
+    {
+      continuation.resume();
+    }
+    else
+    {
+      state.continuation = continuation;
+    }
+  }
+
+  auto await_resume() noexcept
+  {
+    return state.result;
+  }
 };
 
 struct tcp_read_buffer_t
@@ -166,7 +198,7 @@ inline std::expected<sockaddr_in6, error_t> ip6_addr(const std::string &ip, int 
 inline std::expected<tcp_t, error_t> create_tcp(event_loop_t &loop)
 {
   tcp_t tcp{ref_ptr_t<tcp_state_t>(loop)};
-  if (int r = uv_tcp_init(loop.loop(), tcp.get_tcp()); r < 0)
+  if (auto r = uv_tcp_init(loop.loop(), tcp.get_tcp()); r < 0)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
@@ -192,7 +224,7 @@ inline std::expected<tcp_t, error_t> create_tcp(event_loop_t &loop)
 
 inline std::expected<void, error_t> tcp_bind(tcp_t &tcp, const sockaddr *addr, unsigned int flags = 0)
 {
-  const int r = uv_tcp_bind(tcp.get_tcp(), addr, flags);
+  const auto r = uv_tcp_bind(tcp.get_tcp(), addr, flags);
   if (r < 0)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
@@ -200,39 +232,10 @@ inline std::expected<void, error_t> tcp_bind(tcp_t &tcp, const sockaddr *addr, u
   return {};
 }
 
-struct tcp_listen_future_t
-{
-  ref_ptr_t<tcp_state_t> handle;
-  tcp_listen_future_t(ref_ptr_t<tcp_state_t> handle)
-    : handle(std::move(handle))
-  {
-  }
-  bool await_ready() noexcept
-  {
-    return handle->listen.done;
-  }
-
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
-  {
-    if (handle->listen.done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      handle->listen.continuation = continuation;
-    }
-  }
-
-  std::expected<void, error_t> await_resume() noexcept
-  {
-    return handle->listen.result;
-  }
-};
-
+using tcp_listen_future_t = tcp_future_t<tcp_listen_state_t>;
 inline tcp_listen_future_t tcp_listen(tcp_t &tcp, int backlog)
 {
-  tcp_listen_future_t ret(tcp.handle);
+  tcp_listen_future_t ret(tcp.handle, tcp.handle->listen);
 
   auto on_connection = [](uv_stream_t *server, int status)
   {
@@ -256,7 +259,7 @@ inline tcp_listen_future_t tcp_listen(tcp_t &tcp, int backlog)
   auto copy = ret.handle;
   ret.handle->get_stream()->data = copy.release_to_raw();
 
-  int r = uv_listen(tcp.get_stream(), backlog, on_connection);
+  auto r = uv_listen(tcp.get_stream(), backlog, on_connection);
   if (r < 0)
   {
     ret.handle->listen.done = true;
@@ -286,38 +289,10 @@ inline std::expected<tcp_t, error_t> tcp_accept(tcp_t &server)
   return std::move(client);
 }
 
-struct tcp_connect_future_t
-{
-  ref_ptr_t<tcp_state_t> handle;
-  explicit tcp_connect_future_t(ref_ptr_t<tcp_state_t> handle)
-    : handle(std::move(handle))
-  {
-  }
-  bool await_ready() noexcept
-  {
-    return handle->connect.done;
-  }
-
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
-  {
-    if (handle->connect.done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      handle->connect.continuation = continuation;
-    }
-  }
-
-  std::expected<void, error_t> await_resume() noexcept
-  {
-    return handle->connect.result;
-  }
-};
+using tcp_connect_future_t = tcp_future_t<tcp_connect_state_t>;
 inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
 {
-  tcp_connect_future_t ret(tcp.handle);
+  tcp_connect_future_t ret(tcp.handle, tcp.handle->connect);
   if (ret.handle->connect.started)
   {
     ret.handle->connect.done = true;
@@ -346,7 +321,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   };
   auto copy = ret.handle;
   ret.handle->connect.req.data = copy.release_to_raw();
-  int r = uv_tcp_connect(&ret.handle->connect.req, tcp.get_tcp(), addr, callback);
+  auto r = uv_tcp_connect(&ret.handle->connect.req, tcp.get_tcp(), addr, callback);
   if (r < 0)
   {
     ret.handle->connect.done = true;
@@ -356,38 +331,10 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   return ret;
 }
 
-struct tcp_write_future_t
-{
-  ref_ptr_t<tcp_state_t> handle;
-  explicit tcp_write_future_t(ref_ptr_t<tcp_state_t> handle)
-    : handle(std::move(handle))
-  {
-  }
-  bool await_ready() noexcept
-  {
-    return handle->write.done;
-  }
-
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
-  {
-    if (handle->write.done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      handle->write.continuation = continuation;
-    }
-  }
-
-  std::expected<void, error_t> await_resume() noexcept
-  {
-    return handle->write.result;
-  }
-};
+using tcp_write_future_t = tcp_future_t<tcp_write_state_t>;
 inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length)
 {
-  tcp_write_future_t ret(tcp.handle);
+  tcp_write_future_t ret(tcp.handle, tcp.handle->write);
 
   uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
 
@@ -409,8 +356,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
 
   auto copy = ret.handle;
   ret.handle->write.req.data = copy.release_to_raw();
-  fprintf(stderr, "write_tcp: %p\n", ret.handle->get_stream());
-  int r = uv_write(&ret.handle->write.req, tcp.get_stream(), &buf, 1, callback);
+  auto r = uv_write(&ret.handle->write.req, tcp.get_stream(), &buf, 1, callback);
 
   if (r < 0)
   {
@@ -596,10 +542,9 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
     tcp_state->read.alloc_buffer_cb(tcp_state->read.alloc_cb_data, size, buf);
     tcp_state.release_to_raw();
   };
-  fprintf(stderr, "tcp read start %p\n.", tcp.get_stream());
   auto copy = tcp.handle;
   tcp.get_stream()->data = copy.release_to_raw();
-  if (const int r = uv_read_start(tcp.get_stream(), alloc_cb, &tcp_reader_t::read_cb); r >= 0)
+  if (const auto r = uv_read_start(tcp.get_stream(), alloc_cb, &tcp_reader_t::read_cb); r >= 0)
   {
 
     tcp.handle->read.active = true;
