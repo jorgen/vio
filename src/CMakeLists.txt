@@ -4,10 +4,14 @@ add_library(vio STATIC
     worker.cpp
 
 )
+configure_file(${libressl_SOURCE_DIR}/cert.pem ${CMAKE_CURRENT_SOURCE_DIR}/default_certs/cert.pem COPYONLY)
+cmrc_add_resource_library(vio_default_certs ALIAS vio::default_certs NAMESPACE vio default_certs/cert.pem)
 
 BuildExternalTargetLinkLibrary(vio PUBLIC LibreSSL::TLS ada)
 
 target_include_directories(vio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_link_libraries(vio PRIVATE vio::default_certs)
 
 if (VIO_USE_SYSTEM_LIBUV)
     find_package(libuv REQUIRED)

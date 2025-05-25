@@ -1,2 +1,5 @@
 .idea
-cmake-build-debug
+cmake-build-*
+src/default_certs
+3rdparty
+

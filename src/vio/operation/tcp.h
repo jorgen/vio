@@ -113,32 +113,32 @@ template <typename State>
 struct tcp_future_t
 {
   ref_ptr_t<tcp_state_t> handle;
-  State &state;
+  State *state;
   tcp_future_t(ref_ptr_t<tcp_state_t> handle, State &state)
     : handle(std::move(handle))
-    , state(state)
+    , state(&state)
   {
   }
   bool await_ready() noexcept
   {
-    return state.done;
+    return state->done;
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
   {
-    if (state.done)
+    if (state->done)
     {
       continuation.resume();
     }
     else
     {
-      state.continuation = continuation;
+      state->continuation = continuation;
     }
   }
 
   auto await_resume() noexcept
   {
-    return state.result;
+    return state->result;
   }
 };
 
@@ -195,7 +195,7 @@ inline std::expected<sockaddr_in6, error_t> ip6_addr(const std::string &ip, int 
   return addr;
 }
 
-inline std::expected<tcp_t, error_t> create_tcp(event_loop_t &loop)
+inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
 {
   tcp_t tcp{ref_ptr_t<tcp_state_t>(loop)};
   if (auto r = uv_tcp_init(loop.loop(), tcp.get_tcp()); r < 0)
@@ -205,16 +205,22 @@ inline std::expected<tcp_t, error_t> create_tcp(event_loop_t &loop)
   auto to_close = [](ref_ptr_t<tcp_state_t> &handle)
   {
     if (!handle.ptr())
+    {
       return;
+    }
     auto copy = handle;
     handle->get_handle()->data = copy.release_to_raw();
     auto close_cb = [](uv_handle_t *handle)
     {
       if (handle->data)
       {
-        auto stateRef = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
+        auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
+        handle->data = nullptr;
       }
-      handle->data = nullptr;
+      else
+      {
+        handle->data = nullptr;
+      }
     };
     uv_close(handle->get_handle(), close_cb);
   };
@@ -275,7 +281,7 @@ inline std::expected<tcp_t, error_t> tcp_accept(tcp_t &server)
   if (!server.handle.ptr())
     return std::unexpected(error_t{-1, "It's not possible to accept a connection on a closed socket"});
 
-  auto tcp_client = create_tcp(server.handle->event_loop);
+  auto tcp_client = tcp_create(server.handle->event_loop);
   if (!tcp_client.has_value())
   {
     return std::unexpected(tcp_client.error());

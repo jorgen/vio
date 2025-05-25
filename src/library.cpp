@@ -25,10 +25,19 @@
 #include "vio/operation/sleep.h"
 #include "vio/thread_pool.h"
 #include "vio/worker.h"
+
+#include <cmrc/cmrc.hpp>
+#include <span>
 #include <tls.h>
-int function()
+CMRC_DECLARE(vio);
+namespace vio
 {
-  auto config = tls_config_new();
-  tls_config_free(config);
-  return 0;
+std::span<const uint8_t> get_default_ca_certificates()
+{
+  auto file = cmrc::vio::get_filesystem().open("default_certs/cert.pem");
+  if (!file.size())
+    return {};
+  return {reinterpret_cast<const uint8_t *>(file.begin()), file.size()};
 }
+
+} // namespace vio

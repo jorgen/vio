@@ -46,7 +46,7 @@ vio::task_t<void> test_tcp_server(vio::event_loop_t &event_loop, vio::tcp_t &&s,
 // A client task that connects to the server, writes a message, and reads the server's reply
 vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int server_port, bool &client_got_server_reply)
 {
-  auto client_or_err = vio::create_tcp(event_loop);
+  auto client_or_err = vio::tcp_create(event_loop);
   REQUIRE_EXPECTED(client_or_err);
   auto client_raw = std::move(client_or_err.value());
 
@@ -72,14 +72,14 @@ vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int server_port
 }
 
 #define PROPAGATE_ERROR(x)                                                                                                                                                                                                 \
-  if (!(x).has_value())                                                                                                                                                                                                      \
+  if (!(x).has_value())                                                                                                                                                                                                    \
     return std::unexpected(std::move((x).error()));
 
 std::expected<std::pair<vio::tcp_t, int>, vio::error_t> get_ephemeral_port(vio::event_loop_t &event_loop)
 {
   auto addr_or_err = vio::ip4_addr("127.0.0.1", 0);
   PROPAGATE_ERROR(addr_or_err);
-  auto tmp_tcp = vio::create_tcp(event_loop);
+  auto tmp_tcp = vio::tcp_create(event_loop);
   PROPAGATE_ERROR(tmp_tcp);
   auto bind_res = vio::tcp_bind(tmp_tcp.value(), reinterpret_cast<const sockaddr *>(&addr_or_err.value()));
   PROPAGATE_ERROR(bind_res);

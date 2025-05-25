@@ -14,7 +14,7 @@ auto dns_lookup_localhost(vio::event_loop_t &event_loop, bool &test_completed) -
   hints.family = AF_UNSPEC;
   hints.socktype = SOCK_STREAM;
 
-  auto result = co_await get_addrinfo(event_loop, "localhost", hints);
+  auto result = co_await vio::get_addrinfo(event_loop, "localhost", hints);
 
   REQUIRE_EXPECTED(result);
   REQUIRE(result->size());
@@ -77,8 +77,9 @@ auto dns_lookup_ipv4(vio::event_loop_t &event_loop, bool &test_completed) -> vio
 auto dns_lookup_google(vio::event_loop_t &event_loop, bool &test_completed) -> vio::task_t<void>
 {
   vio::address_info_t hints;
-  hints.family = AF_INET;
+  hints.family = AF_UNSPEC;
   hints.socktype = SOCK_STREAM;
+  hints.protocol = IPPROTO_TCP;
 
   auto result = co_await get_addrinfo(event_loop, "google.com", hints);
 

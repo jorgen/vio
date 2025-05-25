@@ -98,8 +98,7 @@ inline address_info_list_t convert_addrinfo_list(const addrinfo *info)
 {
   address_info_list_t result;
   addrinfo hints;
-  result.reserve(10);
-  result.reserve(info->ai_addrlen);
+  result.reserve(5);
   for (const addrinfo *current = info; current != nullptr; current = current->ai_next)
   {
     result.emplace_back(*current);
@@ -110,7 +109,7 @@ inline address_info_list_t convert_addrinfo_list(const addrinfo *info)
 struct get_addrinfo_state_t
 {
   std::string host;
-  uv_getaddrinfo_t req;
+  uv_getaddrinfo_t req = {};
   std::expected<address_info_list_t, error_t> result;
   std::coroutine_handle<> continuation;
   bool done = false;
@@ -137,7 +136,8 @@ struct get_addrinfo_state_t
     return std::move(result);
   }
 };
-inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, const std::string &host, const address_info_t &hints)
+
+inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, const std::string &host, const address_info_t &hints = address_info_t{})
 {
   using ret_t = decltype(get_addrinfo(event_loop, host, hints));
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
@@ -145,8 +145,10 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   ret.state.host = host;
   auto hints_converted = convert_to_addrinfo(hints);
   auto req = &ret.state.req;
-  auto copy = ret.state_ptr;
-  req->data = copy.release_to_raw();
+  {
+    auto copy = ret.state_ptr;
+    req->data = copy.release_to_raw();
+  }
   auto callback = [](uv_getaddrinfo_t *req, int status, addrinfo *res)
   {
     auto state = future_ref_ptr_t::from_raw(req->data);
@@ -218,8 +220,10 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
   auto req = &ret.state.req;
-  auto copy = ret.state_ptr;
-  req->data = copy.release_to_raw();
+  {
+    auto copy = ret.state_ptr;
+    req->data = copy.release_to_raw();
+  }
   auto callback = [](uv_getnameinfo_t *req, int status, const char *hostname, const char *service)
   {
     auto state = future_ref_ptr_t::from_raw(req->data);
