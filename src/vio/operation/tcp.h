@@ -552,7 +552,6 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
   tcp.get_stream()->data = copy.release_to_raw();
   if (const auto r = uv_read_start(tcp.get_stream(), alloc_cb, &tcp_reader_t::read_cb); r >= 0)
   {
-
     tcp.handle->read.active = true;
     tcp.handle->read.started = true;
   }

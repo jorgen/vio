@@ -23,9 +23,11 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include "dns.h"
+#include "tcp.h"
 #include "vio/error.h"
 #include "vio/ref_ptr.h"
 
+#include <array>
 #include <coroutine>
 #include <expected>
 #include <span>
@@ -36,6 +38,9 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+
+using ssl_client_dealloc_cb_t = void (*)(void *user_ptr, char *data_ptr);
+using ssl_client_alloc_cb_t = void (*)(void *user_ptr, size_t suggested_size, uv_buf_t *buf);
 
 struct ssl_client_state_t
 {
@@ -57,6 +62,14 @@ struct ssl_client_state_t
   bool connected = false;
   bool connecting = false;
   bool resolved_done = false;
+
+  uv_poll_t poll_req = {};
+  bool reader_active = false;
+  ssl_client_alloc_cb_t alloc_cb;
+  ssl_client_dealloc_cb_t dealloc_cb;
+  int buffer_front = 0;
+  int buffer_back = 0;
+  std::array<std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>, 10> buffer_queue;
 
   uv_tcp_t *get_tcp()
   {
@@ -313,6 +326,55 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   client.state->resolved_done = false;
   impl_ssl_client_resolve_host(client);
   return {client.state};
+}
+
+inline void default_dealloc(void *, char *ptr)
+{
+  delete[] ptr;
+}
+
+inline void default_alloc(void *, size_t suggested_size, uv_buf_t *buf)
+{
+  if (buf == nullptr)
+  {
+    return;
+  }
+  buf->base = new char[suggested_size];
+  buf->len = suggested_size;
+}
+
+struct ssl_client_reader_t
+{
+  ref_ptr_t<ssl_client_state_t> state;
+};
+
+inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client, ssl_client_alloc_cb_t alloc_cb = default_alloc, ssl_client_dealloc_cb_t dealloc_cb = default_dealloc,
+                                                                            void *user_alloc_ptr = nullptr)
+{
+  if (client.state.ptr() == nullptr)
+  {
+    return std::unexpected(error_t{1, "Can not create a reader for a closed client"});
+  }
+  if (client.state->reader_active)
+  {
+    return std::unexpected(error_t{1, "Can not create a reader for a client that already has a reader active"});
+  }
+  if (!client.state->connected)
+  {
+    return std::unexpected(error_t{1, "Can not create a reader for a client that is not connected"});
+  }
+  client.state->reader_active = true;
+  uv_poll_init_socket(client.state->event_loop.loop(), &client.state->poll_req, client.state->socket_fd);
+  {
+    auto copy = client.state;
+    client.state->poll_req.data = copy.release_to_raw();
+  }
+  client.state->alloc_cb = alloc_cb;
+  client.state->dealloc_cb = dealloc_cb;
+
+
+
+  return {ssl_client_reader_t{client.state}};
 }
 
 } // namespace vio
