@@ -30,6 +30,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <array>
 #include <coroutine>
 #include <expected>
+#include <openssl/bio.h>
 #include <span>
 #include <string>
 #include <tls.h>
@@ -39,8 +40,29 @@ Copyright (c) 2025 Jørgen Lind
 namespace vio
 {
 
-using ssl_client_dealloc_cb_t = void (*)(void *user_ptr, char *data_ptr);
+using ssl_client_dealloc_cb_t = void (*)(void *user_ptr, uv_buf_t *buf);
 using ssl_client_alloc_cb_t = void (*)(void *user_ptr, size_t suggested_size, uv_buf_t *buf);
+
+struct ssl_config
+{
+  std::optional<std::string> ca_file;
+  std::optional<std::string> ca_path;
+  std::optional<std::string> cert_file;
+  std::optional<std::string> key_file;
+  std::optional<std::string> ocsp_staple_file;
+  std::optional<std::vector<uint8_t>> ca_mem;
+  std::optional<std::vector<uint8_t>> cert_mem;
+  std::optional<std::vector<uint8_t>> key_mem;
+  std::optional<std::vector<uint8_t>> ocsp_staple_mem;
+  std::optional<std::string> ciphers;
+  std::optional<std::string> alpn;
+  std::optional<bool> verify_client;
+  std::optional<bool> verify_depth;
+  std::optional<bool> verify_optional;
+  std::optional<uint32_t> protocols;
+  std::optional<uint32_t> dheparams;
+  std::optional<uint32_t> ecdhecurve;
+};
 
 struct ssl_client_state_t
 {
@@ -50,7 +72,7 @@ struct ssl_client_state_t
   uv_getaddrinfo_t getaddrinfo_req = {};
   uv_connect_t connect_req = {};
   uv_tcp_t tcp_req = {};
-  struct tls *tls_ctx = nullptr;
+  tls *tls_ctx = nullptr;
   int socket_fd = -1;
   std::vector<uint8_t> cert_data;
 
@@ -64,12 +86,14 @@ struct ssl_client_state_t
   bool resolved_done = false;
 
   uv_poll_t poll_req = {};
+  bool poll_active = false;
   bool reader_active = false;
+  std::coroutine_handle<> read_continuation;
   ssl_client_alloc_cb_t alloc_cb;
   ssl_client_dealloc_cb_t dealloc_cb;
   int buffer_front = 0;
   int buffer_back = 0;
-  std::array<std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>, 10> buffer_queue;
+  std::array<std::expected<std::pair<uv_buf_t, ssl_client_dealloc_cb_t>, error_t>, 10> buffer_queue;
 
   uv_tcp_t *get_tcp()
   {
@@ -88,10 +112,7 @@ struct ssl_client_state_t
 
   static void connect_to_current_index(ref_ptr_t<ssl_client_state_t> &state)
   {
-    {
-      auto copy = state;
-      state->connect_req.data = copy.release_to_raw();
-    }
+    state.inc_ref_and_store_in_handle(state->connect_req);
     auto on_connect = [](uv_connect_t *req, int status)
     {
       auto state = ref_ptr_t<ssl_client_state_t>::from_raw(req->data);
@@ -118,12 +139,26 @@ struct ssl_client_state_t
       uv_os_fd_t socket;
       if (uv_fileno(state->get_tcp_handle(), &socket) == 0)
       {
-        state->socket_fd = int(socket);
+        state->socket_fd = reinterpret_cast<int>(socket);
+        BIO_socket_nbio(state->socket_fd, 0);
 
-        if (auto tls_result = tls_connect_socket(state->tls_ctx, state->socket_fd, state->host.c_str()); tls_result == 0)
+        if (auto tls_result = tls_connect_socket(state->tls_ctx, state->socket_fd, "localhost"); tls_result == 0)
         {
           state->connected = true;
           state->connect_result = {};
+          if (auto error_code = tls_handshake(state->tls_ctx); error_code != 0)
+          {
+            auto error = tls_error(state->tls_ctx);
+            if (error)
+            {
+              state->connect_result = std::unexpected(error_t{-1, tls_error(state->tls_ctx)});
+            }
+            else
+            {
+              state->connect_result = std::unexpected(error_t{-1, "TLS handshake failed"});
+            }
+            state->connecting = false;
+          }
         }
         else
         {
@@ -143,6 +178,7 @@ struct ssl_client_state_t
     auto connect_result = uv_tcp_connect(&state->connect_req, state->get_tcp(), state->addresses[state->address_index].get_sockaddr(), on_connect);
     if (connect_result < 0)
     {
+      ref_ptr_t<ssl_client_state_t>::from_raw(state->connect_req.data);
       state->address_index++;
       if (state->address_index < state->addresses.size())
       {
@@ -152,7 +188,6 @@ struct ssl_client_state_t
       {
         state->connecting = false;
         state->connect_result = std::unexpected(error_t{connect_result, uv_strerror(connect_result)});
-        ref_ptr_t<ssl_client_state_t>::from_raw(state->connect_req.data);
         if (state->connect_continuation)
         {
           state->connect_continuation.resume();
@@ -188,7 +223,7 @@ struct ssl_client_t
 
 std::span<const uint8_t> get_default_ca_certificates();
 
-inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop)
+inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config &config = {})
 {
   ssl_client_t ret{ref_ptr_t<ssl_client_state_t>{event_loop}};
   if (auto r = uv_tcp_init(event_loop.loop(), &ret.state->tcp_req); r < 0)
@@ -201,10 +236,7 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
     {
       return;
     }
-    {
-      auto copy = state;
-      state->get_tcp_handle()->data = copy.release_to_raw();
-    }
+    state.inc_ref_and_store_in_handle(state->tcp_req);
     auto close_cb = [](uv_handle_t *handle)
     {
       if (handle->data)
@@ -229,25 +261,90 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
   auto cert_data = get_default_ca_certificates();
   ret.state->cert_data.assign(cert_data.begin(), cert_data.end());
 
-  auto config = tls_config_new();
-  if (!config)
+  using tls_config_ptr_t = std::unique_ptr<tls_config, decltype(&tls_config_free)>;
+  tls_config_ptr_t tls_config(tls_config_new(), &tls_config_free);
+  if (!tls_config)
   {
     return std::unexpected(error_t{-1, "Failed to create TLS config"});
   }
 
-  if (auto result = tls_config_set_ca_mem(config, ret.state->cert_data.data(), ret.state->cert_data.size()); result < 0)
+  if (config.ca_mem)
   {
-    tls_config_free(config);
-    return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+    if (auto result = tls_config_set_ca_mem(tls_config.get(), config.ca_mem->data(), config.ca_mem->size()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+  }
+  else if (config.ca_file || config.ca_path)
+  {
+    if (auto result = tls_config_set_ca_file(tls_config.get(), config.ca_file ? config.ca_file->c_str() : nullptr); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+    if (auto result = tls_config_set_ca_path(tls_config.get(), config.ca_path ? config.ca_path->c_str() : nullptr); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+  }
+  else
+  {
+    if (auto result = tls_config_set_ca_mem(tls_config.get(), ret.state->cert_data.data(), ret.state->cert_data.size()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
   }
 
-  if (auto result = tls_configure(ret.state->tls_ctx, config); result < 0)
+  if (config.cert_mem && config.key_mem)
   {
-    tls_config_free(config);
-    return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+    if (auto result = tls_config_set_cert_mem(tls_config.get(), config.cert_mem->data(), config.cert_mem->size()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+    if (auto result = tls_config_set_key_mem(tls_config.get(), config.key_mem->data(), config.key_mem->size()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+  }
+  else if (config.cert_file && config.key_file)
+  {
+    if (auto result = tls_config_set_cert_file(tls_config.get(), config.cert_file->c_str()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+    if (auto result = tls_config_set_key_file(tls_config.get(), config.key_file->c_str()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
   }
 
-  tls_config_free(config);
+  if (config.ocsp_staple_mem)
+  {
+    if (auto result = tls_config_set_ocsp_staple_mem(tls_config.get(), config.ocsp_staple_mem->data(), config.ocsp_staple_mem->size()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+  }
+  else if (config.ocsp_staple_file)
+  {
+    if (auto result = tls_config_set_ocsp_staple_file(tls_config.get(), config.ocsp_staple_file->c_str()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+  }
+
+  if (config.ciphers)
+    if (auto result = tls_config_set_ciphers(tls_config.get(), config.ciphers->c_str()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+
+  if (config.alpn)
+    if (auto result = tls_config_set_alpn(tls_config.get(), config.alpn->c_str()); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+
+  if (config.protocols)
+    if (auto result = tls_config_set_protocols(tls_config.get(), *config.protocols); result < 0)
+      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+
+  if (config.dheparams)
+    // if (auto result = tls_config_set_dheparams(tls_config.get(), *config.dheparams); result < 0)
+    //   return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+
+    if (config.ecdhecurve)
+      // if (auto result = tls_config_set_ecdhecurve(tls_config.get(), *config.ecdhecurve); result < 0)
+      //   return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+
+      if (config.verify_client)
+        tls_config_verify_client(tls_config.get());
+
+  if (config.verify_depth)
+    tls_config_set_verify_depth(tls_config.get(), *config.verify_depth);
+
+  if (config.verify_optional)
+    tls_config_verify(tls_config.get());
+
+  if (auto result = tls_configure(ret.state->tls_ctx, tls_config.get()); result < 0)
+  {
+    return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+  }
 
   return ret;
 }
@@ -264,10 +361,7 @@ inline void impl_ssl_client_resolve_host(ssl_client_t &client)
     ssl_client_state_t::on_resolve_done(client.state, std::unexpected(error_t{1, "Can not resolve host, host is empty"}));
   }
 
-  {
-    auto copy = client.state;
-    client.state->getaddrinfo_req.data = copy.release_to_raw();
-  }
+  client.state.inc_ref_and_store_in_handle(client.state->getaddrinfo_req);
   auto callback = [](uv_getaddrinfo_t *req, int status, addrinfo *res)
   {
     auto state = ref_ptr_t<ssl_client_state_t>::from_raw(req->data);
@@ -294,6 +388,7 @@ inline void impl_ssl_client_resolve_host(ssl_client_t &client)
   hints.ai_protocol = IPPROTO_TCP;
   if (const auto r = uv_getaddrinfo(client.state->event_loop.loop(), &client.state->getaddrinfo_req, callback, client.state->host.c_str(), client.state->port.c_str(), &hints); r < 0)
   {
+    ref_ptr_t<ssl_client_state_t>::from_raw(client.state->getaddrinfo_req.data);
     ssl_client_state_t::on_resolve_done(client.state, std::unexpected(error_t{.code = r, .msg = uv_strerror(r)}));
   }
 }
@@ -320,6 +415,10 @@ struct ssl_client_connecting_future_t
 
 inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, const std::string &host, uint16_t port)
 {
+  if (client.state.ptr() == nullptr)
+  {
+    return {{}};
+  }
   client.state->host = host;
   client.state->port = std::to_string(port);
   client.state->connecting = true;
@@ -328,9 +427,11 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   return {client.state};
 }
 
-inline void default_dealloc(void *, char *ptr)
+inline void default_dealloc(void *, uv_buf_t *data)
 {
-  delete[] ptr;
+  delete[] data->base;
+  data->base = nullptr;
+  data->len = 0;
 }
 
 inline void default_alloc(void *, size_t suggested_size, uv_buf_t *buf)
@@ -343,9 +444,159 @@ inline void default_alloc(void *, size_t suggested_size, uv_buf_t *buf)
   buf->len = suggested_size;
 }
 
+inline void on_readable(uv_poll_t *handle, int status, int events);
+
+bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
+{
+  struct call_read_resume_on_exit_t
+  {
+    ref_ptr_t<ssl_client_state_t> &state;
+    call_read_resume_on_exit_t(ref_ptr_t<ssl_client_state_t> &state)
+      : state(state)
+    {
+    }
+
+    ~call_read_resume_on_exit_t()
+    {
+      if (state->read_continuation && state->buffer_front != state->buffer_back)
+      {
+        state->read_continuation.resume();
+      }
+    }
+  };
+  call_read_resume_on_exit_t call_read_resume_on_exit{state};
+  while ((state->buffer_back + 1) % state->buffer_queue.size() != state->buffer_front)
+  {
+    uv_buf_t read_buf;
+    state->alloc_cb(nullptr, 4096, &read_buf);
+
+    auto r = tls_read(state->tls_ctx, read_buf.base, read_buf.len);
+    if (r == TLS_WANT_POLLIN || r == 0)
+    {
+      state->dealloc_cb(nullptr, &read_buf);
+      if (!state->poll_active)
+      {
+        state->poll_active = true;
+        uv_poll_start(&state->poll_req, UV_READABLE, on_readable);
+      }
+      return true;
+    }
+
+    if (r < 0)
+    {
+      state->dealloc_cb(nullptr, &read_buf);
+      state->buffer_queue[state->buffer_back] = std::unexpected(error_t{int(r), tls_error(state->tls_ctx)});
+      state->buffer_back = (state->buffer_back + 1) % state->buffer_queue.size();
+      uv_poll_stop(&state->poll_req);
+      state->poll_active = false;
+      return false;
+    }
+
+    read_buf.len = size_t(r);
+    state->buffer_queue[state->buffer_back] = std::make_pair(read_buf, state->dealloc_cb);
+    state->buffer_back = (state->buffer_back + 1) % state->buffer_queue.size();
+  }
+
+  state->poll_active = false;
+  uv_poll_stop(&state->poll_req);
+
+  return true;
+}
+
+inline void on_readable(uv_poll_t *handle, int status, int events)
+{
+  auto state = ref_ptr_t<ssl_client_state_t>::from_raw(handle->data);
+  if (status < 0)
+  {
+    return;
+  }
+
+  if (!(events & UV_READABLE))
+  {
+    return;
+  }
+  if (!(events & UV_READABLE))
+  {
+    return;
+  }
+
+  read_from_tls_context(state);
+}
+
 struct ssl_client_reader_t
 {
   ref_ptr_t<ssl_client_state_t> state;
+
+  ssl_client_reader_t(const ref_ptr_t<ssl_client_state_t> &state)
+    : state(state)
+  {
+  }
+
+  ssl_client_reader_t(const ssl_client_reader_t &) = delete;
+  ssl_client_reader_t &operator=(const ssl_client_reader_t &) = delete;
+
+  ssl_client_reader_t(ssl_client_reader_t &&other) noexcept
+    : state(std::move(other.state))
+  {
+    assert(state.ptr() && "Invalid state in move constructor");
+  }
+
+  ssl_client_reader_t &operator=(ssl_client_reader_t &&other) noexcept
+  {
+    if (this != &other)
+    {
+      assert(other.state.ptr() && "Invalid state in move assignment");
+      state = std::move(other.state);
+    }
+    return *this;
+  }
+
+  ~ssl_client_reader_t()
+  {
+    if (!state.ptr())
+    {
+      return;
+    }
+    state->reader_active = false;
+    if (state->poll_active)
+    {
+      uv_poll_stop(&state->poll_req);
+      state->poll_active = false;
+    }
+    state.inc_ref_and_store_in_handle(state->poll_req);
+    auto close_cb = [](uv_handle_t *handle)
+    {
+      if (handle->data)
+      {
+        auto state_ref = ref_ptr_t<ssl_client_state_t>::from_raw(handle->data);
+        handle->data = nullptr;
+      }
+    };
+    uv_close((uv_handle_t *)&state->poll_req, close_cb);
+  }
+
+  bool await_ready() noexcept
+  {
+    if (!state.ptr())
+    {
+      throw std::runtime_error("Invalid state in await_ready");
+    }
+    return state->buffer_front != state->buffer_back;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    assert(state.ptr() && "Invalid state in await_suspend");
+    state->read_continuation = continuation;
+  }
+
+  auto await_resume() noexcept
+  {
+    assert(state.ptr() && "Invalid state in await_resume");
+    auto ret = std::move(state->buffer_queue[state->buffer_front]);
+    state->buffer_front = (state->buffer_front + 1) % state->buffer_queue.size();
+    return ret;
+  }
 };
 
 inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client, ssl_client_alloc_cb_t alloc_cb = default_alloc, ssl_client_dealloc_cb_t dealloc_cb = default_dealloc,
@@ -364,15 +615,14 @@ inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_
     return std::unexpected(error_t{1, "Can not create a reader for a client that is not connected"});
   }
   client.state->reader_active = true;
+  client.state->buffer_front = 0;
+  client.state->buffer_back = 0;
+
   uv_poll_init_socket(client.state->event_loop.loop(), &client.state->poll_req, client.state->socket_fd);
-  {
-    auto copy = client.state;
-    client.state->poll_req.data = copy.release_to_raw();
-  }
   client.state->alloc_cb = alloc_cb;
   client.state->dealloc_cb = dealloc_cb;
 
-
+  read_from_tls_context(client.state);
 
   return {ssl_client_reader_t{client.state}};
 }

@@ -71,7 +71,6 @@ struct ref_counted_allocation_t
     {
       if (close_guard != nullptr)
       {
-        fprintf(stderr, "close guard %p -  %p\n",this, close_guard);
         auto tmp_close_guard = close_guard;
         close_guard = nullptr;
         tmp_close_guard(ref_ptr);
@@ -212,11 +211,24 @@ struct ref_ptr_t
     return temp;
   }
 
+  template <typename UV_HANDLE>
+  void inc_ref_and_store_in_handle(UV_HANDLE &handle)
+  {
+    auto copy = *this;
+    handle.data = copy.release_to_raw();
+  }
+
   static ref_ptr_t from_raw(void *raw_ptr)
   {
     ref_ptr_t tmp;
     tmp.alloc_ptr_ = static_cast<ref_counted_allocation_t<T> *>(raw_ptr);
     return tmp;
+  }
+
+  template <typename UV_HANDLE>
+  ref_ptr_t from_handle(UV_HANDLE &handle)
+  {
+    return from_raw(handle.data);
   }
 
   template <typename... Args>

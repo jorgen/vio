@@ -1,0 +1,1 @@
+../../cmake-build-debug/libressl_4.1.0_install/bin/openssl s_server        -accept 4433        -cert server.crt        -key server.key        -CAfile ca.crt        -debug        -msg        -state -www
