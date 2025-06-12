@@ -26,7 +26,6 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
   //   auto read_result = co_await reader;
   //   REQUIRE(read_result.has_value());
   //   MESSAGE("Got " << read_result.value().first.len << " bytes from SSL client");
-
   event_loop.stop();
   co_return;
 }

@@ -64,6 +64,16 @@ struct ssl_config
   std::optional<uint32_t> ecdhecurve;
 };
 
+struct ssl_write_state_t
+{
+  uv_buf_t buf = {};
+  size_t bytes_written = 0;
+  bool done = false;
+  bool error = false;
+  std::string error_msg;
+  std::coroutine_handle<> continuation;
+};
+
 struct ssl_client_state_t
 {
   event_loop_t &event_loop;
@@ -94,6 +104,8 @@ struct ssl_client_state_t
   int buffer_front = 0;
   int buffer_back = 0;
   std::array<std::expected<std::pair<uv_buf_t, ssl_client_dealloc_cb_t>, error_t>, 10> buffer_queue;
+
+  std::queue<ssl_write_state_t> write_queue;
 
   uv_tcp_t *get_tcp()
   {
@@ -625,6 +637,49 @@ inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_
   read_from_tls_context(client.state);
 
   return {ssl_client_reader_t{client.state}};
+}
+
+struct ssl_client_write_awaitable_t
+{
+  ref_ptr_t<ssl_client_state_t> state;
+  ssl_write_state_t &write_state;
+
+  ssl_client_write_awaitable_t(ref_ptr_t<ssl_client_state_t> state, ssl_write_state_t &write_state)
+    : state(state)
+    , write_state(write_state)
+  {
+  }
+
+  ssl_client_write_awaitable_t(const ssl_client_write_awaitable_t &) = delete;
+  ssl_client_write_awaitable_t &operator=(const ssl_client_write_awaitable_t &) = delete;
+
+  ssl_client_write_awaitable_t(ssl_client_write_awaitable_t &&) noexcept = default;
+  ssl_client_write_awaitable_t &operator=(ssl_client_write_awaitable_t &&) noexcept = default;
+
+  bool await_ready() const noexcept
+  {
+    return write_state.done || write_state.error;
+  }
+  void await_suspend(std::coroutine_handle<> h) noexcept
+  {
+    write_state.continuation = h;
+  }
+  std::expected<void, error_t> await_resume() noexcept
+  {
+    if (write_state.error)
+      return std::unexpected(error_t{-1, write_state.error_msg});
+    return {};
+  }
+};
+
+inline std::expected<ssl_client_write_awaitable_t, error_t> ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
+{
+  assert(client.state.ptr() != nullptr && "Can not write to a closed client");
+  assert(client.state->connected && "Can not write to a client that is not connected");
+
+  auto &write_state = client.state->write_queue.emplace();
+  write_state.buf = buffer;
+  return ssl_client_write_awaitable_t(client.state, write_state);
 }
 
 } // namespace vio
