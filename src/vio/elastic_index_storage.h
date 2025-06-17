@@ -34,15 +34,14 @@ class elastic_index_storage_t
   static_assert(PreferredSize > 0, "PreferredSize must be greater than 0");
 
 public:
-  explicit elastic_index_storage_t()
+  elastic_index_storage_t()
   {
     _used_bits.resize(PreferredSize);
     _processed_bits.resize(PreferredSize);
     _data.resize(PreferredSize);
   }
 
-  template <typename... Args>
-  std::size_t emplace(Args &&...args)
+  std::size_t activate()
   {
     std::size_t idx = _used_bits.find_first_clear_bit();
     if (idx == dynamic_bitset_t::INVALID_INDEX)
@@ -56,22 +55,40 @@ public:
     }
     _used_bits.set(idx);
 
-    _data[idx] = T(std::forward<Args>(args)...);
     _processed_bits.clear(idx);
     _insertion_queue.push(idx);
 
     return idx;
   }
 
+  std::size_t activate_with_value(const T &value)
+  {
+    std::size_t idx = activate();
+    _data[idx] = value;
+    return idx;
+  }
+
   void deactivate(std::size_t index)
   {
     assert(index < _data.size() && "Index out of range");
+    _data[index] = T();
     _used_bits.clear(index);
 
     if (std::size_t rightmost_active = _used_bits.find_rightmost_set_bit(); rightmost_active == dynamic_bitset_t::INVALID_INDEX || rightmost_active < PreferredSize)
     {
       resize_storage(PreferredSize);
     }
+  }
+
+  void deactivate_current()
+  {
+    assert(_insertion_queue.size() > 0 && "No current item");
+    deactivate(_insertion_queue.front());
+  }
+
+  [[nodiscard]] bool current_item_is_active() const
+  {
+    return !_insertion_queue.empty() && _used_bits.test(_insertion_queue.front());
   }
 
   T &current_item()

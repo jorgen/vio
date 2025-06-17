@@ -22,6 +22,13 @@
 
 #pragma once
 
+#ifdef max // MSVC defines this macro
+#undef max
+#endif
+#ifdef min
+#undef min
+#endif
+
 #include <climits>
 #include <cstdint>
 #include <limits>

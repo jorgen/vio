@@ -23,7 +23,8 @@ TEST_SUITE("elastic_index_storage_t Tests")
   TEST_CASE("Emplace single element")
   {
     vio::elastic_index_storage_t<int, 2> storage;
-    auto index = storage.emplace(42);
+    auto index = storage.activate();
+    storage[index] = 42;
 
     CHECK_EQ(storage.size(), 2);
     CHECK(storage.is_active(index));
@@ -36,11 +37,14 @@ TEST_SUITE("elastic_index_storage_t Tests")
   TEST_CASE("Emplace multiple elements and exceed preferred size")
   {
     vio::elastic_index_storage_t<int, 2> storage;
-    auto idx1 = storage.emplace(10);
-    auto idx2 = storage.emplace(20);
+    auto idx1 = storage.activate();
+    storage[idx1] = 10;
+    auto idx2 = storage.activate();
+    storage[idx2] = 20;
 
-    // The next emplace should expand beyond the preferred size
-    auto idx3 = storage.emplace(30);
+    // The next activate_with_value should expand beyond the preferred size
+    auto idx3 = storage.activate();
+    storage[idx3] = 30;
 
     CHECK_EQ(storage.size(), 3);
 
@@ -58,9 +62,9 @@ TEST_SUITE("elastic_index_storage_t Tests")
     vio::elastic_index_storage_t<int, 3> storage;
 
     // Fill up to exactly the preferred size
-    auto idxA = storage.emplace(100);
-    auto idxB = storage.emplace(200);
-    auto idxC = storage.emplace(300);
+    auto idxA = storage.activate_with_value(100);
+    auto idxB = storage.activate_with_value(200);
+    auto idxC = storage.activate_with_value(300);
     CHECK_EQ(storage.size(), 3);
 
     // Deactivate one element and ensure it becomes inactive
@@ -71,7 +75,7 @@ TEST_SUITE("elastic_index_storage_t Tests")
     CHECK_GE(storage.size(), static_cast<std::size_t>(3));
 
     // Reuse the deactivated slot:
-    auto idxD = storage.emplace(400);
+    auto idxD = storage.activate_with_value(400);
     CHECK(storage.is_active(idxD));
     CHECK_EQ(storage[idxD], 400);
 
@@ -89,9 +93,9 @@ TEST_SUITE("elastic_index_storage_t Tests")
     vio::elastic_index_storage_t<int, 3> storage;
 
     // Emplace three items
-    auto idx1 = storage.emplace(1);
-    auto idx2 = storage.emplace(2);
-    auto idx3 = storage.emplace(3);
+    auto idx1 = storage.activate_with_value(1);
+    auto idx2 = storage.activate_with_value(2);
+    auto idx3 = storage.activate_with_value(3);
 
     // currentItem should initially point to the first item inserted
     CHECK_EQ(storage.current_item(), 1);
@@ -121,9 +125,9 @@ TEST_SUITE("elastic_index_storage_t Tests")
   {
     vio::elastic_index_storage_t<int, 3> storage;
 
-    auto idx1 = storage.emplace(10);
-    auto idx2 = storage.emplace(20);
-    auto idx3 = storage.emplace(30);
+    auto idx1 = storage.activate_with_value(10);
+    auto idx2 = storage.activate_with_value(20);
+    auto idx3 = storage.activate_with_value(30);
 
     // Deactivate the middle item before starting iteration
     storage.deactivate(idx2);
@@ -142,8 +146,8 @@ TEST_SUITE("elastic_index_storage_t Tests")
   TEST_CASE("Access operator[] for active/inactive items")
   {
     vio::elastic_index_storage_t<int, 4> storage;
-    auto idx1 = storage.emplace(10);
-    auto idx2 = storage.emplace(20);
+    auto idx1 = storage.activate_with_value(10);
+    auto idx2 = storage.activate_with_value(20);
 
     CHECK(storage.is_active(idx1));
     CHECK(storage.is_active(idx2));
@@ -166,13 +170,13 @@ TEST_SUITE("elastic_index_storage_t Tests")
   {
     // This is just a small check to ensure it compiles and works with different types
     vio::elastic_index_storage_t<std::string, 2> stringStorage;
-    auto idxStr = stringStorage.emplace("Hello");
+    auto idxStr = stringStorage.activate_with_value("Hello");
     CHECK(stringStorage.is_active(idxStr));
     CHECK_EQ(stringStorage[idxStr], "Hello");
 
     // For a user-defined type, using a pair as a simple example
     vio::elastic_index_storage_t<std::pair<int, double>, 1> pairStorage;
-    auto idxPair = pairStorage.emplace(std::make_pair(5, 3.14));
+    auto idxPair = pairStorage.activate_with_value(std::make_pair(5, 3.14));
     CHECK(pairStorage.is_active(idxPair));
     CHECK_EQ(pairStorage[idxPair].first, 5);
     CHECK_EQ(pairStorage[idxPair].second, doctest::Approx(3.14));

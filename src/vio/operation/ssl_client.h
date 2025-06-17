@@ -24,6 +24,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include "dns.h"
 #include "tcp.h"
+#include "vio/elastic_index_storage.h"
 #include "vio/error.h"
 #include "vio/ref_ptr.h"
 
@@ -68,10 +69,11 @@ struct ssl_write_state_t
 {
   uv_buf_t buf = {};
   size_t bytes_written = 0;
+  int ref = 2;
   bool done = false;
-  bool error = false;
+  int error_code = 0;
   std::string error_msg;
-  std::coroutine_handle<> continuation;
+  std::coroutine_handle<> continuation = {};
 };
 
 struct ssl_client_state_t
@@ -96,7 +98,9 @@ struct ssl_client_state_t
   bool resolved_done = false;
 
   uv_poll_t poll_req = {};
-  bool poll_active = false;
+  bool poll_read_active = false;
+  bool poll_write_active = false;
+  bool poll_running = false;
   bool reader_active = false;
   std::coroutine_handle<> read_continuation;
   ssl_client_alloc_cb_t alloc_cb;
@@ -105,7 +109,7 @@ struct ssl_client_state_t
   int buffer_back = 0;
   std::array<std::expected<std::pair<uv_buf_t, ssl_client_dealloc_cb_t>, error_t>, 10> buffer_queue;
 
-  std::queue<ssl_write_state_t> write_queue;
+  elastic_index_storage_t<ssl_write_state_t> write_queue;
 
   uv_tcp_t *get_tcp()
   {
@@ -151,10 +155,10 @@ struct ssl_client_state_t
       uv_os_fd_t socket;
       if (uv_fileno(state->get_tcp_handle(), &socket) == 0)
       {
-        state->socket_fd = reinterpret_cast<int>(socket);
+        state->socket_fd = *reinterpret_cast<int *>(&socket);
         BIO_socket_nbio(state->socket_fd, 0);
 
-        if (auto tls_result = tls_connect_socket(state->tls_ctx, state->socket_fd, "localhost"); tls_result == 0)
+        if (auto tls_result = tls_connect_socket(state->tls_ctx, state->socket_fd, state->host.c_str()); tls_result == 0)
         {
           state->connected = true;
           state->connect_result = {};
@@ -180,6 +184,11 @@ struct ssl_client_state_t
       else
       {
         state->connect_result = std::unexpected(error_t{.code = -1, .msg = "Failed to get socket fd"});
+      }
+
+      if (int result = uv_poll_init_socket(state->event_loop.loop(), &state->poll_req, state->socket_fd); result < 0)
+      {
+        state->connect_result = std::unexpected(error_t{.code = -1, .msg = std::string("Failed to initialize poll, ") + uv_strerror(result)});
       }
 
       if (state->connect_continuation)
@@ -456,7 +465,44 @@ inline void default_alloc(void *, size_t suggested_size, uv_buf_t *buf)
   buf->len = suggested_size;
 }
 
-inline void on_readable(uv_poll_t *handle, int status, int events);
+static void on_readable(uv_poll_t *handle, int status, int events);
+static void on_writable(uv_poll_t *handle, int status, int events);
+
+static void on_poll_event(uv_poll_t *handle, int status, int events)
+{
+  if (events & UV_WRITABLE)
+  {
+    on_writable(handle, status, events);
+  }
+  if (events & UV_READABLE)
+  {
+    on_readable(handle, status, events);
+  }
+  if (!(events & (UV_WRITABLE | UV_READABLE)))
+  {
+    fprintf(stderr, "on_poll_event: unexpected events %d\n", events);
+  }
+}
+
+void set_poll_state(ref_ptr_t<ssl_client_state_t> &state)
+{
+  int events = 0;
+  if (state->poll_read_active)
+    events |= UV_READABLE;
+  if (state->poll_write_active)
+    events |= UV_WRITABLE;
+
+  if (events)
+  {
+    uv_poll_start(&state->poll_req, events, on_poll_event);
+    state->poll_running = true;
+  }
+  else if (state->poll_running)
+  {
+    uv_poll_stop(&state->poll_req);
+    state->poll_running = false;
+  }
+}
 
 bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
 {
@@ -486,10 +532,10 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
     if (r == TLS_WANT_POLLIN || r == 0)
     {
       state->dealloc_cb(nullptr, &read_buf);
-      if (!state->poll_active)
+      if (!state->poll_read_active)
       {
-        state->poll_active = true;
-        uv_poll_start(&state->poll_req, UV_READABLE, on_readable);
+        state->poll_read_active = true;
+        set_poll_state(state);
       }
       return true;
     }
@@ -500,7 +546,7 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
       state->buffer_queue[state->buffer_back] = std::unexpected(error_t{int(r), tls_error(state->tls_ctx)});
       state->buffer_back = (state->buffer_back + 1) % state->buffer_queue.size();
       uv_poll_stop(&state->poll_req);
-      state->poll_active = false;
+      state->poll_read_active = false;
       return false;
     }
 
@@ -509,8 +555,8 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
     state->buffer_back = (state->buffer_back + 1) % state->buffer_queue.size();
   }
 
-  state->poll_active = false;
-  uv_poll_stop(&state->poll_req);
+  state->poll_read_active = false;
+  set_poll_state(state);
 
   return true;
 }
@@ -518,21 +564,16 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
 inline void on_readable(uv_poll_t *handle, int status, int events)
 {
   auto state = ref_ptr_t<ssl_client_state_t>::from_raw(handle->data);
-  if (status < 0)
-  {
-    return;
-  }
+  assert(state && "Invalid state in on_readable");
 
-  if (!(events & UV_READABLE))
-  {
-    return;
-  }
   if (!(events & UV_READABLE))
   {
     return;
   }
 
   read_from_tls_context(state);
+  if (state->poll_read_active)
+    state.inc_ref_and_store_in_handle(state->poll_req);
 }
 
 struct ssl_client_reader_t
@@ -570,10 +611,10 @@ struct ssl_client_reader_t
       return;
     }
     state->reader_active = false;
-    if (state->poll_active)
+    if (state->poll_read_active)
     {
       uv_poll_stop(&state->poll_req);
-      state->poll_active = false;
+      state->poll_read_active = false;
     }
     state.inc_ref_and_store_in_handle(state->poll_req);
     auto close_cb = [](uv_handle_t *handle)
@@ -589,10 +630,7 @@ struct ssl_client_reader_t
 
   bool await_ready() noexcept
   {
-    if (!state.ptr())
-    {
-      throw std::runtime_error("Invalid state in await_ready");
-    }
+    assert(state && "Invalid state in await_ready");
     return state->buffer_front != state->buffer_back;
   }
 
@@ -630,11 +668,12 @@ inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_
   client.state->buffer_front = 0;
   client.state->buffer_back = 0;
 
-  uv_poll_init_socket(client.state->event_loop.loop(), &client.state->poll_req, client.state->socket_fd);
   client.state->alloc_cb = alloc_cb;
   client.state->dealloc_cb = dealloc_cb;
 
   read_from_tls_context(client.state);
+  if (client.state->poll_read_active)
+    client.state.inc_ref_and_store_in_handle(client.state->poll_req);
 
   return {ssl_client_reader_t{client.state}};
 }
@@ -642,12 +681,25 @@ inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_
 struct ssl_client_write_awaitable_t
 {
   ref_ptr_t<ssl_client_state_t> state;
-  ssl_write_state_t &write_state;
+  size_t write_state_index;
 
-  ssl_client_write_awaitable_t(ref_ptr_t<ssl_client_state_t> state, ssl_write_state_t &write_state)
+  ssl_client_write_awaitable_t(ref_ptr_t<ssl_client_state_t> state, size_t write_state_index)
     : state(state)
-    , write_state(write_state)
+    , write_state_index(write_state_index)
   {
+  }
+  ~ssl_client_write_awaitable_t()
+  {
+    if (!state)
+    {
+      return;
+    }
+    auto &write_state = state->write_queue[write_state_index];
+    if (--write_state.ref == 0)
+    {
+      write_state.done = false;
+      state->write_queue.deactivate(write_state_index);
+    };
   }
 
   ssl_client_write_awaitable_t(const ssl_client_write_awaitable_t &) = delete;
@@ -656,30 +708,117 @@ struct ssl_client_write_awaitable_t
   ssl_client_write_awaitable_t(ssl_client_write_awaitable_t &&) noexcept = default;
   ssl_client_write_awaitable_t &operator=(ssl_client_write_awaitable_t &&) noexcept = default;
 
-  bool await_ready() const noexcept
+  [[nodiscard]] bool await_ready() const noexcept
   {
-    return write_state.done || write_state.error;
+    if (!state)
+    {
+      return true;
+    }
+    auto &write_state = state->write_queue[write_state_index];
+    return write_state.done || write_state.error_code != 0;
   }
   void await_suspend(std::coroutine_handle<> h) noexcept
   {
+    if (!state)
+    {
+      return;
+    }
+    auto &write_state = state->write_queue[write_state_index];
     write_state.continuation = h;
   }
   std::expected<void, error_t> await_resume() noexcept
   {
-    if (write_state.error)
+    if (!state)
+    {
+      return {};
+    }
+    auto &write_state = state->write_queue[write_state_index];
+    if (write_state.error_code != 0)
+    {
       return std::unexpected(error_t{-1, write_state.error_msg});
+    }
     return {};
   }
 };
+static void try_write_queue(ref_ptr_t<ssl_client_state_t> &state)
+{
+  if (!state->write_queue.current_item_is_active() && !state->write_queue.next())
+  {
+    return;
+  }
 
-inline std::expected<ssl_client_write_awaitable_t, error_t> ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
+  while (state->write_queue.current_item_is_active())
+  {
+    auto &write_state = state->write_queue.current_item();
+    auto remaining = write_state.buf.len - write_state.bytes_written;
+    auto written = tls_write(state->tls_ctx, write_state.buf.base + write_state.bytes_written, remaining);
+    if (written == TLS_WANT_POLLOUT)
+    {
+      if (!state->poll_write_active)
+      {
+        state->poll_write_active = true;
+        set_poll_state(state);
+      }
+      return;
+    }
+    if (written >= 0)
+    {
+      write_state.bytes_written += written;
+      if (write_state.bytes_written == write_state.buf.len)
+      {
+        write_state.done = true;
+        if (write_state.continuation)
+          write_state.continuation.resume();
+        if (--write_state.ref == 0)
+        {
+          state->write_queue.deactivate_current();
+        }
+        state->write_queue.next();
+      }
+    }
+    else
+    {
+      write_state.error_code = int(written);
+      write_state.error_msg = tls_error(state->tls_ctx);
+      write_state.done = true;
+      if (write_state.continuation)
+        write_state.continuation.resume();
+      if (--write_state.ref == 0)
+      {
+        state->write_queue.deactivate_current();
+      }
+      state->write_queue.next();
+    }
+  }
+  state->poll_write_active = false;
+  set_poll_state(state);
+};
+
+static void on_writable(uv_poll_t *handle, int status, int events)
+{
+  if (status < 0 || !(events & UV_WRITABLE))
+  {
+    fprintf(stderr, "on_writable: unexpected events %d\n", events);
+  }
+  auto state = ref_ptr_t<ssl_client_state_t>::from_raw(handle->data);
+  assert(state && "Invalid state in on_writable");
+  try_write_queue(state);
+  if (state->poll_write_active)
+    state.inc_ref_and_store_in_handle(state->poll_req);
+}
+
+inline ssl_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
 {
   assert(client.state.ptr() != nullptr && "Can not write to a closed client");
   assert(client.state->connected && "Can not write to a client that is not connected");
 
-  auto &write_state = client.state->write_queue.emplace();
-  write_state.buf = buffer;
-  return ssl_client_write_awaitable_t(client.state, write_state);
+  auto write_state_index = client.state->write_queue.activate();
+  client.state->write_queue[write_state_index].buf = buffer;
+
+  try_write_queue(client.state);
+  if (client.state->poll_write_active)
+    client.state.inc_ref_and_store_in_handle(client.state->poll_req);
+  return ssl_client_write_awaitable_t(client.state, write_state_index);
 }
 
 } // namespace vio

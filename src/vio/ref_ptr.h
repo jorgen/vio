@@ -174,6 +174,11 @@ struct ref_ptr_t
     return *this;
   }
 
+  explicit operator bool() const noexcept
+  {
+    return alloc_ptr_ != nullptr;
+  }
+
   T *ptr()
   {
     return alloc_ptr_ ? &alloc_ptr_->object : nullptr;
