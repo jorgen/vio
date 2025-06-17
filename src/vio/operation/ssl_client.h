@@ -103,11 +103,16 @@ struct ssl_client_state_t
   bool poll_running = false;
   bool reader_active = false;
   std::coroutine_handle<> read_continuation;
+  std::coroutine_handle<> read_buffer_continuation;
   ssl_client_alloc_cb_t alloc_cb;
   ssl_client_dealloc_cb_t dealloc_cb;
   int buffer_front = 0;
   int buffer_back = 0;
   std::array<std::expected<std::pair<uv_buf_t, ssl_client_dealloc_cb_t>, error_t>, 10> buffer_queue;
+
+  uv_buf_t read_buffer = {};
+  size_t bytes_read = 0;
+  error_t read_buffer_error = {};
 
   elastic_index_storage_t<ssl_write_state_t> write_queue;
 
@@ -516,17 +521,49 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
 
     ~call_read_resume_on_exit_t()
     {
-      if (state->read_continuation && state->buffer_front != state->buffer_back)
+      if (state->read_buffer.len > 0 && state->bytes_read == state->read_buffer.len || state->read_buffer_error.code)
+      {
+        state->read_buffer_continuation.resume();
+      }
+      if (state->read_buffer.len == 0 && state->read_continuation && state->buffer_front != state->buffer_back)
       {
         state->read_continuation.resume();
       }
     }
   };
   call_read_resume_on_exit_t call_read_resume_on_exit{state};
+
+  if (state->read_buffer.len > 0)
+  {
+    while (state->bytes_read < state->read_buffer.len)
+    {
+      auto remaining = state->read_buffer.len - state->bytes_read;
+      auto r = tls_read(state->tls_ctx, state->read_buffer.base + state->bytes_read, remaining);
+      if (r == TLS_WANT_POLLIN || r == 0)
+      {
+        if (!state->poll_read_active)
+        {
+          state->poll_read_active = true;
+          set_poll_state(state);
+        }
+        return true;
+      }
+      if (r < 0)
+      {
+        state->read_buffer_error = error_t{int(r), tls_error(state->tls_ctx)};
+        state->poll_read_active = false;
+        set_poll_state(state);
+        return false;
+      }
+      state->bytes_read += r;
+    }
+    return true;
+  }
+
   while ((state->buffer_back + 1) % state->buffer_queue.size() != state->buffer_front)
   {
     uv_buf_t read_buf;
-    state->alloc_cb(nullptr, 4096, &read_buf);
+    state->alloc_cb(nullptr, 65536, &read_buf);
 
     auto r = tls_read(state->tls_ctx, read_buf.base, read_buf.len);
     if (r == TLS_WANT_POLLIN || r == 0)
@@ -575,6 +612,36 @@ inline void on_readable(uv_poll_t *handle, int status, int events)
   if (state->poll_read_active)
     state.inc_ref_and_store_in_handle(state->poll_req);
 }
+
+struct ssl_client_read_awaitable_t
+{
+  ref_ptr_t<ssl_client_state_t> state;
+
+  bool await_ready() noexcept
+  {
+    assert(state && "Invalid state in await_ready");
+    return state->bytes_read == state->read_buffer.len || state->read_buffer_error.code;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    assert(state.ptr() && "Invalid state in await_suspend");
+    state->read_buffer_continuation = continuation;
+    read_from_tls_context(state);
+  }
+
+  auto await_resume() noexcept
+  {
+    assert(state.ptr() && "Invalid state in await_resume");
+    if (state->buffer_front != state->buffer_back)
+    {
+      auto ret = std::move(state->buffer_queue[state->buffer_front]);
+      state->buffer_front = (state->buffer_front + 1) % state->buffer_queue.size();
+      return ret;
+    }
+    return std::expected<std::pair<uv_buf_t, ssl_client_dealloc_cb_t>, error_t>{{state->read_buffer, nullptr}};
+  }
+};
 
 struct ssl_client_reader_t
 {
@@ -643,9 +710,38 @@ struct ssl_client_reader_t
   auto await_resume() noexcept
   {
     assert(state.ptr() && "Invalid state in await_resume");
+    assert(state->buffer_front != state->buffer_back && "Empty buffer in await_resume");
     auto ret = std::move(state->buffer_queue[state->buffer_front]);
     state->buffer_front = (state->buffer_front + 1) % state->buffer_queue.size();
     return ret;
+  }
+
+  ssl_client_read_awaitable_t read(uv_buf_t buf)
+  {
+    state->read_buffer = buf;
+    state->bytes_read = 0;
+
+    while (state->buffer_front != state->buffer_back && state->bytes_read < buf.len)
+    {
+      auto &queued = state->buffer_queue[state->buffer_front].value();
+      auto to_copy = std::min(queued.first.len, buf.len - ULONG(state->bytes_read));
+      std::memcpy(buf.base + state->bytes_read, queued.first.base, to_copy);
+      state->bytes_read += to_copy;
+
+      if (to_copy == queued.first.len)
+      {
+        if (queued.second)
+          queued.second(nullptr, &queued.first);
+        state->buffer_front = (state->buffer_front + 1) % state->buffer_queue.size();
+      }
+      else
+      {
+        queued.first.base += to_copy;
+        queued.first.len -= to_copy;
+      }
+    }
+
+    return {state};
   }
 };
 
