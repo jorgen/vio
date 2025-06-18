@@ -8,6 +8,9 @@ configure_file(${libressl_SOURCE_DIR}/cert.pem ${CMAKE_CURRENT_SOURCE_DIR}/defau
 cmrc_add_resource_library(vio_default_certs ALIAS vio::default_certs NAMESPACE vio default_certs/cert.pem)
 
 BuildExternalTargetLinkLibrary(vio PUBLIC LibreSSL::TLS ada)
+if (WIN32)
+    BuildExternalTargetLinkLibrary(vio PUBLIC crypt32)
+endif ()
 
 target_include_directories(vio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

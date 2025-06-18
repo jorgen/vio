@@ -39,7 +39,7 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
       REQUIRE_EXPECTED(read_result);
       auto &value = read_result.value();
 
-      header_buffer.insert(header_buffer.end(), value.first.base, value.first.base + value.first.len);
+      header_buffer.insert(header_buffer.end(), value.buf.base, value.buf.base + value.buf.len);
 
       auto header_str = std::string_view(header_buffer.data(), header_buffer.size());
       if (auto pos = header_str.find(header_end); pos != std::string::npos)

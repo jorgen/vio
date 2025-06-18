@@ -27,6 +27,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/elastic_index_storage.h"
 #include "vio/error.h"
 #include "vio/ref_ptr.h"
+#include "vio/unique_buf.h"
 
 #include <array>
 #include <coroutine>
@@ -41,8 +42,8 @@ Copyright (c) 2025 Jørgen Lind
 namespace vio
 {
 
-using ssl_client_dealloc_cb_t = void (*)(void *user_ptr, uv_buf_t *buf);
-using ssl_client_alloc_cb_t = void (*)(void *user_ptr, size_t suggested_size, uv_buf_t *buf);
+using dealloc_cb_t = void (*)(void *user_ptr, uv_buf_t *buf);
+using alloc_cb_t = void (*)(void *user_ptr, size_t suggested_size, uv_buf_t *buf);
 
 struct ssl_config
 {
@@ -104,11 +105,30 @@ struct ssl_client_state_t
   bool reader_active = false;
   std::coroutine_handle<> read_continuation;
   std::coroutine_handle<> read_buffer_continuation;
-  ssl_client_alloc_cb_t alloc_cb;
-  ssl_client_dealloc_cb_t dealloc_cb;
+  alloc_cb_t alloc_cb;
+  dealloc_cb_t dealloc_cb;
+  void *user_alloc_ptr = nullptr;
+
   int buffer_front = 0;
   int buffer_back = 0;
-  std::array<std::expected<std::pair<uv_buf_t, ssl_client_dealloc_cb_t>, error_t>, 10> buffer_queue;
+  struct ssl_client_buffer_t
+  {
+    uv_buf_t buf;
+    size_t capacity;
+    dealloc_cb_t dealloc_cb;
+  };
+  std::array<std::expected<ssl_client_buffer_t, error_t>, 10> buffer_queue;
+  [[nodiscard]] bool has_buffer_with_error_or_data() const
+  {
+    if (buffer_front == buffer_back)
+      return false;
+    auto &buffer = buffer_queue[buffer_front];
+    if (!buffer.has_value() && buffer.error().code)
+      return true;
+    if (buffer.has_value() && buffer.value().buf.len > 0)
+      return true;
+    return false;
+  }
 
   uv_buf_t read_buffer = {};
   size_t bytes_read = 0;
@@ -247,7 +267,7 @@ struct ssl_client_t
   ref_ptr_t<ssl_client_state_t> state;
 };
 
-std::span<const uint8_t> get_default_ca_certificates();
+std::string get_default_ca_certificates();
 
 inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config &config = {})
 {
@@ -453,23 +473,6 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   return {client.state};
 }
 
-inline void default_dealloc(void *, uv_buf_t *data)
-{
-  delete[] data->base;
-  data->base = nullptr;
-  data->len = 0;
-}
-
-inline void default_alloc(void *, size_t suggested_size, uv_buf_t *buf)
-{
-  if (buf == nullptr)
-  {
-    return;
-  }
-  buf->base = new char[suggested_size];
-  buf->len = suggested_size;
-}
-
 static void on_readable(uv_poll_t *handle, int status, int events);
 static void on_writable(uv_poll_t *handle, int status, int events);
 
@@ -521,11 +524,11 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
 
     ~call_read_resume_on_exit_t()
     {
-      if (state->read_buffer.len > 0 && state->bytes_read == state->read_buffer.len || state->read_buffer_error.code)
+      if (state->read_buffer_continuation && (state->read_buffer.len > 0 && state->bytes_read == state->read_buffer.len || state->read_buffer_error.code))
       {
         state->read_buffer_continuation.resume();
       }
-      if (state->read_buffer.len == 0 && state->read_continuation && state->buffer_front != state->buffer_back)
+      if (state->read_buffer.len == 0 && state->read_continuation && state->has_buffer_with_error_or_data())
       {
         state->read_continuation.resume();
       }
@@ -562,13 +565,31 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
 
   while ((state->buffer_back + 1) % state->buffer_queue.size() != state->buffer_front)
   {
-    uv_buf_t read_buf;
-    state->alloc_cb(nullptr, 65536, &read_buf);
+    ssl_client_state_t::ssl_client_buffer_t *current_buffer = nullptr;
+    if (state->buffer_back > 0)
+    {
+      auto &last = state->buffer_queue[state->buffer_back - 1];
+      if (last.has_value() && last->buf.len < last->capacity)
+      {
+        current_buffer = &last.value();
+      }
+    }
 
-    auto r = tls_read(state->tls_ctx, read_buf.base, read_buf.len);
+    if (!current_buffer)
+    {
+      uv_buf_t read_buf;
+      state->alloc_cb(state->user_alloc_ptr, 65536, &read_buf);
+      auto capacity = read_buf.len;
+      read_buf.len = 0;
+      state->buffer_queue[state->buffer_back] = ssl_client_state_t::ssl_client_buffer_t{read_buf, capacity, state->dealloc_cb};
+      current_buffer = &state->buffer_queue[state->buffer_back].value();
+      state->buffer_back = (state->buffer_back + 1) % state->buffer_queue.size();
+    }
+
+    auto remaining = current_buffer->capacity - current_buffer->buf.len;
+    auto r = tls_read(state->tls_ctx, current_buffer->buf.base + current_buffer->buf.len, remaining);
     if (r == TLS_WANT_POLLIN || r == 0)
     {
-      state->dealloc_cb(nullptr, &read_buf);
       if (!state->poll_read_active)
       {
         state->poll_read_active = true;
@@ -579,17 +600,17 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
 
     if (r < 0)
     {
-      state->dealloc_cb(nullptr, &read_buf);
-      state->buffer_queue[state->buffer_back] = std::unexpected(error_t{int(r), tls_error(state->tls_ctx)});
-      state->buffer_back = (state->buffer_back + 1) % state->buffer_queue.size();
+      if (current_buffer->buf.len == 0)
+      {
+        current_buffer->dealloc_cb(nullptr, &current_buffer->buf);
+        state->buffer_queue[state->buffer_back - 1] = std::unexpected(error_t{int(r), tls_error(state->tls_ctx)});
+      }
       uv_poll_stop(&state->poll_req);
       state->poll_read_active = false;
       return false;
     }
 
-    read_buf.len = size_t(r);
-    state->buffer_queue[state->buffer_back] = std::make_pair(read_buf, state->dealloc_cb);
-    state->buffer_back = (state->buffer_back + 1) % state->buffer_queue.size();
+    current_buffer->buf.len += r;
   }
 
   state->poll_read_active = false;
@@ -633,13 +654,8 @@ struct ssl_client_read_awaitable_t
   auto await_resume() noexcept
   {
     assert(state.ptr() && "Invalid state in await_resume");
-    if (state->buffer_front != state->buffer_back)
-    {
-      auto ret = std::move(state->buffer_queue[state->buffer_front]);
-      state->buffer_front = (state->buffer_front + 1) % state->buffer_queue.size();
-      return ret;
-    }
-    return std::expected<std::pair<uv_buf_t, ssl_client_dealloc_cb_t>, error_t>{{state->read_buffer, nullptr}};
+    assert(state->bytes_read == state->read_buffer.len || state->read_buffer_error.code);
+    return std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>{{state->read_buffer, nullptr}};
   }
 };
 
@@ -698,7 +714,7 @@ struct ssl_client_reader_t
   bool await_ready() noexcept
   {
     assert(state && "Invalid state in await_ready");
-    return state->buffer_front != state->buffer_back;
+    return state->has_buffer_with_error_or_data();
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
@@ -707,13 +723,18 @@ struct ssl_client_reader_t
     state->read_continuation = continuation;
   }
 
-  auto await_resume() noexcept
+  auto await_resume() noexcept -> std::expected<unique_buf_t, error_t>
   {
     assert(state.ptr() && "Invalid state in await_resume");
-    assert(state->buffer_front != state->buffer_back && "Empty buffer in await_resume");
+    assert(state->has_buffer_with_error_or_data() && "Empty buffer in await_resume");
     auto ret = std::move(state->buffer_queue[state->buffer_front]);
     state->buffer_front = (state->buffer_front + 1) % state->buffer_queue.size();
-    return ret;
+
+    if (!ret.has_value())
+    {
+      return std::unexpected(ret.error());
+    }
+    return unique_buf_t(ret.value().buf, ret.value().dealloc_cb, state->user_alloc_ptr);
   }
 
   ssl_client_read_awaitable_t read(uv_buf_t buf)
@@ -724,20 +745,20 @@ struct ssl_client_reader_t
     while (state->buffer_front != state->buffer_back && state->bytes_read < buf.len)
     {
       auto &queued = state->buffer_queue[state->buffer_front].value();
-      auto to_copy = std::min(queued.first.len, buf.len - ULONG(state->bytes_read));
-      std::memcpy(buf.base + state->bytes_read, queued.first.base, to_copy);
+      auto to_copy = std::min(queued.buf.len, buf.len - ULONG(state->bytes_read));
+      std::memcpy(buf.base + state->bytes_read, queued.buf.base, to_copy);
       state->bytes_read += to_copy;
 
-      if (to_copy == queued.first.len)
+      if (to_copy == queued.buf.len)
       {
-        if (queued.second)
-          queued.second(nullptr, &queued.first);
+        if (queued.dealloc_cb)
+          queued.dealloc_cb(nullptr, &queued.buf);
         state->buffer_front = (state->buffer_front + 1) % state->buffer_queue.size();
       }
       else
       {
-        queued.first.base += to_copy;
-        queued.first.len -= to_copy;
+        queued.buf.base += to_copy;
+        queued.buf.len -= to_copy;
       }
     }
 
@@ -745,8 +766,7 @@ struct ssl_client_reader_t
   }
 };
 
-inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client, ssl_client_alloc_cb_t alloc_cb = default_alloc, ssl_client_dealloc_cb_t dealloc_cb = default_dealloc,
-                                                                            void *user_alloc_ptr = nullptr)
+inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client, alloc_cb_t alloc_cb = default_alloc, dealloc_cb_t dealloc_cb = default_dealloc, void *user_alloc_ptr = nullptr)
 {
   if (client.state.ptr() == nullptr)
   {
@@ -766,6 +786,7 @@ inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_
 
   client.state->alloc_cb = alloc_cb;
   client.state->dealloc_cb = dealloc_cb;
+  client.state->user_alloc_ptr = user_alloc_ptr;
 
   read_from_tls_context(client.state);
   if (client.state->poll_read_active)

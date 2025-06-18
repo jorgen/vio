@@ -24,6 +24,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/unique_buf.h"
 #include "vio/uv_coro.h"
 
 #include <coroutine>
@@ -34,22 +35,6 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
-
-typedef void (*alloc_cb_t)(void *handle, size_t suggested_size, uv_buf_t *buf);
-typedef void (*dealloc_cb_t)(void *handle, const char *base);
-
-inline void default_tcp_alloc_cb(void *handle, size_t suggested_size, uv_buf_t *buf)
-{
-  (void)handle;
-  auto *data = new uint8_t[suggested_size];
-  *buf = uv_buf_init(reinterpret_cast<char *>(data), static_cast<unsigned int>(suggested_size));
-}
-inline void default_tcp_dealloc_cb(void *handle, const char *buf)
-{
-  (void)handle;
-  delete[] reinterpret_cast<const uint8_t *>(buf);
-}
-
 struct tcp_listen_state_t
 {
   std::coroutine_handle<> continuation;
@@ -80,10 +65,10 @@ struct tcp_read_state_t
   bool started = false;
   bool is_cancelled = false;
   bool cancelled = false;
-  std::vector<std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>> buffer_queue;
+  std::vector<std::expected<unique_buf_t, error_t>> buffer_queue;
   std::coroutine_handle<> continuation;
-  alloc_cb_t alloc_buffer_cb = default_tcp_alloc_cb;
-  dealloc_cb_t dealloc_buffer_cb = default_tcp_dealloc_cb;
+  alloc_cb_t alloc_buffer_cb = default_alloc;
+  dealloc_cb_t dealloc_buffer_cb = default_dealloc;
   void *alloc_cb_data = nullptr;
 };
 struct tcp_state_t
@@ -140,12 +125,6 @@ struct tcp_future_t
   {
     return state->result;
   }
-};
-
-struct tcp_read_buffer_t
-{
-  std::unique_ptr<uint8_t[], std::function<void(uint8_t *)>> data = nullptr;
-  size_t size = 0;
 };
 
 struct tcp_t
@@ -445,27 +424,11 @@ public:
       state->read.continuation = handle;
     }
 
-    std::expected<tcp_read_buffer_t, error_t> await_resume()
+    std::expected<unique_buf_t, error_t> await_resume()
     {
       auto result = std::move(state->read.buffer_queue.front());
       state->read.buffer_queue.erase(state->read.buffer_queue.begin());
-      if (!result.has_value())
-      {
-        return std::unexpected(result.error());
-      }
-
-      using unique_ptr_t = decltype(tcp_read_buffer_t::data);
-
-      void *user_data = state->read.alloc_cb_data;
-      dealloc_cb_t dealloc_cb = result.value().second;
-      auto deallocator = [user_data, dealloc_cb](uint8_t *ptr)
-      {
-        char *char_ptr = reinterpret_cast<char *>(ptr);
-        dealloc_cb(user_data, char_ptr);
-      };
-      unique_ptr_t ptr(reinterpret_cast<uint8_t *>(result.value().first.base), deallocator);
-
-      return tcp_read_buffer_t{std::move(ptr), result.value().first.len};
+      return result;
     }
   };
 
@@ -495,7 +458,7 @@ public:
 
     if (nread > 0)
     {
-      tcp_state->read.buffer_queue.emplace_back(std::make_pair(*buf, tcp_state->read.dealloc_buffer_cb));
+      tcp_state->read.buffer_queue.emplace_back(unique_buf_t(*buf, tcp_state->read.dealloc_buffer_cb, tcp_state->read.alloc_cb_data));
     }
     else
     {
@@ -507,7 +470,7 @@ public:
 
       if (buf && buf->base)
       {
-        tcp_state->read.dealloc_buffer_cb(tcp_state->read.alloc_cb_data, buf->base);
+        tcp_state->read.dealloc_buffer_cb(tcp_state->read.alloc_cb_data, const_cast<uv_buf_t *>(buf));
       }
     }
 
