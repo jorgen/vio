@@ -22,6 +22,7 @@
 
 #include "vio/event_loop.h"
 #include "vio/operation/sleep.h"
+#include "vio/operation/ssl_common.h"
 #include "vio/thread_pool.h"
 
 #include <cmrc/cmrc.hpp>
@@ -139,6 +140,7 @@ std::string get_default_ca_certificates()
 }
 
 #else
+
 std::string get_default_ca_certificates()
 {
   static std::string cert = get_fallback_ca_certificates();

@@ -26,6 +26,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "tcp.h"
 #include "vio/elastic_index_storage.h"
 #include "vio/error.h"
+#include "vio/operation/ssl_common.h"
 #include "vio/ref_ptr.h"
 #include "vio/unique_buf.h"
 
@@ -41,31 +42,6 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
-
-using dealloc_cb_t = void (*)(void *user_ptr, uv_buf_t *buf);
-using alloc_cb_t = void (*)(void *user_ptr, size_t suggested_size, uv_buf_t *buf);
-
-struct ssl_config
-{
-  std::optional<std::string> ca_file;
-  std::optional<std::string> ca_path;
-  std::optional<std::string> cert_file;
-  std::optional<std::string> key_file;
-  std::optional<std::string> ocsp_staple_file;
-  std::optional<std::vector<uint8_t>> ca_mem;
-  std::optional<std::vector<uint8_t>> cert_mem;
-  std::optional<std::vector<uint8_t>> key_mem;
-  std::optional<std::vector<uint8_t>> ocsp_staple_mem;
-  std::optional<std::string> ciphers;
-  std::optional<std::string> alpn;
-  std::optional<bool> verify_client;
-  std::optional<bool> verify_depth;
-  std::optional<bool> verify_optional;
-  std::optional<uint32_t> protocols;
-  std::optional<uint32_t> dheparams;
-  std::optional<uint32_t> ecdhecurve;
-};
-
 struct ssl_write_state_t
 {
   uv_buf_t buf = {};
@@ -87,7 +63,7 @@ struct ssl_client_state_t
   uv_tcp_t tcp_req = {};
   tls *tls_ctx = nullptr;
   int socket_fd = -1;
-  std::vector<uint8_t> cert_data;
+  std::string cert_data;
 
   std::coroutine_handle<> connect_continuation;
   std::expected<void, error_t> connect_result;
@@ -267,8 +243,6 @@ struct ssl_client_t
   ref_ptr_t<ssl_client_state_t> state;
 };
 
-std::string get_default_ca_certificates();
-
 inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config &config = {})
 {
   ssl_client_t ret{ref_ptr_t<ssl_client_state_t>{event_loop}};
@@ -282,6 +256,9 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
     {
       return;
     }
+    tls_close(state->tls_ctx);
+    tls_free(state->tls_ctx);
+
     state.inc_ref_and_store_in_handle(state->tcp_req);
     auto close_cb = [](uv_handle_t *handle)
     {
@@ -304,92 +281,11 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
     return std::unexpected(error_t{-1, "Failed to create TLS client"});
   }
 
-  auto cert_data = get_default_ca_certificates();
-  ret.state->cert_data.assign(cert_data.begin(), cert_data.end());
-
-  using tls_config_ptr_t = std::unique_ptr<tls_config, decltype(&tls_config_free)>;
-  tls_config_ptr_t tls_config(tls_config_new(), &tls_config_free);
-  if (!tls_config)
+  ret.state->cert_data = get_default_ca_certificates();
+  auto apply = apply_ssl_config_to_tls_ctx(config, ret.state->cert_data, ret.state->tls_ctx);
+  if (!apply.has_value())
   {
-    return std::unexpected(error_t{-1, "Failed to create TLS config"});
-  }
-
-  if (config.ca_mem)
-  {
-    if (auto result = tls_config_set_ca_mem(tls_config.get(), config.ca_mem->data(), config.ca_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-  }
-  else if (config.ca_file || config.ca_path)
-  {
-    if (auto result = tls_config_set_ca_file(tls_config.get(), config.ca_file ? config.ca_file->c_str() : nullptr); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-    if (auto result = tls_config_set_ca_path(tls_config.get(), config.ca_path ? config.ca_path->c_str() : nullptr); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-  }
-  else
-  {
-    if (auto result = tls_config_set_ca_mem(tls_config.get(), ret.state->cert_data.data(), ret.state->cert_data.size()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-  }
-
-  if (config.cert_mem && config.key_mem)
-  {
-    if (auto result = tls_config_set_cert_mem(tls_config.get(), config.cert_mem->data(), config.cert_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-    if (auto result = tls_config_set_key_mem(tls_config.get(), config.key_mem->data(), config.key_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-  }
-  else if (config.cert_file && config.key_file)
-  {
-    if (auto result = tls_config_set_cert_file(tls_config.get(), config.cert_file->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-    if (auto result = tls_config_set_key_file(tls_config.get(), config.key_file->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-  }
-
-  if (config.ocsp_staple_mem)
-  {
-    if (auto result = tls_config_set_ocsp_staple_mem(tls_config.get(), config.ocsp_staple_mem->data(), config.ocsp_staple_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-  }
-  else if (config.ocsp_staple_file)
-  {
-    if (auto result = tls_config_set_ocsp_staple_file(tls_config.get(), config.ocsp_staple_file->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-  }
-
-  if (config.ciphers)
-    if (auto result = tls_config_set_ciphers(tls_config.get(), config.ciphers->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-
-  if (config.alpn)
-    if (auto result = tls_config_set_alpn(tls_config.get(), config.alpn->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-
-  if (config.protocols)
-    if (auto result = tls_config_set_protocols(tls_config.get(), *config.protocols); result < 0)
-      return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-
-  if (config.dheparams)
-    // if (auto result = tls_config_set_dheparams(tls_config.get(), *config.dheparams); result < 0)
-    //   return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-
-    if (config.ecdhecurve)
-      // if (auto result = tls_config_set_ecdhecurve(tls_config.get(), *config.ecdhecurve); result < 0)
-      //   return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
-
-      if (config.verify_client)
-        tls_config_verify_client(tls_config.get());
-
-  if (config.verify_depth)
-    tls_config_set_verify_depth(tls_config.get(), *config.verify_depth);
-
-  if (config.verify_optional)
-    tls_config_verify(tls_config.get());
-
-  if (auto result = tls_configure(ret.state->tls_ctx, tls_config.get()); result < 0)
-  {
-    return std::unexpected(error_t{result, tls_error(ret.state->tls_ctx)});
+    return std::unexpected(apply.error());
   }
 
   return ret;
