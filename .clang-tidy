@@ -14,7 +14,8 @@ CheckOptions:
     value: lower_case
   - key: readability-identifier-naming.MemberCase
     value: lower_case
-
+  - key: readability-identifier-naming.PrivateMemberPrefix
+    value: _
   - key: readability-identifier-naming.ClassSuffix
     value: _t
   - key: readability-identifier-naming.StructSuffix
