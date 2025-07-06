@@ -77,6 +77,7 @@ struct ssl_client_state_t
   bool connected = false;
   bool connecting = false;
   bool resolved_done = false;
+  bool closing = false;
 
   uv_poll_t poll_req = {};
   bool poll_read_active = false;
@@ -188,6 +189,7 @@ struct ssl_client_state_t
       {
         state->connect_result = std::unexpected(error_t{.code = -1, .msg = std::string("Failed to initialize poll, ") + uv_strerror(result)});
       }
+      state->poll_req.data = state.ptr();
 
       if (state->connect_continuation)
       {
@@ -254,6 +256,7 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
     {
       return;
     }
+    state->closing = true;
     tls_close(state->tls_ctx);
     tls_free(state->tls_ctx);
 
@@ -384,39 +387,41 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
 
 static void on_poll_event(uv_poll_t *handle, int status, int events);
 
-void set_poll_state(ref_ptr_t<ssl_client_state_t> &state)
+void set_poll_state(ssl_client_state_t &state)
 {
-  assert(state.ptr() != nullptr && "Invalid state in set_poll_state");
+  if (state.closing)
+  {
+    return;
+  }
   int events = 0;
-  if (state->poll_read_active && (state->write_got_poll_in || state->reader_active))
+  if (state.poll_read_active && (state.write_got_poll_in || state.reader_active))
   {
     events |= UV_READABLE;
   }
-  if (state->poll_write_active)
+  if (state.poll_write_active)
   {
     events |= UV_WRITABLE;
   }
 
   if (events != 0)
   {
-    state.inc_ref_and_store_in_handle(state->poll_req);
-    uv_poll_start(&state->poll_req, events, on_poll_event);
-    state->poll_running = true;
+    uv_poll_start(&state.poll_req, events, on_poll_event);
+    state.poll_running = true;
   }
-  else if (state->poll_running)
+  else if (state.poll_running)
   {
-    uv_poll_stop(&state->poll_req);
-    state->poll_running = false;
+    uv_poll_stop(&state.poll_req);
+    state.poll_running = false;
   }
 }
 
-static void on_readable(ref_ptr_t<ssl_client_state_t> &state);
-static void on_writable(ref_ptr_t<ssl_client_state_t> &state);
+static void on_readable(ssl_client_state_t &state);
+static void on_writable(ssl_client_state_t &state);
 
 static void on_poll_event(uv_poll_t *handle, int status, int events)
 {
-  auto state = ref_ptr_t<ssl_client_state_t>::from_raw(handle->data);
-  assert(state.ptr() != nullptr && "Invalid state in on_poll_event");
+  auto state = static_cast<ssl_client_state_t *>(handle->data);
+  assert(handle == &state->poll_req && "Invalid state in on_poll_event");
 
   if (status < 0)
   {
@@ -431,11 +436,11 @@ static void on_poll_event(uv_poll_t *handle, int status, int events)
     if (state->read_got_poll_out)
     {
       state->read_got_poll_out = false;
-      on_readable(state);
+      on_readable(*state);
     }
     else
     {
-      on_writable(state);
+      on_writable(*state);
     }
   }
   if (events & UV_READABLE)
@@ -443,75 +448,75 @@ static void on_poll_event(uv_poll_t *handle, int status, int events)
     if (state->write_got_poll_in)
     {
       state->write_got_poll_in = false;
-      on_writable(state);
+      on_writable(*state);
     }
-    on_readable(state);
+    on_readable(*state);
   }
   if (!(events & (UV_WRITABLE | UV_READABLE)))
   {
     fprintf(stderr, "on_poll_event: unexpected events %d\n", events);
   }
-  set_poll_state(state);
+  set_poll_state(*state);
 }
 
-bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
+bool read_from_tls_context(ssl_client_state_t &state)
 {
   struct call_read_resume_on_exit_t
   {
-    ref_ptr_t<ssl_client_state_t> &state;
-    call_read_resume_on_exit_t(ref_ptr_t<ssl_client_state_t> &state)
+    ssl_client_state_t &state;
+    call_read_resume_on_exit_t(ssl_client_state_t &state)
       : state(state)
     {
     }
 
     ~call_read_resume_on_exit_t()
     {
-      if (state->read_buffer_continuation && (state->read_buffer.len > 0 && state->bytes_read == state->read_buffer.len || state->read_buffer_error.code))
+      if (state.read_buffer_continuation && (state.read_buffer.len > 0 && state.bytes_read == state.read_buffer.len || state.read_buffer_error.code))
       {
-        state->read_buffer_continuation.resume();
+        state.read_buffer_continuation.resume();
       }
-      if (state->read_buffer.len == 0 && state->read_continuation && state->has_buffer_with_data_or_error())
+      if (state.read_buffer.len == 0 && state.read_continuation && state.has_buffer_with_data_or_error())
       {
-        state->read_continuation.resume();
+        state.read_continuation.resume();
       }
     }
   };
   call_read_resume_on_exit_t call_read_resume_on_exit{state};
 
-  state->read_got_poll_out = false;
-  if (state->read_buffer.len > 0)
+  state.read_got_poll_out = false;
+  if (state.read_buffer.len > 0)
   {
-    while (state->bytes_read < state->read_buffer.len)
+    while (state.bytes_read < state.read_buffer.len)
     {
-      auto remaining = state->read_buffer.len - state->bytes_read;
-      auto r = tls_read(state->tls_ctx, state->read_buffer.base + state->bytes_read, remaining);
+      auto remaining = state.read_buffer.len - state.bytes_read;
+      auto r = tls_read(state.tls_ctx, state.read_buffer.base + state.bytes_read, remaining);
       if (r == TLS_WANT_POLLOUT)
       {
-        state->read_got_poll_out = true;
-        state->poll_write_active = true;
+        state.read_got_poll_out = true;
+        state.poll_write_active = true;
       }
       if (r == TLS_WANT_POLLIN || r == 0)
       {
-        state->poll_read_active = true;
+        state.poll_read_active = true;
         return true;
       }
       if (r < 0)
       {
-        state->read_buffer_error = error_t{int(r), tls_error(state->tls_ctx)};
-        state->poll_read_active = false;
+        state.read_buffer_error = error_t{int(r), tls_error(state.tls_ctx)};
+        state.poll_read_active = false;
         return false;
       }
-      state->bytes_read += r;
+      state.bytes_read += r;
     }
     return true;
   }
 
-  while (!state->buffer_queue.full())
+  while (!state.buffer_queue.full())
   {
     ssl_client_state_t::ssl_client_buffer_t *current_buffer = nullptr;
-    if (!state->buffer_queue.empty())
+    if (!state.buffer_queue.empty())
     {
-      auto &last = state->buffer_queue.back();
+      auto &last = state.buffer_queue.back();
       if (last.has_value() && last->buf.len < last->capacity)
       {
         current_buffer = &last.value();
@@ -521,23 +526,23 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
     if (!current_buffer)
     {
       uv_buf_t read_buf;
-      state->alloc_cb(state->user_alloc_ptr, 65536, &read_buf);
+      state.alloc_cb(state.user_alloc_ptr, 65536, &read_buf);
       auto capacity = read_buf.len;
       read_buf.len = 0;
-      current_buffer = &state->buffer_queue.push(ssl_client_state_t::ssl_client_buffer_t{read_buf, capacity, state->dealloc_cb}).value();
+      current_buffer = &state.buffer_queue.push(ssl_client_state_t::ssl_client_buffer_t{read_buf, capacity, state.dealloc_cb}).value();
     }
 
     auto remaining = current_buffer->capacity - current_buffer->buf.len;
-    auto r = tls_read(state->tls_ctx, current_buffer->buf.base + current_buffer->buf.len, remaining);
+    auto r = tls_read(state.tls_ctx, current_buffer->buf.base + current_buffer->buf.len, remaining);
     if (r == TLS_WANT_POLLIN || r == 0)
     {
-      state->poll_read_active = true;
+      state.poll_read_active = true;
       return true;
     }
     if (r == TLS_WANT_POLLOUT)
     {
-      state->poll_write_active = true;
-      state->read_got_poll_out = true;
+      state.poll_write_active = true;
+      state.read_got_poll_out = true;
       return true;
     }
 
@@ -545,23 +550,23 @@ bool read_from_tls_context(ref_ptr_t<ssl_client_state_t> state)
     {
       if (current_buffer->buf.len == 0)
       {
-        current_buffer->dealloc_cb(state->user_alloc_ptr, &current_buffer->buf);
-        state->buffer_queue.replace_back(std::unexpected(error_t{int(r), tls_error(state->tls_ctx)}));
+        current_buffer->dealloc_cb(state.user_alloc_ptr, &current_buffer->buf);
+        state.buffer_queue.replace_back(std::unexpected(error_t{int(r), tls_error(state.tls_ctx)}));
       }
-      uv_poll_stop(&state->poll_req);
-      state->poll_read_active = false;
+      uv_poll_stop(&state.poll_req);
+      state.poll_read_active = false;
       return false;
     }
 
     current_buffer->buf.len += r;
   }
 
-  state->poll_read_active = false;
+  state.poll_read_active = false;
 
   return true;
 }
 
-inline void on_readable(ref_ptr_t<ssl_client_state_t> &state)
+inline void on_readable(ssl_client_state_t &state)
 {
   read_from_tls_context(state);
 }
@@ -660,7 +665,8 @@ struct ssl_client_reader_t
     while (!state->buffer_queue.empty() && state->bytes_read < buf.len)
     {
       auto &queued = state->buffer_queue.front().value();
-      auto to_copy = std::min(queued.buf.len, buf.len - ULONG(state->bytes_read));
+      using to_copy_t = decltype(buf.len);
+      auto to_copy = std::min(queued.buf.len, buf.len - to_copy_t(state->bytes_read));
       std::memcpy(buf.base + state->bytes_read, queued.buf.base, to_copy);
       state->bytes_read += to_copy;
 
@@ -697,8 +703,8 @@ inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_
   }
   client.state->reader_active = true;
 
-  read_from_tls_context(client.state);
-  set_poll_state(client.state);
+  read_from_tls_context(*client.state);
+  set_poll_state(*client.state);
 
   return {ssl_client_reader_t{client.state}};
 }
@@ -765,28 +771,27 @@ struct ssl_client_write_awaitable_t
     return {};
   }
 };
-static void try_write_queue(ref_ptr_t<ssl_client_state_t> &state)
+static void try_write_queue(ssl_client_state_t &state)
 {
-  assert(state);
-  if (!state->write_queue.current_item_is_active() && !state->write_queue.next())
+  if (!state.write_queue.current_item_is_active() && !state.write_queue.next())
   {
     return;
   }
 
-  while (state->write_queue.current_item_is_active())
+  while (state.write_queue.current_item_is_active())
   {
-    auto &write_state = state->write_queue.current_item();
+    auto &write_state = state.write_queue.current_item();
     auto remaining = write_state.buf.len - write_state.bytes_written;
-    auto written = tls_write(state->tls_ctx, write_state.buf.base + write_state.bytes_written, remaining);
+    auto written = tls_write(state.tls_ctx, write_state.buf.base + write_state.bytes_written, remaining);
     if (written == TLS_WANT_POLLOUT)
     {
-      state->poll_write_active = true;
+      state.poll_write_active = true;
       return;
     }
     if (written == TLS_WANT_POLLIN)
     {
-      state->poll_read_active = true;
-      state->write_got_poll_in = true;
+      state.poll_read_active = true;
+      state.write_got_poll_in = true;
       return;
     }
     if (written >= 0)
@@ -799,29 +804,29 @@ static void try_write_queue(ref_ptr_t<ssl_client_state_t> &state)
           write_state.continuation.resume();
         if (--write_state.ref == 0)
         {
-          state->write_queue.deactivate_current();
+          state.write_queue.deactivate_current();
         }
-        state->write_queue.next();
+        state.write_queue.next();
       }
     }
     else
     {
       write_state.error_code = int(written);
-      write_state.error_msg = tls_error(state->tls_ctx);
+      write_state.error_msg = tls_error(state.tls_ctx);
       write_state.done = true;
       if (write_state.continuation)
         write_state.continuation.resume();
       if (--write_state.ref == 0)
       {
-        state->write_queue.deactivate_current();
+        state.write_queue.deactivate_current();
       }
-      state->write_queue.next();
+      state.write_queue.next();
     }
   }
-  state->poll_write_active = false;
+  state.poll_write_active = false;
 };
 
-static void on_writable(ref_ptr_t<ssl_client_state_t> &state)
+static void on_writable(ssl_client_state_t &state)
 {
   try_write_queue(state);
 }
@@ -834,8 +839,8 @@ inline ssl_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_bu
   auto write_state_index = client.state->write_queue.activate();
   client.state->write_queue[write_state_index].buf = buffer;
 
-  try_write_queue(client.state);
-  set_poll_state(client.state);
+  try_write_queue(*client.state);
+  set_poll_state(*client.state);
   return ssl_client_write_awaitable_t(client.state, write_state_index);
 }
 

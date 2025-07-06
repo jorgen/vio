@@ -9,8 +9,7 @@ add_executable(vio_tests
     test_elastic_index_storage.cpp
 )
 
-BuildExternalTargetLinkLibrary(vio_tests PRIVATE vio bcrypt LibreSSL::Crypto LibreSSL::SSL LibreSSL::TLS)
-target_link_libraries(vio_tests PRIVATE bcrypt)
+BuildExternalTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::Crypto LibreSSL::SSL LibreSSL::TLS)
 
 
 target_include_directories(vio_tests PRIVATE
