@@ -77,7 +77,7 @@ struct ssl_client_state_t
   bool connected = false;
   bool connecting = false;
   bool resolved_done = false;
-  bool closing = false;
+  bool closed = false;
 
   uv_poll_t poll_req = {};
   bool poll_read_active = false;
@@ -242,6 +242,8 @@ struct ssl_client_t
   ref_ptr_t<ssl_client_state_t> state;
 };
 
+void set_poll_state(ssl_client_state_t &state);
+
 inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config &config = {}, alloc_cb_t alloc_cb = default_alloc, dealloc_cb_t dealloc_cb = default_dealloc,
                                                               void *user_alloc_ptr = nullptr)
 {
@@ -256,7 +258,6 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
     {
       return;
     }
-    state->closing = true;
     tls_close(state->tls_ctx);
     tls_free(state->tls_ctx);
 
@@ -273,6 +274,10 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
         handle->data = nullptr;
       }
     };
+    state->poll_read_active = false;
+    state->poll_write_active = false;
+    state->closed = true;
+    uv_poll_stop(&state->poll_req);
     uv_close(state->get_tcp_handle(), close_cb);
     state.inc_ref_and_store_in_handle(state->poll_req);
     auto close_poll_cb = [](uv_handle_t *handle)
@@ -389,7 +394,7 @@ static void on_poll_event(uv_poll_t *handle, int status, int events);
 
 void set_poll_state(ssl_client_state_t &state)
 {
-  if (state.closing)
+  if (state.closed)
   {
     return;
   }
@@ -403,15 +408,15 @@ void set_poll_state(ssl_client_state_t &state)
     events |= UV_WRITABLE;
   }
 
-  if (events != 0)
-  {
-    uv_poll_start(&state.poll_req, events, on_poll_event);
-    state.poll_running = true;
-  }
-  else if (state.poll_running)
+  if (events == 0)
   {
     uv_poll_stop(&state.poll_req);
     state.poll_running = false;
+  }
+  else
+  {
+    uv_poll_start(&state.poll_req, events, on_poll_event);
+    state.poll_running = true;
   }
 }
 
@@ -420,9 +425,20 @@ static void on_writable(ssl_client_state_t &state);
 
 static void on_poll_event(uv_poll_t *handle, int status, int events)
 {
+
+  static int c = 0;
+  fprintf(stderr, "on_poll_event: status %d events %d #%d\n", status, events, c++);
   auto state = static_cast<ssl_client_state_t *>(handle->data);
   assert(handle == &state->poll_req && "Invalid state in on_poll_event");
 
+  if (events & UV_DISCONNECT)
+  {
+    state->connected = false;
+    state->poll_read_active = false;
+    state->poll_write_active = false;
+    uv_poll_stop(&state->poll_req);
+    return;
+  }
   if (status < 0)
   {
     fprintf(stderr, "on_poll_event: error %s\n", uv_strerror(status));
