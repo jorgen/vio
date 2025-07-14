@@ -22,35 +22,14 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
-#include <optional>
+#include <vio/ssl_config.h>
+
 #include <string>
-#include <vector>
 
 #include <tls.h>
 
 namespace vio
 {
-struct ssl_config
-{
-  std::optional<std::string> ca_file;
-  std::optional<std::string> ca_path;
-  std::optional<std::string> cert_file;
-  std::optional<std::string> key_file;
-  std::optional<std::string> ocsp_staple_file;
-  std::optional<std::vector<uint8_t>> ca_mem;
-  std::optional<std::vector<uint8_t>> cert_mem;
-  std::optional<std::vector<uint8_t>> key_mem;
-  std::optional<std::vector<uint8_t>> ocsp_staple_mem;
-  std::optional<std::string> ciphers;
-  std::optional<std::string> alpn;
-  std::optional<bool> verify_client;
-  std::optional<bool> verify_depth;
-  std::optional<bool> verify_optional;
-  std::optional<uint32_t> protocols;
-  std::optional<uint32_t> dheparams;
-  std::optional<uint32_t> ecdhecurve;
-};
-
 std::string get_default_ca_certificates();
 
 using tls_config_ptr_t = std::unique_ptr<tls_config, decltype(&tls_config_free)>;
@@ -137,15 +116,17 @@ static std::expected<tls_config_ptr_t, error_t> create_tls_config(const ssl_conf
   return tls_config;
 }
 
-inline std::expected<void, error_t> apply_ssl_config_to_tls_ctx(const ssl_config &config, const std::string &default_ca_certificates, tls *tls_ctx)
+inline error_t apply_ssl_config_to_tls_ctx(const ssl_config &config, const std::string &default_ca_certificates, tls *tls_ctx)
 {
   auto tls_config = create_tls_config(config, default_ca_certificates);
   if (!tls_config)
-    return std::unexpected(tls_config.error());
+  {
+    return tls_config.error();
+  }
 
   if (auto result = tls_configure(tls_ctx, tls_config.value().get()); result < 0)
   {
-    return std::unexpected(error_t{result, tls_error(tls_ctx)});
+    return error_t{result, tls_error(tls_ctx)};
   }
   return {};
 }

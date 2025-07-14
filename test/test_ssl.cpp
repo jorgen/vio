@@ -82,6 +82,7 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
     MESSAGE("Headers:\n" << headers);
     MESSAGE("Body:\n" << std::string_view(body_buffer.data(), content_length));
   }
+
   event_loop.stop();
 }
 
