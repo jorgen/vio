@@ -22,6 +22,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include <vio/socket_stream.h>
 #include <vio/ssl_config.h>
 
 #include <string>
@@ -30,6 +31,7 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+
 std::string get_default_ca_certificates();
 
 using tls_config_ptr_t = std::unique_ptr<tls_config, decltype(&tls_config_free)>;
@@ -130,5 +132,75 @@ inline error_t apply_ssl_config_to_tls_ctx(const ssl_config &config, const std::
   }
   return {};
 }
+
+struct tls_stream
+{
+  tls *tls_ctx = nullptr;
+  std::string cert_data;
+
+  error_t initialize(const ssl_config &config)
+  {
+    tls_ctx = tls_client();
+    if (!tls_ctx)
+    {
+      return error_t{-1, "Failed to create TLS client"};
+    }
+
+    cert_data = get_default_ca_certificates();
+    return apply_ssl_config_to_tls_ctx(config, cert_data, tls_ctx);
+  }
+
+  error_t connect(int socket_fd, const std::string &host, const std::string &_port)
+  {
+    auto tls_result = tls_connect_socket(tls_ctx, socket_fd, host.c_str());
+    if (tls_result != 0)
+    {
+      return error_t{.code = tls_result, .msg = tls_error(tls_ctx)};
+    }
+    return {};
+  }
+
+  std::expected<std::pair<stream_io_result_t, uint32_t>, error_t> read(void *target, uint32_t size)
+  {
+    auto r = tls_read(tls_ctx, target, size);
+    if (r == TLS_WANT_POLLIN)
+    {
+      return std::make_pair(stream_io_result_t::poll_in, uint32_t(0));
+    }
+    if (r == TLS_WANT_POLLOUT)
+    {
+      return std::make_pair(stream_io_result_t::poll_out, uint32_t(0));
+    }
+    if (r < 0)
+    {
+      return std::unexpected(error_t{int(r), tls_error(tls_ctx)});
+    }
+    return std::make_pair(stream_io_result_t::ok, uint32_t(r));
+  }
+
+  std::expected<std::pair<stream_io_result_t, uint32_t>, error_t> write(void *source, uint32_t size)
+  {
+    auto written = tls_write(tls_ctx, source, size);
+    if (written == TLS_WANT_POLLIN)
+    {
+      return std::make_pair(stream_io_result_t::poll_in, uint32_t(0));
+    }
+    if (written == TLS_WANT_POLLOUT)
+    {
+      return std::make_pair(stream_io_result_t::poll_out, uint32_t(0));
+    }
+    if (written < 0)
+    {
+      return std::unexpected(error_t{int(written), tls_error(tls_ctx)});
+    }
+    return std::make_pair(stream_io_result_t::ok, uint32_t(written));
+  }
+
+  void close()
+  {
+    tls_close(tls_ctx);
+    tls_free(tls_ctx);
+  }
+};
 
 } // namespace vio

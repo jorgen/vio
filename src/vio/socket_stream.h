@@ -22,9 +22,6 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
-#include "ada/state.h"
-#include "operation/ssl_client.h"
-
 #include <coroutine>
 #include <expected>
 
@@ -36,7 +33,7 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
-struct ssl_write_state_t
+struct stream_write_state_t
 {
   uv_buf_t buf = {};
   size_t bytes_written = 0;
@@ -64,73 +61,72 @@ enum class stream_io_result_t
 template <typename T>
 struct socket_stream_t;
 
-template <typename T>
-struct ssl_client_read_awaitable_t
+template <typename REF_PTR_T, typename STREAM>
+struct stream_read_awaitable_t
 {
-  T ref_ptr;
-  socket_stream_t<>
+  REF_PTR_T ref_ptr;
+  socket_stream_t<STREAM> *stream;
 
-    bool await_ready() noexcept
+  bool await_ready() noexcept
   {
-    assert(state && "Invalid state in await_ready");
-    return state->socket_stream.bytes_read == state->socket_stream.read_buffer.len || state->socket_stream.read_buffer_error.code;
+    assert(ref_ptr && "Invalid state in await_ready");
+    return stream->bytes_read == stream->read_buffer.len || stream->read_buffer_error.code;
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
   {
-    assert(state && "Invalid state in await_suspend");
-    state->socket_stream.read_buffer_continuation = continuation;
+    assert(ref_ptr && "Invalid state in await_suspend");
+    stream->read_buffer_continuation = continuation;
   }
 
   auto await_resume() noexcept
   {
-    assert(state && "Invalid state in await_resume");
-    assert(state->socket_stream.bytes_read == state->socket_stream.read_buffer.len || state->socket_stream.read_buffer_error.code);
-    return std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>{{state->socket_stream.read_buffer, nullptr}};
+    assert(stream && "Invalid state in await_resume");
+    assert(stream->bytes_read == stream->read_buffer.len || stream->read_buffer_error.code);
+    return std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>{{stream->read_buffer, nullptr}};
   }
 };
 
 template <typename REF_PTR_T, typename STREAM>
-struct ssl_client_reader_t
+struct stream_reader_t
 {
-  REF_PTR_Tref_ptr;
-  socket_stream_t<T> *stream;
+  REF_PTR_T ref_ptr;
+  socket_stream_t<STREAM> *stream;
 
-  ssl_client_reader_t(const T &state, socket_stream_t<T> *stream)
-    : ref_ptr(state)
-    , stream(stream)
-  {
-  }
+  stream_reader_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream);
+  stream_reader_t(stream_reader_t &&other) noexcept;
+  ~stream_reader_t();
 
-  ssl_client_reader_t(const ssl_client_reader_t &) = delete;
-  ssl_client_reader_t &operator=(const ssl_client_reader_t &) = delete;
+  stream_reader_t(const stream_reader_t &) = delete;
+  stream_reader_t &operator=(const stream_reader_t &) = delete;
 
-  ssl_client_reader_t(ssl_client_reader_t &&other) noexcept
-    : ref_ptr(std::move(other.ref_ptr))
-    , stream(other.stream)
-  {
-    assert(ref_ptr && "Invalid state in move constructor");
-    other.stream = nullptr;
-  }
-
-  ssl_client_reader_t &operator=(ssl_client_reader_t &&other) noexcept
-  {
-    if (this != &other)
-    {
-      assert(other.ref_ptr && "Invalid state in move assignment");
-      ref_ptr = std::move(other.ref_ptr);
-      stream = other.stream;
-      other.stream = nullptr;
-    }
-    return *this;
-  }
-
-  ~ssl_client_reader_t();
+  stream_reader_t &operator=(stream_reader_t &&other) noexcept;
 
   bool await_ready() noexcept;
   void await_suspend(std::coroutine_handle<> continuation) noexcept;
   auto await_resume() noexcept -> std::expected<unique_buf_t, error_t>;
-  ssl_client_read_awaitable_t read(uv_buf_t buf);
+  stream_read_awaitable_t<REF_PTR_T, STREAM> read(uv_buf_t buf);
+};
+
+template <typename REF_PTR_T, typename STREAM>
+struct stream_write_awaitable_t
+{
+  REF_PTR_T ref_ptr;
+  socket_stream_t<STREAM> *stream;
+  size_t write_state_index;
+
+  stream_write_awaitable_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream, size_t write_state_index);
+  ~stream_write_awaitable_t();
+
+  stream_write_awaitable_t(const stream_write_awaitable_t &) = delete;
+  stream_write_awaitable_t &operator=(const stream_write_awaitable_t &) = delete;
+
+  stream_write_awaitable_t(stream_write_awaitable_t &&) noexcept = default;
+  stream_write_awaitable_t &operator=(stream_write_awaitable_t &&) noexcept = default;
+
+  [[nodiscard]] bool await_ready() const noexcept;
+  void await_suspend(std::coroutine_handle<> h) noexcept;
+  std::expected<void, error_t> await_resume() noexcept;
 };
 
 template <typename T>
@@ -145,24 +141,26 @@ struct socket_stream_t : public T
     poll_req.data = this;
   }
 
+  ~socket_stream_t() = default;
   socket_stream_t(socket_stream_t &) = delete;
   socket_stream_t &operator=(socket_stream_t &) = delete;
   socket_stream_t(socket_stream_t &&) = delete;
   socket_stream_t &operator=(socket_stream_t &&) = delete;
 
-  [[nodiscard]] error_t initialize(int socket, const std::string &host, const std::string &port);
+  [[nodiscard]] error_t initialize(const ssl_config &config);
+  [[nodiscard]] error_t connect(int socket, const std::string &host, const std::string &port);
   void close(std::function<void()> continuation);
   [[nodiscard]] bool has_buffer_with_data_or_error() const;
 
   void set_poll_state();
-  void on_readable();
-  void on_writable();
   static void on_poll_event(uv_poll_t *handle, int status, int events);
 
   bool read();
+  void write();
 
   event_loop_t &event_loop;
   uv_poll_t poll_req = {};
+  bool connected = false;
   bool poll_read_active = false;
   bool poll_write_active = false;
   bool read_got_poll_out = false;
@@ -183,7 +181,7 @@ struct socket_stream_t : public T
   size_t bytes_read = 0;
   error_t read_buffer_error = {};
 
-  elastic_index_storage_t<ssl_write_state_t> write_queue;
+  elastic_index_storage_t<stream_write_state_t> write_queue;
 };
 
 template <typename T>
@@ -206,9 +204,15 @@ bool socket_stream_t<T>::has_buffer_with_data_or_error() const
 }
 
 template <typename T>
-error_t socket_stream_t<T>::initialize(int socket, const std::string &host, const std::string &port)
+error_t socket_stream_t<T>::initialize(const ssl_config &config)
 {
-  error_t err = static_cast<T *>(this)->initialize(socket, host, port);
+  return static_cast<T *>(this)->initialize(config);
+}
+
+template <typename T>
+error_t socket_stream_t<T>::connect(int socket, const std::string &host, const std::string &port)
+{
+  error_t err = static_cast<T *>(this)->connect(socket, host, port);
   if (err.code != 0)
   {
     return err;
@@ -219,7 +223,8 @@ error_t socket_stream_t<T>::initialize(int socket, const std::string &host, cons
     err = error_t{.code = -1, .msg = std::string("Failed to initialize poll, ") + uv_strerror(result)};
     return err;
   }
-  poll_req.data = this;
+  connected = true;
+  return err;
 }
 
 template <typename T>
@@ -273,8 +278,6 @@ void socket_stream_t<T>::set_poll_state()
 template <typename T>
 void socket_stream_t<T>::on_poll_event(uv_poll_t *handle, int status, int events)
 {
-  static int c = 0;
-  fprintf(stderr, "on_poll_event: status %d events %d #%d\n", status, events, c++);
   auto state = static_cast<socket_stream_t<T> *>(handle->data);
   assert(handle == &state->poll_req && "Invalid state in on_poll_event");
 
@@ -299,11 +302,11 @@ void socket_stream_t<T>::on_poll_event(uv_poll_t *handle, int status, int events
     if (state->read_got_poll_out)
     {
       state->read_got_poll_out = false;
-      on_readable(*state);
+      state->read();
     }
     else
     {
-      on_writable(*state);
+      state->write();
     }
   }
   if (events & UV_READABLE)
@@ -311,15 +314,15 @@ void socket_stream_t<T>::on_poll_event(uv_poll_t *handle, int status, int events
     if (state->write_got_poll_in)
     {
       state->write_got_poll_in = false;
-      on_writable(*state);
+      state->write();
     }
-    on_readable(*state);
+    state->read();
   }
   if (!(events & (UV_WRITABLE | UV_READABLE)))
   {
     fprintf(stderr, "on_poll_event: unexpected events %d\n", events);
   }
-  set_poll_state(*state);
+  state->set_poll_state();
 }
 
 template <typename T>
@@ -399,13 +402,13 @@ bool socket_stream_t<T>::read()
     }
 
     auto remaining = current_buffer->capacity - current_buffer->buf.len;
-    auto result_or_error = static_cast<T *>(this)->read(read_buffer.base + current_buffer->buf.len, remaining);
+    auto result_or_error = static_cast<T *>(this)->read(current_buffer->buf.base + current_buffer->buf.len, remaining);
     if (!result_or_error.has_value())
     {
       if (current_buffer->buf.len == 0)
       {
         current_buffer->dealloc_cb(user_alloc_ptr, &current_buffer->buf);
-        buffer_queue.replace_back(std::move(result_or_error));
+        buffer_queue.replace_back(std::unexpected(std::move(result_or_error.error())));
       }
       uv_poll_stop(&poll_req);
       poll_read_active = false;
@@ -433,31 +436,128 @@ bool socket_stream_t<T>::read()
 }
 
 template <typename T>
-ssl_client_reader_t<T>::~ssl_client_reader_t()
+void socket_stream_t<T>::write()
+{
+  if (!write_queue.current_item_is_active() && !write_queue.next())
+  {
+    return;
+  }
+
+  while (write_queue.current_item_is_active())
+  {
+    auto &write_state = write_queue.current_item();
+    auto remaining = write_state.buf.len - write_state.bytes_written;
+
+    auto write_result = static_cast<T *>(this)->write(write_state.buf.base + write_state.bytes_written, remaining);
+    if (write_result.has_value())
+    {
+      auto &result = write_result.value();
+      if (result.second > 0)
+      {
+        write_state.bytes_written += result.second;
+        if (write_state.bytes_written == write_state.buf.len)
+        {
+          write_state.done = true;
+          if (write_state.continuation)
+          {
+            write_state.continuation.resume();
+          }
+          if (--write_state.ref == 0)
+          {
+            write_queue.deactivate_current();
+          }
+          write_queue.next();
+        }
+      }
+      if (result.first == stream_io_result_t::poll_out)
+      {
+        poll_write_active = true;
+        return;
+      }
+      if (result.first == stream_io_result_t::poll_in)
+      {
+        poll_read_active = true;
+        write_got_poll_in = true;
+        return;
+      }
+    }
+    else
+    {
+      auto &error = write_result.error();
+      write_state.error_code = error.code;
+      write_state.error_msg = std::move(error.msg);
+      write_state.done = true;
+      if (write_state.continuation)
+      {
+        write_state.continuation.resume();
+      }
+      if (--write_state.ref == 0)
+      {
+        write_queue.deactivate_current();
+      }
+      write_queue.next();
+    }
+  }
+  poll_write_active = false;
+}
+
+template <typename REF_PTR_T, typename STREAM>
+stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream)
+  : ref_ptr(ref_ptr)
+  , stream(stream)
+{
+  stream->reader_active = true;
+
+  stream->read();
+  stream->set_poll_state();
+}
+template <typename REF_PTR_T, typename STREAM>
+stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(stream_reader_t &&other) noexcept
+  : ref_ptr(std::move(other.ref_ptr))
+  , stream(other.stream)
+{
+  assert(ref_ptr && "Invalid state in move constructor");
+  other.stream = nullptr;
+}
+template <typename REF_PTR_T, typename STREAM>
+stream_reader_t<REF_PTR_T, STREAM> &stream_reader_t<REF_PTR_T, STREAM>::operator=(stream_reader_t<REF_PTR_T, STREAM> &&other) noexcept
+{
+  if (this != &other)
+  {
+    assert(other.ref_ptr && "Invalid state in move assignment");
+    ref_ptr = std::move(other.ref_ptr);
+    stream = other.stream;
+    other.stream = nullptr;
+  }
+  return *this;
+}
+
+template <typename REF_PTR_T, typename STREAM>
+stream_reader_t<REF_PTR_T, STREAM>::~stream_reader_t()
 {
   if (!ref_ptr)
   {
     return;
   }
-  stream.reader_active = false;
+  stream->reader_active = false;
 }
 
-template <typename T>
-bool ssl_client_reader_t<T>::await_ready() noexcept
+template <typename REF_PTR_T, typename STREAM>
+bool stream_reader_t<REF_PTR_T, STREAM>::await_ready() noexcept
 {
   assert(ref_ptr && "Invalid state in await_ready");
   return stream->has_buffer_with_data_or_error();
 }
 
-template <typename T>
-void ssl_client_reader_t<T>::await_suspend(std::coroutine_handle<> continuation) noexcept
+template <typename REF_PTR_T, typename STREAM>
+void stream_reader_t<REF_PTR_T, STREAM>::await_suspend(std::coroutine_handle<> continuation) noexcept
 {
   assert(ref_ptr && "Invalid state in await_suspend");
   stream->read_continuation = continuation;
 }
 
-template <typename T>
-auto ssl_client_reader_t<T>::await_resume() noexcept -> std::expected<unique_buf_t, error_t>
+template <typename REF_PTR_T, typename STREAM>
+auto stream_reader_t<REF_PTR_T, STREAM>::await_resume() noexcept -> std::expected<unique_buf_t, error_t>
 {
   assert(ref_ptr && "Invalid state in await_resume");
   assert(stream->has_buffer_with_data_or_error() && "Empty buffer in await_resume");
@@ -470,24 +570,25 @@ auto ssl_client_reader_t<T>::await_resume() noexcept -> std::expected<unique_buf
   return unique_buf_t(ret.value().buf, ret.value().dealloc_cb, stream->user_alloc_ptr);
 }
 
-ssl_client_read_awaitable_t read(uv_buf_t buf)
+template <typename REF_PTR_T, typename STREAM>
+stream_read_awaitable_t<REF_PTR_T, STREAM> stream_reader_t<REF_PTR_T, STREAM>::read(uv_buf_t buf)
 {
-  state->socket_stream.read_buffer = buf;
-  state->socket_stream.bytes_read = 0;
+  stream->read_buffer = buf;
+  stream->bytes_read = 0;
 
-  while (!state->socket_stream.buffer_queue.empty() && state->socket_stream.bytes_read < buf.len)
+  while (!stream->buffer_queue.empty() && stream->bytes_read < buf.len)
   {
-    auto &queued = state->socket_stream.buffer_queue.front().value();
+    auto &queued = stream->buffer_queue.front().value();
     using to_copy_t = decltype(buf.len);
-    auto to_copy = std::min(queued.buf.len, buf.len - to_copy_t(state->socket_stream.bytes_read));
-    std::memcpy(buf.base + state->bytes_read, queued.buf.base, to_copy);
-    state->bytes_read += to_copy;
+    auto to_copy = std::min(queued.buf.len, buf.len - to_copy_t(stream->bytes_read));
+    std::memcpy(buf.base + stream->bytes_read, queued.buf.base, to_copy);
+    stream->bytes_read += to_copy;
 
     if (to_copy == queued.buf.len)
     {
       if (queued.dealloc_cb)
         queued.dealloc_cb(nullptr, &queued.buf);
-      state->buffer_queue.discard_front();
+      stream->buffer_queue.discard_front();
     }
     else
     {
@@ -496,6 +597,62 @@ ssl_client_read_awaitable_t read(uv_buf_t buf)
     }
   }
 
-  return {state};
+  return {ref_ptr, stream};
+}
+
+template <typename REF_PTR_T, typename STREAM>
+stream_write_awaitable_t<REF_PTR_T, STREAM>::stream_write_awaitable_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream, size_t write_state_index)
+  : ref_ptr(ref_ptr)
+  , stream(stream)
+  , write_state_index(write_state_index)
+{
+}
+template <typename REF_PTR_T, typename STREAM>
+stream_write_awaitable_t<REF_PTR_T, STREAM>::~stream_write_awaitable_t()
+{
+  if (!ref_ptr)
+  {
+    return;
+  }
+  auto &write_state = stream->write_queue[write_state_index];
+  if (--write_state.ref == 0)
+  {
+    write_state.done = false;
+    stream->write_queue.deactivate(write_state_index);
+  };
+}
+template <typename REF_PTR_T, typename STREAM>
+[[nodiscard]] bool stream_write_awaitable_t<REF_PTR_T, STREAM>::await_ready() const noexcept
+{
+  if (!ref_ptr)
+  {
+    return true;
+  }
+  auto &write_state = stream->write_queue[write_state_index];
+  return write_state.done || write_state.error_code != 0;
+}
+template <typename REF_PTR_T, typename STREAM>
+void stream_write_awaitable_t<REF_PTR_T, STREAM>::await_suspend(std::coroutine_handle<> h) noexcept
+{
+  if (!ref_ptr)
+  {
+    return;
+  }
+  auto &write_state = stream->write_queue[write_state_index];
+  write_state.continuation = h;
+}
+template <typename REF_PTR_T, typename STREAM>
+std::expected<void, error_t> stream_write_awaitable_t<REF_PTR_T, STREAM>::await_resume() noexcept
+{
+  if (!ref_ptr)
+  {
+    return {};
+  }
+  auto &write_state = stream->write_queue[write_state_index];
+  if (write_state.error_code != 0)
+  {
+    return std::unexpected(error_t{-1, write_state.error_msg});
+  }
+  return {};
 }
 } // namespace vio

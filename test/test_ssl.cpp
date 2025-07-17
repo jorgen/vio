@@ -1,7 +1,7 @@
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
-#include <vio/operation/ssl_client.h>
+#include <vio/operation/tls_client.h>
 #include <vio/task.h>
 
 #include "require_expected.h"

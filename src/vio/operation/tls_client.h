@@ -25,7 +25,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "dns.h"
 #include "vio/elastic_index_storage.h"
 #include "vio/error.h"
-#include "vio/operation/ssl_common.h"
+#include "vio/operation/tls_common.h"
 #include "vio/ref_ptr.h"
 #include "vio/socket_stream.h"
 #include "vio/ssl_config.h"
@@ -42,58 +42,6 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
-
-struct ssl_stream
-{
-  tls *tls_ctx = nullptr;
-  std::string cert_data;
-
-  error_t initialize(ssl_config &config)
-  {
-    tls_ctx = tls_client();
-    if (!tls_ctx)
-    {
-      return error_t{-1, "Failed to create TLS client"};
-    }
-
-    cert_data = get_default_ca_certificates();
-    return apply_ssl_config_to_tls_ctx(config, cert_data, tls_ctx);
-  }
-
-  error_t connect(int socket_fd, const std::string &host)
-  {
-    auto tls_result = tls_connect_socket(tls_ctx, socket_fd, host.c_str());
-    if (tls_result != 0)
-    {
-      return error_t{.code = tls_result, .msg = tls_error(tls_ctx)};
-    }
-  }
-
-  std::expected<std::pair<stream_io_result_t, uint32_t>, error_t> read(void *target, uint32_t size)
-  {
-    auto r = tls_read(tls_ctx, target, size);
-    if (r == TLS_WANT_POLLIN)
-    {
-      return std::make_pair(stream_io_result_t::poll_in, uint32_t(0));
-    }
-    if (r == TLS_WANT_POLLOUT)
-    {
-      return std::make_pair(stream_io_result_t::poll_out, uint32_t(0));
-    }
-    if (r < 0)
-    {
-      return std::unexpected(error_t{int(r), tls_error(tls_ctx)});
-    }
-    return std::make_pair(stream_io_result_t::ok, uint32_t(r));
-  }
-
-  void close()
-  {
-    tls_close(tls_ctx);
-    tls_free(tls_ctx);
-  }
-};
-
 struct ssl_client_state_t
 {
   ssl_client_state_t(event_loop_t &event_loop, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
@@ -123,7 +71,7 @@ struct ssl_client_state_t
   bool connecting = false;
   bool resolved_done = false;
 
-  socket_stream_t<ssl_stream> socket_stream;
+  socket_stream_t<tls_stream> socket_stream;
 
   uv_tcp_t *get_tcp()
   {
@@ -170,7 +118,7 @@ struct ssl_client_state_t
       if (uv_fileno(state->get_tcp_handle(), &socket) == 0)
       {
         state->socket_fd = *reinterpret_cast<int *>(&socket);
-        if (auto socket_err = state->socket_stream.initialize(state->socket_fd, state->host, state->port); socket_err.code == 0)
+        if (auto socket_err = state->socket_stream.connect(state->socket_fd, state->host, state->port); socket_err.code == 0)
         {
           state->connected = true;
           state->connect_result = {};
@@ -242,6 +190,11 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
                                                               void *user_alloc_ptr = nullptr)
 {
   ssl_client_t ret{ref_ptr_t<ssl_client_state_t>{event_loop, alloc_cb, dealloc_cb, user_alloc_ptr}};
+  if (auto error = ret.state->socket_stream.initialize(config); error.code != 0)
+  {
+    return std::unexpected(std::move(error));
+  }
+
   if (auto r = uv_tcp_init(event_loop.loop(), &ret.state->tcp_req); r < 0)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
@@ -356,37 +309,14 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   return {client.state};
 }
 
-struct ssl_client_read_awaitable_t
-{
-  ref_ptr_t<ssl_client_state_t> state;
-
-  bool await_ready() noexcept
-  {
-    assert(state && "Invalid state in await_ready");
-    return state->socket_stream.bytes_read == state->socket_stream.read_buffer.len || state->socket_stream.read_buffer_error.code;
-  }
-
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
-  {
-    assert(state && "Invalid state in await_suspend");
-    state->socket_stream.read_buffer_continuation = continuation;
-  }
-
-  auto await_resume() noexcept
-  {
-    assert(state && "Invalid state in await_resume");
-    assert(state->socket_stream.bytes_read == state->socket_stream.read_buffer.len || state->socket_stream.read_buffer_error.code);
-    return std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>{{state->socket_stream.read_buffer, nullptr}};
-  }
-};
-
-inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client)
+using tls_client_reader_t = stream_reader_t<ref_ptr_t<ssl_client_state_t>, tls_stream>;
+inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client)
 {
   if (client.state.ptr() == nullptr)
   {
     return std::unexpected(error_t{1, "Can not create a reader for a closed client"});
   }
-  if (client.state->reader_active)
+  if (client.state->socket_stream.reader_active)
   {
     return std::unexpected(error_t{1, "Can not create a reader for a client that already has a reader active"});
   }
@@ -394,147 +324,21 @@ inline std::expected<ssl_client_reader_t, error_t> ssl_client_create_reader(ssl_
   {
     return std::unexpected(error_t{1, "Can not create a reader for a client that is not connected"});
   }
-  client.state->reader_active = true;
-
-  read_from_tls_context(*client.state);
-  set_poll_state(*client.state);
-
-  return {ssl_client_reader_t{client.state}};
+  return {tls_client_reader_t{client.state, &client.state->socket_stream}};
 }
 
-struct ssl_client_write_awaitable_t
-{
-  ref_ptr_t<ssl_client_state_t> state;
-  size_t write_state_index;
-
-  ssl_client_write_awaitable_t(ref_ptr_t<ssl_client_state_t> state, size_t write_state_index)
-    : state(state)
-    , write_state_index(write_state_index)
-  {
-  }
-  ~ssl_client_write_awaitable_t()
-  {
-    if (!state)
-    {
-      return;
-    }
-    auto &write_state = state->write_queue[write_state_index];
-    if (--write_state.ref == 0)
-    {
-      write_state.done = false;
-      state->write_queue.deactivate(write_state_index);
-    };
-  }
-
-  ssl_client_write_awaitable_t(const ssl_client_write_awaitable_t &) = delete;
-  ssl_client_write_awaitable_t &operator=(const ssl_client_write_awaitable_t &) = delete;
-
-  ssl_client_write_awaitable_t(ssl_client_write_awaitable_t &&) noexcept = default;
-  ssl_client_write_awaitable_t &operator=(ssl_client_write_awaitable_t &&) noexcept = default;
-
-  [[nodiscard]] bool await_ready() const noexcept
-  {
-    if (!state)
-    {
-      return true;
-    }
-    auto &write_state = state->write_queue[write_state_index];
-    return write_state.done || write_state.error_code != 0;
-  }
-  void await_suspend(std::coroutine_handle<> h) noexcept
-  {
-    if (!state)
-    {
-      return;
-    }
-    auto &write_state = state->write_queue[write_state_index];
-    write_state.continuation = h;
-  }
-  std::expected<void, error_t> await_resume() noexcept
-  {
-    if (!state)
-    {
-      return {};
-    }
-    auto &write_state = state->write_queue[write_state_index];
-    if (write_state.error_code != 0)
-    {
-      return std::unexpected(error_t{-1, write_state.error_msg});
-    }
-    return {};
-  }
-};
-static void try_write_queue(ssl_client_state_t &state)
-{
-  if (!state.write_queue.current_item_is_active() && !state.write_queue.next())
-  {
-    return;
-  }
-
-  while (state.write_queue.current_item_is_active())
-  {
-    auto &write_state = state.write_queue.current_item();
-    auto remaining = write_state.buf.len - write_state.bytes_written;
-    auto written = tls_write(state.tls_ctx, write_state.buf.base + write_state.bytes_written, remaining);
-    if (written == TLS_WANT_POLLOUT)
-    {
-      state.poll_write_active = true;
-      return;
-    }
-    if (written == TLS_WANT_POLLIN)
-    {
-      state.poll_read_active = true;
-      state.write_got_poll_in = true;
-      return;
-    }
-    if (written >= 0)
-    {
-      write_state.bytes_written += written;
-      if (write_state.bytes_written == write_state.buf.len)
-      {
-        write_state.done = true;
-        if (write_state.continuation)
-          write_state.continuation.resume();
-        if (--write_state.ref == 0)
-        {
-          state.write_queue.deactivate_current();
-        }
-        state.write_queue.next();
-      }
-    }
-    else
-    {
-      write_state.error_code = int(written);
-      write_state.error_msg = tls_error(state.tls_ctx);
-      write_state.done = true;
-      if (write_state.continuation)
-        write_state.continuation.resume();
-      if (--write_state.ref == 0)
-      {
-        state.write_queue.deactivate_current();
-      }
-      state.write_queue.next();
-    }
-  }
-  state.poll_write_active = false;
-};
-
-static void on_writable(ssl_client_state_t &state)
-{
-  try_write_queue(state);
-}
-
-inline ssl_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
+using tls_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_client_state_t>, tls_stream>;
+inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
 {
   assert(client.state.ptr() != nullptr && "Can not write to a closed client");
   assert(client.state->connected && "Can not write to a client that is not connected");
 
-  auto write_state_index = client.state->write_queue.activate();
-  client.state->write_queue[write_state_index].buf = buffer;
+  auto write_state_index = client.state->socket_stream.write_queue.activate();
+  client.state->socket_stream.write_queue[write_state_index].buf = buffer;
 
-  try_write_queue(*client.state);
-  set_poll_state(*client.state);
-  return ssl_client_write_awaitable_t(client.state, write_state_index);
+  client.state->socket_stream.write();
+  client.state->socket_stream.set_poll_state();
+  return tls_client_write_awaitable_t(client.state, &client.state->socket_stream, write_state_index);
 }
 
 } // namespace vio

@@ -21,7 +21,6 @@ Copyright (c) 2025 Jørgen Lind
 */
 
 #pragma once
-#include "ssl_common.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/ref_ptr.h"
