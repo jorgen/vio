@@ -29,6 +29,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/elastic_index_storage.h>
 #include <vio/error.h>
 #include <vio/ring_buffer.h>
+#include <vio/ssl_config.h>
 #include <vio/unique_buf.h>
 
 namespace vio
@@ -37,9 +38,9 @@ struct stream_write_state_t
 {
   uv_buf_t buf = {};
   size_t bytes_written = 0;
-  int ref = 2;
-  bool done = false;
   int error_code = 0;
+  int8_t ref = 2;
+  bool done = false;
   std::string error_msg;
   std::coroutine_handle<> continuation = {};
 };
