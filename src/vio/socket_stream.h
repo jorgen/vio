@@ -29,7 +29,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/elastic_index_storage.h>
 #include <vio/error.h>
 #include <vio/ring_buffer.h>
-#include <vio/ssl_config.h>
+#include <vio/ssl_config_t.h>
 #include <vio/unique_buf.h>
 
 namespace vio
@@ -148,8 +148,6 @@ struct socket_stream_t : public T
   socket_stream_t(socket_stream_t &&) = delete;
   socket_stream_t &operator=(socket_stream_t &&) = delete;
 
-  [[nodiscard]] error_t initialize(const ssl_config &config);
-  [[nodiscard]] error_t connect(int socket, const std::string &host, const std::string &port);
   void close(std::function<void()> continuation);
   [[nodiscard]] bool has_buffer_with_data_or_error() const;
 
@@ -205,15 +203,9 @@ bool socket_stream_t<T>::has_buffer_with_data_or_error() const
 }
 
 template <typename T>
-error_t socket_stream_t<T>::initialize(const ssl_config &config)
+error_t socket_stream_t<T>::connect(int socket, const std::string &host)
 {
-  return static_cast<T *>(this)->initialize(config);
-}
-
-template <typename T>
-error_t socket_stream_t<T>::connect(int socket, const std::string &host, const std::string &port)
-{
-  error_t err = static_cast<T *>(this)->connect(socket, host, port);
+  error_t err = static_cast<T *>(this)->connect(socket, host);
   if (err.code != 0)
   {
     return err;

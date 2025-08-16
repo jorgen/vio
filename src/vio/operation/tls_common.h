@@ -23,7 +23,7 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include <vio/socket_stream.h>
-#include <vio/ssl_config.h>
+#include <vio/ssl_config_t.h>
 
 #include <string>
 
@@ -35,7 +35,7 @@ namespace vio
 std::string get_default_ca_certificates();
 
 using tls_config_ptr_t = std::unique_ptr<tls_config, decltype(&tls_config_free)>;
-static std::expected<tls_config_ptr_t, error_t> create_tls_config(const ssl_config &config, const std::string &default_ca_certificates)
+static std::expected<tls_config_ptr_t, error_t> create_tls_config(const ssl_config_t &config, const std::string &default_ca_certificates)
 {
   tls_config_ptr_t tls_config(tls_config_new(), &tls_config_free);
   if (!tls_config)
@@ -118,7 +118,7 @@ static std::expected<tls_config_ptr_t, error_t> create_tls_config(const ssl_conf
   return tls_config;
 }
 
-inline error_t apply_ssl_config_to_tls_ctx(const ssl_config &config, const std::string &default_ca_certificates, tls *tls_ctx)
+inline error_t apply_ssl_config_to_tls_ctx(const ssl_config_t &config, const std::string &default_ca_certificates, tls *tls_ctx)
 {
   auto tls_config = create_tls_config(config, default_ca_certificates);
   if (!tls_config)
@@ -133,35 +133,19 @@ inline error_t apply_ssl_config_to_tls_ctx(const ssl_config &config, const std::
   return {};
 }
 
-struct tls_stream
+struct tls_stream_t
 {
   tls *tls_ctx = nullptr;
-  std::string cert_data;
 
-  error_t initialize(const ssl_config &config)
+  void initialize_tls_ctx(tls *tls_ctx)
   {
-    tls_ctx = tls_client();
-    if (!tls_ctx)
-    {
-      return error_t{-1, "Failed to create TLS client"};
-    }
-
-    cert_data = get_default_ca_certificates();
-    return apply_ssl_config_to_tls_ctx(config, cert_data, tls_ctx);
-  }
-
-  error_t connect(int socket_fd, const std::string &host, const std::string &_port)
-  {
-    auto tls_result = tls_connect_socket(tls_ctx, socket_fd, host.c_str());
-    if (tls_result != 0)
-    {
-      return error_t{.code = tls_result, .msg = tls_error(tls_ctx)};
-    }
-    return {};
+    assert(!tls_ctx);
+    this->tls_ctx = tls_ctx;
   }
 
   std::expected<std::pair<stream_io_result_t, uint32_t>, error_t> read(void *target, uint32_t size)
   {
+    assert(tls_ctx);
     auto r = tls_read(tls_ctx, target, size);
     if (r == TLS_WANT_POLLIN)
     {
@@ -180,6 +164,7 @@ struct tls_stream
 
   std::expected<std::pair<stream_io_result_t, uint32_t>, error_t> write(void *source, uint32_t size)
   {
+    assert(tls_ctx);
     auto written = tls_write(tls_ctx, source, size);
     if (written == TLS_WANT_POLLIN)
     {
@@ -198,6 +183,7 @@ struct tls_stream
 
   void close()
   {
+    assert(tls_ctx);
     tls_close(tls_ctx);
     tls_free(tls_ctx);
   }

@@ -26,7 +26,9 @@ Copyright (c) 2025 Jørgen Lind
 #include <string>
 #include <vector>
 
-struct ssl_config
+namespace vio
+{
+struct ssl_config_t
 {
   std::optional<std::string> ca_file;
   std::optional<std::string> ca_path;
@@ -46,3 +48,4 @@ struct ssl_config
   std::optional<uint32_t> dheparams;
   std::optional<uint32_t> ecdhecurve;
 };
+} // namespace vio

@@ -28,7 +28,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/operation/tls_common.h"
 #include "vio/ref_ptr.h"
 #include "vio/socket_stream.h"
-#include "vio/ssl_config.h"
+#include "vio/ssl_config_t.h"
 #include "vio/unique_buf.h"
 
 #include <coroutine>
@@ -42,6 +42,33 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+struct tls_client_stream_t : tls_stream_t
+{
+  std::string cert_data;
+
+  error_t initialize(const ssl_config_t &config)
+  {
+    tls_ctx = tls_client();
+    if (!tls_ctx)
+    {
+      return error_t{-1, "Failed to create TLS client"};
+    }
+
+    cert_data = get_default_ca_certificates();
+    return apply_ssl_config_to_tls_ctx(config, cert_data, tls_ctx);
+  }
+
+  error_t connect(int socket_fd, const std::string &host)
+  {
+    auto tls_result = tls_connect_socket(tls_ctx, socket_fd, host.c_str());
+    if (tls_result != 0)
+    {
+      return error_t{.code = tls_result, .msg = tls_error(tls_ctx)};
+    }
+    return {};
+  }
+};
+
 struct ssl_client_state_t
 {
   ssl_client_state_t(event_loop_t &event_loop, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
@@ -71,7 +98,7 @@ struct ssl_client_state_t
   bool connecting = false;
   bool resolved_done = false;
 
-  socket_stream_t<tls_stream> socket_stream;
+  socket_stream_t<tls_stream_t> socket_stream;
 
   uv_tcp_t *get_tcp()
   {
@@ -118,7 +145,7 @@ struct ssl_client_state_t
       if (uv_fileno(state->get_tcp_handle(), &socket) == 0)
       {
         state->socket_fd = *reinterpret_cast<int *>(&socket);
-        if (auto socket_err = state->socket_stream.connect(state->socket_fd, state->host, state->port); socket_err.code == 0)
+        if (auto socket_err = state->socket_stream.connect(state->socket_fd, state->host); socket_err.code == 0)
         {
           state->connected = true;
           state->connect_result = {};
@@ -186,7 +213,7 @@ struct ssl_client_t
 
 void set_poll_state(ssl_client_state_t &state);
 
-inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config &config = {}, alloc_cb_t alloc_cb = default_alloc, dealloc_cb_t dealloc_cb = default_dealloc,
+inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config_t &config = {}, alloc_cb_t alloc_cb = default_alloc, dealloc_cb_t dealloc_cb = default_dealloc,
                                                               void *user_alloc_ptr = nullptr)
 {
   ssl_client_t ret{ref_ptr_t<ssl_client_state_t>{event_loop, alloc_cb, dealloc_cb, user_alloc_ptr}};
@@ -309,7 +336,44 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   return {client.state};
 }
 
-using tls_client_reader_t = stream_reader_t<ref_ptr_t<ssl_client_state_t>, tls_stream>;
+inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, const std::string &host, uint16_t port, const std::string &ip)
+{
+  if (client.state.ptr() == nullptr)
+  {
+    return {{}};
+  }
+  client.state->host = host;
+  client.state->port = std::to_string(port);
+  client.state->connecting = true;
+  client.state->resolved_done = true;
+
+  struct sockaddr_storage storage;
+  int r = uv_ip4_addr(ip.c_str(), port, (struct sockaddr_in *)&storage);
+  if (r < 0)
+  {
+    r = uv_ip6_addr(ip.c_str(), port, (struct sockaddr_in6 *)&storage);
+  }
+  if (r < 0)
+  {
+    client.state->connect_result = std::unexpected(error_t{r, uv_strerror(r)});
+    return {client.state};
+  }
+
+  struct addrinfo ai;
+  std::memset(&ai, 0, sizeof(ai));
+  ai.ai_family = storage.ss_family;
+  ai.ai_socktype = SOCK_STREAM;
+  ai.ai_protocol = IPPROTO_TCP;
+  ai.ai_addr = (struct sockaddr *)&storage;
+  ai.ai_addrlen = sizeof(storage);
+
+  client.state->addresses.emplace_back(ai);
+  client.state->address_index = 0;
+  ssl_client_state_t::connect_to_current_index(client.state);
+  return {client.state};
+}
+
+using tls_client_reader_t = stream_reader_t<ref_ptr_t<ssl_client_state_t>, tls_client_stream_t>;
 inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client)
 {
   if (client.state.ptr() == nullptr)
@@ -327,7 +391,7 @@ inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_
   return {tls_client_reader_t{client.state, &client.state->socket_stream}};
 }
 
-using tls_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_client_state_t>, tls_stream>;
+using tls_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_client_state_t>, tls_client_stream_t>;
 inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
 {
   assert(client.state.ptr() != nullptr && "Can not write to a closed client");
