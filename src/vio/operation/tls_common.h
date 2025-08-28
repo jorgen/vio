@@ -133,18 +133,19 @@ inline error_t apply_ssl_config_to_tls_ctx(const ssl_config_t &config, const std
   return {};
 }
 
+template <typename T>
 struct tls_stream_t
 {
-  tls *tls_ctx = nullptr;
+  T &connection_handler;
 
-  void initialize_tls_ctx(tls *tls_ctx)
+  void close()
   {
-    assert(!tls_ctx);
-    this->tls_ctx = tls_ctx;
+    connection_handler.close();
   }
 
   std::expected<std::pair<stream_io_result_t, uint32_t>, error_t> read(void *target, uint32_t size)
   {
+    tls *tls_ctx = connection_handler.stream_tls_ctx;
     assert(tls_ctx);
     auto r = tls_read(tls_ctx, target, size);
     if (r == TLS_WANT_POLLIN)
@@ -164,6 +165,7 @@ struct tls_stream_t
 
   std::expected<std::pair<stream_io_result_t, uint32_t>, error_t> write(void *source, uint32_t size)
   {
+    tls *tls_ctx = connection_handler.stream_tls_ctx;
     assert(tls_ctx);
     auto written = tls_write(tls_ctx, source, size);
     if (written == TLS_WANT_POLLIN)
@@ -179,13 +181,6 @@ struct tls_stream_t
       return std::unexpected(error_t{int(written), tls_error(tls_ctx)});
     }
     return std::make_pair(stream_io_result_t::ok, uint32_t(written));
-  }
-
-  void close()
-  {
-    assert(tls_ctx);
-    tls_close(tls_ctx);
-    tls_free(tls_ctx);
   }
 };
 

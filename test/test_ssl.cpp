@@ -16,7 +16,7 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
   REQUIRE_EXPECTED(connect_result);
 
   {
-    std::string client_message = "GET /wiki/Susan_B._Anthony HTTP/1.1\r\nHost: en.wikipedia.org\r\nConnection: close\r\n\r\n";
+    std::string client_message = "GET /wiki/Susan_B._Anthony HTTP/1.1\r\nHost: en.wikipedia.org\r\nUser-Agent: vio-simple-test-agent\r\nConnection: close\r\n\r\n";
     uv_buf_t buf;
     buf.base = client_message.data();
     buf.len = client_message.size();

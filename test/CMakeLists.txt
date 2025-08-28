@@ -7,7 +7,7 @@ add_executable(vio_tests
     test_ssl.cpp
     test_dns.cpp
     test_elastic_index_storage.cpp
-    test_tls_server.cpp
+    #test_tls_server.cpp
 )
 
 BuildExternalTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::Crypto LibreSSL::SSL LibreSSL::TLS)

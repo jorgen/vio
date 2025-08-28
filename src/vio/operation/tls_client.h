@@ -42,45 +42,56 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
-struct tls_client_stream_t : tls_stream_t
+struct tls_client_connection_handler_t
 {
   std::string cert_data;
+  tls *stream_tls_ctx = nullptr;
 
   error_t initialize(const ssl_config_t &config)
   {
-    tls_ctx = tls_client();
-    if (!tls_ctx)
+    stream_tls_ctx = tls_client();
+    if (!stream_tls_ctx)
     {
       return error_t{-1, "Failed to create TLS client"};
     }
 
     cert_data = get_default_ca_certificates();
-    return apply_ssl_config_to_tls_ctx(config, cert_data, tls_ctx);
+    return apply_ssl_config_to_tls_ctx(config, cert_data, stream_tls_ctx);
   }
 
   error_t connect(int socket_fd, const std::string &host)
   {
-    auto tls_result = tls_connect_socket(tls_ctx, socket_fd, host.c_str());
+    auto tls_result = tls_connect_socket(stream_tls_ctx, socket_fd, host.c_str());
     if (tls_result != 0)
     {
-      return error_t{.code = tls_result, .msg = tls_error(tls_ctx)};
+      return error_t{.code = tls_result, .msg = tls_error(stream_tls_ctx)};
     }
     return {};
   }
+
+  void close()
+  {
+    assert(stream_tls_ctx);
+    tls_close(stream_tls_ctx);
+    tls_free(stream_tls_ctx);
+  }
 };
 
+using tls_native_client_stream_t = tls_stream_t<tls_client_connection_handler_t>;
+using tls_client_socket_stream_t = vio::socket_stream_t<tls_native_client_stream_t>;
 struct ssl_client_state_t
 {
   ssl_client_state_t(event_loop_t &event_loop, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
     : event_loop(event_loop)
-    , socket_stream(event_loop, alloc_cb, dealloc_cb, user_alloc_ptr)
+    , native_stream(connection_handler)
+    , socket_stream(native_stream, event_loop, alloc_cb, dealloc_cb, user_alloc_ptr)
   {
-    fprintf(stderr, "ssl_client_state_t constructor\n");
   }
+
   ~ssl_client_state_t()
   {
-    fprintf(stderr, "ssl_client_state_t destructor\n");
   }
+
   event_loop_t &event_loop;
   std::string host;
   std::string port;
@@ -98,7 +109,9 @@ struct ssl_client_state_t
   bool connecting = false;
   bool resolved_done = false;
 
-  socket_stream_t<tls_stream_t> socket_stream;
+  tls_client_connection_handler_t connection_handler;
+  tls_native_client_stream_t native_stream;
+  tls_client_socket_stream_t socket_stream;
 
   uv_tcp_t *get_tcp()
   {
@@ -145,10 +158,11 @@ struct ssl_client_state_t
       if (uv_fileno(state->get_tcp_handle(), &socket) == 0)
       {
         state->socket_fd = *reinterpret_cast<int *>(&socket);
-        if (auto socket_err = state->socket_stream.connect(state->socket_fd, state->host); socket_err.code == 0)
+        if (auto socket_err = state->connection_handler.connect(state->socket_fd, state->host); socket_err.code == 0)
         {
           state->connected = true;
           state->connect_result = {};
+          state->socket_stream.connect(state->socket_fd);
         }
         else
         {
@@ -217,7 +231,7 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
                                                               void *user_alloc_ptr = nullptr)
 {
   ssl_client_t ret{ref_ptr_t<ssl_client_state_t>{event_loop, alloc_cb, dealloc_cb, user_alloc_ptr}};
-  if (auto error = ret.state->socket_stream.initialize(config); error.code != 0)
+  if (auto error = ret.state->connection_handler.initialize(config); error.code != 0)
   {
     return std::unexpected(std::move(error));
   }
@@ -373,7 +387,7 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   return {client.state};
 }
 
-using tls_client_reader_t = stream_reader_t<ref_ptr_t<ssl_client_state_t>, tls_client_stream_t>;
+using tls_client_reader_t = stream_reader_t<ref_ptr_t<ssl_client_state_t>, tls_client_socket_stream_t>;
 inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client)
 {
   if (client.state.ptr() == nullptr)
@@ -388,10 +402,11 @@ inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_
   {
     return std::unexpected(error_t{1, "Can not create a reader for a client that is not connected"});
   }
-  return {tls_client_reader_t{client.state, &client.state->socket_stream}};
+
+  return tls_client_reader_t{client.state, &client.state->socket_stream};
 }
 
-using tls_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_client_state_t>, tls_client_stream_t>;
+using tls_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_client_state_t>, tls_client_socket_stream_t>;
 inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
 {
   assert(client.state.ptr() != nullptr && "Can not write to a closed client");
@@ -402,7 +417,7 @@ inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_bu
 
   client.state->socket_stream.write();
   client.state->socket_stream.set_poll_state();
-  return tls_client_write_awaitable_t(client.state, &client.state->socket_stream, write_state_index);
+  return {client.state, &client.state->socket_stream, write_state_index};
 }
 
 } // namespace vio

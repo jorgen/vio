@@ -59,14 +59,11 @@ enum class stream_io_result_t
   poll_out,
 };
 
-template <typename T>
-struct socket_stream_t;
-
 template <typename REF_PTR_T, typename STREAM>
 struct stream_read_awaitable_t
 {
   REF_PTR_T ref_ptr;
-  socket_stream_t<STREAM> *stream;
+  STREAM *stream;
 
   bool await_ready() noexcept
   {
@@ -92,9 +89,9 @@ template <typename REF_PTR_T, typename STREAM>
 struct stream_reader_t
 {
   REF_PTR_T ref_ptr;
-  socket_stream_t<STREAM> *stream;
+  STREAM *stream;
 
-  stream_reader_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream);
+  stream_reader_t(const REF_PTR_T &ref_ptr, STREAM *stream);
   stream_reader_t(stream_reader_t &&other) noexcept;
   ~stream_reader_t();
 
@@ -113,10 +110,10 @@ template <typename REF_PTR_T, typename STREAM>
 struct stream_write_awaitable_t
 {
   REF_PTR_T ref_ptr;
-  socket_stream_t<STREAM> *stream;
+  STREAM *stream;
   size_t write_state_index;
 
-  stream_write_awaitable_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream, size_t write_state_index);
+  stream_write_awaitable_t(const REF_PTR_T &ref_ptr, STREAM *stream, size_t write_state_index);
   ~stream_write_awaitable_t();
 
   stream_write_awaitable_t(const stream_write_awaitable_t &) = delete;
@@ -130,11 +127,12 @@ struct stream_write_awaitable_t
   std::expected<void, error_t> await_resume() noexcept;
 };
 
-template <typename T>
-struct socket_stream_t : public T
+template <typename NATIVE_SOCKET_STREAM_T>
+struct socket_stream_t
 {
-  socket_stream_t(event_loop_t &event_loop, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
-    : event_loop(event_loop)
+  socket_stream_t(NATIVE_SOCKET_STREAM_T &native_socket_stream, event_loop_t &event_loop, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
+    : native_socket_stream(native_socket_stream)
+    , event_loop(event_loop)
     , alloc_cb(alloc_cb)
     , dealloc_cb(dealloc_cb)
     , user_alloc_ptr(user_alloc_ptr)
@@ -148,6 +146,7 @@ struct socket_stream_t : public T
   socket_stream_t(socket_stream_t &&) = delete;
   socket_stream_t &operator=(socket_stream_t &&) = delete;
 
+  error_t connect(int socket);
   void close(std::function<void()> continuation);
   [[nodiscard]] bool has_buffer_with_data_or_error() const;
 
@@ -157,6 +156,7 @@ struct socket_stream_t : public T
   bool read();
   void write();
 
+  NATIVE_SOCKET_STREAM_T &native_socket_stream;
   event_loop_t &event_loop;
   uv_poll_t poll_req = {};
   bool connected = false;
@@ -183,8 +183,8 @@ struct socket_stream_t : public T
   elastic_index_storage_t<stream_write_state_t> write_queue;
 };
 
-template <typename T>
-bool socket_stream_t<T>::has_buffer_with_data_or_error() const
+template <typename NATIVE_SOCKET_STREAM_T>
+bool socket_stream_t<NATIVE_SOCKET_STREAM_T>::has_buffer_with_data_or_error() const
 {
   if (buffer_queue.empty())
   {
@@ -202,28 +202,23 @@ bool socket_stream_t<T>::has_buffer_with_data_or_error() const
   return false;
 }
 
-template <typename T>
-error_t socket_stream_t<T>::connect(int socket, const std::string &host)
+template <typename NATIVE_SOCKET_STREAM_T>
+error_t socket_stream_t<NATIVE_SOCKET_STREAM_T>::connect(int socket)
 {
-  error_t err = static_cast<T *>(this)->connect(socket, host);
-  if (err.code != 0)
-  {
-    return err;
-  }
-
+  error_t err = {};
   if (int result = uv_poll_init_socket(event_loop.loop(), &poll_req, socket); result < 0)
   {
-    err = error_t{.code = -1, .msg = std::string("Failed to initialize poll, ") + uv_strerror(result)};
+    err = error_t{.code = 1, .msg = std::string("Failed to initialize poll, ") + uv_strerror(result)};
     return err;
   }
   connected = true;
   return err;
 }
 
-template <typename T>
-void socket_stream_t<T>::close(std::function<void()> continuation)
+template <typename NATIVE_SOCKET_STREAM_T>
+void socket_stream_t<NATIVE_SOCKET_STREAM_T>::close(std::function<void()> continuation)
 {
-  static_cast<T *>(this)->close();
+  native_socket_stream.close();
   close_continuation = std::move(continuation);
 
   poll_read_active = false;
@@ -232,15 +227,15 @@ void socket_stream_t<T>::close(std::function<void()> continuation)
   uv_poll_stop(&poll_req);
   auto close_poll_cb = [](uv_handle_t *handle)
   {
-    auto self = static_cast<socket_stream_t<T> *>(handle->data);
+    auto self = static_cast<socket_stream_t<NATIVE_SOCKET_STREAM_T> *>(handle->data);
     self->close_continuation();
     handle->data = nullptr;
   };
   uv_close((uv_handle_t *)&poll_req, close_poll_cb);
 }
 
-template <typename T>
-void socket_stream_t<T>::set_poll_state()
+template <typename NATIVE_SOCKET_STREAM_T>
+void socket_stream_t<NATIVE_SOCKET_STREAM_T>::set_poll_state()
 {
   if (closed)
   {
@@ -268,10 +263,10 @@ void socket_stream_t<T>::set_poll_state()
   }
 }
 
-template <typename T>
-void socket_stream_t<T>::on_poll_event(uv_poll_t *handle, int status, int events)
+template <typename NATIVE_SOCKET_STREAM_T>
+void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, int status, int events)
 {
-  auto state = static_cast<socket_stream_t<T> *>(handle->data);
+  auto state = static_cast<socket_stream_t<NATIVE_SOCKET_STREAM_T> *>(handle->data);
   assert(handle == &state->poll_req && "Invalid state in on_poll_event");
 
   if (events & UV_DISCONNECT)
@@ -318,13 +313,13 @@ void socket_stream_t<T>::on_poll_event(uv_poll_t *handle, int status, int events
   state->set_poll_state();
 }
 
-template <typename T>
-bool socket_stream_t<T>::read()
+template <typename NATIVE_SOCKET_STREAM_T>
+bool socket_stream_t<NATIVE_SOCKET_STREAM_T>::read()
 {
   struct call_read_resume_on_exit_t
   {
-    socket_stream_t<T> &state;
-    call_read_resume_on_exit_t(socket_stream_t<T> &state)
+    socket_stream_t<NATIVE_SOCKET_STREAM_T> &state;
+    call_read_resume_on_exit_t(socket_stream_t<NATIVE_SOCKET_STREAM_T> &state)
       : state(state)
     {
     }
@@ -350,7 +345,7 @@ bool socket_stream_t<T>::read()
     {
       auto remaining = read_buffer.len - bytes_read;
 
-      std::expected<std::pair<stream_io_result_t, int64_t>, error_t> read_result = static_cast<T *>(this)->read(read_buffer.base + bytes_read, remaining);
+      std::expected<std::pair<stream_io_result_t, int64_t>, error_t> read_result = native_socket_stream.read(read_buffer.base + bytes_read, remaining);
       if (!read_result.has_value())
       {
         read_buffer_error = read_result.error();
@@ -395,7 +390,7 @@ bool socket_stream_t<T>::read()
     }
 
     auto remaining = current_buffer->capacity - current_buffer->buf.len;
-    auto result_or_error = static_cast<T *>(this)->read(current_buffer->buf.base + current_buffer->buf.len, remaining);
+    auto result_or_error = native_socket_stream.read(current_buffer->buf.base + current_buffer->buf.len, remaining);
     if (!result_or_error.has_value())
     {
       if (current_buffer->buf.len == 0)
@@ -410,7 +405,7 @@ bool socket_stream_t<T>::read()
 
     auto result = result_or_error.value();
     current_buffer->buf.len += result.second;
-    if (result.first == stream_io_result_t::poll_in)
+    if (result.first == stream_io_result_t::poll_in || result.second == 0)
     {
       poll_read_active = true;
       return true;
@@ -428,8 +423,8 @@ bool socket_stream_t<T>::read()
   return true;
 }
 
-template <typename T>
-void socket_stream_t<T>::write()
+template <typename NATIVE_SOCKET_STREAM_T>
+void socket_stream_t<NATIVE_SOCKET_STREAM_T>::write()
 {
   if (!write_queue.current_item_is_active() && !write_queue.next())
   {
@@ -441,7 +436,7 @@ void socket_stream_t<T>::write()
     auto &write_state = write_queue.current_item();
     auto remaining = write_state.buf.len - write_state.bytes_written;
 
-    auto write_result = static_cast<T *>(this)->write(write_state.buf.base + write_state.bytes_written, remaining);
+    auto write_result = native_socket_stream.write(write_state.buf.base + write_state.bytes_written, remaining);
     if (write_result.has_value())
     {
       auto &result = write_result.value();
@@ -495,7 +490,7 @@ void socket_stream_t<T>::write()
 }
 
 template <typename REF_PTR_T, typename STREAM>
-stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream)
+stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(const REF_PTR_T &ref_ptr, STREAM *stream)
   : ref_ptr(ref_ptr)
   , stream(stream)
 {
@@ -504,6 +499,7 @@ stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(const REF_PTR_T &ref_ptr, so
   stream->read();
   stream->set_poll_state();
 }
+
 template <typename REF_PTR_T, typename STREAM>
 stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(stream_reader_t &&other) noexcept
   : ref_ptr(std::move(other.ref_ptr))
@@ -512,6 +508,7 @@ stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(stream_reader_t &&other) noe
   assert(ref_ptr && "Invalid state in move constructor");
   other.stream = nullptr;
 }
+
 template <typename REF_PTR_T, typename STREAM>
 stream_reader_t<REF_PTR_T, STREAM> &stream_reader_t<REF_PTR_T, STREAM>::operator=(stream_reader_t<REF_PTR_T, STREAM> &&other) noexcept
 {
@@ -594,7 +591,7 @@ stream_read_awaitable_t<REF_PTR_T, STREAM> stream_reader_t<REF_PTR_T, STREAM>::r
 }
 
 template <typename REF_PTR_T, typename STREAM>
-stream_write_awaitable_t<REF_PTR_T, STREAM>::stream_write_awaitable_t(const REF_PTR_T &ref_ptr, socket_stream_t<STREAM> *stream, size_t write_state_index)
+stream_write_awaitable_t<REF_PTR_T, STREAM>::stream_write_awaitable_t(const REF_PTR_T &ref_ptr, STREAM *stream, size_t write_state_index)
   : ref_ptr(ref_ptr)
   , stream(stream)
   , write_state_index(write_state_index)
