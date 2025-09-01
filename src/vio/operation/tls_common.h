@@ -147,7 +147,7 @@ struct tls_stream_t
   {
     tls *tls_ctx = connection_handler.stream_tls_ctx;
     assert(tls_ctx);
-    auto r = tls_read(tls_ctx, target, size);
+    const auto r = tls_read(tls_ctx, target, size);
     if (r == TLS_WANT_POLLIN)
     {
       return std::make_pair(stream_io_result_t::poll_in, uint32_t(0));

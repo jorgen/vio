@@ -35,45 +35,79 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+
+struct tls_server_client_tls_t
+{
+  tls *stream_tls_ctx = nullptr;
+  void close()
+  {
+    tls_close(stream_tls_ctx);
+    tls_free(stream_tls_ctx);
+  }
+};
+
+struct tls_native_server_ctx_t
+{
+  error_t initialize(const ssl_config_t &config)
+  {
+    tls_ctx = tls_server();
+    if (tls_ctx == nullptr)
+    {
+      return error_t{.code = -1, .msg = "failed to create tls_server handle."};
+    }
+    return apply_ssl_config_to_tls_ctx(config, get_default_ca_certificates(), tls_ctx);
+  }
+
+  std::expected<tls_server_client_tls_t, error_t> accept(int socket_fd)
+  {
+    tls *client = nullptr;
+    if (auto result = tls_accept_socket(tls_ctx, &client, socket_fd); result < 0)
+    {
+      return std::unexpected(error_t{.code = result, .msg = tls_error(tls_ctx)});
+    }
+    return tls_server_client_tls_t{client};
+  }
+
+  tls *tls_ctx = nullptr;
+};
+
+template <typename NATIVE_SERVER_CTX>
 struct ssl_server_state_t
 {
   event_loop_t &event_loop;
   vio::tcp_server_t tcp = {};
   std::string host;
-  tls *tls_ctx = nullptr;
   alloc_cb_t alloc_cb = {};
   dealloc_cb_t dealloc_cb = {};
   void *user_alloc_ptr = nullptr;
+  NATIVE_SERVER_CTX tls_ctx = {};
 };
 
-struct tls_server_client_tls_t : tls_client_stream_t
-{
-  error_t initialize(const ssl_config_t &_config)
-  {
-    return {};
-  }
-};
+using tls_server_state_t = ssl_server_state_t<tls_native_server_ctx_t>;
 
+using tls_native_server_stream_t = tls_stream_t<tls_server_client_tls_t>;
+using tls_server_socket_stream_t = vio::socket_stream_t<tls_native_server_stream_t>;
 struct ssl_server_client_state_t
 {
-  ssl_server_client_state_t(event_loop_t &event_loop, tls *tls_ctx, tcp_t &&tcp, int socket_fd, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
+  ssl_server_client_state_t(event_loop_t &event_loop, tcp_t &&tcp, tls_server_client_tls_t &&tls, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
     : event_loop(event_loop)
-    , tls_ctx(tls_ctx)
     , tcp(std::move(tcp))
-    , socket_fd(socket_fd)
-    , socket_stream(event_loop, alloc_cb, dealloc_cb, user_alloc_ptr)
+    , connection_handler(tls)
+    , native_stream(connection_handler)
+    , socket_stream(native_stream, event_loop, alloc_cb, dealloc_cb, user_alloc_ptr)
   {
   }
   event_loop_t &event_loop;
-  tls *tls_ctx;
   tcp_t tcp;
-  int socket_fd;
-  socket_stream_t<tls_server_client_tls_t> socket_stream;
+
+  tls_server_client_tls_t connection_handler;
+  tls_native_server_stream_t native_stream;
+  tls_server_socket_stream_t socket_stream;
 };
 
 struct ssl_server_t
 {
-  ref_ptr_t<ssl_server_state_t> handle;
+  ref_ptr_t<tls_server_state_t> handle;
 };
 
 struct ssl_server_client_t
@@ -84,18 +118,12 @@ struct ssl_server_client_t
 inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t &event_loop, vio::tcp_server_t &&server, const std::string &host, const ssl_config_t &config = {}, alloc_cb_t alloc_cb = default_alloc,
                                                               dealloc_cb_t dealloc_cb = default_dealloc, void *user_alloc_ptr = nullptr)
 {
-  auto tls_server_handle = tls_server();
-  if (!tls_server_handle)
+  auto ret = ssl_server_t{ref_ptr_t<tls_server_state_t>(event_loop, std::move(server), host, alloc_cb, dealloc_cb, user_alloc_ptr)};
+  if (auto error = ret.handle->tls_ctx.initialize(config); error.code != 0)
   {
-    return std::unexpected(error_t{-1, "failed to create tls_server handle."});
+    return std::unexpected(std::move(error));
   }
-  auto apply_ssl_config_result = apply_ssl_config_to_tls_ctx(config, get_default_ca_certificates(), tls_server_handle);
-  if (apply_ssl_config_result.code != 0)
-  {
-    return std::unexpected(apply_ssl_config_result);
-  }
-
-  return ssl_server_t{ref_ptr_t<ssl_server_state_t>(event_loop, std::move(server), host, tls_server_handle, alloc_cb, dealloc_cb, user_alloc_ptr)};
+  return std::move(ret);
 }
 
 inline tcp_listen_future_t ssl_server_listen(ssl_server_t &server, int backlog)
@@ -110,30 +138,59 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
     return std::unexpected(error_t{.code = -1, .msg = "It's not possible to accept a connection on a closed TLS socket"});
   }
 
-  auto tcp_client = tcp_accept(server.handle->tcp);
-  if (!tcp_client.has_value())
+  auto tcp_accept_result = tcp_accept(server.handle->tcp);
+  if (!tcp_accept_result.has_value())
   {
-    return std::unexpected(tcp_client.error());
+    return std::unexpected(tcp_accept_result.error());
   }
-  auto server_client = ssl_server_client_t{
-    ref_ptr_t<ssl_server_client_state_t>(server.handle->event_loop, server.handle->tls_ctx, std::move(tcp_client.value()), -1, server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
 
+  auto client_tcp = std::move(tcp_accept_result.value());
   uv_os_fd_t socket;
-  if (uv_fileno(server_client.handle->tcp.get_handle(), &socket) == 0)
+  if (uv_fileno(client_tcp.get_handle(), &socket) != 0)
   {
-    server_client.handle->socket_fd = *reinterpret_cast<int *>(&socket);
-    if (auto socket_err = server_client.handle->socket_stream.connect(server_client.handle->socket_fd, server.handle->host); socket_err.code == 0)
-    {
-      return std::unexpected(socket_err);
-    }
+    return std::unexpected(error_t{.code = -1, .msg = "Failed to get socket file descriptor"});
   }
-  tls *client = {};
-  if (auto client_handle = tls_accept_socket(server.handle->tls_ctx, &client, server_client.handle->socket_fd))
+  int socket_fd = *reinterpret_cast<int *>(&socket);
+
+  auto tls_client = server.handle->tls_ctx.accept(socket_fd);
+
+  if (!tls_client.has_value())
   {
-    return std::unexpected(error_t{.code = client_handle, .msg = tls_error(server.handle->tls_ctx)});
+    return std::unexpected(tls_client.error());
   }
 
+  auto server_client = ssl_server_client_t{
+    ref_ptr_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
+  server_client.handle->socket_stream.connect(socket_fd);
   return std::move(server_client);
+}
+
+using tls_server_client_reader_t = stream_reader_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
+inline std::expected<tls_server_client_reader_t, error_t> ssl_server_client_create_reader(ssl_server_client_t &client)
+{
+  if (client.handle.ptr() == nullptr)
+  {
+    return std::unexpected(error_t{1, "Can not create a reader for a closed client"});
+  }
+  if (client.handle->socket_stream.reader_active)
+  {
+    return std::unexpected(error_t{1, "Can not create a reader for a client that already has a reader active"});
+  }
+
+  return tls_server_client_reader_t{client.handle, &client.handle->socket_stream};
+}
+
+using tls_server_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
+inline tls_server_client_write_awaitable_t ssl_server_client_write(ssl_server_client_t &client, uv_buf_t buffer)
+{
+  assert(client.handle.ptr() != nullptr && "Can not write to a closed client");
+
+  auto write_state_index = client.handle->socket_stream.write_queue.activate();
+  client.handle->socket_stream.write_queue[write_state_index].buf = buffer;
+
+  client.handle->socket_stream.write();
+  client.handle->socket_stream.set_poll_state();
+  return {client.handle, &client.handle->socket_stream, write_state_index};
 }
 
 } // namespace vio

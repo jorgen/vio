@@ -22,8 +22,40 @@
 namespace
 {
 
-std::pair<std::vector<uint8_t>, std::vector<uint8_t>> generate_test_cert_and_key()
+struct test_certificates_t
 {
+  std::vector<uint8_t> ca_cert;
+  std::vector<uint8_t> ca_key;
+  std::vector<uint8_t> cert;
+  std::vector<uint8_t> key;
+};
+
+test_certificates_t generate_test_certs()
+{
+  // Generate CA key and certificate
+  X509 *ca_cert = X509_new();
+  EVP_PKEY *ca_pkey = EVP_PKEY_new();
+  EVP_PKEY_CTX *ca_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+  EVP_PKEY_keygen_init(ca_ctx);
+  EVP_PKEY_CTX_set_rsa_keygen_bits(ca_ctx, 2048);
+  EVP_PKEY_keygen(ca_ctx, &ca_pkey);
+  EVP_PKEY_CTX_free(ca_ctx);
+
+  X509_set_version(ca_cert, 2);
+  ASN1_INTEGER_set(X509_get_serialNumber(ca_cert), 1);
+  X509_gmtime_adj(X509_get_notBefore(ca_cert), 0);
+  X509_gmtime_adj(X509_get_notAfter(ca_cert), 31536000L);
+  X509_set_pubkey(ca_cert, ca_pkey);
+
+  auto *ca_name = X509_get_subject_name(ca_cert);
+  X509_NAME_add_entry_by_txt(ca_name, "C", MBSTRING_ASC, (unsigned char *)"NO", -1, -1, 0);
+  X509_NAME_add_entry_by_txt(ca_name, "O", MBSTRING_ASC, (unsigned char *)"vio CA", -1, -1, 0);
+  X509_NAME_add_entry_by_txt(ca_name, "CN", MBSTRING_ASC, (unsigned char *)"vio CA", -1, -1, 0);
+  X509_set_issuer_name(ca_cert, ca_name);
+
+  X509_sign(ca_cert, ca_pkey, EVP_sha256());
+
+  // Generate server certificate
   X509 *cert = X509_new();
   EVP_PKEY *pkey = EVP_PKEY_new();
   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
@@ -42,35 +74,44 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> generate_test_cert_and_key
   X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (unsigned char *)"NO", -1, -1, 0);
   X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (unsigned char *)"vio unit test", -1, -1, 0);
   X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"localhost", -1, -1, 0);
-  X509_set_issuer_name(cert, name);
+  X509_set_issuer_name(cert, ca_name);
 
-  X509_sign(cert, pkey, EVP_sha256());
+  X509_sign(cert, ca_pkey, EVP_sha256());
 
+  BIO *ca_cert_bio = BIO_new(BIO_s_mem());
+  BIO *ca_key_bio = BIO_new(BIO_s_mem());
   BIO *cert_bio = BIO_new(BIO_s_mem());
   BIO *key_bio = BIO_new(BIO_s_mem());
+
+  PEM_write_bio_X509(ca_cert_bio, ca_cert);
+  PEM_write_bio_PrivateKey(ca_key_bio, ca_pkey, nullptr, nullptr, 0, nullptr, nullptr);
   PEM_write_bio_X509(cert_bio, cert);
   PEM_write_bio_PrivateKey(key_bio, pkey, nullptr, nullptr, 0, nullptr, nullptr);
 
+  std::vector<uint8_t> ca_cert_data(BIO_pending(ca_cert_bio));
+  std::vector<uint8_t> ca_key_data(BIO_pending(ca_key_bio));
   std::vector<uint8_t> cert_data(BIO_pending(cert_bio));
   std::vector<uint8_t> key_data(BIO_pending(key_bio));
+
+  BIO_read(ca_cert_bio, ca_cert_data.data(), ca_cert_data.size());
+  BIO_read(ca_key_bio, ca_key_data.data(), ca_key_data.size());
   BIO_read(cert_bio, cert_data.data(), cert_data.size());
   BIO_read(key_bio, key_data.data(), key_data.size());
 
+  BIO_free(ca_cert_bio);
+  BIO_free(ca_key_bio);
   BIO_free(cert_bio);
   BIO_free(key_bio);
+  X509_free(ca_cert);
+  EVP_PKEY_free(ca_pkey);
   X509_free(cert);
   EVP_PKEY_free(pkey);
 
-  return {cert_data, key_data};
+  return {ca_cert_data, ca_key_data, cert_data, key_data};
 }
 
-vio::task_t<void> test_tls_server(vio::event_loop_t &event_loop, vio::tcp_server_t &&s, int port, bool &server_got_data, bool &server_wrote_msg)
+vio::task_t<void> test_tls_server(vio::event_loop_t &event_loop, vio::tcp_server_t &&s, int port, vio::ssl_config_t config, bool &server_got_data, bool &server_wrote_msg)
 {
-  auto [cert_data, key_data] = generate_test_cert_and_key();
-  vio::ssl_config_t config;
-  config.cert_mem = cert_data;
-  config.key_mem = key_data;
-
   auto server_create_result = vio::ssl_server_create(event_loop, std::move(s), "localhost", config);
   REQUIRE_EXPECTED(server_create_result);
 
@@ -79,8 +120,21 @@ vio::task_t<void> test_tls_server(vio::event_loop_t &event_loop, vio::tcp_server
   REQUIRE_EXPECTED(server_listen_result);
   auto client_or_err = vio::ssl_server_accept(server);
   REQUIRE_EXPECTED(client_or_err);
-
-  co_return;
+  auto client = std::move(client_or_err.value());
+  auto reader = vio::ssl_server_client_create_reader(client);
+  auto read_result = co_await reader.value();
+  REQUIRE_EXPECTED(read_result);
+  auto &read_data = read_result.value();
+  std::string_view sv(read_data->base, read_data->len);
+  if (sv.find("Hello from client") != std::string_view::npos)
+  {
+    server_got_data = true;
+  }
+  std::string reply = "Hello from server";
+  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(reply.data()), reply.size());
+  auto write_result = co_await vio::ssl_server_client_write(client, buf);
+  REQUIRE_EXPECTED(write_result);
+  server_wrote_msg = true;
 };
 
 std::expected<std::pair<vio::tcp_server_t, int>, vio::error_t> get_ephemeral_port(vio::event_loop_t &event_loop)
@@ -100,9 +154,9 @@ std::expected<std::pair<vio::tcp_server_t, int>, vio::error_t> get_ephemeral_por
 }
 
 // A client task that connects to the server, writes a message, and reads the server's reply
-vio::task_t<void> test_tls_client(vio::event_loop_t &event_loop, int server_port, bool &client_got_server_reply)
+vio::task_t<void> test_tls_client(vio::event_loop_t &event_loop, int server_port, vio::ssl_config_t config, bool &client_got_server_reply)
 {
-  auto client_or_err = vio::ssl_client_create(event_loop);
+  auto client_or_err = vio::ssl_client_create(event_loop, config);
   REQUIRE_EXPECTED(client_or_err);
   auto client_raw = std::move(client_or_err.value());
 
@@ -139,15 +193,21 @@ TEST_CASE("test basic tls server")
   server_wrote_msg = false;
   client_got_server_reply = false;
 
+  auto certs = generate_test_certs();
+  vio::ssl_config_t config;
+  config.cert_mem = certs.cert;
+  config.key_mem = certs.key;
+  config.ca_mem = certs.ca_cert;
+
   event_loop.run_in_loop(
-    [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply]() -> vio::task_t<void>
+    [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply, config]() -> vio::task_t<void>
     {
       auto ev = &event_loop;
       auto server_tcp_pair = get_ephemeral_port(*ev);
       REQUIRE_EXPECTED(server_tcp_pair);
 
-      auto server = test_tls_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, server_got_data, server_wrote_msg);
-      co_await test_tls_client(*ev, server_tcp_pair->second, client_got_server_reply);
+      auto server = test_tls_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, config, server_got_data, server_wrote_msg);
+      co_await test_tls_client(*ev, server_tcp_pair->second, config, client_got_server_reply);
       co_await std::move(server);
 
       ev->stop();
