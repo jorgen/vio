@@ -166,7 +166,7 @@ vio::task_t<void> test_tls_client(vio::event_loop_t &event_loop, int server_port
   auto connect_result = co_await vio::ssl_client_connect(client_raw, "localhost", server_port, "127.0.0.1");
   REQUIRE_EXPECTED(connect_result);
 
-  std::string client_message = "Hello TCP server";
+  std::string client_message = "Hello from client";
   uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(client_message.data()), client_message.size());
   auto write_result = co_await vio::ssl_client_write(client_raw, buf);
   REQUIRE_EXPECTED(write_result);
@@ -194,20 +194,22 @@ TEST_CASE("test basic tls server")
   client_got_server_reply = false;
 
   auto certs = generate_test_certs();
-  vio::ssl_config_t config;
-  config.cert_mem = certs.cert;
-  config.key_mem = certs.key;
-  config.ca_mem = certs.ca_cert;
+  vio::ssl_config_t server_config;
+  server_config.cert_mem = certs.cert;
+  server_config.key_mem = certs.key;
+  server_config.ca_mem = certs.ca_cert;
 
+  vio::ssl_config_t client_config;
+  client_config.ca_mem = certs.ca_cert;
   event_loop.run_in_loop(
-    [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply, config]() -> vio::task_t<void>
+    [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply, client_config, server_config]() -> vio::task_t<void>
     {
       auto ev = &event_loop;
       auto server_tcp_pair = get_ephemeral_port(*ev);
       REQUIRE_EXPECTED(server_tcp_pair);
 
-      auto server = test_tls_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, config, server_got_data, server_wrote_msg);
-      co_await test_tls_client(*ev, server_tcp_pair->second, config, client_got_server_reply);
+      auto server = test_tls_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, server_config, server_got_data, server_wrote_msg);
+      co_await test_tls_client(*ev, server_tcp_pair->second, client_config, client_got_server_reply);
       co_await std::move(server);
 
       ev->stop();

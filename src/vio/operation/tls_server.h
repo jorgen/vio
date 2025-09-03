@@ -162,6 +162,21 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
   auto server_client = ssl_server_client_t{
     ref_ptr_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
   server_client.handle->socket_stream.connect(socket_fd);
+
+  auto to_close = [](ref_ptr_t<ssl_server_client_state_t> &state)
+  {
+    if (!state.ptr())
+    {
+      return;
+    }
+
+    auto copy = state;
+
+    auto ptr = copy.release_to_raw();
+
+    state->socket_stream.close(std::move([ptr] { auto state = ref_ptr_t<ssl_server_client_state_t>::from_raw(ptr); }));
+  };
+  server_client.handle.set_close_guard(to_close);
   return std::move(server_client);
 }
 
