@@ -33,6 +33,7 @@
 #include "thread_pool.h"
 #include "worker.h"
 
+#include <barrier>
 #include <cassert>
 
 namespace vio
@@ -50,6 +51,12 @@ public:
   {
     return [this, f](Args &&...args) { return ((*static_cast<Class *>(this)).*f)(std::move(args)...); };
   }
+};
+
+struct barrier_t
+{
+  std::mutex mutex;
+  std::condition_variable wait;
 };
 
 class event_loop_t
@@ -124,8 +131,18 @@ public:
     }
     else
     {
-      std::function<uv_handle_t *(uv_loop_t *)> func = [&event_pipe](uv_loop_t *loop) { return event_pipe.initialize_in_loop(loop); };
+      barrier_t barrier;
+      std::unique_lock<std::mutex> lock(barrier.mutex);
+
+      std::function<uv_handle_t *(uv_loop_t *)> func = [&event_pipe, &barrier](uv_loop_t *loop)
+      {
+        auto to_ret = event_pipe.initialize_in_loop(loop);
+        std::unique_lock<std::mutex> lock(barrier.mutex);
+        barrier.wait.notify_one();
+        return to_ret;
+      };
       _add_pipe.post_event(std::move(func));
+      barrier.wait.wait(lock);
     }
   }
 
@@ -243,12 +260,6 @@ public:
   }
 
 private:
-  struct barrier_t
-  {
-    std::mutex mutex;
-    std::condition_variable wait;
-  };
-
   event_loop_t _event_loop;
   std::unique_ptr<std::thread> _thread;
 };

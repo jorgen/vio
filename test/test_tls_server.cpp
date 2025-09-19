@@ -21,7 +21,6 @@
 
 namespace
 {
-
 struct test_certificates_t
 {
   std::vector<uint8_t> ca_cert;
@@ -221,6 +220,41 @@ TEST_CASE("test basic tls server")
   REQUIRE(server_wrote_msg);
   REQUIRE(client_got_server_reply);
 }
+
+TEST_CASE("test destroy server while listening")
+{
+  vio::event_loop_t event_loop;
+  auto certs = generate_test_certs();
+  vio::ssl_config_t server_config;
+  server_config.cert_mem = certs.cert;
+  server_config.key_mem = certs.key;
+  server_config.ca_mem = certs.ca_cert;
+
+  event_loop.run_in_loop(
+    [&event_loop, server_config]() -> vio::task_t<void>
+    {
+      auto server_tcp_pair = get_ephemeral_port(event_loop);
+      REQUIRE_EXPECTED(server_tcp_pair);
+
+      auto server_create_result = vio::ssl_server_create(event_loop, std::move(server_tcp_pair->first), "localhost", server_config);
+      REQUIRE_EXPECTED(server_create_result);
+
+      auto server = std::move(server_create_result.value());
+      auto listen_future = vio::ssl_server_listen(server, server_tcp_pair->second);
+
+      {
+        auto temp_server = std::move(server);
+      }
+
+      auto listen_result = co_await listen_future;
+      REQUIRE(!listen_result.has_value());
+
+      event_loop.stop();
+    });
+
+  event_loop.run();
+}
+
 } // namespace
 // Created by Jørgen Lind on 30/07/2025.
 //
