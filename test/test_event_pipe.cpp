@@ -37,9 +37,6 @@ TEST_CASE("Test basic event pipe")
   REQUIRE(has_event_from_main_thread_been_called);
 }
 
-{
-}
-
 TEST_CASE("Test awaitable event pipe")
 {
 }
