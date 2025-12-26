@@ -109,9 +109,10 @@ public:
   {
     if (this != &other)
     {
-      if (storage)
+      if (storage && storage->ref_count.dec())
       {
-        storage->ref_count.dec();
+        // Object was destroyed, storage is now invalid
+        storage = nullptr;
       }
       storage = other.storage;
       if (storage)
@@ -126,9 +127,10 @@ public:
   {
     if (this != &other)
     {
-      if (storage)
+      if (storage && storage->ref_count.dec())
       {
-        storage->ref_count.dec();
+        // Object was destroyed, storage is now invalid
+        storage = nullptr;
       }
       storage = other.storage;
       other.storage = nullptr;
@@ -141,6 +143,15 @@ public:
     if (storage)
     {
       storage->ref_count.dec();
+    }
+  }
+
+  void release()
+  {
+    if (storage)
+    {
+      storage->ref_count.dec();
+      storage = nullptr;
     }
   }
 
@@ -199,6 +210,11 @@ public:
   wrapper_t &operator=(wrapper_t &&) = delete;
 
   ~wrapper_t() = default;
+
+  void release()
+  {
+    parent_ref_count = nullptr;
+  }
 
   Data *operator->()
   {

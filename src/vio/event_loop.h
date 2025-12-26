@@ -195,7 +195,7 @@ private:
     {
       uv_close(close_handle, nullptr);
     }
-    uv_run(event_loop->_loop, UV_RUN_NOWAIT);
+    uv_run(event_loop->_loop, UV_RUN_DEFAULT);
 
     uv_prepare_stop(&event_loop->_about_to_block);
   }
