@@ -21,16 +21,16 @@
 */
 
 #pragma once
-#include "ref_ptr.h"
+#include "ref_counted_wrapper.h"
 
 namespace vio
 {
 template <typename STATE>
 struct future_t
 {
-  using future_ref_ptr_t = ref_ptr_t<STATE>;
-  future_ref_ptr_t state_ptr = make_ref_ptr<STATE>();
-  STATE &state = *state_ptr.ptr();
+  using future_ref_ptr_t = owned_wrapper_t<STATE>;
+  future_ref_ptr_t state_ptr = make_owned_wrapper<STATE>();
+  STATE &state = state_ptr.data();
 
   auto &operator co_await() noexcept
   {

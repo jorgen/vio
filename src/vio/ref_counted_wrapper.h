@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <type_traits>
@@ -10,7 +11,7 @@ namespace vio
 
 struct reference_counted_t
 {
-  std::size_t ref_count{1};
+  std::atomic<std::size_t> ref_count{1};
   std::vector<std::function<void()>> destroy_callbacks;
   std::function<void()> destroyer;
 
@@ -21,12 +22,12 @@ struct reference_counted_t
 
   void inc()
   {
-    ++ref_count;
+    ref_count.fetch_add(1, std::memory_order_relaxed);
   }
 
   bool dec()
   {
-    if (--ref_count == 0)
+    if (ref_count.fetch_sub(1, std::memory_order_acquire) == 1)
     {
       std::vector<std::function<void()>> callbacks;
       std::swap(callbacks, destroy_callbacks);
@@ -34,7 +35,7 @@ struct reference_counted_t
       {
         (*it)();
       }
-      if (ref_count == 0)
+      if (ref_count.load(std::memory_order_relaxed) == 0)
       {
         destroyer();
         return true;
@@ -62,15 +63,16 @@ public:
     Data data;
 
     storage_t()
+      requires std::default_initializable<Data>
       : ref_count([this] { delete this; })
-      , data(&ref_count)
+      , data{}
     {
     }
 
     template <typename... Args>
     explicit storage_t(Args &&...args)
       : ref_count([this] { delete this; })
-      , data(&ref_count, std::forward<Args>(args)...)
+      , data(std::forward<Args>(args)...)
     {
     }
   };
@@ -78,13 +80,21 @@ public:
 private:
   storage_t *storage;
 
+  // Private constructor for from_raw - does not allocate
+  explicit wrapper_t(storage_t *ptr)
+    : storage(ptr)
+  {
+  }
+
 public:
   wrapper_t()
+    requires std::default_initializable<Data>
     : storage(new storage_t())
   {
   }
 
   template <typename... Args>
+    requires(sizeof...(Args) > 0) && (sizeof...(Args) != 1 || !(std::same_as<std::remove_cvref_t<Args>, wrapper_t> || ...))
   explicit wrapper_t(Args &&...args)
     : storage(new storage_t(std::forward<Args>(args)...))
   {
@@ -155,6 +165,33 @@ public:
     }
   }
 
+  void *release_to_raw()
+  {
+    storage_t *temp = storage;
+    storage = nullptr;
+    return temp;
+  }
+
+  static wrapper_t from_raw(void *raw_ptr)
+  {
+    return wrapper_t(static_cast<storage_t *>(raw_ptr));
+  }
+
+  static wrapper_t null()
+  {
+    return wrapper_t(static_cast<storage_t *>(nullptr));
+  }
+
+  template <typename UV_HANDLE>
+  void inc_ref_and_store_in_handle(UV_HANDLE &handle)
+  {
+    if (storage)
+    {
+      storage->ref_count.inc();
+    }
+    handle.data = storage;
+  }
+
   Data *operator->()
   {
     return &storage->data;
@@ -180,6 +217,11 @@ public:
   const reference_counted_t *ref_counted() const
   {
     return storage ? &storage->ref_count : nullptr;
+  }
+
+  explicit operator bool() const noexcept
+  {
+    return storage != nullptr;
   }
 };
 
@@ -249,5 +291,11 @@ using inline_wrapper_t = wrapper_t<Data, false>;
 
 template <typename Data>
 using owned_wrapper_t = wrapper_t<Data, true>;
+
+template <typename Data, typename... Args>
+owned_wrapper_t<Data> make_owned_wrapper(Args &&...args)
+{
+  return owned_wrapper_t<Data>(std::forward<Args>(args)...);
+}
 
 } // namespace vio

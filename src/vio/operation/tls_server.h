@@ -27,7 +27,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "tls_common.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
-#include "vio/ref_ptr.h"
+#include "vio/ref_counted_wrapper.h"
 #include "vio/ssl_config_t.h"
 
 #include <expected>
@@ -75,12 +75,12 @@ template <typename NATIVE_SERVER_CTX>
 struct ssl_server_state_t
 {
   event_loop_t &event_loop;
-  vio::tcp_server_t tcp = {};
+  vio::tcp_server_t tcp;
   std::string host;
-  alloc_cb_t alloc_cb = {};
-  dealloc_cb_t dealloc_cb = {};
-  void *user_alloc_ptr = nullptr;
-  NATIVE_SERVER_CTX tls_ctx = {};
+  alloc_cb_t alloc_cb;
+  dealloc_cb_t dealloc_cb;
+  void *user_alloc_ptr;
+  NATIVE_SERVER_CTX tls_ctx;
 };
 
 using tls_server_state_t = ssl_server_state_t<tls_native_server_ctx_t>;
@@ -107,18 +107,18 @@ struct ssl_server_client_state_t
 
 struct ssl_server_t
 {
-  ref_ptr_t<tls_server_state_t> handle;
+  owned_wrapper_t<tls_server_state_t> handle;
 };
 
 struct ssl_server_client_t
 {
-  ref_ptr_t<ssl_server_client_state_t> handle;
+  owned_wrapper_t<ssl_server_client_state_t> handle;
 };
 
 inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t &event_loop, vio::tcp_server_t &&server, const std::string &host, const ssl_config_t &config = {}, alloc_cb_t alloc_cb = default_alloc,
                                                               dealloc_cb_t dealloc_cb = default_dealloc, void *user_alloc_ptr = nullptr)
 {
-  auto ret = ssl_server_t{ref_ptr_t<tls_server_state_t>(event_loop, std::move(server), host, alloc_cb, dealloc_cb, user_alloc_ptr)};
+  auto ret = ssl_server_t{owned_wrapper_t<tls_server_state_t>(event_loop, std::move(server), host, alloc_cb, dealloc_cb, user_alloc_ptr)};
   if (auto error = ret.handle->tls_ctx.initialize(config); error.code != 0)
   {
     return std::unexpected(std::move(error));
@@ -133,7 +133,7 @@ inline tcp_listen_future_t ssl_server_listen(ssl_server_t &server, int backlog)
 
 inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_t &server)
 {
-  if (server.handle.ptr() == nullptr)
+  if (server.handle.ref_counted() == nullptr)
   {
     return std::unexpected(error_t{.code = -1, .msg = "It's not possible to accept a connection on a closed TLS socket"});
   }
@@ -160,30 +160,28 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
   }
 
   auto server_client = ssl_server_client_t{
-    ref_ptr_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
+    owned_wrapper_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
   server_client.handle->socket_stream.connect(socket_fd);
 
-  auto to_close = [](ref_ptr_t<ssl_server_client_state_t> &state)
+  server_client.handle.ref_counted()->register_destroy_callback([state_copy = server_client.handle]() mutable
   {
-    if (!state.ptr())
+    if (!state_copy.ref_counted())
     {
       return;
     }
 
-    auto copy = state;
+    auto ptr = state_copy.release_to_raw();
 
-    auto ptr = copy.release_to_raw();
-
-    state->socket_stream.close(std::move([ptr] { auto state = ref_ptr_t<ssl_server_client_state_t>::from_raw(ptr); }));
-  };
-  server_client.handle.set_close_guard(to_close);
+    // Note: socket_stream.close takes ownership of ptr through the lambda
+    state_copy->socket_stream.close(std::move([ptr] { auto state = owned_wrapper_t<ssl_server_client_state_t>::from_raw(ptr); }));
+  });
   return std::move(server_client);
 }
 
-using tls_server_client_reader_t = stream_reader_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
+using tls_server_client_reader_t = stream_reader_t<owned_wrapper_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
 inline std::expected<tls_server_client_reader_t, error_t> ssl_server_client_create_reader(ssl_server_client_t &client)
 {
-  if (client.handle.ptr() == nullptr)
+  if (client.handle.ref_counted() == nullptr)
   {
     return std::unexpected(error_t{1, "Can not create a reader for a closed client"});
   }
@@ -195,10 +193,10 @@ inline std::expected<tls_server_client_reader_t, error_t> ssl_server_client_crea
   return tls_server_client_reader_t{client.handle, &client.handle->socket_stream};
 }
 
-using tls_server_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
+using tls_server_client_write_awaitable_t = stream_write_awaitable_t<owned_wrapper_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
 inline tls_server_client_write_awaitable_t ssl_server_client_write(ssl_server_client_t &client, uv_buf_t buffer)
 {
-  assert(client.handle.ptr() != nullptr && "Can not write to a closed client");
+  assert(client.handle.ref_counted() != nullptr && "Can not write to a closed client");
 
   auto write_state_index = client.handle->socket_stream.write_queue.activate();
   client.handle->socket_stream.write_queue[write_state_index].buf = buffer;

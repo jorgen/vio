@@ -97,9 +97,9 @@ struct tcp_state_t
 template <typename State>
 struct tcp_future_t
 {
-  ref_ptr_t<tcp_state_t> handle;
+  owned_wrapper_t<tcp_state_t> handle;
   State *state;
-  tcp_future_t(ref_ptr_t<tcp_state_t> handle, State &state)
+  tcp_future_t(owned_wrapper_t<tcp_state_t> handle, State &state)
     : handle(std::move(handle))
     , state(&state)
   {
@@ -129,24 +129,24 @@ struct tcp_future_t
 
 struct tcp_t
 {
-  ref_ptr_t<tcp_state_t> handle;
+  owned_wrapper_t<tcp_state_t> handle;
 
   uv_tcp_t *get_tcp()
   {
-    if (!handle.ptr())
+    if (!handle.ref_counted())
       return nullptr;
     return handle->get_tcp();
   }
 
   uv_stream_t *get_stream()
   {
-    if (!handle.ptr())
+    if (!handle.ref_counted())
       return nullptr;
     return handle->get_stream();
   }
   uv_handle_t *get_handle()
   {
-    if (!handle.ptr())
+    if (!handle.ref_counted())
       return nullptr;
     return handle->get_handle();
   }
@@ -176,24 +176,25 @@ inline std::expected<sockaddr_in6, error_t> ip6_addr(const std::string &ip, int 
 
 inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
 {
-  tcp_t tcp{ref_ptr_t<tcp_state_t>(loop)};
+  tcp_t tcp{owned_wrapper_t<tcp_state_t>(loop)};
   if (auto r = uv_tcp_init(loop.loop(), tcp.get_tcp()); r < 0)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
-  auto to_close = [](ref_ptr_t<tcp_state_t> &handle)
+  tcp.handle.ref_counted()->register_destroy_callback([handle_ptr = tcp.handle]() mutable
   {
-    if (!handle.ptr())
+    if (!handle_ptr.ref_counted())
     {
       return;
     }
-    auto copy = handle;
-    handle->get_handle()->data = copy.release_to_raw();
+    handle_ptr.ref_counted()->inc();
+    auto uv_handle = handle_ptr->get_handle();
+    uv_handle->data = handle_ptr.release_to_raw();
     auto close_cb = [](uv_handle_t *handle)
     {
       if (handle->data)
       {
-        auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
+        auto state_ref = owned_wrapper_t<tcp_state_t>::from_raw(handle->data);
         handle->data = nullptr;
       }
       else
@@ -201,9 +202,8 @@ inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
         handle->data = nullptr;
       }
     };
-    uv_close(handle->get_handle(), close_cb);
-  };
-  tcp.handle.set_close_guard(to_close);
+    uv_close(uv_handle, close_cb);
+  });
   return tcp;
 }
 
@@ -221,7 +221,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   ret.handle->connect.done = false;
   auto callback = [](uv_connect_t *req, int status)
   {
-    auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
+    auto state_ref = owned_wrapper_t<tcp_state_t>::from_raw(req->data);
     if (status < 0)
     {
       state_ref->connect.result = std::unexpected(error_t{status, uv_strerror(status)});
@@ -244,7 +244,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   {
     ret.handle->connect.done = true;
     ret.handle->connect.result = std::unexpected(error_t{r, uv_strerror(r)});
-    ref_ptr_t<tcp_state_t>::from_raw(ret.handle->connect.req.data);
+    owned_wrapper_t<tcp_state_t>::from_raw(ret.handle->connect.req.data);
   }
   return ret;
 }
@@ -269,7 +269,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
 
   auto callback = [](uv_write_t *req, int status)
   {
-    auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
+    auto state_ref = owned_wrapper_t<tcp_state_t>::from_raw(req->data);
     if (status < 0)
     {
       state_ref->write.result = std::unexpected(error_t{status, uv_strerror(status)});
@@ -291,7 +291,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   {
     ret.handle->write.done = true;
     ret.handle->write.result = std::unexpected(error_t{r, uv_strerror(r)});
-    ref_ptr_t<tcp_state_t>::from_raw(ret.handle->write.req.data);
+    owned_wrapper_t<tcp_state_t>::from_raw(ret.handle->write.req.data);
   }
 
   return ret;
@@ -325,7 +325,7 @@ public:
   {
     if (is_valid && handle->read.started)
     {
-      auto state = ref_ptr_t<tcp_state_t>::from_raw(handle->get_stream()->data);
+      auto state = owned_wrapper_t<tcp_state_t>::from_raw(handle->get_stream()->data);
       uv_read_stop(handle->get_stream());
       state->read.started = false;
       state->read.active = false;
@@ -356,7 +356,7 @@ public:
 
   struct awaiter
   {
-    ref_ptr_t<tcp_state_t> state;
+    owned_wrapper_t<tcp_state_t> state;
 
     bool await_ready() const
     {
@@ -383,7 +383,7 @@ public:
 
   struct ref_ptr_releaser
   {
-    ref_ptr_releaser(ref_ptr_t<tcp_state_t> &handle)
+    ref_ptr_releaser(owned_wrapper_t<tcp_state_t> &handle)
       : handle(handle)
     {
     }
@@ -392,12 +392,12 @@ public:
     {
       handle.release_to_raw();
     }
-    ref_ptr_t<tcp_state_t> &handle;
+    owned_wrapper_t<tcp_state_t> &handle;
   };
 
   static void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
   {
-    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
+    auto tcp_state = owned_wrapper_t<tcp_state_t>::from_raw(stream->data);
     ref_ptr_releaser releaser(tcp_state);
 
     if (nread > 0)
@@ -426,7 +426,7 @@ public:
     }
   }
 
-  ref_ptr_t<tcp_state_t> handle;
+  owned_wrapper_t<tcp_state_t> handle;
   friend std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp);
 
 private:
@@ -440,7 +440,7 @@ private:
 
 inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
 {
-  if (tcp.handle.ptr() == nullptr)
+  if (tcp.handle.ref_counted() == nullptr)
   {
     return std::unexpected(error_t{1, "Can not create a reader for a closed socket"});
   }
@@ -451,7 +451,7 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
 
   auto alloc_cb = [](uv_handle_t *handle, size_t size, uv_buf_t *buf)
   {
-    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
+    auto tcp_state = owned_wrapper_t<tcp_state_t>::from_raw(handle->data);
     tcp_state->read.alloc_buffer_cb(tcp_state->read.alloc_cb_data, size, buf);
     tcp_state.release_to_raw();
   };
@@ -464,7 +464,7 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
   }
   else
   {
-    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(tcp.get_stream()->data);
+    auto tcp_state = owned_wrapper_t<tcp_state_t>::from_raw(tcp.get_stream()->data);
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
 

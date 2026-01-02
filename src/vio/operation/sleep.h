@@ -24,7 +24,7 @@
 
 #include "vio/error.h"
 #include "vio/event_loop.h"
-#include "vio/ref_ptr.h"
+#include "vio/ref_counted_wrapper.h"
 #include "vio/uv_coro.h"
 
 #include <chrono>

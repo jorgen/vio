@@ -21,6 +21,26 @@ struct test_data_t
   int value{0};
   bool *destroyed{nullptr};
 
+  // Constructors for owned_wrapper_t (no parent ref_counted)
+  test_data_t()
+  {
+    destruction_tracker_t::construction_count++;
+  }
+
+  explicit test_data_t(int v)
+    : value(v)
+  {
+    destruction_tracker_t::construction_count++;
+  }
+
+  explicit test_data_t(int v, bool *d)
+    : value(v)
+    , destroyed(d)
+  {
+    destruction_tracker_t::construction_count++;
+  }
+
+  // Constructors for inline_wrapper_t (with parent ref_counted)
   test_data_t(vio::reference_counted_t *ref_counted)
   {
     (void)ref_counted;

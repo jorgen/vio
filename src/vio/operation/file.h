@@ -28,7 +28,7 @@
 
 #include "vio/auto_closer.h"
 #include "vio/error.h"
-#include "vio/ref_ptr.h"
+#include "vio/ref_counted_wrapper.h"
 #include "vio/uv_coro.h"
 
 #include <coroutine>
@@ -164,10 +164,6 @@ struct file_io_state_t
 inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset)
 {
   using ret_t = decltype(write_file(event_loop, file, data, length, offset));
-  auto closer = [](ref_ptr_t<file_io_state_t> &state)
-  {
-    auto copy = state;
-  };
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
   uv_buf_t buf = uv_buf_init(std::bit_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
