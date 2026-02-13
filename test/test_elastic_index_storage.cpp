@@ -7,14 +7,14 @@ TEST_SUITE("elastic_index_storage_t Tests")
 {
   TEST_CASE("Construction and initial state")
   {
-    constexpr std::size_t preferredSize = 5;
-    vio::elastic_index_storage_t<int, preferredSize> storage;
+    constexpr std::size_t preferred_size = 5;
+    const vio::elastic_index_storage_t<int, preferred_size> storage;
 
     // Check initial size
-    CHECK_EQ(storage.size(), preferredSize);
+    CHECK_EQ(storage.size(), preferred_size);
 
     // Since none of them are yet used, they should be inactive
-    for (std::size_t i = 0; i < preferredSize; ++i)
+    for (std::size_t i = 0; i < preferred_size; ++i)
     {
       CHECK_FALSE(storage.is_active(i));
     }
@@ -62,27 +62,27 @@ TEST_SUITE("elastic_index_storage_t Tests")
     vio::elastic_index_storage_t<int, 3> storage;
 
     // Fill up to exactly the preferred size
-    auto idxA = storage.activate_with_value(100);
-    auto idxB = storage.activate_with_value(200);
-    auto idxC = storage.activate_with_value(300);
+    auto idx_a = storage.activate_with_value(100);
+    auto idx_b = storage.activate_with_value(200);
+    auto idx_c = storage.activate_with_value(300);
     CHECK_EQ(storage.size(), 3);
 
     // Deactivate one element and ensure it becomes inactive
-    storage.deactivate(idxB);
-    CHECK_FALSE(storage.is_active(idxB));
+    storage.deactivate(idx_b);
+    CHECK_FALSE(storage.is_active(idx_b));
 
     // The storage should still report a size of at least 3
     CHECK_GE(storage.size(), static_cast<std::size_t>(3));
 
     // Reuse the deactivated slot:
-    auto idxD = storage.activate_with_value(400);
-    CHECK(storage.is_active(idxD));
-    CHECK_EQ(storage[idxD], 400);
+    auto idx_d = storage.activate_with_value(400);
+    CHECK(storage.is_active(idx_d));
+    CHECK_EQ(storage[idx_d], 400);
 
     // Deactivate everything to trigger a potential shrink
-    storage.deactivate(idxA);
-    storage.deactivate(idxC);
-    storage.deactivate(idxD);
+    storage.deactivate(idx_a);
+    storage.deactivate(idx_c);
+    storage.deactivate(idx_d);
 
     // In this implementation, the container will resize down to at least the preferred size
     CHECK_EQ(storage.size(), 3);
@@ -93,9 +93,9 @@ TEST_SUITE("elastic_index_storage_t Tests")
     vio::elastic_index_storage_t<int, 3> storage;
 
     // Emplace three items
-    auto idx1 = storage.activate_with_value(1);
+    [[maybe_unused]] auto idx1 = storage.activate_with_value(1);
     auto idx2 = storage.activate_with_value(2);
-    auto idx3 = storage.activate_with_value(3);
+    [[maybe_unused]] auto idx3 = storage.activate_with_value(3);
 
     // currentItem should initially point to the first item inserted
     CHECK_EQ(storage.current_item(), 1);
@@ -125,9 +125,9 @@ TEST_SUITE("elastic_index_storage_t Tests")
   {
     vio::elastic_index_storage_t<int, 3> storage;
 
-    auto idx1 = storage.activate_with_value(10);
+    [[maybe_unused]] auto idx1 = storage.activate_with_value(10);
     auto idx2 = storage.activate_with_value(20);
-    auto idx3 = storage.activate_with_value(30);
+    [[maybe_unused]] auto idx3 = storage.activate_with_value(30);
 
     // Deactivate the middle item before starting iteration
     storage.deactivate(idx2);
@@ -169,16 +169,16 @@ TEST_SUITE("elastic_index_storage_t Tests")
   TEST_CASE("Emplace with different types (brief check)")
   {
     // This is just a small check to ensure it compiles and works with different types
-    vio::elastic_index_storage_t<std::string, 2> stringStorage;
-    auto idxStr = stringStorage.activate_with_value("Hello");
-    CHECK(stringStorage.is_active(idxStr));
-    CHECK_EQ(stringStorage[idxStr], "Hello");
+    vio::elastic_index_storage_t<std::string, 2> string_storage;
+    auto idx_str = string_storage.activate_with_value("Hello");
+    CHECK(string_storage.is_active(idx_str));
+    CHECK_EQ(string_storage[idx_str], "Hello");
 
     // For a user-defined type, using a pair as a simple example
-    vio::elastic_index_storage_t<std::pair<int, double>, 1> pairStorage;
-    auto idxPair = pairStorage.activate_with_value(std::make_pair(5, 3.14));
-    CHECK(pairStorage.is_active(idxPair));
-    CHECK_EQ(pairStorage[idxPair].first, 5);
-    CHECK_EQ(pairStorage[idxPair].second, doctest::Approx(3.14));
+    vio::elastic_index_storage_t<std::pair<int, double>, 1> pair_storage;
+    auto idx_pair = pair_storage.activate_with_value(std::make_pair(5, 3.14));
+    CHECK(pair_storage.is_active(idx_pair));
+    CHECK_EQ(pair_storage[idx_pair].first, 5);
+    CHECK_EQ(pair_storage[idx_pair].second, doctest::Approx(3.14));
   }
 }

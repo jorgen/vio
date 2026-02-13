@@ -5,9 +5,9 @@
 #include <vio/task.h>
 
 // Minimum timer accuracy on Windows is 16ms.
-auto delay = std::chrono::milliseconds(32);
+static auto delay = std::chrono::milliseconds(32);
 
-vio::task_t<int> sleep_task_2(vio::event_loop_t &event_loop)
+static vio::task_t<int> sleep_task_2(vio::event_loop_t &event_loop)
 {
 
   auto to_wait = vio::sleep(event_loop, delay);
@@ -15,13 +15,13 @@ vio::task_t<int> sleep_task_2(vio::event_loop_t &event_loop)
   co_return 1;
 }
 
-vio::task_t<void> sleep_task_3(vio::event_loop_t &event_loop)
+static vio::task_t<void> sleep_task_3(vio::event_loop_t &event_loop)
 {
   auto to_wait = vio::sleep(event_loop, delay * 2);
   co_await to_wait;
 }
 
-vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
+static vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
 {
   auto start_time = std::chrono::high_resolution_clock::now();
   auto to_wait = vio::sleep(event_loop, delay);

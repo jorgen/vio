@@ -31,9 +31,8 @@ namespace vio
 {
 
 worker_t::worker_t()
-  : _done(false)
 {
-  async.data = this;
+  _async.data = this;
 }
 
 worker_t::~worker_t()

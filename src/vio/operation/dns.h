@@ -70,12 +70,12 @@ public:
     }
   }
 
-  struct sockaddr *get_sockaddr()
+  [[nodiscard]] struct sockaddr *get_sockaddr()
   {
     return addr.empty() ? nullptr : reinterpret_cast<struct sockaddr *>(addr.data());
   }
 
-  const struct sockaddr *get_sockaddr() const
+  [[nodiscard]] const struct sockaddr *get_sockaddr() const
   {
     return addr.empty() ? nullptr : reinterpret_cast<const struct sockaddr *>(addr.data());
   }
@@ -97,7 +97,6 @@ inline addrinfo convert_to_addrinfo(const address_info_t &info)
 inline address_info_list_t convert_addrinfo_list(const addrinfo *info)
 {
   address_info_list_t result;
-  addrinfo hints;
   result.reserve(5);
   for (const addrinfo *current = info; current != nullptr; current = current->ai_next)
   {
@@ -114,7 +113,7 @@ struct get_addrinfo_state_t
   std::coroutine_handle<> continuation;
   bool done = false;
 
-  bool await_ready() noexcept
+  [[nodiscard]] bool await_ready() const noexcept
   {
     return done;
   }
@@ -122,7 +121,9 @@ struct get_addrinfo_state_t
   bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
+    {
       return false;
+    }
     this->continuation = continuation;
     return true;
   }
@@ -152,7 +153,7 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
     if (status < 0)
     {
       std::string msg(uv_strerror(status));
-      error_t err = {status, msg};
+      error_t err = {.code = status, .msg = msg};
       state->result = std::unexpected(err);
     }
     else
@@ -163,14 +164,16 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
     uv_freeaddrinfo(res);
 
     if (state->continuation)
+    {
       state->continuation.resume();
+    }
   };
   auto r = uv_getaddrinfo(event_loop.loop(), req, callback, host.c_str(), nullptr, &hints_converted);
   if (r < 0)
   {
     // Mark as done right away and set the error.
     ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return ret;
 }
@@ -187,7 +190,7 @@ struct getnameinfo_state_t
   std::coroutine_handle<> continuation;
   bool done = false;
 
-  bool await_ready() noexcept
+  [[nodiscard]] bool await_ready() const noexcept
   {
     return done;
   }
@@ -195,7 +198,9 @@ struct getnameinfo_state_t
   bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
+    {
       return false;
+    }
     this->continuation = continuation;
     return true;
   }
@@ -223,7 +228,7 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
     if (status < 0)
     {
       std::string msg(uv_strerror(status));
-      error_t err = {status, msg};
+      error_t err = {.code = status, .msg = msg};
       state->result = std::unexpected(err);
     }
     else
@@ -232,13 +237,15 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
     }
 
     if (state->continuation)
+    {
       state->continuation.resume();
+    }
   };
   auto r = uv_getnameinfo(event_loop.loop(), req, callback, addr.get_sockaddr(), hints);
   if (r < 0)
   {
     ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return ret;
 }

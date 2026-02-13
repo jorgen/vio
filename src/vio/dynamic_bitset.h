@@ -34,7 +34,7 @@
 #include <limits>
 #include <vector>
 
-#if defined(_MSC_VER)
+#ifdef _MSC_VER
 #include <intrin.h>
 static inline unsigned long find_first_set_bit_64(uint64_t mask)
 {
@@ -97,7 +97,7 @@ static inline unsigned long find_highest_set_bit_64(uint64_t mask)
 class dynamic_bitset_t
 {
 public:
-  static constexpr std::size_t INVALID_INDEX = static_cast<std::size_t>(-1);
+  static constexpr std::size_t invalid_index = static_cast<std::size_t>(-1);
 
   dynamic_bitset_t() = default;
 
@@ -123,7 +123,7 @@ public:
     }
   }
 
-  bool test(std::size_t idx) const
+  [[nodiscard]] bool test(std::size_t idx) const
   {
     std::size_t block_index = 0;
     std::size_t bit_in_block = 0;
@@ -167,13 +167,13 @@ public:
         // Some zero bits exist
         const uint64_t inverted = ~block;
         // Find index of first "1" in 'inverted'
-        if (const unsigned long bit_index = find_first_set_bit_64(inverted); bit_index < BITS_PER_BLOCK)
+        if (const unsigned long bit_index = find_first_set_bit_64(inverted); bit_index < bits_per_block)
         {
-          return (blk * BITS_PER_BLOCK) + bit_index;
+          return (blk * bits_per_block) + bit_index;
         }
       }
     }
-    return INVALID_INDEX;
+    return invalid_index;
   }
 
   [[nodiscard]] std::size_t find_rightmost_set_bit() const
@@ -185,34 +185,30 @@ public:
       if (block != 0ULL)
       {
         // find highest set bit
-        if (const unsigned long bit_index = find_highest_set_bit_64(block); bit_index < BITS_PER_BLOCK)
+        if (const unsigned long bit_index = find_highest_set_bit_64(block); bit_index < bits_per_block)
         {
-          return ((blk - 1) * BITS_PER_BLOCK) + bit_index;
+          return ((blk - 1) * bits_per_block) + bit_index;
         }
       }
     }
-    return INVALID_INDEX;
+    return invalid_index;
   }
 
 private:
-  static constexpr std::size_t BITS_PER_BLOCK = sizeof(std::uint64_t) * CHAR_BIT;
+  static constexpr std::size_t bits_per_block = sizeof(std::uint64_t) * CHAR_BIT;
 
   std::size_t _block_count = 0;
   std::vector<std::uint64_t> _bits;
 
   static std::size_t block_count_for_bits(std::size_t bit_count)
   {
-    return (bit_count + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK;
+    return (bit_count + bits_per_block - 1) / bits_per_block;
   }
 
   bool locate_bit(std::size_t idx, std::size_t &block_index, std::size_t &bit_in_block) const
   {
-    block_index = idx / BITS_PER_BLOCK;
-    bit_in_block = idx % BITS_PER_BLOCK;
-    if (block_index >= _block_count)
-    {
-      return false;
-    }
-    return true;
+    block_index = idx / bits_per_block;
+    bit_in_block = idx % bits_per_block;
+    return block_index < _block_count;
   }
 };

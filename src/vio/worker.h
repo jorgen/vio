@@ -32,12 +32,16 @@ class event_loop_t;
 class worker_t
 {
 public:
-  enum completion_t
+  enum completion_t : std::uint8_t
   {
     cancelled,
     completed
   };
   worker_t();
+  worker_t(const worker_t &) = delete;
+  worker_t(worker_t &&) = default;
+  worker_t &operator=(const worker_t &) = delete;
+  worker_t &operator=(worker_t &&) = default;
   virtual ~worker_t();
   virtual void work() = 0;
   virtual void after_work(completion_t completion) = 0;
@@ -47,13 +51,13 @@ public:
   {
     _done = true;
   }
-  bool done() const
+  [[nodiscard]] bool done() const
   {
     return _done;
   }
 
 private:
-  bool _done;
-  uv_async_t async;
+  bool _done{false};
+  uv_async_t _async = {};
 };
 } // namespace points::converter

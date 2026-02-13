@@ -42,6 +42,11 @@ namespace vio
 class about_to_block_t
 {
 public:
+  about_to_block_t() = default;
+  about_to_block_t(const about_to_block_t &) = default;
+  about_to_block_t(about_to_block_t &&) = default;
+  about_to_block_t &operator=(const about_to_block_t &) = default;
+  about_to_block_t &operator=(about_to_block_t &&) = default;
   virtual ~about_to_block_t() = default;
 
   virtual void about_to_block() = 0;
@@ -131,7 +136,7 @@ public:
     }
     else
     {
-      barrier_t barrier;
+      barrier_t barrier; // NOLINT(misc-const-correctness)
       std::unique_lock<std::mutex> lock(barrier.mutex);
 
       std::function<uv_handle_t *(uv_loop_t *)> func = [&event_pipe, &barrier](uv_loop_t *loop)
@@ -188,8 +193,8 @@ private:
 
   static void exit_event_loop_cb(uv_async_t *handle)
   {
-    auto event_loop = static_cast<event_loop_t *>(handle->data);
-    for (auto cancel_handle : event_loop->_to_cancel_work_handles)
+    auto *event_loop = static_cast<event_loop_t *>(handle->data);
+    for (auto *cancel_handle : event_loop->_to_cancel_work_handles)
       uv_cancel((uv_req_t *)cancel_handle);
     for (auto close_handle : event_loop->_to_close_handles)
     {
@@ -219,6 +224,11 @@ private:
 class thread_with_event_loop_t
 {
 public:
+  thread_with_event_loop_t(const thread_with_event_loop_t &) = delete;
+  thread_with_event_loop_t(thread_with_event_loop_t &&) = delete;
+  thread_with_event_loop_t &operator=(const thread_with_event_loop_t &) = delete;
+  thread_with_event_loop_t &operator=(thread_with_event_loop_t &&) = delete;
+
   thread_with_event_loop_t()
     : _event_loop()
   {
@@ -238,18 +248,18 @@ public:
     barrier.wait.wait(lock);
   }
 
-  ~thread_with_event_loop_t()
+  ~thread_with_event_loop_t() // NOLINT(modernize-use-equals-default)
   {
     _event_loop.stop();
     _thread->join();
   }
 
-  event_loop_t &event_loop()
+  [[nodiscard]] event_loop_t &event_loop()
   {
     return _event_loop;
   }
 
-  const event_loop_t &event_loop() const
+  [[nodiscard]] const event_loop_t &event_loop() const
   {
     return _event_loop;
   }

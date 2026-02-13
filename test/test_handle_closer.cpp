@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/ref_counted_wrapper.h>
@@ -5,6 +6,7 @@
 namespace
 {
 
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 struct simple_async_data_t
 {
   std::function<void()> callback;
@@ -112,8 +114,8 @@ TEST_CASE("register_handle with ref_ptr_t")
       async1.on_destroy([&async_closed]() { async_closed = true; });
 
       {
-        owned_async_t async2 = async1;
-        owned_async_t async3 = async2;
+        const owned_async_t async2 = async1; // NOLINT(performance-unnecessary-copy-initialization)
+        const owned_async_t async3 = async2; // NOLINT(performance-unnecessary-copy-initialization)
         CHECK(async1.ref_counted()->ref_count == 3);
         CHECK_FALSE(destroyed);
       }
@@ -169,6 +171,7 @@ TEST_CASE("register_handle reference counting with event loop")
     vio::event_loop_t loop;
     int destruction_phase = 0;
 
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
     struct tracked_async_t
     {
       uv_async_t handle = {};
@@ -223,7 +226,7 @@ TEST_CASE("register_handle reference counting with event loop")
 
     using owned_multi_t = vio::ref_ptr_t<multi_handle_t>;
 
-    std::vector<uv_handle_t *> close_order;
+    const std::vector<uv_handle_t *> close_order;
 
     {
       owned_multi_t wrapper(loop);
@@ -274,9 +277,9 @@ TEST_CASE("register_handle reference counting with event loop")
     loop.run();
 
     REQUIRE(close_order.size() == 3);
-    CHECK(std::find(close_order.begin(), close_order.end(), 1) != close_order.end());
-    CHECK(std::find(close_order.begin(), close_order.end(), 2) != close_order.end());
-    CHECK(std::find(close_order.begin(), close_order.end(), 3) != close_order.end());
+    CHECK(std::ranges::find(close_order, 1) != close_order.end());
+    CHECK(std::ranges::find(close_order, 2) != close_order.end());
+    CHECK(std::ranges::find(close_order, 3) != close_order.end());
   }
 }
 

@@ -17,6 +17,7 @@ struct destruction_tracker_t
   }
 };
 
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 struct test_data_t
 {
   int value{0};
@@ -43,7 +44,7 @@ struct test_data_t
   ~test_data_t()
   {
     destruction_tracker_t::destruction_count++;
-    if (destroyed)
+    if (destroyed != nullptr)
     {
       *destroyed = true;
     }
@@ -60,7 +61,7 @@ TEST_CASE("reference_counted_t basic operations")
     {
     };
     auto *obj = new dummy_t();
-    vio::reference_counted_t ref([obj]() { delete obj; });
+    const vio::reference_counted_t ref([obj]() { delete obj; });
 
     CHECK(ref.ref_count == 1);
   }
@@ -107,10 +108,11 @@ TEST_CASE("reference_counted_t basic operations")
   SUBCASE("dec to zero triggers deletion")
   {
     bool destroyed = false;
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
     struct test_t
     {
       bool *flag;
-      test_t(bool *f)
+      explicit test_t(bool *f)
         : flag(f)
       {
       }
@@ -124,7 +126,7 @@ TEST_CASE("reference_counted_t basic operations")
     auto *ref = new vio::reference_counted_t([obj]() { delete obj; });
 
     CHECK_FALSE(destroyed);
-    bool result = ref->dec();
+    const bool result = ref->dec();
     CHECK(result);
     CHECK(destroyed);
   }
@@ -166,7 +168,7 @@ TEST_CASE("reference_counted_t basic operations")
         ref->inc();
       });
 
-    bool result = ref->dec();
+    const bool result = ref->dec();
     CHECK(callback_called);
     CHECK_FALSE(result);
     CHECK(ref->ref_count == 1);
@@ -221,7 +223,7 @@ TEST_CASE("ref_ptr_t reference counting")
     test_owned_t wrapper1(42);
     CHECK(wrapper1.ref_counted()->ref_count == 1);
 
-    test_owned_t wrapper2 = wrapper1;
+    const test_owned_t wrapper2 = wrapper1; // NOLINT(performance-unnecessary-copy-initialization)
     CHECK(wrapper1.ref_counted()->ref_count == 2);
     CHECK(wrapper2.ref_counted()->ref_count == 2);
     CHECK(wrapper1->value == 42);
@@ -261,7 +263,7 @@ TEST_CASE("ref_ptr_t reference counting")
     {
       test_owned_t wrapper1(42);
       {
-        test_owned_t wrapper2 = wrapper1;
+        const test_owned_t wrapper2 = wrapper1; // NOLINT(performance-unnecessary-copy-initialization)
         CHECK(wrapper1.ref_counted()->ref_count == 2);
       }
       CHECK(wrapper1.ref_counted()->ref_count == 1);
@@ -278,8 +280,8 @@ TEST_CASE("ref_ptr_t reference counting")
     {
       test_owned_t wrapper1(42, &destroyed);
       {
-        test_owned_t wrapper2 = wrapper1;
-        test_owned_t wrapper3 = wrapper2;
+        const test_owned_t wrapper2 = wrapper1;  // NOLINT(performance-unnecessary-copy-initialization)
+        const test_owned_t wrapper3 = wrapper2;   // NOLINT(performance-unnecessary-copy-initialization)
         CHECK(wrapper1.ref_counted()->ref_count == 3);
         CHECK_FALSE(destroyed);
       }
@@ -406,7 +408,7 @@ TEST_CASE("mixed usage scenario")
       test_owned_t owned_tcp;
       int request_id;
 
-      request_t(int id)
+      explicit request_t(int id)
         : owned_tcp(id)
         , request_id(id)
       {
@@ -417,7 +419,7 @@ TEST_CASE("mixed usage scenario")
     CHECK(req.owned_tcp->value == 42);
     CHECK(req.owned_tcp.ref_counted()->ref_count == 1);
 
-    test_owned_t copy = req.owned_tcp;
+    const test_owned_t copy = req.owned_tcp;
     CHECK(req.owned_tcp.ref_counted()->ref_count == 2);
   }
 }

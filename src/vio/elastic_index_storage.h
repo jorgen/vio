@@ -34,7 +34,7 @@ class elastic_index_storage_t
   static_assert(PreferredSize > 0, "PreferredSize must be greater than 0");
 
 public:
-  elastic_index_storage_t()
+  elastic_index_storage_t() // NOLINT(modernize-use-equals-default)
   {
     _used_bits.resize(PreferredSize);
     _processed_bits.resize(PreferredSize);
@@ -44,7 +44,7 @@ public:
   std::size_t activate()
   {
     std::size_t idx = _used_bits.find_first_clear_bit();
-    if (idx == dynamic_bitset_t::INVALID_INDEX)
+    if (idx == dynamic_bitset_t::invalid_index)
     {
       grow_storage();
       idx = _used_bits.find_first_clear_bit();
@@ -74,7 +74,7 @@ public:
     _data[index] = T();
     _used_bits.clear(index);
 
-    if (std::size_t rightmost_active = _used_bits.find_rightmost_set_bit(); rightmost_active == dynamic_bitset_t::INVALID_INDEX || rightmost_active < PreferredSize)
+    if (std::size_t rightmost_active = _used_bits.find_rightmost_set_bit(); rightmost_active == dynamic_bitset_t::invalid_index || rightmost_active < PreferredSize)
     {
       resize_storage(PreferredSize);
     }

@@ -42,7 +42,7 @@ struct sleep_state_t
   std::coroutine_handle<> continuation = {};
   bool done = false;
 
-  bool await_ready() noexcept
+  [[nodiscard]] bool await_ready() const noexcept
   {
     return done;
   }
@@ -50,7 +50,9 @@ struct sleep_state_t
   bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
+    {
       return false;
+    }
     this->continuation = continuation;
     return true;
   }
@@ -79,13 +81,15 @@ inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::mill
     auto close_callback = [](uv_handle_t *handle) { auto timer_state = future_ref_ptr_t::from_raw(handle->data); };
     uv_close((uv_handle_t *)timer, close_callback);
     if (timer_state->continuation)
+    {
       timer_state->continuation.resume();
+    }
   };
   auto r = uv_timer_start(&ret.state_ptr->timer, callback, milliseconds.count(), 0);
   if (r < 0)
   {
     ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return ret;
 }

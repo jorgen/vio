@@ -20,7 +20,7 @@ struct reference_counted_t
   bool in_destroy_sequence{false};
   std::function<void()> destroyer;
 
-  explicit reference_counted_t(std::function<void()> &&destroyer)
+  explicit reference_counted_t(std::function<void()> destroyer)
     : destroyer(std::move(destroyer))
   {
   }
@@ -35,7 +35,9 @@ struct reference_counted_t
     if (ref_count.fetch_sub(1, std::memory_order_acquire) == 1)
     {
       if (in_destroy_sequence)
+      {
         return false;
+      }
       in_destroy_sequence = true;
 
       std::vector<std::function<void()>> callbacks;
@@ -124,56 +126,56 @@ public:
   };
 
 private:
-  storage_t *storage;
+  storage_t *_storage;
 
   // Private constructor for from_raw - does not allocate
   explicit ref_ptr_t(storage_t *ptr)
-    : storage(ptr)
+    : _storage(ptr)
   {
   }
 
 public:
   ref_ptr_t()
     requires std::default_initializable<Data>
-    : storage(new storage_t())
+    : _storage(new storage_t())
   {
   }
 
   template <typename... Args>
     requires(sizeof...(Args) > 0) && (sizeof...(Args) != 1 || !(std::same_as<std::remove_cvref_t<Args>, ref_ptr_t> || ...))
   explicit ref_ptr_t(Args &&...args)
-    : storage(new storage_t(std::forward<Args>(args)...))
+    : _storage(new storage_t(std::forward<Args>(args)...))
   {
   }
 
   ref_ptr_t(const ref_ptr_t &other)
-    : storage(other.storage)
+    : _storage(other._storage)
   {
-    if (storage)
+    if (_storage)
     {
-      storage->ref_count.inc();
+      _storage->ref_count.inc();
     }
   }
 
   ref_ptr_t(ref_ptr_t &&other) noexcept
-    : storage(other.storage)
+    : _storage(other._storage)
   {
-    other.storage = nullptr;
+    other._storage = nullptr;
   }
 
   ref_ptr_t &operator=(const ref_ptr_t &other)
   {
     if (this != &other)
     {
-      if (storage && storage->ref_count.dec())
+      if (_storage && _storage->ref_count.dec())
       {
-        // Object was destroyed, storage is now invalid
-        storage = nullptr;
+        // Object was destroyed, _storage is now invalid
+        _storage = nullptr;
       }
-      storage = other.storage;
-      if (storage)
+      _storage = other._storage;
+      if (_storage)
       {
-        storage->ref_count.inc();
+        _storage->ref_count.inc();
       }
     }
     return *this;
@@ -183,38 +185,38 @@ public:
   {
     if (this != &other)
     {
-      if (storage && storage->ref_count.dec())
+      if (_storage && _storage->ref_count.dec())
       {
-        // Object was destroyed, storage is now invalid
-        storage = nullptr;
+        // Object was destroyed, _storage is now invalid
+        _storage = nullptr;
       }
-      storage = other.storage;
-      other.storage = nullptr;
+      _storage = other._storage;
+      other._storage = nullptr;
     }
     return *this;
   }
 
   ~ref_ptr_t()
   {
-    if (storage)
+    if (_storage)
     {
-      storage->ref_count.dec();
+      _storage->ref_count.dec();
     }
   }
 
   void release()
   {
-    if (storage)
+    if (_storage)
     {
-      storage->ref_count.dec();
-      storage = nullptr;
+      _storage->ref_count.dec();
+      _storage = nullptr;
     }
   }
 
   void *release_to_raw()
   {
-    storage_t *temp = storage;
-    storage = nullptr;
+    storage_t *temp = _storage;
+    _storage = nullptr;
     return temp;
   }
 
@@ -231,54 +233,54 @@ public:
   template <typename UV_HANDLE>
   void inc_ref_and_store_in_handle(UV_HANDLE &handle)
   {
-    if (storage)
+    if (_storage)
     {
-      storage->ref_count.inc();
+      _storage->ref_count.inc();
     }
-    handle.data = storage;
+    handle.data = _storage;
   }
 
   Data *operator->()
   {
-    return &storage->data;
+    return &_storage->data;
   }
   const Data *operator->() const
   {
-    return &storage->data;
+    return &_storage->data;
   }
 
   Data &data()
   {
-    return storage->data;
+    return _storage->data;
   }
   const Data &data() const
   {
-    return storage->data;
+    return _storage->data;
   }
 
-  reference_counted_t *ref_counted()
+  [[nodiscard]] reference_counted_t *ref_counted()
   {
-    return storage ? &storage->ref_count : nullptr;
+    return _storage ? &_storage->ref_count : nullptr;
   }
-  const reference_counted_t *ref_counted() const
+  [[nodiscard]] const reference_counted_t *ref_counted() const
   {
-    return storage ? &storage->ref_count : nullptr;
+    return _storage ? &_storage->ref_count : nullptr;
   }
 
   template <typename UV_HANDLE>
   void register_handle(UV_HANDLE *handle)
   {
-    storage->ref_count.register_closable_handle(handle);
+    _storage->ref_count.register_closable_handle(handle);
   }
 
   void on_destroy(std::function<void()> callback)
   {
-    storage->ref_count.register_destroy_callback(std::move(callback));
+    _storage->ref_count.register_destroy_callback(std::move(callback));
   }
 
   explicit operator bool() const noexcept
   {
-    return storage != nullptr;
+    return _storage != nullptr;
   }
 };
 

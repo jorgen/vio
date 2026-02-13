@@ -112,7 +112,9 @@ struct tcp_future_t
   bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (state->done)
+    {
       return false;
+    }
     state->continuation = continuation;
     return true;
   }
@@ -129,21 +131,27 @@ struct tcp_t
 
   uv_tcp_t *get_tcp()
   {
-    if (!handle.ref_counted())
+    if (handle.ref_counted() == nullptr)
+    {
       return nullptr;
+    }
     return handle->get_tcp();
   }
 
   uv_stream_t *get_stream()
   {
-    if (!handle.ref_counted())
+    if (handle.ref_counted() == nullptr)
+    {
       return nullptr;
+    }
     return handle->get_stream();
   }
   uv_handle_t *get_handle()
   {
-    if (!handle.ref_counted())
+    if (handle.ref_counted() == nullptr)
+    {
       return nullptr;
+    }
     return handle->get_handle();
   }
 };
@@ -154,7 +162,7 @@ inline std::expected<sockaddr_in, error_t> ip4_addr(const std::string &ip, int p
   const int r = uv_ip4_addr(ip.c_str(), port, &addr);
   if (r != 0)
   {
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return addr;
 }
@@ -165,7 +173,7 @@ inline std::expected<sockaddr_in6, error_t> ip6_addr(const std::string &ip, int 
   const int r = uv_ip6_addr(ip.c_str(), port, &addr);
   if (r != 0)
   {
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return addr;
 }
@@ -175,7 +183,7 @@ inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
   tcp_t tcp{ref_ptr_t<tcp_state_t>(loop)};
   if (auto r = uv_tcp_init(loop.loop(), tcp.get_tcp()); r < 0)
   {
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   tcp.handle.register_handle(tcp.get_tcp());
   return tcp;
@@ -188,7 +196,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   if (ret.handle->connect.started)
   {
     ret.handle->connect.done = true;
-    ret.handle->connect.result = std::unexpected(error_t{-1, "It's  an error to listen to more than one connect at a socket at the time"});
+    ret.handle->connect.result = std::unexpected(error_t{.code = -1, .msg = "It's  an error to listen to more than one connect at a socket at the time"});
     return ret;
   }
   ret.handle->connect.started = true;
@@ -198,7 +206,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
     if (status < 0)
     {
-      state_ref->connect.result = std::unexpected(error_t{status, uv_strerror(status)});
+      state_ref->connect.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
     }
 
     state_ref->connect.done = true;
@@ -217,7 +225,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   if (r < 0)
   {
     ret.handle->connect.done = true;
-    ret.handle->connect.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.handle->connect.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     ref_ptr_t<tcp_state_t>::from_raw(ret.handle->connect.req.data);
   }
   return ret;
@@ -229,7 +237,7 @@ inline std::expected<sockaddr_storage, error_t> sockname(tcp_t &tcp)
   int name_len = sizeof(sa_storage);
   if (auto r = uv_tcp_getsockname(tcp.get_tcp(), reinterpret_cast<sockaddr *>(&sa_storage), &name_len); r < 0)
   {
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return sa_storage;
 }
@@ -246,7 +254,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
     if (status < 0)
     {
-      state_ref->write.result = std::unexpected(error_t{status, uv_strerror(status)});
+      state_ref->write.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
     }
     state_ref->write.done = true;
     if (state_ref->write.continuation)
@@ -264,7 +272,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   if (r < 0)
   {
     ret.handle->write.done = true;
-    ret.handle->write.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.handle->write.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     ref_ptr_t<tcp_state_t>::from_raw(ret.handle->write.req.data);
   }
 
@@ -279,9 +287,9 @@ public:
 
   tcp_reader_t(tcp_reader_t &&other) noexcept
     : handle(std::move(other.handle))
-    , is_valid(other.is_valid)
+    , _is_valid(other._is_valid)
   {
-    other.is_valid = false;
+    other._is_valid = false;
   }
 
   tcp_reader_t &operator=(tcp_reader_t &&other) noexcept
@@ -289,15 +297,15 @@ public:
     if (this != &other)
     {
       handle = std::move(other.handle);
-      is_valid = other.is_valid;
-      other.is_valid = false;
+      _is_valid = other._is_valid;
+      other._is_valid = false;
     }
     return *this;
   }
 
   ~tcp_reader_t()
   {
-    if (is_valid && handle->read.started)
+    if (_is_valid && handle->read.started)
     {
       auto state = ref_ptr_t<tcp_state_t>::from_raw(handle->get_stream()->data);
       uv_read_stop(handle->get_stream());
@@ -309,11 +317,13 @@ public:
   void cancel()
   {
     if (handle->read.is_cancelled)
+    {
       return;
+    }
 
     handle->read.is_cancelled = true;
 
-    handle->read.buffer_queue.emplace_back(std::unexpected(error_t{UV_ECANCELED, "Operation was cancelled"}));
+    handle->read.buffer_queue.emplace_back(std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"}));
 
     if (handle->read.continuation)
     {
@@ -328,11 +338,11 @@ public:
     return handle->read.is_cancelled;
   }
 
-  struct awaiter
+  struct awaiter_t
   {
     ref_ptr_t<tcp_state_t> state;
 
-    bool await_ready() const
+    [[nodiscard]] bool await_ready() const
     {
       return !state->read.buffer_queue.empty();
     }
@@ -352,17 +362,18 @@ public:
 
   auto operator co_await()
   {
-    return awaiter{this->handle};
+    return awaiter_t{this->handle};
   }
 
-  struct ref_ptr_releaser
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
+  struct ref_ptr_releaser_t
   {
-    ref_ptr_releaser(ref_ptr_t<tcp_state_t> &handle)
+    explicit ref_ptr_releaser_t(ref_ptr_t<tcp_state_t> &handle)
       : handle(handle)
     {
     }
 
-    ~ref_ptr_releaser()
+    ~ref_ptr_releaser_t()
     {
       handle.release_to_raw();
     }
@@ -372,7 +383,7 @@ public:
   static void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
   {
     auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
-    ref_ptr_releaser releaser(tcp_state);
+    ref_ptr_releaser_t releaser(tcp_state);
 
     if (nread > 0)
     {
@@ -382,11 +393,13 @@ public:
     {
       int code = UV_EOF;
       if (nread < 0)
+      {
         code = static_cast<int>(nread);
-      auto error = std::unexpected(error_t{code, uv_strerror(static_cast<int>(nread))});
+      }
+      auto error = std::unexpected(error_t{.code = code, .msg = uv_strerror(static_cast<int>(nread))});
       tcp_state->read.buffer_queue.emplace_back(std::move(error));
 
-      if (buf && buf->base)
+      if (buf != nullptr && buf->base != nullptr)
       {
         tcp_state->read.dealloc_buffer_cb(tcp_state->read.alloc_cb_data, const_cast<uv_buf_t *>(buf));
       }
@@ -404,23 +417,23 @@ public:
   friend std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp);
 
 private:
-  tcp_reader_t(const tcp_t &tcp)
+  explicit tcp_reader_t(const tcp_t &tcp)
     : handle(tcp.handle)
-    , is_valid(true)
+    , _is_valid(true)
   {
   }
-  bool is_valid = false;
+  bool _is_valid = false;
 };
 
 inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
 {
   if (tcp.handle.ref_counted() == nullptr)
   {
-    return std::unexpected(error_t{1, "Can not create a reader for a closed socket"});
+    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a closed socket"});
   }
   if (tcp.handle->read.active)
   {
-    return std::unexpected(error_t(1, "Can not create multiple active readers for a socket. Destroy other reader, before making a new one."));
+    return std::unexpected(error_t{.code = 1, .msg = "Can not create multiple active readers for a socket. Destroy other reader, before making a new one."});
   }
 
   auto alloc_cb = [](uv_handle_t *handle, size_t size, uv_buf_t *buf)
@@ -439,7 +452,7 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
   else
   {
     auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(tcp.get_stream()->data);
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
 
   return tcp_reader_t{tcp};

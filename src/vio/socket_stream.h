@@ -269,7 +269,7 @@ void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, i
   auto state = static_cast<socket_stream_t<NATIVE_SOCKET_STREAM_T> *>(handle->data);
   assert(handle == &state->poll_req && "Invalid state in on_poll_event");
 
-  if (events & UV_DISCONNECT)
+  if ((events & UV_DISCONNECT) != 0)
   {
     state->connected = false;
     state->poll_read_active = false;
@@ -285,7 +285,7 @@ void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, i
 
   assert(state->connected && "on_poll_event: client not connected");
 
-  if (events & UV_WRITABLE)
+  if ((events & UV_WRITABLE) != 0)
   {
     if (state->read_got_poll_out)
     {
@@ -297,7 +297,7 @@ void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, i
       state->write();
     }
   }
-  if (events & UV_READABLE)
+  if ((events & UV_READABLE) != 0)
   {
     if (state->write_got_poll_in)
     {
@@ -306,7 +306,7 @@ void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, i
     }
     state->read();
   }
-  if (!(events & (UV_WRITABLE | UV_READABLE)))
+  if ((events & (UV_WRITABLE | UV_READABLE)) == 0)
   {
     fprintf(stderr, "on_poll_event: unexpected events %d\n", events);
   }
@@ -316,10 +316,11 @@ void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, i
 template <typename NATIVE_SOCKET_STREAM_T>
 bool socket_stream_t<NATIVE_SOCKET_STREAM_T>::read()
 {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
   struct call_read_resume_on_exit_t
   {
     socket_stream_t<NATIVE_SOCKET_STREAM_T> &state;
-    call_read_resume_on_exit_t(socket_stream_t<NATIVE_SOCKET_STREAM_T> &state)
+    explicit call_read_resume_on_exit_t(socket_stream_t<NATIVE_SOCKET_STREAM_T> &state)
       : state(state)
     {
     }
@@ -336,7 +337,7 @@ bool socket_stream_t<NATIVE_SOCKET_STREAM_T>::read()
       }
     }
   };
-  call_read_resume_on_exit_t call_read_resume_on_exit{*this};
+  call_read_resume_on_exit_t call_read_resume_on_exit(*this);
 
   read_got_poll_out = false;
   if (read_buffer.len > 0)
@@ -380,7 +381,7 @@ bool socket_stream_t<NATIVE_SOCKET_STREAM_T>::read()
       }
     }
 
-    if (!current_buffer)
+    if (current_buffer == nullptr)
     {
       uv_buf_t read_buf;
       alloc_cb(user_alloc_ptr, 65536, &read_buf);
@@ -577,7 +578,9 @@ stream_read_awaitable_t<REF_PTR_T, STREAM> stream_reader_t<REF_PTR_T, STREAM>::r
     if (to_copy == queued.buf.len)
     {
       if (queued.dealloc_cb)
+      {
         queued.dealloc_cb(nullptr, &queued.buf);
+      }
       stream->buffer_queue.discard_front();
     }
     else

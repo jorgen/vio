@@ -28,17 +28,12 @@ template <typename T, typename Closer>
 class auto_close_t
 {
 public:
-  auto_close_t() noexcept
-    : m_value()
-    , m_closer(nullptr)
-    , m_close(false)
-  {
-  }
+  auto_close_t() noexcept = default;
 
-  explicit auto_close_t(T &&value, Closer closer) noexcept
-    : m_value(std::move(value))
-    , m_closer(closer)
-    , m_close(true)
+  explicit auto_close_t(T value, Closer closer) noexcept
+    : _value(std::move(value))
+    , _closer(closer)
+    , _close(true)
   {
   }
 
@@ -46,55 +41,59 @@ public:
   auto_close_t &operator=(const auto_close_t &) = delete;
 
   auto_close_t(auto_close_t &&other) noexcept
-    : m_value(std::move(other.m_value))
-    , m_closer(std::move(other.m_closer))
-    , m_close(other.m_close)
+    : _value(std::move(other._value))
+    , _closer(std::move(other._closer))
+    , _close(other._close)
   {
-    other.m_close = false;
+    other._close = false;
   }
 
   auto_close_t &operator=(auto_close_t &&other) noexcept
   {
     if (this != &other)
     {
-      if (m_close)
-        m_closer(&m_value);
-      m_value = std::move(other.m_value);
-      m_closer = std::move(other.m_closer);
-      m_close = other.m_close;
-      other.m_close = false;
+      if (_close)
+      {
+        _closer(&_value);
+      }
+      _value = std::move(other._value);
+      _closer = std::move(other._closer);
+      _close = other._close;
+      other._close = false;
     }
     return *this;
   }
 
   ~auto_close_t()
   {
-    if (m_close)
-      m_closer(&m_value);
+    if (_close)
+    {
+      _closer(&_value);
+    }
   }
 
   T *operator->()
   {
-    return &m_value;
+    return &_value;
   }
   const T *operator->() const
   {
-    return &m_value;
+    return &_value;
   }
 
   T &operator*()
   {
-    return m_value;
+    return _value;
   }
   const T &operator*() const
   {
-    return m_value;
+    return _value;
   }
 
 private:
-  T m_value;
-  Closer m_closer;
-  bool m_close;
+  T _value;
+  Closer _closer;
+  bool _close;
 };
 
 } // namespace vio

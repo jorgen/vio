@@ -21,7 +21,7 @@ auto dns_lookup_localhost(vio::event_loop_t &event_loop, bool &test_completed) -
   MESSAGE("Got " << result->size() << " address(es) for localhost");
 
   const auto &addr_info = (*result)[0];
-  bool is_net = addr_info.family == AF_INET || addr_info.family == AF_INET6;
+  const bool is_net = addr_info.family == AF_INET || addr_info.family == AF_INET6;
   CHECK(is_net);
   CHECK(addr_info.socktype == SOCK_STREAM);
   CHECK(addr_info.get_sockaddr() != nullptr);

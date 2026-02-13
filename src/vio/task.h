@@ -31,15 +31,21 @@ template <typename T>
 class task_t
 {
 public:
-  inline task_t(task_t &&t) noexcept
+  task_t(task_t &&t) noexcept
     : _coro(std::exchange(t._coro, {}))
   {
   }
 
-  inline ~task_t()
+  task_t(const task_t &) = delete;
+  task_t &operator=(const task_t &) = delete;
+  task_t &operator=(task_t &&) = delete;
+
+  ~task_t()
   {
     if (_coro && _coro.done())
+    {
       _coro.destroy();
+    }
   }
 
   struct promise_t
@@ -66,7 +72,7 @@ public:
 
     struct final_awaitable_t
     {
-      bool await_ready() const noexcept
+      [[nodiscard]] bool await_ready() const noexcept
       {
         return false;
       }
@@ -95,11 +101,11 @@ public:
     T return_value_holder;
   };
 
-  class awaiter;
+  class awaiter_t;
 
-  inline awaiter operator co_await() && noexcept;
+  inline awaiter_t operator co_await() && noexcept;
 
-  using promise_type = promise_t;
+  using promise_type = promise_t; // NOLINT(readability-identifier-naming)
 
 private:
   explicit task_t(std::coroutine_handle<promise_t> coro) noexcept
@@ -108,40 +114,40 @@ private:
   }
 
   std::coroutine_handle<promise_t> _coro;
-}; // namespace class task_t
+};
 
 template <typename T>
-class task_t<T>::awaiter
+class task_t<T>::awaiter_t
 {
 public:
   bool await_ready() noexcept
   {
-    return coro_.done();
+    return _coro.done();
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
   {
-    coro_.promise().continuation = continuation;
+    _coro.promise().continuation = continuation;
   }
 
   T await_resume() noexcept
   {
-    return std::move(coro_.promise().return_value_holder);
+    return std::move(_coro.promise().return_value_holder);
   }
 
-  explicit awaiter(std::coroutine_handle<task_t::promise_type> h) noexcept
-    : coro_(h)
+  explicit awaiter_t(std::coroutine_handle<task_t::promise_type> h) noexcept
+    : _coro(h)
   {
   }
 
 private:
-  std::coroutine_handle<task_t::promise_type> coro_;
+  std::coroutine_handle<task_t::promise_type> _coro;
 };
 
 template <typename T>
-inline task_t<T>::awaiter task_t<T>::operator co_await() && noexcept
+inline task_t<T>::awaiter_t task_t<T>::operator co_await() && noexcept
 {
-  return awaiter{_coro};
+  return awaiter_t{_coro};
 }
 
 template <>
@@ -153,10 +159,16 @@ public:
   {
   }
 
+  task_t(const task_t &) = delete;
+  task_t &operator=(const task_t &) = delete;
+  task_t &operator=(task_t &&) = delete;
+
   ~task_t()
   {
     if (_coro && _coro.done())
+    {
       _coro.destroy();
+    }
   }
 
   struct promise_t
@@ -182,7 +194,7 @@ public:
 
     struct final_awaitable_t
     {
-      bool await_ready() const noexcept
+      [[nodiscard]] bool await_ready() const noexcept
       {
         return false;
       }
@@ -210,11 +222,11 @@ public:
     std::coroutine_handle<> continuation;
   };
 
-  class awaiter;
+  class awaiter_t;
 
-  inline awaiter operator co_await() && noexcept;
+  inline awaiter_t operator co_await() && noexcept;
 
-  using promise_type = promise_t;
+  using promise_type = promise_t; // NOLINT(readability-identifier-naming)
 
 private:
   explicit task_t(std::coroutine_handle<promise_t> coro) noexcept
@@ -223,37 +235,37 @@ private:
   }
 
   std::coroutine_handle<promise_t> _coro;
-}; // namespace class task_t
+};
 
-class task_t<void>::awaiter
+class task_t<void>::awaiter_t
 {
 public:
   bool await_ready() noexcept
   {
-    return coro_.done();
+    return _coro.done();
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
   {
-    coro_.promise().continuation = continuation;
+    _coro.promise().continuation = continuation;
   }
 
   void await_resume() noexcept
   {
   }
 
-  explicit awaiter(std::coroutine_handle<task_t::promise_type> h) noexcept
-    : coro_(h)
+  explicit awaiter_t(std::coroutine_handle<task_t::promise_type> h) noexcept
+    : _coro(h)
   {
   }
 
 private:
-  std::coroutine_handle<task_t::promise_type> coro_;
+  std::coroutine_handle<task_t::promise_type> _coro;
 };
 
-inline task_t<void>::awaiter task_t<void>::operator co_await() && noexcept
+inline task_t<void>::awaiter_t task_t<void>::operator co_await() && noexcept
 {
-  return awaiter{_coro};
+  return awaiter_t{_coro};
 }
 
 } // namespace vio

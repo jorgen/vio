@@ -39,27 +39,33 @@ namespace vio
 class thread_pool_t
 {
 public:
-  thread_pool_t(int thread_count = std::thread::hardware_concurrency())
-    : stop(false)
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+  explicit thread_pool_t(uint32_t thread_count = std::thread::hardware_concurrency())
   {
     workers.reserve(thread_count);
-    for (int i = 0; i < thread_count; ++i)
-      workers.emplace_back([this] {
-        for (;;)
+    for (uint32_t i = 0; i < thread_count; ++i)
+      workers.emplace_back(
+        [this]
         {
-          std::function<void()> task;
+          for (;;)
           {
-            std::unique_lock<std::mutex> lock(this->queue_mutex);
-            this->condition.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
-            if (this->stop && this->tasks.empty())
-              return;
-            task = std::move(this->tasks.front());
-            this->tasks.pop();
+            std::function<void()> task;
+            {
+              std::unique_lock<std::mutex> lock(this->queue_mutex);
+              this->condition.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
+              if (this->stop && this->tasks.empty())
+                return;
+              task = std::move(this->tasks.front());
+              this->tasks.pop();
+            }
+            task();
           }
-          task();
-        }
-      });
+        });
   }
+  thread_pool_t(const thread_pool_t &) = delete;
+  thread_pool_t(thread_pool_t &&) = delete;
+  thread_pool_t &operator=(const thread_pool_t &) = delete;
+  thread_pool_t &operator=(thread_pool_t &&) = delete;
   ~thread_pool_t()
   {
     {
@@ -99,6 +105,6 @@ private:
 
   std::mutex queue_mutex;
   std::condition_variable condition;
-  std::atomic<bool> stop;
+  std::atomic<bool> stop{false};
 };
 } // namespace vio

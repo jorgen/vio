@@ -3,8 +3,6 @@
 
 #pragma once
 
-namespace vio {
-  namespace operation {
-    // Generated operations...
-  }
+namespace vio::operation {
+// Generated operations...
 }

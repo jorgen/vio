@@ -38,17 +38,17 @@
 #include <windows.h>
 #endif
 
-CMRC_DECLARE(vio);
+CMRC_DECLARE(vio); // NOLINT(modernize-type-traits)
 namespace vio
 {
 static std::string get_fallback_ca_certificates()
 {
   auto file = cmrc::vio::get_filesystem().open("default_certs/cert.pem");
-  if (!file.size())
+  if (file.size() == 0)
   {
     return {};
   }
-  return std::string(file.begin(), file.size());
+  return {file.begin(), file.size()};
 }
 
 #ifdef _WIN32
@@ -143,7 +143,7 @@ std::string get_default_ca_certificates()
 
 std::string get_default_ca_certificates()
 {
-  static std::string cert = get_fallback_ca_certificates();
+  static const std::string cert = get_fallback_ca_certificates();
   return cert;
 }
 #endif

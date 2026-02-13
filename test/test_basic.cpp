@@ -14,8 +14,10 @@ TEST_CASE("Simple event_pipe")
                                      {
                                        void_called = true;
                                        counter--;
-                                       if (!counter)
+                                       if (counter == 0)
+                                       {
                                          event_loop.stop();
+                                       }
                                      });
 
   vio::event_pipe_t<int> event_pipe_int(event_loop,
@@ -24,8 +26,10 @@ TEST_CASE("Simple event_pipe")
                                       CHECK(i == 567);
                                       int_called = true;
                                       counter--;
-                                      if (!counter)
+                                      if (counter == 0)
+                                      {
                                         event_loop.stop();
+                                      }
                                     });
 
   event_pipe_void.post_event();
@@ -60,11 +64,13 @@ TEST_CASE("Test workers and thread pools")
     {
       thread_id = std::this_thread::get_id();
     }
-    void after_work(completion_t completion) override
+    void after_work(completion_t /*completion*/) override
     {
       counter--;
-      if (!counter)
+      if (counter == 0)
+      {
         loop.stop();
+      }
     }
     vio::event_loop_t &loop;
     int &counter;
@@ -79,9 +85,13 @@ TEST_CASE("Test workers and thread pools")
 
   int counter = 10;
   for (int i = 0; i < 10; ++i)
+  {
     workers.emplace_back(event_loop, counter);
+  }
   for (auto &worker : workers)
+  {
     worker.enqueue(event_loop, pool);
+  }
 
   event_loop.run();
 

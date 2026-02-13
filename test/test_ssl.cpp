@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
@@ -45,21 +46,21 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
       if (auto pos = header_str.find(header_end); pos != std::string::npos)
       {
         header_end_found = true;
-        size_t body_start = pos + header_end.length();
-        size_t leftover_size = header_buffer.size() - body_start;
+        const size_t body_start = pos + header_end.length();
+        const size_t leftover_size = header_buffer.size() - body_start;
         if (leftover_size > 0)
         {
-          body_buffer.insert(body_buffer.end(), header_buffer.begin() + body_start, header_buffer.end());
+          body_buffer.insert(body_buffer.end(), header_buffer.begin() + static_cast<std::ptrdiff_t>(body_start), header_buffer.end());
         }
         header_buffer.resize(pos + header_end.length());
       }
     }
     auto headers = std::string_view(header_buffer.data(), header_buffer.size());
     size_t content_length = 0;
-    std::string_view content_length_header = "content-length: ";
+    const std::string_view content_length_header = "content-length: ";
     std::string headers_lower;
     headers_lower.resize(headers.size());
-    std::transform(headers.begin(), headers.end(), headers_lower.begin(), ::tolower);
+    std::ranges::transform(headers, headers_lower.begin(), ::tolower);
 
     if (auto cl_pos = headers_lower.find(content_length_header); cl_pos != std::string::npos)
     {

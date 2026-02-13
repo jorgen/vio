@@ -39,7 +39,7 @@ namespace vio
 struct tls_server_client_tls_t
 {
   tls *stream_tls_ctx = nullptr;
-  void close()
+  void close() const
   {
     tls_close(stream_tls_ctx);
     tls_free(stream_tls_ctx);
@@ -58,7 +58,7 @@ struct tls_native_server_ctx_t
     return apply_ssl_config_to_tls_ctx(config, get_default_ca_certificates(), tls_ctx);
   }
 
-  std::expected<tls_server_client_tls_t, error_t> accept(int socket_fd)
+  [[nodiscard]] std::expected<tls_server_client_tls_t, error_t> accept(int socket_fd) const
   {
     tls *client = nullptr;
     if (auto result = tls_accept_socket(tls_ctx, &client, socket_fd); result < 0)
@@ -133,7 +133,7 @@ inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t 
       if (!listen.done)
       {
         listen.done = true;
-        listen.result = std::unexpected(error_t{-1, "Server destroyed while listening"});
+        listen.result = std::unexpected(error_t{.code = -1, .msg = "Server destroyed while listening"});
         if (listen.continuation)
         {
           auto cont = listen.continuation;
@@ -209,11 +209,11 @@ inline std::expected<tls_server_client_reader_t, error_t> ssl_server_client_crea
 {
   if (client.handle.ref_counted() == nullptr)
   {
-    return std::unexpected(error_t{1, "Can not create a reader for a closed client"});
+    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a closed client"});
   }
   if (client.handle->socket_stream.reader_active)
   {
-    return std::unexpected(error_t{1, "Can not create a reader for a client that already has a reader active"});
+    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a client that already has a reader active"});
   }
 
   return tls_server_client_reader_t{client.handle, &client.handle->socket_stream};

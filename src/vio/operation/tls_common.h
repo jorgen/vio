@@ -40,81 +40,87 @@ static std::expected<tls_config_ptr_t, error_t> create_tls_config(const ssl_conf
   tls_config_ptr_t tls_config(tls_config_new(), &tls_config_free);
   if (!tls_config)
   {
-    return std::unexpected(error_t{-1, "Failed to create TLS config"});
+    return std::unexpected(error_t{.code = -1, .msg = "Failed to create TLS config"});
   }
 
   if (config.ca_mem)
   {
     if (auto result = tls_config_set_ca_mem(tls_config.get(), config.ca_mem->data(), config.ca_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
   }
   else if (config.ca_file || config.ca_path)
   {
     if (auto result = tls_config_set_ca_file(tls_config.get(), config.ca_file ? config.ca_file->c_str() : nullptr); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
     if (auto result = tls_config_set_ca_path(tls_config.get(), config.ca_path ? config.ca_path->c_str() : nullptr); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
   }
   else
   {
     if (auto result = tls_config_set_ca_mem(tls_config.get(), (uint8_t *)default_ca_certificates.data(), default_ca_certificates.size()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
   }
 
   if (config.cert_mem && config.key_mem)
   {
     if (auto result = tls_config_set_cert_mem(tls_config.get(), config.cert_mem->data(), config.cert_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
     if (auto result = tls_config_set_key_mem(tls_config.get(), config.key_mem->data(), config.key_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
   }
   else if (config.cert_file && config.key_file)
   {
     if (auto result = tls_config_set_cert_file(tls_config.get(), config.cert_file->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
     if (auto result = tls_config_set_key_file(tls_config.get(), config.key_file->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
   }
 
   if (config.ocsp_staple_mem)
   {
     if (auto result = tls_config_set_ocsp_staple_mem(tls_config.get(), config.ocsp_staple_mem->data(), config.ocsp_staple_mem->size()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
   }
   else if (config.ocsp_staple_file)
   {
     if (auto result = tls_config_set_ocsp_staple_file(tls_config.get(), config.ocsp_staple_file->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
   }
 
   if (config.ciphers)
     if (auto result = tls_config_set_ciphers(tls_config.get(), config.ciphers->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
 
   if (config.alpn)
     if (auto result = tls_config_set_alpn(tls_config.get(), config.alpn->c_str()); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
 
   if (config.protocols)
     if (auto result = tls_config_set_protocols(tls_config.get(), *config.protocols); result < 0)
-      return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+      return std::unexpected(error_t{.code = result, .msg = tls_config_error(tls_config.get())});
 
-  if (config.dheparams)
-    // if (auto result = tls_config_set_dheparams(tls_config.get(), *config.dheparams); result < 0)
-    //   return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+  // if (config.dheparams)
+  //   if (auto result = tls_config_set_dheparams(tls_config.get(), *config.dheparams); result < 0)
+  //     return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
 
-    if (config.ecdhecurve)
-      // if (auto result = tls_config_set_ecdhecurve(tls_config.get(), *config.ecdhecurve); result < 0)
-      //   return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
+  // if (config.ecdhecurve)
+  //   if (auto result = tls_config_set_ecdhecurve(tls_config.get(), *config.ecdhecurve); result < 0)
+  //     return std::unexpected(error_t{result, tls_config_error(tls_config.get())});
 
-      if (config.verify_client)
-        tls_config_verify_client(tls_config.get());
+  if (config.verify_client)
+  {
+    tls_config_verify_client(tls_config.get());
+  }
 
   if (config.verify_depth)
+  {
     tls_config_set_verify_depth(tls_config.get(), *config.verify_depth);
+  }
 
   if (config.verify_optional)
+  {
     tls_config_verify(tls_config.get());
+  }
   return tls_config;
 }
 
@@ -128,7 +134,7 @@ inline error_t apply_ssl_config_to_tls_ctx(const ssl_config_t &config, const std
 
   if (auto result = tls_configure(tls_ctx, tls_config.value().get()); result < 0)
   {
-    return error_t{result, tls_error(tls_ctx)};
+    return error_t{.code = result, .msg = tls_error(tls_ctx)};
   }
   return {};
 }
@@ -158,7 +164,7 @@ struct tls_stream_t
     }
     if (r < 0)
     {
-      return std::unexpected(error_t{int(r), tls_error(tls_ctx)});
+      return std::unexpected(error_t{.code = int(r), .msg = tls_error(tls_ctx)});
     }
     return std::make_pair(stream_io_result_t::ok, uint32_t(r));
   }
@@ -178,7 +184,7 @@ struct tls_stream_t
     }
     if (written < 0)
     {
-      return std::unexpected(error_t{int(written), tls_error(tls_ctx)});
+      return std::unexpected(error_t{.code = int(written), .msg = tls_error(tls_ctx)});
     }
     return std::make_pair(stream_io_result_t::ok, uint32_t(written));
   }

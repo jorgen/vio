@@ -65,7 +65,7 @@ vio::task_t<void> test_tcp_client(vio::event_loop_t &event_loop, int server_port
   auto read_result = co_await reader.value();
   REQUIRE_EXPECTED(read_result);
   auto &read_data = read_result.value();
-  std::string_view sv(read_data->base, read_data->len);
+  const std::string_view sv(read_data->base, read_data->len);
   if (sv.find("Hello from server") != std::string_view::npos)
   {
     client_got_server_reply = true;
@@ -111,7 +111,7 @@ TEST_CASE("test basic tcp")
   event_loop.run_in_loop(
     [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply]() -> vio::task_t<void>
     {
-      auto ev = &event_loop;
+      auto *ev = &event_loop;
       auto server_tcp_pair = get_ephemeral_port(*ev);
       REQUIRE_EXPECTED(server_tcp_pair);
 

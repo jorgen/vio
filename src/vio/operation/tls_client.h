@@ -50,16 +50,16 @@ struct tls_client_connection_handler_t
   error_t initialize(const ssl_config_t &config)
   {
     stream_tls_ctx = tls_client();
-    if (!stream_tls_ctx)
+    if (stream_tls_ctx == nullptr)
     {
-      return error_t{-1, "Failed to create TLS client"};
+      return error_t{.code = -1, .msg = "Failed to create TLS client"};
     }
 
     cert_data = get_default_ca_certificates();
     return apply_ssl_config_to_tls_ctx(config, cert_data, stream_tls_ctx);
   }
 
-  error_t connect(int socket_fd, const std::string &host)
+  [[nodiscard]] error_t connect(int socket_fd, const std::string &host) const
   {
     auto tls_result = tls_connect_socket(stream_tls_ctx, socket_fd, host.c_str());
     if (tls_result != 0)
@@ -69,7 +69,7 @@ struct tls_client_connection_handler_t
     return {};
   }
 
-  void close()
+  void close() const
   {
     assert(stream_tls_ctx);
     tls_close(stream_tls_ctx);
@@ -140,7 +140,7 @@ struct ssl_client_state_t
         }
         else
         {
-          state->connect_result = std::unexpected(error_t{status, uv_strerror(status)});
+          state->connect_result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
           state->connecting = false;
           if (state->connect_continuation)
           {
@@ -188,7 +188,7 @@ struct ssl_client_state_t
       else
       {
         state->connecting = false;
-        state->connect_result = std::unexpected(error_t{connect_result, uv_strerror(connect_result)});
+        state->connect_result = std::unexpected(error_t{.code = connect_result, .msg = uv_strerror(connect_result)});
         if (state->connect_continuation)
         {
           state->connect_continuation.resume();
@@ -235,7 +235,7 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
 
   if (auto r = uv_tcp_init(event_loop.loop(), &ret.state->tcp_handle); r < 0)
   {
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   ret.state.register_handle(&ret.state->tcp_handle);
 
@@ -258,12 +258,12 @@ inline void impl_ssl_client_resolve_host(ssl_client_t &client)
 {
   if (client.state.ref_counted() == nullptr)
   {
-    ssl_client_state_t::on_resolve_done(client.state, std::unexpected(error_t{1, "Can not resolve host, client is closed"}));
+    ssl_client_state_t::on_resolve_done(client.state, std::unexpected(error_t{.code = 1, .msg = "Can not resolve host, client is closed"}));
   }
 
   if (client.state->host.empty())
   {
-    ssl_client_state_t::on_resolve_done(client.state, std::unexpected(error_t{1, "Can not resolve host, host is empty"}));
+    ssl_client_state_t::on_resolve_done(client.state, std::unexpected(error_t{.code = 1, .msg = "Can not resolve host, host is empty"}));
   }
 
   client.state.inc_ref_and_store_in_handle(client.state->getaddrinfo_req);
@@ -351,7 +351,7 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   }
   if (r < 0)
   {
-    client.state->connect_result = std::unexpected(error_t{r, uv_strerror(r)});
+    client.state->connect_result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     return {client.state};
   }
 
@@ -374,15 +374,15 @@ inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_
 {
   if (client.state.ref_counted() == nullptr)
   {
-    return std::unexpected(error_t{1, "Can not create a reader for a closed client"});
+    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a closed client"});
   }
   if (client.state->socket_stream.reader_active)
   {
-    return std::unexpected(error_t{1, "Can not create a reader for a client that already has a reader active"});
+    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a client that already has a reader active"});
   }
   if (!client.state->connected)
   {
-    return std::unexpected(error_t{1, "Can not create a reader for a client that is not connected"});
+    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a client that is not connected"});
   }
 
   return tls_client_reader_t{client.state, &client.state->socket_stream};

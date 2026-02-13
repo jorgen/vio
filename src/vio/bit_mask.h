@@ -32,19 +32,20 @@ class bit_mask_t
   using U = typename std::underlying_type<T>::type;
 
 public:
-  constexpr bit_mask_t()
-    : _flags()
-  {
-  }
+  constexpr bit_mask_t() = default;
   constexpr bit_mask_t(const bit_mask_t<T> &other) = default;
+  constexpr bit_mask_t(bit_mask_t<T> &&other) = default;
+  constexpr bit_mask_t<T> &operator=(const bit_mask_t<T> &other) = default;
+  constexpr bit_mask_t<T> &operator=(bit_mask_t<T> &&other) = default;
+  ~bit_mask_t() = default;
 
   template <typename... ARGS>
-  bit_mask_t(T flag, ARGS... args)
+  bit_mask_t(T flag, ARGS... args) // NOLINT(google-explicit-constructor)
     : bit_mask_t(args...)
   {
     _flags |= static_cast<U>(flag);
   }
-  constexpr bit_mask_t(T flag)
+  constexpr bit_mask_t(T flag) // NOLINT(google-explicit-constructor)
     : _flags(static_cast<U>(flag))
   {
   }
@@ -90,18 +91,18 @@ public:
     return *this;
   }
 
-  constexpr operator bool() const
+  explicit constexpr operator bool() const
   {
     return _flags;
   }
 
-  U value() const
+  [[nodiscard]] U value() const
   {
     return _flags;
   }
 
 private:
-  U _flags;
+  U _flags{};
   template <typename V>
   friend constexpr bit_mask_t<V> operator|(V a, bit_mask_t<V> &b);
   template <typename V>

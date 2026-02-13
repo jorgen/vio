@@ -51,7 +51,7 @@ inline std::expected<void, error_t> tcp_bind(tcp_server_t &server, const sockadd
   const auto r = uv_tcp_bind(server.tcp.get_tcp(), addr, flags);
   if (r < 0)
   {
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return {};
 }
@@ -63,19 +63,19 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog)
 
   auto on_connection = [](uv_stream_t *stream, int status)
   {
-    auto stateRef = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
+    auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
     if (status < 0)
     {
-      stateRef->listen.result = std::unexpected(error_t{status, uv_strerror(status)});
+      state_ref->listen.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
     }
     else
     {
     }
-    stateRef->listen.done = true;
-    if (stateRef->listen.continuation)
+    state_ref->listen.done = true;
+    if (state_ref->listen.continuation)
     {
-      auto continuation = stateRef->listen.continuation;
-      stateRef->listen.continuation = {};
+      auto continuation = state_ref->listen.continuation;
+      state_ref->listen.continuation = {};
       continuation.resume();
     }
   };
@@ -87,7 +87,7 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog)
   if (r < 0)
   {
     ret.handle->listen.done = true;
-    ret.handle->listen.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.handle->listen.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     ref_ptr_t<tcp_state_t>::from_raw(ret.handle->uv_handle.data);
   }
 
@@ -97,7 +97,7 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog)
 inline std::expected<tcp_t, error_t> tcp_accept(tcp_server_t &server)
 {
   if (!server.tcp.handle.ref_counted())
-    return std::unexpected(error_t{-1, "It's not possible to accept a connection on a closed socket"});
+    return std::unexpected(error_t{.code = -1, .msg = "It's not possible to accept a connection on a closed socket"});
 
   auto tcp_client = tcp_create(server.tcp.handle->event_loop);
   if (!tcp_client.has_value())
@@ -108,7 +108,7 @@ inline std::expected<tcp_t, error_t> tcp_accept(tcp_server_t &server)
 
   if (const int r = uv_accept(server.tcp.get_stream(), client.get_stream()); r < 0)
   {
-    return std::unexpected(error_t{r, uv_strerror(r)});
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   return std::move(client);
 }

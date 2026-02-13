@@ -31,9 +31,9 @@ struct unique_buf_t
   dealloc_cb_t dealloc_cb{};
   void *user_handle{};
   unique_buf_t() = default;
-  unique_buf_t(uv_buf_t b, dealloc_cb_t cb, void *handle)
-    : buf(b)
-    , dealloc_cb(cb)
+  unique_buf_t(uv_buf_t buffer, dealloc_cb_t dealloc, void *handle)
+    : buf(buffer)
+    , dealloc_cb(dealloc)
     , user_handle(handle)
   {
   }
@@ -53,7 +53,9 @@ struct unique_buf_t
     if (this != &other)
     {
       if (buf.base && dealloc_cb)
+      {
         dealloc_cb(user_handle, &buf);
+      }
       buf = other.buf;
       dealloc_cb = other.dealloc_cb;
       user_handle = other.user_handle;
@@ -66,7 +68,9 @@ struct unique_buf_t
   ~unique_buf_t()
   {
     if (buf.base && dealloc_cb)
+    {
       dealloc_cb(user_handle, &buf);
+    }
   }
 
   uv_buf_t *operator->()
@@ -75,7 +79,7 @@ struct unique_buf_t
   }
 };
 
-inline void default_alloc(void *, size_t suggested_size, uv_buf_t *buf)
+inline void default_alloc(void * /*user_ptr*/, size_t suggested_size, uv_buf_t *buf)
 {
   if (buf == nullptr)
   {
@@ -85,7 +89,7 @@ inline void default_alloc(void *, size_t suggested_size, uv_buf_t *buf)
   buf->len = suggested_size;
 }
 
-inline void default_dealloc(void *, uv_buf_t *data)
+inline void default_dealloc(void * /*user_ptr*/, uv_buf_t *data)
 {
   delete[] data->base;
   data->base = nullptr;
