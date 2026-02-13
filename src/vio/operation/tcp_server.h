@@ -63,7 +63,7 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog)
 
   auto on_connection = [](uv_stream_t *stream, int status)
   {
-    auto stateRef = wrapper_t<tcp_state_t>::from_raw(stream->data);
+    auto stateRef = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
     if (status < 0)
     {
       stateRef->listen.result = std::unexpected(error_t{status, uv_strerror(status)});
@@ -88,7 +88,7 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog)
   {
     ret.handle->listen.done = true;
     ret.handle->listen.result = std::unexpected(error_t{r, uv_strerror(r)});
-    wrapper_t<tcp_state_t>::from_raw(ret.handle->uv_handle.data);
+    ref_ptr_t<tcp_state_t>::from_raw(ret.handle->uv_handle.data);
   }
 
   return std::move(ret);

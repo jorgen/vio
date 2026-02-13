@@ -33,9 +33,9 @@ struct simple_async_data_t
   }
 };
 
-using owned_async_t = vio::wrapper_t<simple_async_data_t>;
+using owned_async_t = vio::ref_ptr_t<simple_async_data_t>;
 
-TEST_CASE("register_handle with wrapper_t")
+TEST_CASE("register_handle with ref_ptr_t")
 {
   SUBCASE("async handle initialization and callback")
   {
@@ -186,7 +186,7 @@ TEST_CASE("register_handle reference counting with event loop")
       }
     };
 
-    using owned_tracked_t = vio::wrapper_t<tracked_async_t>;
+    using owned_tracked_t = vio::ref_ptr_t<tracked_async_t>;
 
     {
       owned_tracked_t async(loop, &destruction_phase);
@@ -221,7 +221,7 @@ TEST_CASE("register_handle reference counting with event loop")
       }
     };
 
-    using owned_multi_t = vio::wrapper_t<multi_handle_t>;
+    using owned_multi_t = vio::ref_ptr_t<multi_handle_t>;
 
     std::vector<uv_handle_t *> close_order;
 
@@ -252,7 +252,7 @@ TEST_CASE("register_handle reference counting with event loop")
       }
     };
 
-    using owned_counted_t = vio::wrapper_t<counted_async_t>;
+    using owned_counted_t = vio::ref_ptr_t<counted_async_t>;
 
     static std::vector<int> close_order;
     close_order.clear();
@@ -297,7 +297,7 @@ TEST_CASE("on_destroy callback behavior")
       }
     };
 
-    using owned_simple_t = vio::wrapper_t<simple_handle_t>;
+    using owned_simple_t = vio::ref_ptr_t<simple_handle_t>;
 
     {
       owned_simple_t wrapper(loop);
@@ -325,7 +325,7 @@ TEST_CASE("on_destroy callback behavior")
       }
     };
 
-    using owned_simple_t = vio::wrapper_t<simple_handle_t>;
+    using owned_simple_t = vio::ref_ptr_t<simple_handle_t>;
 
     bool destroyed = false;
     owned_simple_t *wrapper_ptr = nullptr;

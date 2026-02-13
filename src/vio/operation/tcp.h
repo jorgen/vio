@@ -97,9 +97,9 @@ struct tcp_state_t
 template <typename State>
 struct tcp_future_t
 {
-  wrapper_t<tcp_state_t> handle;
+  ref_ptr_t<tcp_state_t> handle;
   State *state;
-  tcp_future_t(wrapper_t<tcp_state_t> handle, State &state)
+  tcp_future_t(ref_ptr_t<tcp_state_t> handle, State &state)
     : handle(std::move(handle))
     , state(&state)
   {
@@ -125,7 +125,7 @@ struct tcp_future_t
 
 struct tcp_t
 {
-  wrapper_t<tcp_state_t> handle;
+  ref_ptr_t<tcp_state_t> handle;
 
   uv_tcp_t *get_tcp()
   {
@@ -172,7 +172,7 @@ inline std::expected<sockaddr_in6, error_t> ip6_addr(const std::string &ip, int 
 
 inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
 {
-  tcp_t tcp{wrapper_t<tcp_state_t>(loop)};
+  tcp_t tcp{ref_ptr_t<tcp_state_t>(loop)};
   if (auto r = uv_tcp_init(loop.loop(), tcp.get_tcp()); r < 0)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
@@ -195,7 +195,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   ret.handle->connect.done = false;
   auto callback = [](uv_connect_t *req, int status)
   {
-    auto state_ref = wrapper_t<tcp_state_t>::from_raw(req->data);
+    auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
     if (status < 0)
     {
       state_ref->connect.result = std::unexpected(error_t{status, uv_strerror(status)});
@@ -218,7 +218,7 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   {
     ret.handle->connect.done = true;
     ret.handle->connect.result = std::unexpected(error_t{r, uv_strerror(r)});
-    wrapper_t<tcp_state_t>::from_raw(ret.handle->connect.req.data);
+    ref_ptr_t<tcp_state_t>::from_raw(ret.handle->connect.req.data);
   }
   return ret;
 }
@@ -243,7 +243,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
 
   auto callback = [](uv_write_t *req, int status)
   {
-    auto state_ref = wrapper_t<tcp_state_t>::from_raw(req->data);
+    auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
     if (status < 0)
     {
       state_ref->write.result = std::unexpected(error_t{status, uv_strerror(status)});
@@ -265,7 +265,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   {
     ret.handle->write.done = true;
     ret.handle->write.result = std::unexpected(error_t{r, uv_strerror(r)});
-    wrapper_t<tcp_state_t>::from_raw(ret.handle->write.req.data);
+    ref_ptr_t<tcp_state_t>::from_raw(ret.handle->write.req.data);
   }
 
   return ret;
@@ -299,7 +299,7 @@ public:
   {
     if (is_valid && handle->read.started)
     {
-      auto state = wrapper_t<tcp_state_t>::from_raw(handle->get_stream()->data);
+      auto state = ref_ptr_t<tcp_state_t>::from_raw(handle->get_stream()->data);
       uv_read_stop(handle->get_stream());
       state->read.started = false;
       state->read.active = false;
@@ -330,7 +330,7 @@ public:
 
   struct awaiter
   {
-    wrapper_t<tcp_state_t> state;
+    ref_ptr_t<tcp_state_t> state;
 
     bool await_ready() const
     {
@@ -357,7 +357,7 @@ public:
 
   struct ref_ptr_releaser
   {
-    ref_ptr_releaser(wrapper_t<tcp_state_t> &handle)
+    ref_ptr_releaser(ref_ptr_t<tcp_state_t> &handle)
       : handle(handle)
     {
     }
@@ -366,12 +366,12 @@ public:
     {
       handle.release_to_raw();
     }
-    wrapper_t<tcp_state_t> &handle;
+    ref_ptr_t<tcp_state_t> &handle;
   };
 
   static void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
   {
-    auto tcp_state = wrapper_t<tcp_state_t>::from_raw(stream->data);
+    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
     ref_ptr_releaser releaser(tcp_state);
 
     if (nread > 0)
@@ -400,7 +400,7 @@ public:
     }
   }
 
-  wrapper_t<tcp_state_t> handle;
+  ref_ptr_t<tcp_state_t> handle;
   friend std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp);
 
 private:
@@ -425,7 +425,7 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
 
   auto alloc_cb = [](uv_handle_t *handle, size_t size, uv_buf_t *buf)
   {
-    auto tcp_state = wrapper_t<tcp_state_t>::from_raw(handle->data);
+    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
     tcp_state->read.alloc_buffer_cb(tcp_state->read.alloc_cb_data, size, buf);
     tcp_state.release_to_raw();
   };
@@ -438,7 +438,7 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
   }
   else
   {
-    auto tcp_state = wrapper_t<tcp_state_t>::from_raw(tcp.get_stream()->data);
+    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(tcp.get_stream()->data);
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
 

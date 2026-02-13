@@ -107,18 +107,18 @@ struct ssl_server_client_state_t
 
 struct ssl_server_t
 {
-  wrapper_t<tls_server_state_t> handle;
+  ref_ptr_t<tls_server_state_t> handle;
 };
 
 struct ssl_server_client_t
 {
-  wrapper_t<ssl_server_client_state_t> handle;
+  ref_ptr_t<ssl_server_client_state_t> handle;
 };
 
 inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t &event_loop, vio::tcp_server_t &&server, const std::string &host, const ssl_config_t &config = {}, alloc_cb_t alloc_cb = default_alloc,
                                                               dealloc_cb_t dealloc_cb = default_dealloc, void *user_alloc_ptr = nullptr)
 {
-  auto ret = ssl_server_t{wrapper_t<tls_server_state_t>(event_loop, std::move(server), host, alloc_cb, dealloc_cb, user_alloc_ptr)};
+  auto ret = ssl_server_t{ref_ptr_t<tls_server_state_t>(event_loop, std::move(server), host, alloc_cb, dealloc_cb, user_alloc_ptr)};
   if (auto error = ret.handle->tls_ctx.initialize(config); error.code != 0)
   {
     return std::unexpected(std::move(error));
@@ -144,7 +144,7 @@ inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t 
         auto *stream = tcp_handle->get_stream();
         if (stream->data)
         {
-          auto consumed = wrapper_t<tcp_state_t>::from_raw(stream->data);
+          auto consumed = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
           stream->data = nullptr;
         }
       }
@@ -187,7 +187,7 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
   }
 
   auto server_client = ssl_server_client_t{
-    wrapper_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
+    ref_ptr_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
   server_client.handle->socket_stream.connect(socket_fd);
 
   server_client.handle.on_destroy(
@@ -204,7 +204,7 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
   return std::move(server_client);
 }
 
-using tls_server_client_reader_t = stream_reader_t<wrapper_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
+using tls_server_client_reader_t = stream_reader_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
 inline std::expected<tls_server_client_reader_t, error_t> ssl_server_client_create_reader(ssl_server_client_t &client)
 {
   if (client.handle.ref_counted() == nullptr)
@@ -219,7 +219,7 @@ inline std::expected<tls_server_client_reader_t, error_t> ssl_server_client_crea
   return tls_server_client_reader_t{client.handle, &client.handle->socket_stream};
 }
 
-using tls_server_client_write_awaitable_t = stream_write_awaitable_t<wrapper_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
+using tls_server_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
 inline tls_server_client_write_awaitable_t ssl_server_client_write(ssl_server_client_t &client, uv_buf_t buffer)
 {
   assert(client.handle.ref_counted() != nullptr && "Can not write to a closed client");

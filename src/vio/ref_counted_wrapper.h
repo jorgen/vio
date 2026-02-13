@@ -17,6 +17,7 @@ struct reference_counted_t
   std::vector<std::function<void()>> destroy_callbacks;
   std::vector<uv_handle_t *> closable_handles;
   int close_pending{0};
+  bool in_destroy_sequence{false};
   std::function<void()> destroyer;
 
   explicit reference_counted_t(std::function<void()> &&destroyer)
@@ -33,6 +34,10 @@ struct reference_counted_t
   {
     if (ref_count.fetch_sub(1, std::memory_order_acquire) == 1)
     {
+      if (in_destroy_sequence)
+        return false;
+      in_destroy_sequence = true;
+
       std::vector<std::function<void()>> callbacks;
       std::swap(callbacks, destroy_callbacks);
       for (auto it = callbacks.rbegin(); it != callbacks.rend(); ++it)
@@ -41,6 +46,7 @@ struct reference_counted_t
       }
       if (ref_count.load(std::memory_order_relaxed) != 0)
       {
+        in_destroy_sequence = false;
         return false;
       }
       if (!closable_handles.empty())
@@ -94,7 +100,7 @@ private:
 };
 
 template <typename Data>
-class wrapper_t
+class ref_ptr_t
 {
 public:
   struct storage_t
@@ -121,26 +127,26 @@ private:
   storage_t *storage;
 
   // Private constructor for from_raw - does not allocate
-  explicit wrapper_t(storage_t *ptr)
+  explicit ref_ptr_t(storage_t *ptr)
     : storage(ptr)
   {
   }
 
 public:
-  wrapper_t()
+  ref_ptr_t()
     requires std::default_initializable<Data>
     : storage(new storage_t())
   {
   }
 
   template <typename... Args>
-    requires(sizeof...(Args) > 0) && (sizeof...(Args) != 1 || !(std::same_as<std::remove_cvref_t<Args>, wrapper_t> || ...))
-  explicit wrapper_t(Args &&...args)
+    requires(sizeof...(Args) > 0) && (sizeof...(Args) != 1 || !(std::same_as<std::remove_cvref_t<Args>, ref_ptr_t> || ...))
+  explicit ref_ptr_t(Args &&...args)
     : storage(new storage_t(std::forward<Args>(args)...))
   {
   }
 
-  wrapper_t(const wrapper_t &other)
+  ref_ptr_t(const ref_ptr_t &other)
     : storage(other.storage)
   {
     if (storage)
@@ -149,13 +155,13 @@ public:
     }
   }
 
-  wrapper_t(wrapper_t &&other) noexcept
+  ref_ptr_t(ref_ptr_t &&other) noexcept
     : storage(other.storage)
   {
     other.storage = nullptr;
   }
 
-  wrapper_t &operator=(const wrapper_t &other)
+  ref_ptr_t &operator=(const ref_ptr_t &other)
   {
     if (this != &other)
     {
@@ -173,7 +179,7 @@ public:
     return *this;
   }
 
-  wrapper_t &operator=(wrapper_t &&other) noexcept
+  ref_ptr_t &operator=(ref_ptr_t &&other) noexcept
   {
     if (this != &other)
     {
@@ -188,7 +194,7 @@ public:
     return *this;
   }
 
-  ~wrapper_t()
+  ~ref_ptr_t()
   {
     if (storage)
     {
@@ -212,14 +218,14 @@ public:
     return temp;
   }
 
-  static wrapper_t from_raw(void *raw_ptr)
+  static ref_ptr_t from_raw(void *raw_ptr)
   {
-    return wrapper_t(static_cast<storage_t *>(raw_ptr));
+    return ref_ptr_t(static_cast<storage_t *>(raw_ptr));
   }
 
-  static wrapper_t null()
+  static ref_ptr_t null()
   {
-    return wrapper_t(static_cast<storage_t *>(nullptr));
+    return ref_ptr_t(static_cast<storage_t *>(nullptr));
   }
 
   template <typename UV_HANDLE>
@@ -277,9 +283,9 @@ public:
 };
 
 template <typename Data, typename... Args>
-wrapper_t<Data> make_wrapper(Args &&...args)
+ref_ptr_t<Data> make_ref_ptr(Args &&...args)
 {
-  return wrapper_t<Data>(std::forward<Args>(args)...);
+  return ref_ptr_t<Data>(std::forward<Args>(args)...);
 }
 
 } // namespace vio
