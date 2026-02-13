@@ -50,7 +50,7 @@ struct test_data_t
   }
 };
 
-using test_owned_t = vio::owned_wrapper_t<test_data_t>;
+using test_owned_t = vio::wrapper_t<test_data_t>;
 
 TEST_CASE("reference_counted_t basic operations")
 {
@@ -175,7 +175,7 @@ TEST_CASE("reference_counted_t basic operations")
   }
 }
 
-TEST_CASE("owned_wrapper_t basic operations")
+TEST_CASE("wrapper_t basic operations")
 {
   destruction_tracker_t::reset();
 
@@ -212,7 +212,7 @@ TEST_CASE("owned_wrapper_t basic operations")
   }
 }
 
-TEST_CASE("owned_wrapper_t reference counting")
+TEST_CASE("wrapper_t reference counting")
 {
   destruction_tracker_t::reset();
 
@@ -290,7 +290,7 @@ TEST_CASE("owned_wrapper_t reference counting")
   }
 }
 
-TEST_CASE("owned_wrapper_t with callbacks")
+TEST_CASE("wrapper_t with callbacks")
 {
   SUBCASE("destroy callback is invoked on destruction")
   {
@@ -349,7 +349,7 @@ TEST_CASE("owned_wrapper_t with callbacks")
   }
 }
 
-TEST_CASE("owned_wrapper_t register_handle and on_destroy")
+TEST_CASE("wrapper_t register_handle and on_destroy")
 {
   SUBCASE("register_handle stores handle for closing")
   {
@@ -365,7 +365,7 @@ TEST_CASE("owned_wrapper_t register_handle and on_destroy")
       }
     };
 
-    using owned_handle_t = vio::owned_wrapper_t<handle_data_t>;
+    using owned_handle_t = vio::wrapper_t<handle_data_t>;
 
     bool destroyed = false;
     {

@@ -125,12 +125,12 @@ struct ssl_client_state_t
     return reinterpret_cast<uv_handle_t *>(&tcp_handle);
   }
 
-  static void connect_to_current_index(owned_wrapper_t<ssl_client_state_t> &state)
+  static void connect_to_current_index(wrapper_t<ssl_client_state_t> &state)
   {
     state.inc_ref_and_store_in_handle(state->connect_req);
     auto on_connect = [](uv_connect_t *req, int status)
     {
-      auto state = owned_wrapper_t<ssl_client_state_t>::from_raw(req->data);
+      auto state = wrapper_t<ssl_client_state_t>::from_raw(req->data);
       if (status < 0)
       {
         state->address_index++;
@@ -179,7 +179,7 @@ struct ssl_client_state_t
     auto connect_result = uv_tcp_connect(&state->connect_req, state->get_tcp(), state->addresses[state->address_index].get_sockaddr(), on_connect);
     if (connect_result < 0)
     {
-      owned_wrapper_t<ssl_client_state_t>::from_raw(state->connect_req.data);
+      wrapper_t<ssl_client_state_t>::from_raw(state->connect_req.data);
       state->address_index++;
       if (state->address_index < state->addresses.size())
       {
@@ -197,7 +197,7 @@ struct ssl_client_state_t
     }
   }
 
-  static void on_resolve_done(owned_wrapper_t<ssl_client_state_t> &state, std::expected<address_info_list_t, error_t> &&result)
+  static void on_resolve_done(wrapper_t<ssl_client_state_t> &state, std::expected<address_info_list_t, error_t> &&result)
   {
     state->resolved_done = true;
     if (!result.has_value())
@@ -219,7 +219,7 @@ struct ssl_client_state_t
 
 struct ssl_client_t
 {
-  owned_wrapper_t<ssl_client_state_t> state;
+  wrapper_t<ssl_client_state_t> state;
 };
 
 void set_poll_state(ssl_client_state_t &state);
@@ -227,7 +227,7 @@ void set_poll_state(ssl_client_state_t &state);
 inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config_t &config = {}, alloc_cb_t alloc_cb = default_alloc, dealloc_cb_t dealloc_cb = default_dealloc,
                                                               void *user_alloc_ptr = nullptr)
 {
-  ssl_client_t ret{owned_wrapper_t<ssl_client_state_t>{event_loop, alloc_cb, dealloc_cb, user_alloc_ptr}};
+  ssl_client_t ret{wrapper_t<ssl_client_state_t>{event_loop, alloc_cb, dealloc_cb, user_alloc_ptr}};
   if (auto error = ret.state->connection_handler.initialize(config); error.code != 0)
   {
     return std::unexpected(std::move(error));
@@ -269,7 +269,7 @@ inline void impl_ssl_client_resolve_host(ssl_client_t &client)
   client.state.inc_ref_and_store_in_handle(client.state->getaddrinfo_req);
   auto callback = [](uv_getaddrinfo_t *req, int status, addrinfo *res)
   {
-    auto state = owned_wrapper_t<ssl_client_state_t>::from_raw(req->data);
+    auto state = wrapper_t<ssl_client_state_t>::from_raw(req->data);
     std::expected<address_info_list_t, error_t> result;
     state->resolved_done = true;
     if (status < 0)
@@ -293,14 +293,14 @@ inline void impl_ssl_client_resolve_host(ssl_client_t &client)
   hints.ai_protocol = IPPROTO_TCP;
   if (const auto r = uv_getaddrinfo(client.state->event_loop.loop(), &client.state->getaddrinfo_req, callback, client.state->host.c_str(), client.state->port.c_str(), &hints); r < 0)
   {
-    owned_wrapper_t<ssl_client_state_t>::from_raw(client.state->getaddrinfo_req.data);
+    wrapper_t<ssl_client_state_t>::from_raw(client.state->getaddrinfo_req.data);
     ssl_client_state_t::on_resolve_done(client.state, std::unexpected(error_t{.code = r, .msg = uv_strerror(r)}));
   }
 }
 
 struct ssl_client_connecting_future_t
 {
-  owned_wrapper_t<ssl_client_state_t> state;
+  wrapper_t<ssl_client_state_t> state;
 
   bool await_ready() noexcept
   {
@@ -322,7 +322,7 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
 {
   if (client.state.ref_counted() == nullptr)
   {
-    return {owned_wrapper_t<ssl_client_state_t>::null()};
+    return {wrapper_t<ssl_client_state_t>::null()};
   }
   client.state->host = host;
   client.state->port = std::to_string(port);
@@ -336,7 +336,7 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
 {
   if (client.state.ref_counted() == nullptr)
   {
-    return {owned_wrapper_t<ssl_client_state_t>::null()};
+    return {wrapper_t<ssl_client_state_t>::null()};
   }
   client.state->host = host;
   client.state->port = std::to_string(port);
@@ -369,7 +369,7 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   return {client.state};
 }
 
-using tls_client_reader_t = stream_reader_t<owned_wrapper_t<ssl_client_state_t>, tls_client_socket_stream_t>;
+using tls_client_reader_t = stream_reader_t<wrapper_t<ssl_client_state_t>, tls_client_socket_stream_t>;
 inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_client_t &client)
 {
   if (client.state.ref_counted() == nullptr)
@@ -388,7 +388,7 @@ inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_
   return tls_client_reader_t{client.state, &client.state->socket_stream};
 }
 
-using tls_client_write_awaitable_t = stream_write_awaitable_t<owned_wrapper_t<ssl_client_state_t>, tls_client_socket_stream_t>;
+using tls_client_write_awaitable_t = stream_write_awaitable_t<wrapper_t<ssl_client_state_t>, tls_client_socket_stream_t>;
 inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
 {
   assert(client.state.ref_counted() != nullptr && "Can not write to a closed client");

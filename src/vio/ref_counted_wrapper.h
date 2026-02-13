@@ -1,8 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <concepts>
 #include <functional>
-#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -93,11 +93,8 @@ private:
   }
 };
 
-template <typename Data, bool IsOwned>
-class wrapper_t;
-
 template <typename Data>
-class wrapper_t<Data, true>
+class wrapper_t
 {
 public:
   struct storage_t
@@ -279,13 +276,10 @@ public:
   }
 };
 
-template <typename Data>
-using owned_wrapper_t = wrapper_t<Data, true>;
-
 template <typename Data, typename... Args>
-owned_wrapper_t<Data> make_owned_wrapper(Args &&...args)
+wrapper_t<Data> make_wrapper(Args &&...args)
 {
-  return owned_wrapper_t<Data>(std::forward<Args>(args)...);
+  return wrapper_t<Data>(std::forward<Args>(args)...);
 }
 
 } // namespace vio

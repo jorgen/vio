@@ -28,8 +28,8 @@ namespace vio
 template <typename STATE>
 struct future_t
 {
-  using future_ref_ptr_t = owned_wrapper_t<STATE>;
-  future_ref_ptr_t state_ptr = make_owned_wrapper<STATE>();
+  using future_ref_ptr_t = wrapper_t<STATE>;
+  future_ref_ptr_t state_ptr = make_wrapper<STATE>();
 
   auto &operator co_await() noexcept
   {
