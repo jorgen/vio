@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include "vio/event_loop.h"
 #include "vio/ref_counted_wrapper.h"
 
 namespace
@@ -21,7 +22,6 @@ struct test_data_t
   int value{0};
   bool *destroyed{nullptr};
 
-  // Constructors for owned_wrapper_t (no parent ref_counted)
   test_data_t()
   {
     destruction_tracker_t::construction_count++;
@@ -40,28 +40,6 @@ struct test_data_t
     destruction_tracker_t::construction_count++;
   }
 
-  // Constructors for inline_wrapper_t (with parent ref_counted)
-  test_data_t(vio::reference_counted_t *ref_counted)
-  {
-    (void)ref_counted;
-    destruction_tracker_t::construction_count++;
-  }
-
-  explicit test_data_t(vio::reference_counted_t *ref_counted, int v)
-    : value(v)
-  {
-    (void)ref_counted;
-    destruction_tracker_t::construction_count++;
-  }
-
-  explicit test_data_t(vio::reference_counted_t *ref_counted, int v, bool *d)
-    : value(v)
-    , destroyed(d)
-  {
-    (void)ref_counted;
-    destruction_tracker_t::construction_count++;
-  }
-
   ~test_data_t()
   {
     destruction_tracker_t::destruction_count++;
@@ -73,7 +51,6 @@ struct test_data_t
 };
 
 using test_owned_t = vio::owned_wrapper_t<test_data_t>;
-using test_inline_t = vio::inline_wrapper_t<test_data_t>;
 
 TEST_CASE("reference_counted_t basic operations")
 {
@@ -372,270 +349,49 @@ TEST_CASE("owned_wrapper_t with callbacks")
   }
 }
 
-TEST_CASE("inline_wrapper_t basic operations")
+TEST_CASE("owned_wrapper_t register_handle and on_destroy")
 {
-  destruction_tracker_t::reset();
-
-  SUBCASE("construction with parent ref count")
+  SUBCASE("register_handle stores handle for closing")
   {
-    struct container_t
-    {
-      vio::reference_counted_t ref_count;
-      test_inline_t wrapper;
+    vio::event_loop_t loop;
 
-      container_t()
-        : ref_count([this] { delete this; })
-        , wrapper(&ref_count)
+    struct handle_data_t
+    {
+      uv_async_t async = {};
+
+      explicit handle_data_t(vio::event_loop_t &loop)
       {
+        uv_async_init(loop.loop(), &async, nullptr);
       }
     };
 
-    container_t container;
-    CHECK(container.ref_count.ref_count == 1);
-    CHECK(container.wrapper->value == 0);
-  }
+    using owned_handle_t = vio::owned_wrapper_t<handle_data_t>;
 
-  SUBCASE("construction with parent and data arguments")
-  {
-    struct container_t
+    bool destroyed = false;
     {
-      vio::reference_counted_t ref_count;
-      test_inline_t wrapper;
-
-      container_t()
-        : ref_count([this] { delete this; })
-        , wrapper(&ref_count, 42)
-      {
-      }
-    };
-
-    container_t container;
-    CHECK(container.wrapper->value == 42);
-  }
-
-  SUBCASE("data access")
-  {
-    struct container_t
-    {
-      vio::reference_counted_t ref_count;
-      test_inline_t wrapper;
-
-      container_t()
-        : ref_count([this] { delete this; })
-        , wrapper(&ref_count, 100)
-      {
-      }
-    };
-
-    container_t container;
-    container.wrapper->value = 200;
-    CHECK(container.wrapper->value == 200);
-    CHECK(container.wrapper.data().value == 200);
-  }
-
-  SUBCASE("access to parent ref count")
-  {
-    struct container_t
-    {
-      vio::reference_counted_t ref_count;
-      test_inline_t wrapper;
-
-      container_t()
-        : ref_count([this] { delete this; })
-        , wrapper(&ref_count)
-      {
-      }
-    };
-
-    container_t container;
-    CHECK((void *)container.wrapper.ref_counted() == &container.ref_count);
-  }
-}
-
-TEST_CASE("inline_wrapper_t does not manage ref count")
-{
-  destruction_tracker_t::reset();
-
-  SUBCASE("wrapper destruction does not affect parent ref count")
-  {
-    struct container_t
-    {
-      vio::reference_counted_t ref_count;
-      test_inline_t wrapper;
-
-      container_t()
-        : ref_count([this] { delete this; })
-        , wrapper(&ref_count)
-      {
-      }
-    };
-
-    auto *container = new container_t();
-    CHECK(container->ref_count.ref_count == 1);
-
-    container->ref_count.inc();
-    CHECK(container->ref_count.ref_count == 2);
-
-    container->ref_count.dec();
-    CHECK(container->ref_count.ref_count == 1);
-
-    container->ref_count.dec();
-  }
-
-  SUBCASE("parent manages lifetime")
-  {
-    destruction_tracker_t::reset();
-
-    struct container_t
-    {
-      vio::reference_counted_t ref_count;
-      test_inline_t wrapper;
-
-      container_t()
-        : ref_count([this] { delete this; })
-        , wrapper(&ref_count, 42)
-      {
-      }
-    };
-
-    auto *container = new container_t();
-
-    container->ref_count.inc();
-    container->ref_count.inc();
-    CHECK(container->ref_count.ref_count == 3);
-
-    container->ref_count.dec();
-    container->ref_count.dec();
-    CHECK(container->ref_count.ref_count == 1);
-    CHECK(destruction_tracker_t::destruction_count == 0);
-
-    container->ref_count.dec();
-    CHECK(destruction_tracker_t::destruction_count == 1);
-  }
-}
-
-TEST_CASE("inline_wrapper_t with multiple wrappers")
-{
-  destruction_tracker_t::reset();
-
-  struct multi_container_t
-  {
-    vio::reference_counted_t ref_count;
-    test_inline_t wrapper1;
-    test_inline_t wrapper2;
-    test_inline_t wrapper3;
-
-    multi_container_t()
-      : ref_count([this] { delete this; })
-      , wrapper1(&ref_count, 1)
-      , wrapper2(&ref_count, 2)
-      , wrapper3(&ref_count, 3)
-    {
+      owned_handle_t wrapper(loop);
+      wrapper.register_handle(&wrapper->async);
+      wrapper.on_destroy([&destroyed]() { destroyed = true; });
     }
-  };
 
-  SUBCASE("multiple wrappers share parent ref count")
-  {
-    auto *container = new multi_container_t();
-
-    CHECK(container->wrapper1->value == 1);
-    CHECK(container->wrapper2->value == 2);
-    CHECK(container->wrapper3->value == 3);
-
-    CHECK(((void *)container->wrapper1.ref_counted()) == &container->ref_count);
-    CHECK(((void *)container->wrapper2.ref_counted()) == &container->ref_count);
-    CHECK(((void *)container->wrapper3.ref_counted()) == &container->ref_count);
-
-    CHECK(container->ref_count.ref_count == 1);
-
-    container->ref_count.dec();
+    CHECK(destroyed);
+    loop.run_in_loop([&loop] { loop.stop(); });
+    loop.run();
   }
 
-  SUBCASE("all wrappers destroyed with container")
+  SUBCASE("on_destroy is alias for register_destroy_callback")
   {
-    CHECK(destruction_tracker_t::construction_count == 0);
+    std::vector<int> order;
 
-    auto *container = new multi_container_t();
-    CHECK(destruction_tracker_t::construction_count == 3);
-
-    container->ref_count.dec();
-    CHECK(destruction_tracker_t::destruction_count == 3);
-  }
-}
-
-TEST_CASE("inline_wrapper_t with callbacks")
-{
-  SUBCASE("callbacks registered through wrapper")
-  {
-    struct container_t
     {
-      vio::reference_counted_t ref_count;
-      test_inline_t wrapper;
+      test_owned_t wrapper(42);
+      wrapper.on_destroy([&]() { order.push_back(1); });
+      wrapper.on_destroy([&]() { order.push_back(2); });
+    }
 
-      container_t()
-        : ref_count([this] { delete this; })
-        , wrapper(&ref_count, 42)
-      {
-      }
-    };
-
-    bool callback_called = false;
-    auto *container = new container_t();
-
-    container->wrapper.ref_counted()->register_destroy_callback([&]() { callback_called = true; });
-
-    container->ref_count.dec();
-    CHECK(callback_called);
-  }
-
-  SUBCASE("simulate libuv close with inline wrappers")
-  {
-    struct container_t
-    {
-      vio::reference_counted_t ref_count;
-      test_inline_t tcp;
-      test_inline_t async_handle;
-      bool tcp_closed{false};
-      bool async_closed{false};
-
-      container_t()
-        : ref_count([this] { delete this; })
-        , tcp(&ref_count, 1)
-        , async_handle(&ref_count, 2)
-      {
-
-        ref_count.register_destroy_callback(
-          [this]()
-          {
-            ref_count.inc();
-            ref_count.inc();
-
-            auto tcp_close = [this]()
-            {
-              tcp_closed = true;
-              ref_count.dec();
-            };
-
-            auto async_close = [this]()
-            {
-              async_closed = true;
-              ref_count.dec();
-            };
-
-            tcp_close();
-            async_close();
-          });
-      }
-    };
-
-    auto *container = new container_t();
-    CHECK_FALSE(container->tcp_closed);
-    CHECK_FALSE(container->async_closed);
-
-    container->ref_count.dec();
-
-    CHECK(container->tcp_closed);
-    CHECK(container->async_closed);
+    REQUIRE(order.size() == 2);
+    CHECK(order[0] == 2);
+    CHECK(order[1] == 1);
   }
 }
 
@@ -663,38 +419,6 @@ TEST_CASE("mixed usage scenario")
 
     test_owned_t copy = req.owned_tcp;
     CHECK(req.owned_tcp.ref_counted()->ref_count == 2);
-  }
-
-  SUBCASE("inline wrappers in heap-allocated container")
-  {
-    struct connection_t
-    {
-      vio::reference_counted_t ref_count;
-      test_inline_t tcp;
-      test_inline_t file;
-
-      connection_t()
-        : ref_count([this] { delete this; })
-        , tcp(&ref_count, 1)
-        , file(&ref_count, 2)
-      {
-      }
-    };
-
-    auto *conn1 = new connection_t();
-    auto *conn2 = new connection_t();
-
-    conn1->ref_count.inc();
-    conn2->ref_count.inc();
-
-    CHECK(conn1->tcp->value == 1);
-    CHECK(conn2->tcp->value == 1);
-
-    conn1->ref_count.dec();
-    conn1->ref_count.dec();
-
-    conn2->ref_count.dec();
-    conn2->ref_count.dec();
   }
 }
 } // namespace

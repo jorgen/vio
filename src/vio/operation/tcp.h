@@ -109,16 +109,12 @@ struct tcp_future_t
     return state->done;
   }
 
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (state->done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      state->continuation = continuation;
-    }
+      return false;
+    state->continuation = continuation;
+    return true;
   }
 
   auto await_resume() noexcept
@@ -181,29 +177,7 @@ inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
-  tcp.handle.ref_counted()->register_destroy_callback([handle_ptr = tcp.handle]() mutable
-  {
-    if (!handle_ptr.ref_counted())
-    {
-      return;
-    }
-    handle_ptr.ref_counted()->inc();
-    auto uv_handle = handle_ptr->get_handle();
-    uv_handle->data = handle_ptr.release_to_raw();
-    auto close_cb = [](uv_handle_t *handle)
-    {
-      if (handle->data)
-      {
-        auto state_ref = owned_wrapper_t<tcp_state_t>::from_raw(handle->data);
-        handle->data = nullptr;
-      }
-      else
-      {
-        handle->data = nullptr;
-      }
-    };
-    uv_close(uv_handle, close_cb);
-  });
+  tcp.handle.register_handle(tcp.get_tcp());
   return tcp;
 }
 

@@ -1,185 +1,45 @@
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
-#include <vio/handle_closer.h>
 #include <vio/ref_counted_wrapper.h>
 
 namespace
 {
 
-// Test structure using inline_wrapper_t with closable_handle_t
-struct connection_with_inline_t
+struct simple_async_data_t
 {
-  vio::reference_counted_t ref_count;
-  vio::inline_wrapper_t<vio::async_t> async_handle;
-  vio::inline_wrapper_t<vio::timer_t> timer_handle;
-  bool async_closed{false};
-  bool timer_closed{false};
-
-  explicit connection_with_inline_t(vio::event_loop_t &loop)
-    : ref_count(
-        [&loop, this]
-        {
-          loop.stop();
-          delete this;
-        })
-    , async_handle(&ref_count)
-    , timer_handle(&ref_count)
-  {
-    uv_async_init(loop.loop(), &async_handle.data(), nullptr);
-    async_handle->call_close = true;
-
-    uv_timer_init(loop.loop(), &timer_handle.data());
-    timer_handle->call_close = true;
-
-    ref_count.register_destroy_callback(
-      [this]()
-      {
-        if (async_handle->call_close)
-        {
-          async_closed = true;
-        }
-        if (timer_handle->call_close)
-        {
-          timer_closed = true;
-        }
-      });
-  }
-};
-
-// Test structure using owned_wrapper_t with closable_handle_t
-struct async_handle_data_t
-{
-  vio::reference_counted_t internal_ref_count; // For owned_wrapper_t use
-  vio::inline_wrapper_t<vio::closable_handle_t<uv_async_t>> handle;
   std::function<void()> callback;
+  uv_async_t async_handle = {};
   bool &closed;
   bool &destroyed;
 
-  // Helper to compute parent ref_count from this pointer when used with owned_wrapper_t
-  static vio::reference_counted_t *compute_parent_for_owned_wrapper(void *this_ptr)
-  {
-    using storage_t = vio::owned_wrapper_t<async_handle_data_t>::storage_t;
-    return reinterpret_cast<vio::reference_counted_t *>(reinterpret_cast<char *>(this_ptr) - offsetof(storage_t, data));
-  }
-
-  // Constructor for owned_wrapper_t - computes parent ref_count from storage
-  explicit async_handle_data_t(std::function<void()> &&callback, bool &closed, bool &destroyed, vio::event_loop_t &loop)
-    : internal_ref_count([]() {}) // Unused for owned_wrapper_t
-    , handle(compute_parent_for_owned_wrapper(this))
-    , callback(std::move(callback))
+  simple_async_data_t(std::function<void()> &&callback, bool &closed, bool &destroyed, vio::event_loop_t &loop)
+    : callback(std::move(callback))
     , closed(closed)
     , destroyed(destroyed)
   {
-    handle->data = this;
-    uv_async_init(loop.loop(), &handle.data(), on_async_callback);
-    handle->call_close = true;
-
-    compute_parent_for_owned_wrapper(this)->register_destroy_callback([this]() { this->closed = true; });
+    async_handle.data = this;
+    uv_async_init(loop.loop(), &async_handle, on_async_callback);
   }
 
-  // Constructor for inline_wrapper_t - parent passed explicitly
-  explicit async_handle_data_t(vio::reference_counted_t *parent, std::function<void()> &&callback, bool &closed, bool &destroyed, vio::event_loop_t &loop)
-    : internal_ref_count([]() {})
-    , handle(parent)
-    , callback(std::move(callback))
-    , closed(closed)
-    , destroyed(destroyed)
-  {
-    handle->data = this;
-    uv_async_init(loop.loop(), &handle.data(), on_async_callback);
-    handle->call_close = true;
-
-    parent->register_destroy_callback([this]() { this->closed = true; });
-  }
-
-public:
-  ~async_handle_data_t()
+  ~simple_async_data_t()
   {
     destroyed = true;
-    // No need to manually close - closable_handle_t handles that via destroy callbacks
   }
 
   static void on_async_callback(uv_async_t *async)
   {
-    auto *data = static_cast<async_handle_data_t *>(async->data);
+    auto *data = static_cast<simple_async_data_t *>(async->data);
     data->callback();
   }
 };
 
-using owned_async_t = vio::owned_wrapper_t<async_handle_data_t>;
+using owned_async_t = vio::owned_wrapper_t<simple_async_data_t>;
 
-TEST_CASE("closable_handle_t with inline_wrapper_t")
-{
-  SUBCASE("handles are properly initialized")
-  {
-    vio::event_loop_t loop;
-    auto *conn = new connection_with_inline_t(loop);
-
-    CHECK(conn->async_handle->call_close);
-    CHECK(conn->timer_handle->call_close);
-    CHECK_FALSE(conn->async_closed);
-    CHECK_FALSE(conn->timer_closed);
-
-    conn->ref_count.dec();
-    // Event loop needs explicit run() call since it maintains internal handles
-    // even when all user handles are closed
-    loop.run();
-  }
-
-  SUBCASE("handles close on destruction")
-  {
-    vio::event_loop_t loop;
-    bool callback_executed = false;
-
-    {
-      auto *conn = new connection_with_inline_t(loop);
-
-      loop.run_in_loop(
-        [&loop, &callback_executed]()
-        {
-          callback_executed = true;
-          loop.stop();
-        });
-
-      conn->ref_count.dec();
-    }
-
-    loop.run();
-    CHECK(callback_executed);
-  }
-
-  SUBCASE("multiple handles close in correct order")
-  {
-    vio::event_loop_t loop;
-    auto *conn = new connection_with_inline_t(loop);
-
-    std::vector<int> close_order;
-
-    conn->ref_count.register_destroy_callback([&close_order]() { close_order.push_back(1); });
-
-    bool loop_stopped = false;
-    loop.run_in_loop(
-      [&loop, &loop_stopped]()
-      {
-        loop_stopped = true;
-        loop.stop();
-      });
-
-    conn->ref_count.dec();
-    loop.run();
-
-    CHECK(loop_stopped);
-    CHECK(conn->async_closed);
-    CHECK(conn->timer_closed);
-  }
-}
-
-TEST_CASE("closable_handle_t with owned_wrapper_t")
+TEST_CASE("register_handle with owned_wrapper_t")
 {
   SUBCASE("async handle initialization and callback")
   {
     vio::event_loop_t loop;
-    bool loop_finished = false;
     int callback_count = 0;
     bool async_closed = false;
     bool async_destroyed = false;
@@ -188,6 +48,8 @@ TEST_CASE("closable_handle_t with owned_wrapper_t")
 
     auto callback = [&called_from_callback]() { called_from_callback(); };
     owned_async_t async_wrapper(std::move(callback), async_closed, async_destroyed, loop);
+    async_wrapper.register_handle(&async_wrapper->async_handle);
+    async_wrapper.on_destroy([&async_closed]() { async_closed = true; });
 
     called_from_callback = [&async_wrapper, &callback_count]()
     {
@@ -195,20 +57,17 @@ TEST_CASE("closable_handle_t with owned_wrapper_t")
       async_wrapper.release();
     };
 
-    CHECK(async_wrapper->handle->call_close);
     CHECK(callback_count == 0);
 
     loop.run_in_loop(
-      [&loop, &loop_finished, &async_wrapper, &async_closed, &async_destroyed]()
+      [&loop, &async_wrapper]()
       {
-        uv_async_send(&async_wrapper->handle.data());
-        loop_finished = true;
+        uv_async_send(&async_wrapper->async_handle);
         loop.stop();
       });
 
     loop.run();
 
-    CHECK(loop_finished);
     CHECK(callback_count > 0);
   }
 
@@ -218,6 +77,7 @@ TEST_CASE("closable_handle_t with owned_wrapper_t")
     bool async_closed = false;
     bool async_destroyed = false;
     owned_async_t async1([] {}, async_closed, async_destroyed, loop);
+    async1.register_handle(&async1->async_handle);
 
     CHECK(async1.ref_counted()->ref_count == 1);
 
@@ -247,7 +107,9 @@ TEST_CASE("closable_handle_t with owned_wrapper_t")
 
     {
       owned_async_t async1([] {}, async_closed, async_destroyed, loop);
-      async1.ref_counted()->register_destroy_callback([&destroyed]() { destroyed = true; });
+      async1.register_handle(&async1->async_handle);
+      async1.on_destroy([&destroyed]() { destroyed = true; });
+      async1.on_destroy([&async_closed]() { async_closed = true; });
 
       {
         owned_async_t async2 = async1;
@@ -260,25 +122,23 @@ TEST_CASE("closable_handle_t with owned_wrapper_t")
       CHECK_FALSE(destroyed);
     }
 
-    // Now the handle should be scheduled to close
     CHECK(destroyed);
     CHECK(async_closed);
     CHECK_FALSE(async_destroyed);
     loop.run_in_loop([&loop] { loop.stop(); });
     loop.run();
-    CHECK(async_closed);
     CHECK(async_destroyed);
   }
 
   SUBCASE("async send and receive multiple times")
   {
     vio::event_loop_t loop;
-    bool destroyed = false;
     bool async_closed = false;
     bool async_destroyed = false;
 
     int call_count = 0;
     owned_async_t async_wrapper([&call_count] { call_count++; }, async_closed, async_destroyed, loop);
+    async_wrapper.register_handle(&async_wrapper->async_handle);
 
     int send_count = 5;
     loop.run_in_loop(
@@ -286,7 +146,7 @@ TEST_CASE("closable_handle_t with owned_wrapper_t")
       {
         for (int i = 0; i < send_count; ++i)
         {
-          uv_async_send(&async_wrapper->handle.data());
+          uv_async_send(&async_wrapper->async_handle);
         }
         loop.run_in_loop(
           [&async_wrapper, &loop]
@@ -301,9 +161,8 @@ TEST_CASE("closable_handle_t with owned_wrapper_t")
     CHECK(call_count >= 1);
   }
 }
-// Note: Timer tests removed - async tests already cover closable_handle_t functionality
 
-TEST_CASE("closable_handle_t reference counting with event loop")
+TEST_CASE("register_handle reference counting with event loop")
 {
   SUBCASE("handle keeps object alive during close")
   {
@@ -312,39 +171,13 @@ TEST_CASE("closable_handle_t reference counting with event loop")
 
     struct tracked_async_t
     {
-      vio::reference_counted_t internal_ref_count;
-      vio::inline_wrapper_t<vio::closable_handle_t<uv_async_t>> handle;
+      uv_async_t handle = {};
       int *phase;
 
-      // Helper to compute parent ref_count from this pointer when used with owned_wrapper_t
-      static vio::reference_counted_t *compute_parent_for_owned_wrapper(void *this_ptr)
-      {
-        using storage_t = vio::owned_wrapper_t<tracked_async_t>::storage_t;
-        return reinterpret_cast<vio::reference_counted_t *>(reinterpret_cast<char *>(this_ptr) - offsetof(storage_t, data));
-      }
-
-      // Constructor for owned_wrapper_t
       explicit tracked_async_t(vio::event_loop_t &loop, int *p)
-        : internal_ref_count([]() {})
-        , handle(compute_parent_for_owned_wrapper(this))
-        , phase(p)
+        : phase(p)
       {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = true;
-
-        compute_parent_for_owned_wrapper(this)->register_destroy_callback([this, p]() { *p = 1; });
-      }
-
-      // Constructor for inline_wrapper_t
-      explicit tracked_async_t(vio::reference_counted_t *parent, vio::event_loop_t &loop, int *p)
-        : internal_ref_count([]() {})
-        , handle(parent)
-        , phase(p)
-      {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = true;
-
-        parent->register_destroy_callback([this, p]() { *p = 1; });
+        uv_async_init(loop.loop(), &handle, nullptr);
       }
 
       ~tracked_async_t()
@@ -357,218 +190,163 @@ TEST_CASE("closable_handle_t reference counting with event loop")
 
     {
       owned_tracked_t async(loop, &destruction_phase);
+      async.register_handle(&async->handle);
+      async.on_destroy([p = &destruction_phase]() { *p = 1; });
       CHECK(destruction_phase == 0);
     }
 
-    // Destruction callback should have run
     CHECK(destruction_phase == 1);
 
-    // Schedule a stop so the event loop exits after handles close
     loop.run_in_loop([&loop] { loop.stop(); });
     loop.run();
 
-    // After event loop, destructor should have completed
     CHECK(destruction_phase == 2);
   }
 
-  SUBCASE("multiple handles with different lifetimes")
+  SUBCASE("multiple handles close in LIFO order")
   {
     vio::event_loop_t loop;
 
-    static std::vector<int> close_order;
+    struct multi_handle_t
+    {
+      uv_async_t async1 = {};
+      uv_async_t async2 = {};
+      uv_async_t async3 = {};
+
+      explicit multi_handle_t(vio::event_loop_t &loop)
+      {
+        uv_async_init(loop.loop(), &async1, nullptr);
+        uv_async_init(loop.loop(), &async2, nullptr);
+        uv_async_init(loop.loop(), &async3, nullptr);
+      }
+    };
+
+    using owned_multi_t = vio::owned_wrapper_t<multi_handle_t>;
+
+    std::vector<uv_handle_t *> close_order;
+
+    {
+      owned_multi_t wrapper(loop);
+      wrapper.register_handle(&wrapper->async1);
+      wrapper.register_handle(&wrapper->async2);
+      wrapper.register_handle(&wrapper->async3);
+    }
+
+    loop.run_in_loop([&loop] { loop.stop(); });
+    loop.run();
+  }
+
+  SUBCASE("multiple independent wrappers with different lifetimes")
+  {
+    vio::event_loop_t loop;
+
     struct counted_async_t
     {
-      vio::reference_counted_t internal_ref_count;
-      vio::inline_wrapper_t<vio::closable_handle_t<uv_async_t>> handle;
+      uv_async_t handle = {};
       int id;
 
-      // Helper to compute parent ref_count from this pointer when used with owned_wrapper_t
-      static vio::reference_counted_t *compute_parent_for_owned_wrapper(void *this_ptr)
-      {
-        using storage_t = vio::owned_wrapper_t<counted_async_t>::storage_t;
-        return reinterpret_cast<vio::reference_counted_t *>(reinterpret_cast<char *>(this_ptr) - offsetof(storage_t, data));
-      }
-
-      // Constructor for owned_wrapper_t
       explicit counted_async_t(vio::event_loop_t &loop, int i)
-        : internal_ref_count([]() {})
-        , handle(compute_parent_for_owned_wrapper(this))
-        , id(i)
+        : id(i)
       {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = true;
-
-        compute_parent_for_owned_wrapper(this)->register_destroy_callback([this]() { close_order.push_back(id); });
-      }
-
-      // Constructor for inline_wrapper_t
-      explicit counted_async_t(vio::reference_counted_t *parent, vio::event_loop_t &loop, int i)
-        : internal_ref_count([]() {})
-        , handle(parent)
-        , id(i)
-      {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = true;
-
-        parent->register_destroy_callback([this]() { close_order.push_back(id); });
-      }
-
-      ~counted_async_t()
-      {
+        uv_async_init(loop.loop(), &handle, nullptr);
       }
     };
 
     using owned_counted_t = vio::owned_wrapper_t<counted_async_t>;
 
+    static std::vector<int> close_order;
     close_order.clear();
 
     {
       owned_counted_t async1(loop, 1);
+      async1.register_handle(&async1->handle);
+      async1.on_destroy([&]() { close_order.push_back(1); });
       {
         owned_counted_t async2(loop, 2);
+        async2.register_handle(&async2->handle);
+        async2.on_destroy([&]() { close_order.push_back(2); });
         owned_counted_t async3(loop, 3);
+        async3.register_handle(&async3->handle);
+        async3.on_destroy([&]() { close_order.push_back(3); });
       }
-      // async2 and async3 should start closing
     }
-    // async1 should start closing
     loop.run_in_loop([&loop] { loop.stop(); });
     loop.run();
 
-    // All three should have closed
     REQUIRE(close_order.size() == 3);
-    // Order might vary, but all should be present
     CHECK(std::find(close_order.begin(), close_order.end(), 1) != close_order.end());
     CHECK(std::find(close_order.begin(), close_order.end(), 2) != close_order.end());
     CHECK(std::find(close_order.begin(), close_order.end(), 3) != close_order.end());
   }
 }
 
-TEST_CASE("closable_handle_t call_close flag behavior")
+TEST_CASE("on_destroy callback behavior")
 {
-  SUBCASE("call_close=false prevents automatic closing")
+  SUBCASE("destroy callbacks run before handle closing")
   {
     vio::event_loop_t loop;
+    bool callback_called = false;
 
-    struct manual_close_async_t
+    struct simple_handle_t
     {
-      vio::reference_counted_t internal_ref_count;
-      vio::inline_wrapper_t<vio::closable_handle_t<uv_async_t>> handle;
-      bool manually_closed{false};
+      uv_async_t handle = {};
 
-      // Helper to compute parent ref_count from this pointer when used with owned_wrapper_t
-      static vio::reference_counted_t *compute_parent_for_owned_wrapper(void *this_ptr)
+      explicit simple_handle_t(vio::event_loop_t &loop)
       {
-        using storage_t = vio::owned_wrapper_t<manual_close_async_t>::storage_t;
-        return reinterpret_cast<vio::reference_counted_t *>(reinterpret_cast<char *>(this_ptr) - offsetof(storage_t, data));
-      }
-
-      // Constructor for owned_wrapper_t
-      explicit manual_close_async_t(vio::event_loop_t &loop)
-        : internal_ref_count([]() {})
-        , handle(compute_parent_for_owned_wrapper(this))
-      {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = false; // Don't automatically close
-
-        compute_parent_for_owned_wrapper(this)->register_destroy_callback(
-          [this]()
-          {
-            // Manually close
-            manually_closed = true;
-            compute_parent_for_owned_wrapper(this)->inc();
-            uv_close(handle->handle(), manual_close_cb);
-          });
-      }
-
-      // Constructor for inline_wrapper_t
-      explicit manual_close_async_t(vio::reference_counted_t *parent, vio::event_loop_t &loop)
-        : internal_ref_count([]() {})
-        , handle(parent)
-      {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = false; // Don't automatically close
-
-        parent->register_destroy_callback(
-          [this, parent]()
-          {
-            // Manually close
-            manually_closed = true;
-            parent->inc();
-            uv_close(handle->handle(), manual_close_cb);
-          });
-      }
-
-      ~manual_close_async_t()
-      {
-      }
-
-      static void manual_close_cb(uv_handle_t *h)
-      {
-        auto *closable = reinterpret_cast<vio::closable_handle_t<uv_async_t> *>(h);
-        closable->parent->dec();
+        uv_async_init(loop.loop(), &handle, nullptr);
       }
     };
 
-    using owned_manual_t = vio::owned_wrapper_t<manual_close_async_t>;
+    using owned_simple_t = vio::owned_wrapper_t<simple_handle_t>;
 
     {
-      owned_manual_t async(loop);
-      CHECK_FALSE(async->handle->call_close);
+      owned_simple_t wrapper(loop);
+      wrapper.register_handle(&wrapper->handle);
+      wrapper.on_destroy([&callback_called]() { callback_called = true; });
+      CHECK_FALSE(callback_called);
     }
 
+    CHECK(callback_called);
     loop.run_in_loop([&loop] { loop.stop(); });
     loop.run();
   }
 
-  SUBCASE("call_close can be toggled")
+  SUBCASE("destroy callback can increment refcount to postpone destruction")
   {
     vio::event_loop_t loop;
 
-    struct toggleable_async_t
+    struct simple_handle_t
     {
-      vio::reference_counted_t internal_ref_count;
-      vio::inline_wrapper_t<vio::closable_handle_t<uv_async_t>> handle;
+      uv_async_t handle = {};
 
-      // Helper to compute parent ref_count from this pointer when used with owned_wrapper_t
-      static vio::reference_counted_t *compute_parent_for_owned_wrapper(void *this_ptr)
+      explicit simple_handle_t(vio::event_loop_t &loop)
       {
-        using storage_t = vio::owned_wrapper_t<toggleable_async_t>::storage_t;
-        return reinterpret_cast<vio::reference_counted_t *>(reinterpret_cast<char *>(this_ptr) - offsetof(storage_t, data));
-      }
-
-      // Constructor for owned_wrapper_t
-      explicit toggleable_async_t(vio::event_loop_t &loop)
-        : internal_ref_count([]() {})
-        , handle(compute_parent_for_owned_wrapper(this))
-      {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = false;
-      }
-
-      // Constructor for inline_wrapper_t
-      explicit toggleable_async_t(vio::reference_counted_t *parent, vio::event_loop_t &loop)
-        : internal_ref_count([]() {})
-        , handle(parent)
-      {
-        uv_async_init(loop.loop(), &handle.data(), nullptr);
-        handle->call_close = false;
-      }
-
-      ~toggleable_async_t()
-      {
+        uv_async_init(loop.loop(), &handle, nullptr);
       }
     };
 
-    using owned_toggleable_t = vio::owned_wrapper_t<toggleable_async_t>;
+    using owned_simple_t = vio::owned_wrapper_t<simple_handle_t>;
+
+    bool destroyed = false;
+    owned_simple_t *wrapper_ptr = nullptr;
 
     {
-      owned_toggleable_t async(loop);
-      CHECK_FALSE(async->handle->call_close);
+      owned_simple_t wrapper(loop);
+      wrapper.register_handle(&wrapper->handle);
+      wrapper_ptr = &wrapper;
 
-      async->handle->call_close = true;
-      CHECK(async->handle->call_close);
+      wrapper.ref_counted()->register_destroy_callback(
+        [&]()
+        {
+          wrapper_ptr->ref_counted()->inc();
+          auto close_callback = [wrapper_ptr]() { wrapper_ptr->ref_counted()->dec(); };
+          close_callback();
+        });
+
+      wrapper.on_destroy([&destroyed]() { destroyed = true; });
     }
 
+    CHECK(destroyed);
     loop.run_in_loop([&loop] { loop.stop(); });
     loop.run();
   }

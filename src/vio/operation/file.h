@@ -143,16 +143,12 @@ struct file_io_state_t
     return done;
   }
 
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      this->continuation = continuation;
-    }
+      return false;
+    this->continuation = continuation;
+    return true;
   }
 
   auto await_resume() noexcept
@@ -190,13 +186,13 @@ inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &fi
   };
 
   auto copy = ret.state_ptr;
-  ret.state.req.data = copy.release_to_raw();
+  ret.state_ptr->req.data = copy.release_to_raw();
 
-  if (int r = uv_fs_write(event_loop.loop(), &ret.state.req, file.handle, &buf, 1, offset, callback); r < 0)
+  if (int r = uv_fs_write(event_loop.loop(), &ret.state_ptr->req, file.handle, &buf, 1, offset, callback); r < 0)
   {
-    future_ref_ptr_t::from_raw(ret.state.req.data);
+    future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
     ret.state_ptr->done = true;
-    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
   }
 
   return ret;
@@ -229,16 +225,16 @@ inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &fil
       stateRef->continuation.resume();
   };
 
-  auto copy = ret.state_ptr; // Copy the ref_ptr to keep a strong reference
-  ret.state.req.data = copy.release_to_raw();
+  auto copy = ret.state_ptr;
+  ret.state_ptr->req.data = copy.release_to_raw();
 
-  int r = uv_fs_read(event_loop.loop(), &ret.state.req, file.handle, &buf, 1, offset, callback);
+  int r = uv_fs_read(event_loop.loop(), &ret.state_ptr->req, file.handle, &buf, 1, offset, callback);
 
   if (r < 0)
   {
-    auto stateRef = future_ref_ptr_t::from_raw(ret.state.req.data);
+    auto stateRef = future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
     ret.state_ptr->done = true;
-    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
   }
 
   return ret;
@@ -347,14 +343,14 @@ inline future_t<file_io_state_t> send_file(event_loop_t &loop, file_t &outFile, 
   };
 
   auto copy = ret.state_ptr;
-  ret.state.req.data = copy.release_to_raw();
-  const int callResult = uv_fs_sendfile(loop.loop(), &ret.state.req, outFile.handle, inFile.handle, inOffset, length, callback);
+  ret.state_ptr->req.data = copy.release_to_raw();
+  const int callResult = uv_fs_sendfile(loop.loop(), &ret.state_ptr->req, outFile.handle, inFile.handle, inOffset, length, callback);
 
   if (callResult < 0)
   {
-    auto stateRef = future_ref_ptr_t::from_raw(ret.state.req.data);
+    auto stateRef = future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
     ret.state_ptr->done = true;
-    ret.state.result = std::unexpected(error_t{callResult, uv_strerror(callResult)});
+    ret.state_ptr->result = std::unexpected(error_t{callResult, uv_strerror(callResult)});
   }
 
   return ret;

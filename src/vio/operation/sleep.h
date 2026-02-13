@@ -47,16 +47,12 @@ struct sleep_state_t
     return done;
   }
 
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      this->continuation = continuation;
-    }
+      return false;
+    this->continuation = continuation;
+    return true;
   }
 
   auto await_resume() noexcept
@@ -70,9 +66,9 @@ inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::mill
   using ret_t = decltype(sleep(event_loop, milliseconds));
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
-  uv_timer_init(event_loop.loop(), &ret.state.timer);
+  uv_timer_init(event_loop.loop(), &ret.state_ptr->timer);
   auto copy = ret.state_ptr;
-  ret.state.timer.data = copy.release_to_raw();
+  ret.state_ptr->timer.data = copy.release_to_raw();
   auto callback = [](uv_timer_t *timer)
   {
     uv_timer_stop(timer);
@@ -84,14 +80,12 @@ inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::mill
     uv_close((uv_handle_t *)timer, close_callback);
     if (timer_state->continuation)
       timer_state->continuation.resume();
-    timer_state.release_to_raw();
   };
-  auto r = uv_timer_start(&ret.state.timer, callback, milliseconds.count(), 0);
+  auto r = uv_timer_start(&ret.state_ptr->timer, callback, milliseconds.count(), 0);
   if (r < 0)
   {
-    // Mark as done right away and set the error.
     ret.state_ptr->done = true;
-    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
   }
   return ret;
 }

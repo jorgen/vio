@@ -123,6 +123,33 @@ inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t 
   {
     return std::unexpected(std::move(error));
   }
+
+  ret.handle.on_destroy(
+    [state_raw = &ret.handle.data()]()
+    {
+      // Cancel any pending listen operation
+      auto &tcp_handle = state_raw->tcp.tcp.handle;
+      auto &listen = tcp_handle->listen;
+      if (!listen.done)
+      {
+        listen.done = true;
+        listen.result = std::unexpected(error_t{-1, "Server destroyed while listening"});
+        if (listen.continuation)
+        {
+          auto cont = listen.continuation;
+          listen.continuation = {};
+          cont.resume();
+        }
+        // Consume the raw ref stored by tcp_listen in stream->data
+        auto *stream = tcp_handle->get_stream();
+        if (stream->data)
+        {
+          auto consumed = owned_wrapper_t<tcp_state_t>::from_raw(stream->data);
+          stream->data = nullptr;
+        }
+      }
+    });
+
   return std::move(ret);
 }
 
@@ -163,18 +190,17 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
     owned_wrapper_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
   server_client.handle->socket_stream.connect(socket_fd);
 
-  server_client.handle.ref_counted()->register_destroy_callback([state_copy = server_client.handle]() mutable
-  {
-    if (!state_copy.ref_counted())
+  server_client.handle.on_destroy(
+    [state_raw = &server_client.handle.data(), rc = server_client.handle.ref_counted()]()
     {
-      return;
-    }
-
-    auto ptr = state_copy.release_to_raw();
-
-    // Note: socket_stream.close takes ownership of ptr through the lambda
-    state_copy->socket_stream.close(std::move([ptr] { auto state = owned_wrapper_t<ssl_server_client_state_t>::from_raw(ptr); }));
-  });
+      state_raw->connection_handler.close();
+      if (state_raw->socket_stream.connected)
+      {
+        state_raw->socket_stream.closed = true;
+        uv_poll_stop(&state_raw->socket_stream.poll_req);
+        rc->register_closable_handle(reinterpret_cast<uv_handle_t *>(&state_raw->socket_stream.poll_req));
+      }
+    });
   return std::move(server_client);
 }
 

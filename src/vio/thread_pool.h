@@ -21,8 +21,8 @@
 */
 
 #pragma once
-#pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -99,6 +99,6 @@ private:
 
   std::mutex queue_mutex;
   std::condition_variable condition;
-  bool stop;
+  std::atomic<bool> stop;
 };
-} // namespace points::converter
+} // namespace vio

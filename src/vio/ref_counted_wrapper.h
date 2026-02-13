@@ -6,6 +6,8 @@
 #include <type_traits>
 #include <vector>
 
+#include <uv.h>
+
 namespace vio
 {
 
@@ -13,6 +15,8 @@ struct reference_counted_t
 {
   std::atomic<std::size_t> ref_count{1};
   std::vector<std::function<void()>> destroy_callbacks;
+  std::vector<uv_handle_t *> closable_handles;
+  int close_pending{0};
   std::function<void()> destroyer;
 
   explicit reference_counted_t(std::function<void()> &&destroyer)
@@ -35,11 +39,28 @@ struct reference_counted_t
       {
         (*it)();
       }
-      if (ref_count.load(std::memory_order_relaxed) == 0)
+      if (ref_count.load(std::memory_order_relaxed) != 0)
       {
-        destroyer();
-        return true;
+        return false;
       }
+      if (!closable_handles.empty())
+      {
+        close_pending = static_cast<int>(closable_handles.size());
+        for (auto it = closable_handles.rbegin(); it != closable_handles.rend(); ++it)
+        {
+          auto *handle = *it;
+          handle->data = this;
+          uv_close(handle, on_handle_closed);
+        }
+        closable_handles.clear();
+        return false;
+      }
+      if (close_pending > 0)
+      {
+        return false;
+      }
+      destroyer();
+      return true;
     }
     return false;
   }
@@ -47,6 +68,28 @@ struct reference_counted_t
   void register_destroy_callback(std::function<void()> callback)
   {
     destroy_callbacks.push_back(std::move(callback));
+  }
+
+  void register_closable_handle(uv_handle_t *handle)
+  {
+    closable_handles.push_back(handle);
+  }
+
+  template <typename UV_HANDLE>
+  void register_closable_handle(UV_HANDLE *handle)
+  {
+    closable_handles.push_back(reinterpret_cast<uv_handle_t *>(handle));
+  }
+
+private:
+  static void on_handle_closed(uv_handle_t *handle)
+  {
+    auto *self = static_cast<reference_counted_t *>(handle->data);
+    handle->data = nullptr;
+    if (--self->close_pending == 0)
+    {
+      self->destroyer();
+    }
   }
 };
 
@@ -219,75 +262,22 @@ public:
     return storage ? &storage->ref_count : nullptr;
   }
 
+  template <typename UV_HANDLE>
+  void register_handle(UV_HANDLE *handle)
+  {
+    storage->ref_count.register_closable_handle(handle);
+  }
+
+  void on_destroy(std::function<void()> callback)
+  {
+    storage->ref_count.register_destroy_callback(std::move(callback));
+  }
+
   explicit operator bool() const noexcept
   {
     return storage != nullptr;
   }
 };
-
-template <typename Data>
-class wrapper_t<Data, false>
-{
-private:
-  reference_counted_t *parent_ref_count;
-  Data data_;
-
-public:
-  explicit wrapper_t(reference_counted_t *parent)
-    : parent_ref_count(parent)
-    , data_(parent)
-  {
-  }
-
-  template <typename... Args>
-  explicit wrapper_t(reference_counted_t *parent, Args &&...args)
-    : parent_ref_count(parent)
-    , data_(parent, std::forward<Args>(args)...)
-  {
-  }
-
-  wrapper_t(const wrapper_t &) = delete;
-  wrapper_t(wrapper_t &&) = delete;
-  wrapper_t &operator=(const wrapper_t &) = delete;
-  wrapper_t &operator=(wrapper_t &&) = delete;
-
-  ~wrapper_t() = default;
-
-  void release()
-  {
-    parent_ref_count = nullptr;
-  }
-
-  Data *operator->()
-  {
-    return &data_;
-  }
-  const Data *operator->() const
-  {
-    return &data_;
-  }
-
-  Data &data()
-  {
-    return data_;
-  }
-  const Data &data() const
-  {
-    return data_;
-  }
-
-  reference_counted_t *ref_counted()
-  {
-    return parent_ref_count;
-  }
-  const reference_counted_t *ref_counted() const
-  {
-    return parent_ref_count;
-  }
-};
-
-template <typename Data>
-using inline_wrapper_t = wrapper_t<Data, false>;
 
 template <typename Data>
 using owned_wrapper_t = wrapper_t<Data, true>;

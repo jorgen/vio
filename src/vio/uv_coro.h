@@ -30,11 +30,10 @@ struct future_t
 {
   using future_ref_ptr_t = owned_wrapper_t<STATE>;
   future_ref_ptr_t state_ptr = make_owned_wrapper<STATE>();
-  STATE &state = state_ptr.data();
 
   auto &operator co_await() noexcept
   {
-    return state;
+    return state_ptr.data();
   }
 };
 

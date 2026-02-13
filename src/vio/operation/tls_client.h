@@ -25,7 +25,6 @@ Copyright (c) 2025 Jørgen Lind
 #include "dns.h"
 #include "vio/elastic_index_storage.h"
 #include "vio/error.h"
-#include "vio/handle_closer.h"
 #include "vio/operation/tls_common.h"
 #include "vio/ref_counted_wrapper.h"
 #include "vio/socket_stream.h"
@@ -82,26 +81,12 @@ using tls_native_client_stream_t = tls_stream_t<tls_client_connection_handler_t>
 using tls_client_socket_stream_t = vio::socket_stream_t<tls_native_client_stream_t>;
 struct ssl_client_state_t
 {
-  reference_counted_t internal_ref_count;
-  inline_wrapper_t<closable_handle_t<uv_tcp_t>> tcp_handle;
-
-  static reference_counted_t *compute_parent_for_owned_wrapper(void *this_ptr)
-  {
-    using storage_t = owned_wrapper_t<ssl_client_state_t>::storage_t;
-    return reinterpret_cast<reference_counted_t *>(
-      reinterpret_cast<char *>(this_ptr) - offsetof(storage_t, data));
-  }
+  uv_tcp_t tcp_handle = {};
 
   ssl_client_state_t(event_loop_t &event_loop, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
-    : internal_ref_count([]() {})
-    , tcp_handle(compute_parent_for_owned_wrapper(this))
-    , event_loop(event_loop)
+    : event_loop(event_loop)
     , native_stream(connection_handler)
     , socket_stream(native_stream, event_loop, alloc_cb, dealloc_cb, user_alloc_ptr)
-  {
-  }
-
-  ~ssl_client_state_t()
   {
   }
 
@@ -127,17 +112,17 @@ struct ssl_client_state_t
 
   uv_tcp_t *get_tcp()
   {
-    return static_cast<uv_tcp_t *>(&tcp_handle.data());
+    return &tcp_handle;
   }
 
   uv_stream_t *get_tcp_stream()
   {
-    return reinterpret_cast<uv_stream_t *>(static_cast<uv_tcp_t *>(&tcp_handle.data()));
+    return reinterpret_cast<uv_stream_t *>(&tcp_handle);
   }
 
   uv_handle_t *get_tcp_handle()
   {
-    return reinterpret_cast<uv_handle_t *>(static_cast<uv_tcp_t *>(&tcp_handle.data()));
+    return reinterpret_cast<uv_handle_t *>(&tcp_handle);
   }
 
   static void connect_to_current_index(owned_wrapper_t<ssl_client_state_t> &state)
@@ -248,20 +233,22 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
     return std::unexpected(std::move(error));
   }
 
-  if (auto r = uv_tcp_init(event_loop.loop(), static_cast<uv_tcp_t *>(&ret.state->tcp_handle.data())); r < 0)
+  if (auto r = uv_tcp_init(event_loop.loop(), &ret.state->tcp_handle); r < 0)
   {
     return std::unexpected(error_t{r, uv_strerror(r)});
   }
-  ret.state->tcp_handle.data().call_close = true;
+  ret.state.register_handle(&ret.state->tcp_handle);
 
-  ret.state.ref_counted()->register_destroy_callback(
-    [state_copy = ret.state]() mutable
+  ret.state.on_destroy(
+    [state_raw = &ret.state.data(), rc = ret.state.ref_counted()]()
     {
-      if (!state_copy.ref_counted())
+      state_raw->connection_handler.close();
+      if (state_raw->socket_stream.connected)
       {
-        return;
+        state_raw->socket_stream.closed = true;
+        uv_poll_stop(&state_raw->socket_stream.poll_req);
+        rc->register_closable_handle(reinterpret_cast<uv_handle_t *>(&state_raw->socket_stream.poll_req));
       }
-      state_copy->socket_stream.close([]() {});
     });
 
   return ret;

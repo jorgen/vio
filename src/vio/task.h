@@ -38,6 +38,8 @@ public:
 
   inline ~task_t()
   {
+    if (_coro && _coro.done())
+      _coro.destroy();
   }
 
   struct promise_t
@@ -153,6 +155,8 @@ public:
 
   ~task_t()
   {
+    if (_coro && _coro.done())
+      _coro.destroy();
   }
 
   struct promise_t

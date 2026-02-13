@@ -119,16 +119,12 @@ struct get_addrinfo_state_t
     return done;
   }
 
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      this->continuation = continuation;
-    }
+      return false;
+    this->continuation = continuation;
+    return true;
   }
 
   auto await_resume() noexcept
@@ -142,9 +138,9 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   using ret_t = decltype(get_addrinfo(event_loop, host, hints));
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
-  ret.state.host = host;
+  ret.state_ptr->host = host;
   auto hints_converted = convert_to_addrinfo(hints);
-  auto req = &ret.state.req;
+  auto req = &ret.state_ptr->req;
   {
     auto copy = ret.state_ptr;
     req->data = copy.release_to_raw();
@@ -174,7 +170,7 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   {
     // Mark as done right away and set the error.
     ret.state_ptr->done = true;
-    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
   }
   return ret;
 }
@@ -196,16 +192,12 @@ struct getnameinfo_state_t
     return done;
   }
 
-  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
-    {
-      continuation.resume();
-    }
-    else
-    {
-      this->continuation = continuation;
-    }
+      return false;
+    this->continuation = continuation;
+    return true;
   }
 
   auto await_resume() noexcept
@@ -219,7 +211,7 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
   using ret_t = future_t<getnameinfo_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
-  auto req = &ret.state.req;
+  auto req = &ret.state_ptr->req;
   {
     auto copy = ret.state_ptr;
     req->data = copy.release_to_raw();
@@ -246,7 +238,7 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
   if (r < 0)
   {
     ret.state_ptr->done = true;
-    ret.state.result = std::unexpected(error_t{r, uv_strerror(r)});
+    ret.state_ptr->result = std::unexpected(error_t{r, uv_strerror(r)});
   }
   return ret;
 }
