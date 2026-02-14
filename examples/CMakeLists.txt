@@ -1,0 +1,12 @@
+function(add_vio_example name)
+    add_executable(${name} ${name}.cpp)
+    BuildExternalTargetLinkLibrary(${name} PRIVATE vio LibreSSL::Crypto LibreSSL::SSL LibreSSL::TLS)
+    target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endfunction()
+
+add_vio_example(tcp_echo)
+add_vio_example(https_get)
+add_vio_example(https_fetch)
+add_vio_example(udp_echo)
+add_vio_example(dns_resolve)
+add_vio_example(file_copy)
