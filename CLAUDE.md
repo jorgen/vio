@@ -15,17 +15,23 @@ cmake --build cmake-build-debug
 ./cmake-build-debug/test/vio_tests
 ```
 
-## AddressSanitizer Build
+## Sanitizer Builds
 
 ```bash
-# Configure with ASan
+# AddressSanitizer
 cmake --preset asan
-
-# Build
 cmake --build cmake-build-asan
-
-# Run tests under ASan
 ./cmake-build-asan/test/vio_tests
+
+# ThreadSanitizer
+cmake --preset tsan
+cmake --build cmake-build-tsan
+./cmake-build-tsan/test/vio_tests
+
+# UndefinedBehaviorSanitizer
+cmake --preset ubsan
+cmake --build cmake-build-ubsan
+./cmake-build-ubsan/test/vio_tests
 ```
 
 ## Clang-Tidy

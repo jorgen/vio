@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  sanitizers:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan
+            cxx_flags: -fsanitize=address -fno-omit-frame-pointer
+            linker_flags: -fsanitize=address
+          - name: tsan
+            cxx_flags: -fsanitize=thread -fno-omit-frame-pointer
+            linker_flags: -fsanitize=thread
+          - name: ubsan
+            cxx_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
+            linker_flags: -fsanitize=undefined
+
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Install CMake
+        run: pip install cmake
+
+      - name: Configure
+        run: |
+          cmake -G Ninja -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ./build/test/vio_tests
