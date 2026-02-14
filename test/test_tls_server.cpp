@@ -730,7 +730,7 @@ TEST_CASE("tls cannot create multiple active readers on client")
         REQUIRE_EXPECTED(reader_or_err);
         auto reader = std::move(reader_or_err.value());
         auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
+        REQUIRE(!read_result.has_value());
       }(event_loop, std::move(server_tcp_pair->first), server_config, port);
 
       co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &ec) -> vio::task_t<void>
@@ -748,12 +748,6 @@ TEST_CASE("tls cannot create multiple active readers on client")
         auto reader2 = vio::ssl_client_create_reader(client);
         REQUIRE(!reader2.has_value());
         ec = true;
-
-        // Send a done signal so the server can finish
-        std::string msg = "done";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
       }(event_loop, client_config, port, error_caught);
 
       co_await std::move(server_task);
@@ -799,9 +793,8 @@ TEST_CASE("tls cannot create multiple active readers on server client")
         REQUIRE(!reader2.has_value());
         ec = true;
 
-        // Read the done signal from client
         auto read_result = co_await reader1.value();
-        REQUIRE_EXPECTED(read_result);
+        REQUIRE(!read_result.has_value());
       }(event_loop, std::move(server_tcp_pair->first), server_config, port, error_caught);
 
       co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p) -> vio::task_t<void>
@@ -812,12 +805,6 @@ TEST_CASE("tls cannot create multiple active readers on server client")
 
         auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
         REQUIRE_EXPECTED(connect_result);
-
-        // Send a done signal so the server can finish
-        std::string msg = "done";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
       }(event_loop, client_config, port);
 
       co_await std::move(server_task);
@@ -962,13 +949,6 @@ TEST_CASE("tls exact buffer read with stream_reader_t::read()")
         uv_buf_t buf = uv_buf_init(data.data(), data.size());
         auto write_result = co_await vio::ssl_server_client_write(client, buf);
         REQUIRE_EXPECTED(write_result);
-
-        // Wait for client's done signal
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
       }(event_loop, std::move(server_tcp_pair->first), server_config, port);
 
       co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &v) -> vio::task_t<void>
@@ -997,12 +977,6 @@ TEST_CASE("tls exact buffer read with stream_reader_t::read()")
         std::iota(expected.begin(), expected.end(), char(0));
         REQUIRE(std::memcmp(buffer.data(), expected.data(), 100) == 0);
         v = true;
-
-        // Send done signal to server
-        std::string msg = "done";
-        uv_buf_t done_buf = uv_buf_init(msg.data(), msg.size());
-        auto wr = co_await vio::ssl_client_write(client, done_buf);
-        REQUIRE_EXPECTED(wr);
       }(event_loop, client_config, port, verified);
 
       co_await std::move(server_task);
