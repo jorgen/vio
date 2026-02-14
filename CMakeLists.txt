@@ -12,7 +12,7 @@ include(CMake/Fetch3rdParty.cmake)
 Fetch3rdParty()
 include(CMake/Build3rdParty.cmake)
 Build3rdParty()
-include(Cmake/BuildExternalTargetLinkLibrary.cmake)
+include(CMake/BuildExternalTargetLinkLibrary.cmake)
 
 
 add_subdirectory(src)
