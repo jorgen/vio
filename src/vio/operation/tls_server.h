@@ -194,7 +194,7 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
     [state_raw = &server_client.handle.data(), rc = server_client.handle.ref_counted()]()
     {
       state_raw->connection_handler.close();
-      if (state_raw->socket_stream.connected)
+      if (state_raw->socket_stream.connected && !uv_is_closing(reinterpret_cast<uv_handle_t *>(&state_raw->socket_stream.poll_req)))
       {
         state_raw->socket_stream.closed = true;
         uv_poll_stop(&state_raw->socket_stream.poll_req);

@@ -246,6 +246,9 @@ using tcp_write_future_t = tcp_future_t<tcp_write_state_t>;
 inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length)
 {
   tcp_write_future_t ret(tcp.handle, tcp.handle->write);
+  ret.handle->write.started = true;
+  ret.handle->write.done = false;
+  ret.handle->write.result = {};
 
   uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
 
@@ -387,7 +390,9 @@ public:
 
     if (nread > 0)
     {
-      tcp_state->read.buffer_queue.emplace_back(unique_buf_t(*buf, tcp_state->read.dealloc_buffer_cb, tcp_state->read.alloc_cb_data));
+      uv_buf_t sized_buf = *buf;
+      sized_buf.len = static_cast<decltype(sized_buf.len)>(nread);
+      tcp_state->read.buffer_queue.emplace_back(unique_buf_t(sized_buf, tcp_state->read.dealloc_buffer_cb, tcp_state->read.alloc_cb_data));
     }
     else
     {

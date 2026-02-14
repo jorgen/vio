@@ -266,6 +266,10 @@ void socket_stream_t<NATIVE_SOCKET_STREAM_T>::set_poll_state()
 template <typename NATIVE_SOCKET_STREAM_T>
 void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, int status, int events)
 {
+  if (uv_is_closing(reinterpret_cast<uv_handle_t *>(handle)))
+  {
+    return;
+  }
   auto state = static_cast<socket_stream_t<NATIVE_SOCKET_STREAM_T> *>(handle->data);
   assert(handle == &state->poll_req && "Invalid state in on_poll_event");
 
@@ -297,14 +301,26 @@ void socket_stream_t<NATIVE_SOCKET_STREAM_T>::on_poll_event(uv_poll_t *handle, i
       state->write();
     }
   }
+  if (state->closed)
+  {
+    return;
+  }
   if ((events & UV_READABLE) != 0)
   {
     if (state->write_got_poll_in)
     {
       state->write_got_poll_in = false;
       state->write();
+      if (state->closed)
+      {
+        return;
+      }
     }
     state->read();
+  }
+  if (state->closed)
+  {
+    return;
   }
   if ((events & (UV_WRITABLE | UV_READABLE)) == 0)
   {
@@ -399,7 +415,10 @@ bool socket_stream_t<NATIVE_SOCKET_STREAM_T>::read()
         current_buffer->dealloc_cb(user_alloc_ptr, &current_buffer->buf);
         buffer_queue.replace_back(std::unexpected(std::move(result_or_error.error())));
       }
-      uv_poll_stop(&poll_req);
+      if (!closed)
+      {
+        uv_poll_stop(&poll_req);
+      }
       poll_read_active = false;
       return false;
     }

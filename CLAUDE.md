@@ -48,3 +48,126 @@ Configuration is in `.clang-tidy` at the project root.
 - `src/vio/operation/` - Async operation implementations (tcp, tls, dns, file, sleep)
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc
+
+## Key Architecture
+
+### task_t coroutine lifecycle
+
+`task_t<T>` is an eager coroutine (`initial_suspend()` returns `suspend_never`). The coroutine
+frame starts executing immediately when the function is called. `final_suspend()` resumes the
+continuation (the caller that `co_await`ed). The destructor only destroys the frame if
+`_coro.done()` is true.
+
+`operator co_await() &&` copies the `_coro` handle into the `awaiter_t` but does **not** null
+`_coro` in the `task_t`. This means:
+
+- For temporary `task_t` (e.g. `co_await some_lambda(args)`) the temporary persists until after
+  `await_resume()`, then its destructor destroys the done frame.
+- For named `task_t`, the frame is destroyed when the named variable goes out of scope. After
+  `co_await std::move(named_task)` completes, the frame is done but still alive. It is destroyed
+  when `named_task` is destructed (or you can force it with `{ auto tmp = std::move(named_task); }`).
+
+### ref_ptr_t / reference_counted_t destruction sequence
+
+`ref_ptr_t<T>` is a ref-counted smart pointer. When the last reference is released (`dec()`):
+
+1. `on_destroy` callbacks fire (in reverse registration order)
+2. `uv_close` is called on all registered closable handles
+3. Storage is freed only after all close callbacks have fired (via `close_pending` counter)
+
+The `on_destroy` callbacks may register additional closable handles (e.g. the poll handle for
+socket_stream). The `in_destroy_sequence` flag prevents re-entrant destruction if callbacks
+temporarily increment/decrement the ref count.
+
+### socket_stream_t event processing
+
+`on_poll_event` processes events in order: WRITABLE, then READABLE, then `set_poll_state()`.
+A write completion can resume a coroutine chain that destroys the socket_stream owner, so
+defensive `closed` checks are required between each phase:
+
+```
+WRITABLE → check closed → READABLE → check closed → set_poll_state
+```
+
+Within READABLE, if `write_got_poll_in` is set, `write()` is called first (TLS needs read events
+to complete writes). Another `closed` check is needed after that `write()` call.
+
+### event_loop_t
+
+The event loop has always-active internal handles (async, prepare, event pipes).
+`event_loop.run()` (i.e. `uv_run(UV_RUN_DEFAULT)`) will never return on its own — `stop()` must
+be called, which sends an async signal that closes all internal handles. Tests that don't use
+coroutines still need `event_loop.stop()` before `event_loop.run()` for cleanup.
+
+## Writing Tests
+
+### Coroutine test pattern
+
+Tests use `event_loop.run_in_loop()` with a lambda returning `task_t<void>`. Server and client
+tasks run as concurrent coroutines within the same event loop. The pattern is:
+
+```cpp
+event_loop.run_in_loop([&]() -> vio::task_t<void> {
+    auto server_task = [](args...) -> vio::task_t<void> { ... }(captured_args);
+    co_await [](args...) -> vio::task_t<void> { ... }(captured_args); // client
+    co_await std::move(server_task);
+    ev->stop();
+});
+event_loop.run();
+```
+
+### Avoiding dangling-this UB in lambda coroutines
+
+**Critical**: Lambda coroutines that capture by reference (`[&]`) and return `task_t<void>` have a
+dangling `this` pointer bug. The lambda closure object is a temporary — it is destroyed after the
+coroutine is created (since `task_t` is eager). But the coroutine frame holds a `this` pointer to
+the closure for accessing captures. Any `co_await` that suspends and resumes later will access
+freed memory.
+
+**Safe pattern**: Use immediately-invoked lambda coroutines that take all needed state as
+**parameters** (not captures):
+
+```cpp
+// SAFE: parameters are copied into the coroutine frame
+auto task = [](vio::event_loop_t &el, int port) -> vio::task_t<void> {
+    co_await something(el, port);
+}(event_loop, port);  // args passed by value/ref — stored in frame
+```
+
+```cpp
+// UNSAFE: captures become dangling after first suspend
+auto task = [&]() -> vio::task_t<void> {
+    co_await something(event_loop, port);  // UB: 'this' is dangling
+}();
+```
+
+The `[&]` capture in `run_in_loop` is safe because that lambda is not a coroutine itself when it
+simply creates and co_awaits sub-tasks that follow the parameter pattern.
+
+### Disconnect detection does not work
+
+Tests must **not** rely on one side detecting the other's disconnection. The poll-based TLS
+socket_stream does not reliably detect TCP disconnection (the server's poll handle does not fire
+when the client's TCP handle is closed). Instead, have the finishing side send an explicit "done"
+message that the other side reads. Two disconnect tests are skipped (`doctest::skip(true)`) as
+they expose this limitation.
+
+### socket_stream.h defensive guards
+
+Several guards were added to `socket_stream_t` to prevent crashes when a write completion
+destroys the stream during `on_poll_event` processing:
+
+- `uv_is_closing` check at top of `on_poll_event`
+- `if (state->closed) return;` between WRITABLE and READABLE processing
+- `if (state->closed) return;` after `write()` call within READABLE branch
+- `if (!closed)` guard before `uv_poll_stop` in `read()` error path
+- `if (state->closed) return;` after READABLE branch before `set_poll_state`
+
+### on_destroy uv_is_closing guards
+
+Both `tls_client.h` and `tls_server.h` have `uv_is_closing` guards in their `on_destroy`
+callbacks to prevent calling `uv_poll_stop` on an already-closing handle:
+
+```cpp
+if (state_raw->socket_stream.connected && !uv_is_closing(...poll_req...))
+```
