@@ -7,6 +7,8 @@
 
 namespace
 {
+TEST_SUITE("Event Pipe")
+{
 TEST_CASE("Test basic event pipe")
 {
   vio::event_loop_t primary_event_loop;
@@ -40,4 +42,5 @@ TEST_CASE("Test basic event pipe")
 TEST_CASE("Test awaitable event pipe")
 {
 }
+} // TEST_SUITE
 } // namespace

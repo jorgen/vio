@@ -53,6 +53,8 @@ struct test_data_t
 
 using test_owned_t = vio::ref_ptr_t<test_data_t>;
 
+TEST_SUITE("ref_ptr_t")
+{
 TEST_CASE("reference_counted_t basic operations")
 {
   SUBCASE("initial ref count is 1")
@@ -423,4 +425,5 @@ TEST_CASE("mixed usage scenario")
     CHECK(req.owned_tcp.ref_counted()->ref_count == 2);
   }
 }
+} // TEST_SUITE
 } // namespace

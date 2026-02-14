@@ -97,6 +97,8 @@ auto dns_lookup_google(vio::event_loop_t &event_loop, bool &test_completed) -> v
   event_loop.stop();
 }
 // Add this at the start of your test cases to enable verbose output
+TEST_SUITE("DNS")
+{
 TEST_CASE("DNS address info lookup")
 {
   doctest::Context context;
@@ -149,5 +151,6 @@ TEST_CASE("DNS address info lookup")
     REQUIRE(test_completed);
   }
 }
+} // TEST_SUITE
 
 } // namespace

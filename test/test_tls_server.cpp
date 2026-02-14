@@ -183,6 +183,8 @@ vio::task_t<void> test_tls_client(vio::event_loop_t &event_loop, int server_port
     client_got_server_reply = true;
   }
 }
+TEST_SUITE("TLS Server")
+{
 TEST_CASE("test basic tls server")
 {
   vio::event_loop_t event_loop;
@@ -1092,5 +1094,6 @@ TEST_CASE("tls bidirectional concurrent read and write")
   REQUIRE(server_verified);
   REQUIRE(client_verified);
 }
+} // TEST_SUITE
 
 } // namespace

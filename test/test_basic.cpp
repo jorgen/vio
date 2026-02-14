@@ -2,6 +2,8 @@
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
 
+TEST_SUITE("Event Loop")
+{
 TEST_CASE("Simple event_pipe")
 {
   vio::event_loop_t event_loop;
@@ -102,3 +104,4 @@ TEST_CASE("Test workers and thread pools")
     CHECK(worker.thread_id != std::thread::id());
   }
 }
+} // TEST_SUITE

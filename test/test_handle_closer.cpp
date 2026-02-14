@@ -37,6 +37,8 @@ struct simple_async_data_t
 
 using owned_async_t = vio::ref_ptr_t<simple_async_data_t>;
 
+TEST_SUITE("Handle Closer")
+{
 TEST_CASE("register_handle with ref_ptr_t")
 {
   SUBCASE("async handle initialization and callback")
@@ -354,4 +356,5 @@ TEST_CASE("on_destroy callback behavior")
     loop.run();
   }
 }
+} // TEST_SUITE
 } // namespace

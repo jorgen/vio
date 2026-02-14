@@ -36,6 +36,8 @@ static vio::task_t<void> write_a_test_file(vio::event_loop_t &event_loop)
   event_loop.stop();
 }
 
+TEST_SUITE("File I/O")
+{
 TEST_CASE("test basic file")
 {
   vio::event_loop_t event_loop;
@@ -175,3 +177,4 @@ TEST_CASE("test extra file functions")
     event_loop.run();
   }
 }
+} // TEST_SUITE

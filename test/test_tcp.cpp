@@ -95,6 +95,8 @@ std::expected<std::pair<vio::tcp_server_t, int>, vio::error_t> get_ephemeral_por
   return std::make_pair(std::move(tmp_tcp.value()), static_cast<int>(ntohs(sa_in->sin_port)));
 }
 
+TEST_SUITE("TCP")
+{
 TEST_CASE("test basic tcp")
 {
   vio::event_loop_t event_loop;
@@ -976,5 +978,6 @@ TEST_CASE("tcp sockname returns correct address")
   event_loop.stop();
   event_loop.run();
 }
+} // TEST_SUITE
 
 } // namespace

@@ -34,6 +34,8 @@ std::expected<std::pair<vio::udp_t, int>, vio::error_t> get_udp_ephemeral_port(v
   return std::make_pair(std::move(udp_or_err.value()), static_cast<int>(ntohs(sa_in->sin_port)));
 }
 
+TEST_SUITE("UDP")
+{
 TEST_CASE("udp basic send and receive")
 {
   vio::event_loop_t event_loop;
@@ -366,5 +368,6 @@ TEST_CASE("udp sockname returns correct address")
   event_loop.stop();
   event_loop.run();
 }
+} // TEST_SUITE
 
 } // namespace

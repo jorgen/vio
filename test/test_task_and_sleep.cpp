@@ -58,6 +58,8 @@ static vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
   co_return 3;
 }
 
+TEST_SUITE("Task and Sleep")
+{
 TEST_CASE("test sleep and task basics")
 {
   vio::event_loop_t event_loop;
@@ -67,3 +69,4 @@ TEST_CASE("test sleep and task basics")
   auto end_time = std::chrono::high_resolution_clock::now();
   REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) > delay * 5);
 }
+} // TEST_SUITE
