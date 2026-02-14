@@ -105,8 +105,9 @@ struct ring_buffer_t
   T &replace_back(T &&value)
   {
     assert(!empty());
-    _buffer_queue[_buffer_back] = std::move(value);
-    return back();
+    auto back_idx = (_buffer_back - 1 + size) % size;
+    _buffer_queue[back_idx] = std::move(value);
+    return _buffer_queue[back_idx];
   }
 
 private:

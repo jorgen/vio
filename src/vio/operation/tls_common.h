@@ -162,6 +162,10 @@ struct tls_stream_t
     {
       return std::make_pair(stream_io_result_t::poll_out, uint32_t(0));
     }
+    if (r == 0)
+    {
+      return std::unexpected(error_t{.code = -1, .msg = "TLS connection closed"});
+    }
     if (r < 0)
     {
       return std::unexpected(error_t{.code = int(r), .msg = tls_error(tls_ctx)});

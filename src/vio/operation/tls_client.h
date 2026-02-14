@@ -59,7 +59,7 @@ struct tls_client_connection_handler_t
     return apply_ssl_config_to_tls_ctx(config, cert_data, stream_tls_ctx);
   }
 
-  [[nodiscard]] error_t connect(int socket_fd, const std::string &host) const
+  [[nodiscard]] error_t connect(const int socket_fd, const std::string &host)
   {
     auto tls_result = tls_connect_socket(stream_tls_ctx, socket_fd, host.c_str());
     if (tls_result != 0)

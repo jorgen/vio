@@ -15,6 +15,27 @@ cmake --build cmake-build-debug
 ./cmake-build-debug/test/vio_tests
 ```
 
+### Windows
+#### On Windows with MSVC (CLion/Claude Code)
+
+When building from the command line with MSVC toolchain:
+
+```bash
+# First, set up the Visual Studio environment
+"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+
+# Configure with Ninja generator
+cmake -B build -S . -G Ninja
+
+# Build
+cmake --build build
+
+# Run tests
+ctest --test-dir build
+# OR
+./build/test/vio_tests.exe
+
+```
 ## Sanitizer Builds
 
 ```bash
@@ -150,13 +171,16 @@ auto task = [&]() -> vio::task_t<void> {
 The `[&]` capture in `run_in_loop` is safe because that lambda is not a coroutine itself when it
 simply creates and co_awaits sub-tasks that follow the parameter pattern.
 
-### Disconnect detection does not work
+### TLS disconnect detection
 
-Tests must **not** rely on one side detecting the other's disconnection. The poll-based TLS
-socket_stream does not reliably detect TCP disconnection (the server's poll handle does not fire
-when the client's TCP handle is closed). Instead, have the finishing side send an explicit "done"
-message that the other side reads. Two disconnect tests are skipped (`doctest::skip(true)`) as
-they expose this limitation.
+TLS disconnect detection works via two mechanisms in `tls_stream_t::read()`:
+
+1. **Clean TLS shutdown (`tls_read` returns 0):** When the peer sends `close_notify`, `tls_read`
+   returns 0. This is mapped to an error (`"TLS connection closed"`).
+2. **Unclean TCP close (`tls_read` returns `TLS_WANT_POLLIN`):** When the peer closes TCP without
+   `close_notify`, `tls_read` returns `TLS_WANT_POLLIN`. A `recv(fd, buf, 1, MSG_PEEK)` check
+   distinguishes between "no data yet" (`recv` returns -1/EAGAIN) and "peer closed" (`recv`
+   returns 0). The latter maps to an error (`"Connection closed by peer"`).
 
 ### socket_stream.h defensive guards
 

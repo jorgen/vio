@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <ostream>
+
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>

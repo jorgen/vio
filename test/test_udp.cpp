@@ -1,3 +1,5 @@
+#include <ostream>
+
 #include <doctest/doctest.h>
 #include <string>
 #include <string_view>
@@ -76,7 +78,9 @@ TEST_CASE("udp basic send and receive")
 
       co_await std::move(receiver_task);
       *v = true;
-      { auto tmp = std::move(receiver_task); }
+      {
+        auto tmp = std::move(receiver_task);
+      }
       ev->stop();
     });
 
@@ -137,14 +141,16 @@ TEST_CASE("udp echo multiple datagrams")
           auto recv_result = co_await reader;
           REQUIRE_EXPECTED(recv_result);
           auto &datagram = recv_result.value();
-          std::string_view sv(datagram.data->base, datagram.data->len);
-          REQUIRE(sv == msg);
+          std::string str(datagram.data->base, datagram.data->len);
+          REQUIRE(str == msg);
         }
         v = true;
       }(event_loop, echo_port, num_datagrams, verified);
 
       co_await std::move(echo_task);
-      { auto tmp = std::move(echo_task); }
+      {
+        auto tmp = std::move(echo_task);
+      }
       ev->stop();
     });
 
@@ -197,7 +203,9 @@ TEST_CASE("udp connected mode")
       }(event_loop, port);
 
       co_await std::move(receiver_task);
-      { auto tmp = std::move(receiver_task); }
+      {
+        auto tmp = std::move(receiver_task);
+      }
       *v = true;
       ev->stop();
     });

@@ -415,6 +415,10 @@ bool socket_stream_t<NATIVE_SOCKET_STREAM_T>::read()
         current_buffer->dealloc_cb(user_alloc_ptr, &current_buffer->buf);
         buffer_queue.replace_back(std::unexpected(std::move(result_or_error.error())));
       }
+      else if (!buffer_queue.full())
+      {
+        buffer_queue.push(std::unexpected(std::move(result_or_error.error())));
+      }
       if (!closed)
       {
         uv_poll_stop(&poll_req);

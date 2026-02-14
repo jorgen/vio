@@ -1,3 +1,5 @@
+#include <ostream>
+
 #include <doctest/doctest.h>
 #include <numeric>
 #include <string>
@@ -434,7 +436,24 @@ TEST_CASE("tcp server disconnect causes client EOF")
       REQUIRE_EXPECTED(server_tcp_pair);
       int port = server_tcp_pair->second;
 
-      // Client as named task (waits for EOF from server)
+      // Server as named task: created first so uv_listen() is called before client connects
+      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+      {
+        auto server = std::move(s);
+        auto listen_result = co_await vio::tcp_listen(server, 10);
+        REQUIRE_EXPECTED(listen_result);
+        auto client_or_err = vio::tcp_accept(server);
+        REQUIRE_EXPECTED(client_or_err);
+
+        auto client = std::move(client_or_err.value());
+        auto reader_or_err = vio::tcp_create_reader(client);
+        REQUIRE_EXPECTED(reader_or_err);
+        auto reader = std::move(reader_or_err.value());
+        auto read_result = co_await reader;
+        REQUIRE_EXPECTED(read_result);
+      }(std::move(server_tcp_pair->first));
+
+      // Client as named task: server is already listening by now
       auto client_task = [](vio::event_loop_t &el, int p, bool &got_eof) -> vio::task_t<void>
       {
         auto client_or_err = vio::tcp_create(el);
@@ -458,22 +477,10 @@ TEST_CASE("tcp server disconnect causes client EOF")
         got_eof = true;
       }(event_loop, port, client_got_eof);
 
-      // Server as temporary: frame destroyed after co_await, closing accepted TCP -> client gets EOF
-      co_await [](vio::tcp_server_t s) -> vio::task_t<void>
-      {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-
-        auto client = std::move(client_or_err.value());
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-      }(std::move(server_tcp_pair->first));
+      // Wait for server to finish reading, then destroy its frame to close
+      // the accepted connection — this triggers EOF on the client side
+      co_await std::move(server_task);
+      { auto tmp = std::move(server_task); }
 
       co_await std::move(client_task);
       ev->stop();

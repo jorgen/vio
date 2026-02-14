@@ -1,3 +1,5 @@
+#include <ostream>
+
 #include <doctest/doctest.h>
 #include <numeric>
 #include <openssl/err.h>
@@ -226,30 +228,35 @@ TEST_CASE("test destroy server while listening")
   server_config.key_mem = certs.key;
   server_config.ca_mem = certs.ca_cert;
 
+  bool listen_cancelled = false;
+
   event_loop.run_in_loop(
-    [&event_loop, server_config]() -> vio::task_t<void>
+    [&]()
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
+      auto server_tcp_pair = get_ephemeral_port(event_loop);
       REQUIRE_EXPECTED(server_tcp_pair);
 
-      auto server_create_result = vio::ssl_server_create(*ev, std::move(server_tcp_pair->first), "localhost", server_config);
+      auto server_create_result = vio::ssl_server_create(event_loop, std::move(server_tcp_pair->first), "localhost", server_config);
       REQUIRE_EXPECTED(server_create_result);
 
-      auto server = std::move(server_create_result.value());
-      auto listen_future = vio::ssl_server_listen(server, server_tcp_pair->second);
-
       {
-        auto temp_server = std::move(server);
+        auto server = std::move(server_create_result.value());
+        auto listen_future = vio::ssl_server_listen(server, server_tcp_pair->second);
+
+        {
+          auto temp_server = std::move(server);
+        }
+
+        // listen.done is set synchronously by the on_destroy callback
+        listen_cancelled = listen_future.await_ready() && !listen_future.await_resume().has_value();
       }
+      // listen_future destroyed here — TCP handle uv_close is pending
 
-      auto listen_result = co_await listen_future;
-      REQUIRE(!listen_result.has_value());
-
-      ev->stop();
+      event_loop.stop();
     });
 
   event_loop.run();
+  REQUIRE(listen_cancelled);
 }
 
 TEST_CASE("tls echo multiple messages")
@@ -438,7 +445,7 @@ TEST_CASE("tls large data round trip")
   REQUIRE(data_verified);
 }
 
-TEST_CASE("tls client disconnect causes server read error" * doctest::skip(true))
+TEST_CASE("tls client disconnect causes server read error")
 {
   vio::event_loop_t event_loop;
   auto certs = generate_test_certs();
@@ -514,7 +521,7 @@ TEST_CASE("tls client disconnect causes server read error" * doctest::skip(true)
   REQUIRE(server_got_error);
 }
 
-TEST_CASE("tls server disconnect causes client read error" * doctest::skip(true))
+TEST_CASE("tls server disconnect causes client read error")
 {
   vio::event_loop_t event_loop;
   auto certs = generate_test_certs();
@@ -529,6 +536,29 @@ TEST_CASE("tls server disconnect causes client read error" * doctest::skip(true)
       auto server_tcp_pair = get_ephemeral_port(*ev);
       REQUIRE_EXPECTED(server_tcp_pair);
       int port = server_tcp_pair->second;
+
+      // Server as named task: starts first so it's listening before the client connects
+      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
+      {
+        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+        REQUIRE_EXPECTED(server_create_result);
+        auto server = std::move(server_create_result.value());
+
+        auto listen_result = co_await vio::ssl_server_listen(server, p);
+        REQUIRE_EXPECTED(listen_result);
+        auto client_or_err = vio::ssl_server_accept(server);
+        REQUIRE_EXPECTED(client_or_err);
+        auto client = std::move(client_or_err.value());
+
+        // Read one message then destroy
+        auto reader_or_err = vio::ssl_server_client_create_reader(client);
+        REQUIRE_EXPECTED(reader_or_err);
+        auto reader = std::move(reader_or_err.value());
+        auto read_result = co_await reader;
+        REQUIRE_EXPECTED(read_result);
+
+        // Server client destroyed here
+      }(event_loop, std::move(server_tcp_pair->first), server_config, port);
 
       // Client as named task (waits for server disconnect error)
       auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &cge) -> vio::task_t<void>
@@ -561,30 +591,19 @@ TEST_CASE("tls server disconnect causes client read error" * doctest::skip(true)
         }
       }(event_loop, client_config, port, client_got_error);
 
-      // Server as temporary: frame destroyed after co_await, closing TLS → client gets read error
-      co_await [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
+      co_await std::move(server_task);
+      // Explicitly destroy the server task to tear down the coroutine frame
+      // (and thus the server client inside it), closing the TLS connection.
       {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
-
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-
-        // Read one message then destroy
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-
-        // Server client destroyed here
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port);
+        auto destroy = std::move(server_task);
+      }
 
       co_await std::move(client_task);
+      // Explicitly destroy the client task to close TLS/TCP handles
+      // so the event loop can exit cleanly.
+      {
+        auto destroy = std::move(client_task);
+      }
       ev->stop();
     });
 
