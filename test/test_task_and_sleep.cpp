@@ -36,7 +36,7 @@ static vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
   co_await to_wait3;
   end_time = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-  auto expected_max_duration = delay * 2 + (delay / 2);
+  auto expected_max_duration = (delay * 2) + (delay / 2);
   REQUIRE(duration <= expected_max_duration);
 
   start_time = std::chrono::high_resolution_clock::now();

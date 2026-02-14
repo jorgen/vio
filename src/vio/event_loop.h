@@ -167,7 +167,7 @@ public:
       [done]
       {
         done->mark_done();
-        done->after_work(worker_t::completed);
+        done->after_work(worker_t::completion_t::completed);
       });
   }
 

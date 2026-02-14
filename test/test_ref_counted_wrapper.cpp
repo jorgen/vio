@@ -275,7 +275,7 @@ TEST_CASE("ref_ptr_t reference counting")
   SUBCASE("storage deleted when last reference is destroyed")
   {
     destruction_tracker_t::reset();
-    bool destroyed = false;
+    bool destroyed = false; // NOLINT(misc-const-correctness) modified via lambda capture
 
     {
       test_owned_t wrapper1(42, &destroyed);
@@ -415,7 +415,7 @@ TEST_CASE("mixed usage scenario")
       }
     };
 
-    request_t req(42);
+    const request_t req(42);
     CHECK(req.owned_tcp->value == 42);
     CHECK(req.owned_tcp.ref_counted()->ref_count == 1);
 

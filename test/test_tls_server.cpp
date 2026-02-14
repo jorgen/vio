@@ -193,13 +193,8 @@ TEST_CASE("test basic tls server")
   client_got_server_reply = false;
 
   auto certs = generate_test_certs();
-  vio::ssl_config_t server_config;
-  server_config.cert_mem = certs.cert;
-  server_config.key_mem = certs.key;
-  server_config.ca_mem = certs.ca_cert;
-
-  vio::ssl_config_t client_config;
-  client_config.ca_mem = certs.ca_cert;
+  const vio::ssl_config_t server_config{.ca_mem = certs.ca_cert, .cert_mem = certs.cert, .key_mem = certs.key};
+  const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   event_loop.run_in_loop(
     [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply, client_config, server_config]() -> vio::task_t<void>
     {

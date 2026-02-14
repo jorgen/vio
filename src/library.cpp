@@ -133,7 +133,7 @@ static std::string resolve_windows_ca_certificates()
   return cert;
 }
 
-std::string get_default_ca_certificates()
+std::string get_default_ca_certificates() // NOLINT(misc-use-internal-linkage) declared in tls_common.h
 {
   static const std::string cert = resolve_windows_ca_certificates();
   return cert;
@@ -141,7 +141,7 @@ std::string get_default_ca_certificates()
 
 #else
 
-std::string get_default_ca_certificates()
+std::string get_default_ca_certificates() // NOLINT(misc-use-internal-linkage) declared in tls_common.h
 {
   static const std::string cert = get_fallback_ca_certificates();
   return cert;

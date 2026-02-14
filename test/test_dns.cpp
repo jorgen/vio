@@ -108,7 +108,7 @@ TEST_CASE("DNS address info lookup")
   SUBCASE("lookup valid hostname")
   {
     bool test_completed = false;
-    INFO("Testing DNS resolution for localhost");
+    INFO("Testing DNS resolution for localhost"); // NOLINT(misc-const-correctness) doctest macro
 
     event_loop.run_in_loop([&event_loop, &test_completed]() -> void { dns_lookup_localhost(event_loop, test_completed); });
 
@@ -119,7 +119,7 @@ TEST_CASE("DNS address info lookup")
   SUBCASE("lookup invalid hostname")
   {
     bool test_completed = false;
-    INFO("Testing DNS resolution for invalid hostname");
+    INFO("Testing DNS resolution for invalid hostname"); // NOLINT(misc-const-correctness) doctest macro
 
     event_loop.run_in_loop([&event_loop, &test_completed]() -> void { dns_lookup_invalid(event_loop, test_completed); });
 
@@ -130,7 +130,7 @@ TEST_CASE("DNS address info lookup")
   SUBCASE("lookup with specific family (IPv4)")
   {
     bool test_completed = false;
-    INFO("Testing IPv4-specific DNS resolution");
+    INFO("Testing IPv4-specific DNS resolution"); // NOLINT(misc-const-correctness) doctest macro
 
     event_loop.run_in_loop([&event_loop, &test_completed]() -> void { dns_lookup_ipv4(event_loop, test_completed); });
 
@@ -141,7 +141,7 @@ TEST_CASE("DNS address info lookup")
   SUBCASE("lookup google")
   {
     bool test_completed = false;
-    INFO("Testing that we can lookup google");
+    INFO("Testing that we can lookup google"); // NOLINT(misc-const-correctness) doctest macro
 
     event_loop.run_in_loop([&event_loop, &test_completed]() -> void { dns_lookup_google(event_loop, test_completed); });
 

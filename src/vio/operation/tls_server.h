@@ -172,7 +172,7 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
   }
 
   auto client_tcp = std::move(tcp_accept_result.value());
-  uv_os_fd_t socket;
+  uv_os_fd_t socket{};
   if (uv_fileno(client_tcp.get_handle(), &socket) != 0)
   {
     return std::unexpected(error_t{.code = -1, .msg = "Failed to get socket file descriptor"});

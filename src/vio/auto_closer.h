@@ -93,7 +93,7 @@ public:
 private:
   T _value;
   Closer _closer;
-  bool _close;
+  bool _close = false;
 };
 
 } // namespace vio

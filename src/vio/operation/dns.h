@@ -37,20 +37,14 @@ namespace vio
 class address_info_t
 {
 public:
-  int flags;
-  int family;
-  int socktype;
-  int protocol;
+  int flags = 0;
+  int family = 0;
+  int socktype = 0;
+  int protocol = 0;
   std::string canonname;
   std::vector<uint8_t> addr;
 
-  address_info_t()
-    : flags(0)
-    , family(0)
-    , socktype(0)
-    , protocol(0)
-  {
-  }
+  address_info_t() = default;
 
   explicit address_info_t(const addrinfo &info)
     : flags(info.ai_flags)

@@ -8,7 +8,7 @@ TEST_CASE("Simple event_pipe")
 
   int counter = 2;
   bool void_called = false;
-  bool int_called = false;
+  bool int_called = false; // NOLINT(misc-const-correctness) modified via lambda capture
   vio::event_pipe_t<void> event_pipe_void(event_loop,
                                      [&void_called, &event_loop, &counter]()
                                      {
@@ -77,7 +77,7 @@ TEST_CASE("Test workers and thread pools")
     std::thread::id thread_id;
   };
 
-  vio::thread_pool_t pool(4);
+  vio::thread_pool_t pool(4); // NOLINT(misc-const-correctness) passed as non-const ref
   vio::event_loop_t event_loop;
 
   std::vector<my_worker_t> workers;

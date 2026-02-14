@@ -43,8 +43,8 @@ TEST_CASE("register_handle with ref_ptr_t")
   {
     vio::event_loop_t loop;
     int callback_count = 0;
-    bool async_closed = false;
-    bool async_destroyed = false;
+    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
+    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
 
     std::function<void()> called_from_callback;
 
@@ -76,8 +76,8 @@ TEST_CASE("register_handle with ref_ptr_t")
   SUBCASE("owned wrapper can be copied and shared")
   {
     vio::event_loop_t loop;
-    bool async_closed = false;
-    bool async_destroyed = false;
+    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
+    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
     owned_async_t async1([] {}, async_closed, async_destroyed, loop);
     async1.register_handle(&async1->async_handle);
 
@@ -103,9 +103,9 @@ TEST_CASE("register_handle with ref_ptr_t")
   SUBCASE("handle closes when last reference is dropped")
   {
     vio::event_loop_t loop;
-    bool destroyed = false;
-    bool async_closed = false;
-    bool async_destroyed = false;
+    bool destroyed = false; // NOLINT(misc-const-correctness) modified via callback
+    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
+    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
 
     {
       owned_async_t async1([] {}, async_closed, async_destroyed, loop);
@@ -135,10 +135,10 @@ TEST_CASE("register_handle with ref_ptr_t")
   SUBCASE("async send and receive multiple times")
   {
     vio::event_loop_t loop;
-    bool async_closed = false;
-    bool async_destroyed = false;
+    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
+    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
 
-    int call_count = 0;
+    int call_count = 0; // NOLINT(misc-const-correctness) modified via lambda capture
     owned_async_t async_wrapper([&call_count] { call_count++; }, async_closed, async_destroyed, loop);
     async_wrapper.register_handle(&async_wrapper->async_handle);
 

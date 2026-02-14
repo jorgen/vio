@@ -11,7 +11,7 @@ TEST_CASE("Test basic event pipe")
 {
   vio::event_loop_t primary_event_loop;
 
-  bool has_event_from_secondary_been_called = false;
+  bool has_event_from_secondary_been_called = false; // NOLINT(misc-const-correctness) modified via lambda capture
   vio::event_pipe_t<int> event_from_secondary(primary_event_loop,
                                               [&primary_event_loop, &has_event_from_secondary_been_called](int a)
                                               {
@@ -20,8 +20,8 @@ TEST_CASE("Test basic event pipe")
                                                 primary_event_loop.stop();
                                               });
 
-  vio::thread_with_event_loop_t secondary_event_loop;
-  bool has_event_from_main_thread_been_called = false;
+  vio::thread_with_event_loop_t secondary_event_loop; // NOLINT(misc-const-correctness) event_loop() is non-const
+  bool has_event_from_main_thread_been_called = false; // NOLINT(misc-const-correctness) modified via lambda capture
   vio::event_pipe_t<int> event_from_main_thread_been_called(secondary_event_loop.event_loop(),
                                                             [&has_event_from_main_thread_been_called, &event_from_secondary](int a)
                                                             {

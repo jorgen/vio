@@ -32,7 +32,7 @@ class event_loop_t;
 class worker_t
 {
 public:
-  enum completion_t : std::uint8_t
+  enum class completion_t : std::uint8_t
   {
     cancelled,
     completed

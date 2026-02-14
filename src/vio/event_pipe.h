@@ -35,7 +35,7 @@ struct event_bind_t
   template <typename Ret, typename Class, typename... Args>
   static std::function<void(Args &&...)> bind(Class &ref, Ret (Class::*f)(Args &&...))
   {
-    return [&ref, f](Args &&...args) { return ((*static_cast<Class *>(&ref)).*f)(std::move(args)...); };
+    return [&ref, f](Args &&...args) { return ((*static_cast<Class *>(&ref)).*f)(std::forward<Args>(args)...); };
   }
 };
 
@@ -79,7 +79,7 @@ public:
   void post_event(ARGS &&...args)
   {
     std::unique_lock<std::mutex> lock(_mutex);
-    _events.emplace_back(std::move(args)...);
+    _events.emplace_back(std::forward<ARGS>(args)...);
     uv_async_send(&_pipe);
   }
 
