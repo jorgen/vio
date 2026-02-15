@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "vio/cancellation.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/ref_counted_wrapper.h"
@@ -40,6 +41,7 @@ struct sleep_state_t
   uv_timer_t timer = {};
   std::expected<void, error_t> result = {};
   std::coroutine_handle<> continuation = {};
+  registration_t cancel_registration;
   bool done = false;
 
   [[nodiscard]] bool await_ready() const noexcept
@@ -63,11 +65,19 @@ struct sleep_state_t
   }
 };
 
-inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds)
+inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::milliseconds milliseconds, cancellation_t *cancel = nullptr)
 {
-  using ret_t = decltype(sleep(event_loop, milliseconds));
+  using ret_t = future_t<sleep_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
+
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.state_ptr->done = true;
+    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
+
   uv_timer_init(event_loop.loop(), &ret.state_ptr->timer);
   auto copy = ret.state_ptr;
   ret.state_ptr->timer.data = copy.release_to_raw();
@@ -76,6 +86,7 @@ inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::mill
     uv_timer_stop(timer);
     auto timer_state = future_ref_ptr_t::from_raw(timer->data);
     timer_state->done = true;
+    timer_state->cancel_registration.reset();
     auto to_callback = timer_state;
     timer->data = to_callback.release_to_raw();
     auto close_callback = [](uv_handle_t *handle) { auto timer_state = future_ref_ptr_t::from_raw(handle->data); };
@@ -90,7 +101,32 @@ inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::mill
   {
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return ret;
   }
+
+  if (cancel)
+  {
+    auto *state_raw = &ret.state_ptr.data();
+    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
+    {
+      if (state_raw->done)
+        return;
+      uv_timer_stop(&state_raw->timer);
+      state_raw->done = true;
+      state_raw->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+      state_raw->cancel_registration.reset();
+      auto state_ref = future_ref_ptr_t::from_raw(state_raw->timer.data);
+      auto to_close = state_ref;
+      state_raw->timer.data = to_close.release_to_raw();
+      auto close_callback = [](uv_handle_t *handle) { auto timer_state = future_ref_ptr_t::from_raw(handle->data); };
+      uv_close((uv_handle_t *)&state_raw->timer, close_callback);
+      if (state_raw->continuation)
+      {
+        state_raw->continuation.resume();
+      }
+    });
+  }
+
   return ret;
 }
 } // namespace vio

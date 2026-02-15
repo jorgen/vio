@@ -22,6 +22,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include "vio/cancellation.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/unique_buf.h"
@@ -39,6 +40,7 @@ struct tcp_listen_state_t
 {
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
+  registration_t cancel_registration;
   bool done = false;
 };
 
@@ -47,6 +49,7 @@ struct tcp_connect_state_t
   uv_connect_t req = {};
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
+  registration_t cancel_registration;
   bool started = false;
   bool done = false;
 };
@@ -190,9 +193,15 @@ inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
 }
 
 using tcp_connect_future_t = tcp_future_t<tcp_connect_state_t>;
-inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
+inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr, cancellation_t *cancel = nullptr)
 {
   tcp_connect_future_t ret(tcp.handle, tcp.handle->connect);
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.handle->connect.done = true;
+    ret.handle->connect.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
   if (ret.handle->connect.started)
   {
     ret.handle->connect.done = true;
@@ -204,6 +213,9 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
   auto callback = [](uv_connect_t *req, int status)
   {
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
+    state_ref->connect.cancel_registration.reset();
+    if (state_ref->connect.done)
+      return;
     if (status < 0)
     {
       state_ref->connect.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
@@ -227,6 +239,26 @@ inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr)
     ret.handle->connect.done = true;
     ret.handle->connect.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     ref_ptr_t<tcp_state_t>::from_raw(ret.handle->connect.req.data);
+  }
+  else if (cancel)
+  {
+    auto *state_raw = &ret.handle.data();
+    ret.handle->connect.cancel_registration = cancel->register_callback(
+      [state_raw]()
+      {
+        if (state_raw->connect.done)
+          return;
+        state_raw->connect.done = true;
+        state_raw->connect.started = false;
+        state_raw->connect.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+        state_raw->connect.cancel_registration.reset();
+        if (state_raw->connect.continuation)
+        {
+          auto cont = state_raw->connect.continuation;
+          state_raw->connect.continuation = {};
+          cont.resume();
+        }
+      });
   }
   return ret;
 }

@@ -22,6 +22,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 #include "uv.h"
+#include "vio/cancellation.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/uv_coro.h"
@@ -105,6 +106,7 @@ struct get_addrinfo_state_t
   uv_getaddrinfo_t req = {};
   std::expected<address_info_list_t, error_t> result;
   std::coroutine_handle<> continuation;
+  registration_t cancel_registration;
   bool done = false;
 
   [[nodiscard]] bool await_ready() const noexcept
@@ -128,11 +130,19 @@ struct get_addrinfo_state_t
   }
 };
 
-inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, const std::string &host, const address_info_t &hints = address_info_t{})
+inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, const std::string &host, const address_info_t &hints = address_info_t{}, cancellation_t *cancel = nullptr)
 {
-  using ret_t = decltype(get_addrinfo(event_loop, host, hints));
+  using ret_t = future_t<get_addrinfo_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
+
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.state_ptr->done = true;
+    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
+
   ret.state_ptr->host = host;
   auto hints_converted = convert_to_addrinfo(hints);
   auto req = &ret.state_ptr->req;
@@ -144,6 +154,7 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   {
     auto state = future_ref_ptr_t::from_raw(req->data);
     state->done = true;
+    state->cancel_registration.reset();
     if (status < 0)
     {
       std::string msg(uv_strerror(status));
@@ -165,10 +176,22 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   auto r = uv_getaddrinfo(event_loop.loop(), req, callback, host.c_str(), nullptr, &hints_converted);
   if (r < 0)
   {
-    // Mark as done right away and set the error.
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return ret;
   }
+
+  if (cancel)
+  {
+    auto *state_raw = &ret.state_ptr.data();
+    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
+    {
+      if (state_raw->done)
+        return;
+      uv_cancel((uv_req_t *)&state_raw->req);
+    });
+  }
+
   return ret;
 }
 
@@ -182,6 +205,7 @@ struct getnameinfo_state_t
   uv_getnameinfo_t req;
   std::expected<name_info_result_t, error_t> result;
   std::coroutine_handle<> continuation;
+  registration_t cancel_registration;
   bool done = false;
 
   [[nodiscard]] bool await_ready() const noexcept
@@ -205,11 +229,19 @@ struct getnameinfo_state_t
   }
 };
 
-inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, const address_info_t &addr, int hints = NI_NUMERICHOST | NI_NUMERICSERV)
+inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, const address_info_t &addr, int hints = NI_NUMERICHOST | NI_NUMERICSERV, cancellation_t *cancel = nullptr)
 {
   using ret_t = future_t<getnameinfo_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
+
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.state_ptr->done = true;
+    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
+
   auto req = &ret.state_ptr->req;
   {
     auto copy = ret.state_ptr;
@@ -219,6 +251,7 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
   {
     auto state = future_ref_ptr_t::from_raw(req->data);
     state->done = true;
+    state->cancel_registration.reset();
     if (status < 0)
     {
       std::string msg(uv_strerror(status));
@@ -240,7 +273,20 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
   {
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return ret;
   }
+
+  if (cancel)
+  {
+    auto *state_raw = &ret.state_ptr.data();
+    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
+    {
+      if (state_raw->done)
+        return;
+      uv_cancel((uv_req_t *)&state_raw->req);
+    });
+  }
+
   return ret;
 }
 

@@ -57,19 +57,28 @@ inline std::expected<void, error_t> tcp_bind(tcp_server_t &server, const sockadd
 }
 
 using tcp_listen_future_t = tcp_future_t<tcp_listen_state_t>;
-inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog)
+inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog, cancellation_t *cancel = nullptr)
 {
   tcp_listen_future_t ret(server.tcp.handle, server.tcp.handle->listen);
 
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.handle->listen.done = true;
+    ret.handle->listen.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return std::move(ret);
+  }
+
   auto on_connection = [](uv_stream_t *stream, int status)
   {
+    if (!stream->data)
+      return;
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
+    state_ref->listen.cancel_registration.reset();
+    if (state_ref->listen.done)
+      return;
     if (status < 0)
     {
       state_ref->listen.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
-    }
-    else
-    {
     }
     state_ref->listen.done = true;
     if (state_ref->listen.continuation)
@@ -89,6 +98,32 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog)
     ret.handle->listen.done = true;
     ret.handle->listen.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     ref_ptr_t<tcp_state_t>::from_raw(ret.handle->uv_handle.data);
+  }
+  else if (cancel)
+  {
+    auto *state_raw = &ret.handle.data();
+    ret.handle->listen.cancel_registration = cancel->register_callback(
+      [state_raw]()
+      {
+        if (state_raw->listen.done)
+          return;
+        state_raw->listen.done = true;
+        state_raw->listen.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+        state_raw->listen.cancel_registration.reset();
+        // Consume the raw ref stored by tcp_listen so the handle can be cleaned up
+        auto *stream = state_raw->get_stream();
+        if (stream->data)
+        {
+          auto consumed = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
+          stream->data = nullptr;
+        }
+        if (state_raw->listen.continuation)
+        {
+          auto cont = state_raw->listen.continuation;
+          state_raw->listen.continuation = {};
+          cont.resume();
+        }
+      });
   }
 
   return std::move(ret);

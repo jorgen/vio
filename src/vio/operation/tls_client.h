@@ -23,6 +23,7 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include "dns.h"
+#include "vio/cancellation.h"
 #include "vio/elastic_index_storage.h"
 #include "vio/error.h"
 #include "vio/operation/tls_common.h"
@@ -105,6 +106,7 @@ struct ssl_client_state_t
   bool connected = false;
   bool connecting = false;
   bool resolved_done = false;
+  registration_t cancel_registration;
 
   tls_client_connection_handler_t connection_handler;
   tls_native_client_stream_t native_stream;
@@ -127,10 +129,14 @@ struct ssl_client_state_t
 
   static void connect_to_current_index(ref_ptr_t<ssl_client_state_t> &state)
   {
+    if (!state->connecting)
+      return;
     state.inc_ref_and_store_in_handle(state->connect_req);
     auto on_connect = [](uv_connect_t *req, int status)
     {
       auto state = ref_ptr_t<ssl_client_state_t>::from_raw(req->data);
+      if (!state->connecting)
+        return;
       if (status < 0)
       {
         state->address_index++;
@@ -140,6 +146,7 @@ struct ssl_client_state_t
         }
         else
         {
+          state->cancel_registration.reset();
           state->connect_result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
           state->connecting = false;
           if (state->connect_continuation)
@@ -150,6 +157,7 @@ struct ssl_client_state_t
         return;
       }
 
+      state->cancel_registration.reset();
       state->connecting = false;
       uv_os_fd_t socket;
       if (uv_fileno(state->get_tcp_handle(), &socket) == 0)
@@ -180,6 +188,8 @@ struct ssl_client_state_t
     if (connect_result < 0)
     {
       ref_ptr_t<ssl_client_state_t>::from_raw(state->connect_req.data);
+      if (!state->connecting)
+        return;
       state->address_index++;
       if (state->address_index < state->addresses.size())
       {
@@ -187,6 +197,7 @@ struct ssl_client_state_t
       }
       else
       {
+        state->cancel_registration.reset();
         state->connecting = false;
         state->connect_result = std::unexpected(error_t{.code = connect_result, .msg = uv_strerror(connect_result)});
         if (state->connect_continuation)
@@ -200,8 +211,11 @@ struct ssl_client_state_t
   static void on_resolve_done(ref_ptr_t<ssl_client_state_t> &state, std::expected<address_info_list_t, error_t> &&result)
   {
     state->resolved_done = true;
+    if (!state->connecting)
+      return;
     if (!result.has_value())
     {
+      state->cancel_registration.reset();
       state->connecting = false;
       state->connect_result = std::unexpected(std::move(result.error()));
       if (state->connect_continuation)
@@ -318,25 +332,60 @@ struct ssl_client_connecting_future_t
   }
 };
 
-inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, const std::string &host, uint16_t port)
+inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, const std::string &host, uint16_t port, cancellation_t *cancel = nullptr)
 {
   if (client.state.ref_counted() == nullptr)
   {
     return {ref_ptr_t<ssl_client_state_t>::null()};
+  }
+  if (cancel && cancel->is_cancelled())
+  {
+    client.state->connecting = false;
+    client.state->connect_result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return {client.state};
   }
   client.state->host = host;
   client.state->port = std::to_string(port);
   client.state->connecting = true;
   client.state->resolved_done = false;
   impl_ssl_client_resolve_host(client);
+  if (cancel && client.state->connecting)
+  {
+    auto *state_raw = &client.state.data();
+    client.state->cancel_registration = cancel->register_callback(
+      [state_raw]()
+      {
+        if (!state_raw->connecting)
+          return;
+        state_raw->connecting = false;
+        state_raw->connect_result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+        state_raw->cancel_registration.reset();
+        if (!state_raw->resolved_done)
+        {
+          uv_cancel(reinterpret_cast<uv_req_t *>(&state_raw->getaddrinfo_req));
+        }
+        if (state_raw->connect_continuation)
+        {
+          auto cont = state_raw->connect_continuation;
+          state_raw->connect_continuation = {};
+          cont.resume();
+        }
+      });
+  }
   return {client.state};
 }
 
-inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, const std::string &host, uint16_t port, const std::string &ip)
+inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, const std::string &host, uint16_t port, const std::string &ip, cancellation_t *cancel = nullptr)
 {
   if (client.state.ref_counted() == nullptr)
   {
     return {ref_ptr_t<ssl_client_state_t>::null()};
+  }
+  if (cancel && cancel->is_cancelled())
+  {
+    client.state->connecting = false;
+    client.state->connect_result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return {client.state};
   }
   client.state->host = host;
   client.state->port = std::to_string(port);
@@ -366,6 +415,25 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
   client.state->addresses.emplace_back(ai);
   client.state->address_index = 0;
   ssl_client_state_t::connect_to_current_index(client.state);
+  if (cancel && client.state->connecting)
+  {
+    auto *state_raw = &client.state.data();
+    client.state->cancel_registration = cancel->register_callback(
+      [state_raw]()
+      {
+        if (!state_raw->connecting)
+          return;
+        state_raw->connecting = false;
+        state_raw->connect_result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+        state_raw->cancel_registration.reset();
+        if (state_raw->connect_continuation)
+        {
+          auto cont = state_raw->connect_continuation;
+          state_raw->connect_continuation = {};
+          cont.resume();
+        }
+      });
+  }
   return {client.state};
 }
 

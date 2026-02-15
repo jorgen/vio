@@ -12,6 +12,7 @@ add_executable(vio_tests
     test_ref_counted_wrapper.cpp
     test_handle_closer.cpp
     test_udp.cpp
+    test_cancellation.cpp
 )
 
 BuildExternalTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::Crypto LibreSSL::SSL LibreSSL::TLS)

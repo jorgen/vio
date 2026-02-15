@@ -153,9 +153,9 @@ inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t 
   return std::move(ret);
 }
 
-inline tcp_listen_future_t ssl_server_listen(ssl_server_t &server, int backlog)
+inline tcp_listen_future_t ssl_server_listen(ssl_server_t &server, int backlog, cancellation_t *cancel = nullptr)
 {
-  return tcp_listen(server.handle->tcp, backlog);
+  return tcp_listen(server.handle->tcp, backlog, cancel);
 }
 
 inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_t &server)

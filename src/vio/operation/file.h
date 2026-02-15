@@ -27,6 +27,7 @@
 #include "vio/bit_mask.h"
 
 #include "vio/auto_closer.h"
+#include "vio/cancellation.h"
 #include "vio/error.h"
 #include "vio/ref_counted_wrapper.h"
 #include "vio/uv_coro.h"
@@ -133,6 +134,7 @@ struct file_io_state_t
   uv_fs_t req;
   std::expected<std::size_t, error_t> result;
   std::coroutine_handle<> continuation = {};
+  registration_t cancel_registration;
   bool done = false;
 
   [[nodiscard]] bool await_ready() const noexcept
@@ -156,11 +158,19 @@ struct file_io_state_t
   }
 };
 
-inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset)
+inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset, cancellation_t *cancel = nullptr)
 {
-  using ret_t = decltype(write_file(event_loop, file, data, length, offset));
+  using ret_t = future_t<file_io_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
+
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.state_ptr->done = true;
+    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
+
   uv_buf_t buf = uv_buf_init(std::bit_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
 
   auto callback = [](uv_fs_t *req_ptr)
@@ -177,8 +187,8 @@ inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &fi
       state_ref->result = static_cast<std::size_t>(result);
     }
 
-    // Mark as done and resume the coroutine if there is one.
     state_ref->done = true;
+    state_ref->cancel_registration.reset();
     uv_fs_req_cleanup(req_ptr);
     if (state_ref->continuation)
     {
@@ -194,16 +204,36 @@ inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &fi
     future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return ret;
+  }
+
+  if (cancel)
+  {
+    auto *state_raw = &ret.state_ptr.data();
+    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
+    {
+      if (state_raw->done)
+        return;
+      uv_cancel((uv_req_t *)&state_raw->req);
+    });
   }
 
   return ret;
 }
 
-inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &file, uint8_t *buffer, std::size_t length, std::int64_t offset)
+inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &file, uint8_t *buffer, std::size_t length, std::int64_t offset, cancellation_t *cancel = nullptr)
 {
-  using ret_t = decltype(read_file(event_loop, file, buffer, length, offset));
+  using ret_t = future_t<file_io_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
+
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.state_ptr->done = true;
+    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
+
   uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(buffer), static_cast<unsigned int>(length));
 
   auto callback = [](uv_fs_t *req_ptr)
@@ -221,6 +251,7 @@ inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &fil
     }
 
     state_ref->done = true;
+    state_ref->cancel_registration.reset();
     uv_fs_req_cleanup(req_ptr);
     if (state_ref->continuation)
     {
@@ -238,6 +269,18 @@ inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &fil
     auto state_ref = future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return ret;
+  }
+
+  if (cancel)
+  {
+    auto *state_raw = &ret.state_ptr.data();
+    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
+    {
+      if (state_raw->done)
+        return;
+      uv_cancel((uv_req_t *)&state_raw->req);
+    });
   }
 
   return ret;
@@ -331,11 +374,18 @@ inline std::expected<std::string, error_t> mkdtemp_path(event_loop_t &loop, cons
   return path;
 }
 
-inline future_t<file_io_state_t> send_file(event_loop_t &loop, file_t &out_file, file_t &in_file, std::int64_t in_offset, std::size_t length)
+inline future_t<file_io_state_t> send_file(event_loop_t &loop, file_t &out_file, file_t &in_file, std::int64_t in_offset, std::size_t length, cancellation_t *cancel = nullptr)
 {
-  using ret_t = decltype(send_file(loop, out_file, in_file, in_offset, length));
+  using ret_t = future_t<file_io_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
   ret_t ret;
+
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.state_ptr->done = true;
+    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
 
   auto callback = [](uv_fs_t *req_ptr)
   {
@@ -352,6 +402,7 @@ inline future_t<file_io_state_t> send_file(event_loop_t &loop, file_t &out_file,
     }
 
     state_ref->done = true;
+    state_ref->cancel_registration.reset();
     uv_fs_req_cleanup(req_ptr);
     if (state_ref->continuation)
     {
@@ -368,6 +419,18 @@ inline future_t<file_io_state_t> send_file(event_loop_t &loop, file_t &out_file,
     auto state_ref = future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = call_result, .msg = uv_strerror(call_result)});
+    return ret;
+  }
+
+  if (cancel)
+  {
+    auto *state_raw = &ret.state_ptr.data();
+    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
+    {
+      if (state_raw->done)
+        return;
+      uv_cancel((uv_req_t *)&state_raw->req);
+    });
   }
 
   return ret;
