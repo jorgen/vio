@@ -60,6 +60,18 @@ cmake --build cmake-build-msan
 ./cmake-build-msan/test/vio_tests
 ```
 
+### Windows (MSVC AddressSanitizer)
+
+Requires a Visual Studio developer command prompt (vcvars64.bat):
+
+```bash
+cmake --preset msvc-asan
+cmake --build --preset msvc-asan
+ctest --preset msvc-asan
+```
+
+Note: MSVC ASan does not include LeakSanitizer. TSan, UBSan, and MSan are not available on MSVC.
+
 ## Docker (Sanitizer Builds)
 
 A Docker image (`ghcr.io/jorgen/vio-ci:latest`) provides a consistent environment for sanitizer

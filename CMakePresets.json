@@ -62,6 +62,24 @@
         "CMAKE_CXX_FLAGS": "-fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=memory"
       }
+    },
+    {
+      "name": "msvc-asan",
+      "displayName": "Debug with AddressSanitizer (MSVC)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-msvc-asan",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_C_FLAGS": "/fsanitize=address",
+        "CMAKE_CXX_FLAGS": "/EHsc /fsanitize=address"
+      }
     }
   ],
   "buildPresets": [
@@ -84,6 +102,10 @@
     {
       "name": "msan",
       "configurePreset": "msan"
+    },
+    {
+      "name": "msvc-asan",
+      "configurePreset": "msvc-asan"
     }
   ],
   "testPresets": [
@@ -106,6 +128,10 @@
     {
       "name": "msan",
       "configurePreset": "msan"
+    },
+    {
+      "name": "msvc-asan",
+      "configurePreset": "msvc-asan"
     }
   ]
 }
