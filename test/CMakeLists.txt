@@ -15,7 +15,7 @@ add_executable(vio_tests
     test_cancellation.cpp
 )
 
-BuildExternalTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::Crypto LibreSSL::SSL LibreSSL::TLS)
+BuildExternalTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
 
 
 target_include_directories(vio_tests PRIVATE
