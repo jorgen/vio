@@ -1,4 +1,5 @@
 #include <cstring>
+#include <optional>
 #include <ostream>
 
 #include <doctest/doctest.h>
@@ -110,19 +111,22 @@ TEST_CASE("test basic tcp")
   server_wrote_msg = false;
   client_got_server_reply = false;
 
-  event_loop.run_in_loop(
-    [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &server_got_data, bool &server_wrote_msg, bool &client_got_server_reply) -> vio::task_t<void>
+      {
+        auto *ev = &event_loop;
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
 
-      auto server = test_tcp_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, server_got_data, server_wrote_msg);
-      co_await test_tcp_client(*ev, server_tcp_pair->second, client_got_server_reply);
-      co_await std::move(server);
+        auto server = test_tcp_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, server_got_data, server_wrote_msg);
+        co_await test_tcp_client(*ev, server_tcp_pair->second, client_got_server_reply);
+        co_await std::move(server);
 
-      ev->stop();
-    });
+        ev->stop();
+      }(event_loop, server_got_data, server_wrote_msg, client_got_server_reply));
+  });
 
   event_loop.run();
 
@@ -136,79 +140,82 @@ TEST_CASE("tcp echo multiple messages")
   vio::event_loop_t event_loop;
   bool data_verified = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &data_verified) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        while (true)
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
+
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
-            break;
-          auto &data = read_result.value();
-          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(data->base), data->len);
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
+
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          while (true)
+          {
+            auto read_result = co_await reader;
+            if (!read_result.has_value())
+              break;
+            auto &data = read_result.value();
+            auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(data->base), data->len);
+            REQUIRE_EXPECTED(write_result);
+          }
+        }(std::move(server_tcp_pair->first));
+
+        co_await [](vio::event_loop_t &el, int p, bool &dv) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
+
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
+
+          constexpr int num_messages = 10;
+          std::string all_data;
+          for (int i = 0; i < num_messages; i++)
+            all_data += "message_" + std::to_string(i) + ";";
+
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(all_data.data()), all_data.size());
           REQUIRE_EXPECTED(write_result);
-        }
-      }(std::move(server_tcp_pair->first));
 
-      co_await [](vio::event_loop_t &el, int p, bool &dv) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          std::vector<char> received;
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          while (received.size() < all_data.size())
+          {
+            auto read_result = co_await reader;
+            if (!read_result.has_value())
+              break;
+            auto &data = read_result.value();
+            received.insert(received.end(), data->base, data->base + data->len);
+          }
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+          REQUIRE(received.size() >= all_data.size());
+          std::string received_str(received.data(), all_data.size());
+          REQUIRE(received_str == all_data);
+          dv = true;
+        }(event_loop, port, data_verified);
 
-        constexpr int num_messages = 10;
-        std::string all_data;
-        for (int i = 0; i < num_messages; i++)
-          all_data += "message_" + std::to_string(i) + ";";
-
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(all_data.data()), all_data.size());
-        REQUIRE_EXPECTED(write_result);
-
-        std::vector<char> received;
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        while (received.size() < all_data.size())
-        {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
-            break;
-          auto &data = read_result.value();
-          received.insert(received.end(), data->base, data->base + data->len);
-        }
-
-        REQUIRE(received.size() >= all_data.size());
-        std::string received_str(received.data(), all_data.size());
-        REQUIRE(received_str == all_data);
-        dv = true;
-      }(event_loop, port, data_verified);
-
-      co_await std::move(server_task);
-      ev->stop();
-    });
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, data_verified));
+  });
 
   event_loop.run();
   REQUIRE(data_verified);
@@ -220,63 +227,65 @@ TEST_CASE("tcp large data transfer")
   constexpr size_t data_size = 1024 * 1024; // 1MB
   bool data_verified = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-      auto *dv = &data_verified;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s, size_t ds) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, size_t data_size, bool &data_verified) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        std::vector<char> received;
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        while (true)
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
+
+        auto server_task = [](vio::tcp_server_t s, size_t ds) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
-            break;
-          auto &data = read_result.value();
-          received.insert(received.end(), data->base, data->base + data->len);
-        }
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        REQUIRE(received.size() == ds);
-      }(std::move(server_tcp_pair->first), data_size);
+          std::vector<char> received;
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          while (true)
+          {
+            auto read_result = co_await reader;
+            if (!read_result.has_value())
+              break;
+            auto &data = read_result.value();
+            received.insert(received.end(), data->base, data->base + data->len);
+          }
 
-      co_await [](vio::event_loop_t &el, int p, size_t ds) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          REQUIRE(received.size() == ds);
+        }(std::move(server_tcp_pair->first), data_size);
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+        co_await [](vio::event_loop_t &el, int p, size_t ds) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        std::vector<uint8_t> send_data(ds);
-        std::iota(send_data.begin(), send_data.end(), uint8_t(0));
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
 
-        auto write_result = co_await vio::write_tcp(client, send_data.data(), send_data.size());
-        REQUIRE_EXPECTED(write_result);
-      }(event_loop, port, data_size);
+          std::vector<uint8_t> send_data(ds);
+          std::iota(send_data.begin(), send_data.end(), uint8_t(0));
 
-      co_await std::move(server_task);
-      *dv = true;
-      ev->stop();
-    });
+          auto write_result = co_await vio::write_tcp(client, send_data.data(), send_data.size());
+          REQUIRE_EXPECTED(write_result);
+        }(event_loop, port, data_size);
+
+        co_await std::move(server_task);
+        data_verified = true;
+        ev->stop();
+      }(event_loop, data_size, data_verified));
+  });
 
   event_loop.run();
   REQUIRE(data_verified);
@@ -288,85 +297,88 @@ TEST_CASE("tcp large data round trip")
   constexpr size_t data_size = 256 * 1024; // 256KB
   bool data_verified = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s, size_t ds) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, size_t data_size, bool &data_verified) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        size_t total_read = 0;
-        std::vector<char> received;
-        received.reserve(ds);
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        while (total_read < ds)
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
+
+        auto server_task = [](vio::tcp_server_t s, size_t ds) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
-            break;
-          auto &data = read_result.value();
-          received.insert(received.end(), data->base, data->base + data->len);
-          total_read += data->len;
-        }
-        REQUIRE(total_read == ds);
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(received.data()), received.size());
-        REQUIRE_EXPECTED(write_result);
-      }(std::move(server_tcp_pair->first), data_size);
+          size_t total_read = 0;
+          std::vector<char> received;
+          received.reserve(ds);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          while (total_read < ds)
+          {
+            auto read_result = co_await reader;
+            if (!read_result.has_value())
+              break;
+            auto &data = read_result.value();
+            received.insert(received.end(), data->base, data->base + data->len);
+            total_read += data->len;
+          }
+          REQUIRE(total_read == ds);
 
-      co_await [](vio::event_loop_t &el, int p, size_t ds, bool &dv) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(received.data()), received.size());
+          REQUIRE_EXPECTED(write_result);
+        }(std::move(server_tcp_pair->first), data_size);
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
-
-        std::vector<uint8_t> send_data(ds);
-        std::iota(send_data.begin(), send_data.end(), uint8_t(0));
-
-        auto write_result = co_await vio::write_tcp(client, send_data.data(), send_data.size());
-        REQUIRE_EXPECTED(write_result);
-
-        size_t total_read = 0;
-        std::vector<char> received;
-        received.reserve(ds);
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        while (total_read < ds)
+        co_await [](vio::event_loop_t &el, int p, size_t ds, bool &dv) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
-            break;
-          auto &data = read_result.value();
-          received.insert(received.end(), data->base, data->base + data->len);
-          total_read += data->len;
-        }
-        REQUIRE(total_read == ds);
-        REQUIRE(std::memcmp(received.data(), send_data.data(), ds) == 0);
-        dv = true;
-      }(event_loop, port, data_size, data_verified);
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
+
+          std::vector<uint8_t> send_data(ds);
+          std::iota(send_data.begin(), send_data.end(), uint8_t(0));
+
+          auto write_result = co_await vio::write_tcp(client, send_data.data(), send_data.size());
+          REQUIRE_EXPECTED(write_result);
+
+          size_t total_read = 0;
+          std::vector<char> received;
+          received.reserve(ds);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          while (total_read < ds)
+          {
+            auto read_result = co_await reader;
+            if (!read_result.has_value())
+              break;
+            auto &data = read_result.value();
+            received.insert(received.end(), data->base, data->base + data->len);
+            total_read += data->len;
+          }
+          REQUIRE(total_read == ds);
+          REQUIRE(std::memcmp(received.data(), send_data.data(), ds) == 0);
+          dv = true;
+        }(event_loop, port, data_size, data_verified);
+
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, data_size, data_verified));
+  });
 
   event_loop.run();
   REQUIRE(data_verified);
@@ -377,49 +389,52 @@ TEST_CASE("tcp client disconnect causes server EOF")
   vio::event_loop_t event_loop;
   bool server_got_eof = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s, bool &got_eof) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &server_got_eof) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE(!read_result.has_value());
-        REQUIRE(read_result.error().code == UV_EOF);
-        got_eof = true;
-      }(std::move(server_tcp_pair->first), server_got_eof);
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
 
-      // Client as temporary: frame destroyed after co_await, closing TCP -> server gets EOF
-      co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto server_task = [](vio::tcp_server_t s, bool &got_eof) -> vio::task_t<void>
+        {
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
-      }(event_loop, port);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+          REQUIRE(!read_result.has_value());
+          REQUIRE(read_result.error().code == UV_EOF);
+          got_eof = true;
+        }(std::move(server_tcp_pair->first), server_got_eof);
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+        // Client as temporary: frame destroyed after co_await, closing TCP -> server gets EOF
+        co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
+
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
+        }(event_loop, port);
+
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, server_got_eof));
+  });
 
   event_loop.run();
   REQUIRE(server_got_eof);
@@ -430,64 +445,67 @@ TEST_CASE("tcp server disconnect causes client EOF")
   vio::event_loop_t event_loop;
   bool client_got_eof = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      // Server as named task: created first so uv_listen() is called before client connects
-      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &client_got_eof) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
+        auto *ev = &event_loop;
 
-        auto client = std::move(client_or_err.value());
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-      }(std::move(server_tcp_pair->first));
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
 
-      // Client as named task: server is already listening by now
-      auto client_task = [](vio::event_loop_t &el, int p, bool &got_eof) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        // Server as named task: created first so uv_listen() is called before client connects
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+        {
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+          auto client = std::move(client_or_err.value());
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+          REQUIRE_EXPECTED(read_result);
+        }(std::move(server_tcp_pair->first));
 
-        std::string msg = "ping";
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
-        REQUIRE_EXPECTED(write_result);
+        // Client as named task: server is already listening by now
+        auto client_task = [](vio::event_loop_t &el, int p, bool &got_eof) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE(!read_result.has_value());
-        got_eof = true;
-      }(event_loop, port, client_got_eof);
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
 
-      // Wait for server to finish reading, then destroy its frame to close
-      // the accepted connection — this triggers EOF on the client side
-      co_await std::move(server_task);
-      { auto tmp = std::move(server_task); }
+          std::string msg = "ping";
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
+          REQUIRE_EXPECTED(write_result);
 
-      co_await std::move(client_task);
-      ev->stop();
-    });
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+          REQUIRE(!read_result.has_value());
+          got_eof = true;
+        }(event_loop, port, client_got_eof);
+
+        // Wait for server to finish reading, then destroy its frame to close
+        // the accepted connection — this triggers EOF on the client side
+        co_await std::move(server_task);
+        { auto tmp = std::move(server_task); }
+
+        co_await std::move(client_task);
+        ev->stop();
+      }(event_loop, client_got_eof));
+  });
 
   event_loop.run();
   REQUIRE(client_got_eof);
@@ -500,73 +518,76 @@ TEST_CASE("tcp multiple clients to same server")
   int clients_served = 0;
   int clients_replied = 0;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s, int nc, int &served) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, int num_clients, int &clients_served, int &clients_replied) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        for (int i = 0; i < nc; i++)
+        auto *ev = &event_loop;
+
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
+
+        auto server_task = [](vio::tcp_server_t s, int nc, int &served) -> vio::task_t<void>
         {
-          auto listen_result = co_await vio::tcp_listen(server, 10);
-          REQUIRE_EXPECTED(listen_result);
-          auto client_or_err = vio::tcp_accept(server);
-          REQUIRE_EXPECTED(client_or_err);
-          auto client = std::move(client_or_err.value());
-          server.tcp.handle->listen.done = false;
+          auto server = std::move(s);
+          for (int i = 0; i < nc; i++)
+          {
+            auto listen_result = co_await vio::tcp_listen(server, 10);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::tcp_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
+            server.tcp.handle->listen.done = false;
 
-          auto reader_or_err = vio::tcp_create_reader(client);
-          REQUIRE_EXPECTED(reader_or_err);
-          auto reader = std::move(reader_or_err.value());
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          served++;
+            auto reader_or_err = vio::tcp_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            served++;
 
-          auto &data = read_result.value();
-          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(data->base), data->len);
-          REQUIRE_EXPECTED(write_result);
-        }
-      }(std::move(server_tcp_pair->first), num_clients, clients_served);
+            auto &data = read_result.value();
+            auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(data->base), data->len);
+            REQUIRE_EXPECTED(write_result);
+          }
+        }(std::move(server_tcp_pair->first), num_clients, clients_served);
 
-      // Each client is a separate connection
-      co_await [](vio::event_loop_t &el, int p, int nc, int &cr) -> vio::task_t<void>
-      {
-        for (int i = 0; i < nc; i++)
+        // Each client is a separate connection
+        co_await [](vio::event_loop_t &el, int p, int nc, int &cr) -> vio::task_t<void>
         {
-          auto client_or_err = vio::tcp_create(el);
-          REQUIRE_EXPECTED(client_or_err);
-          auto client = std::move(client_or_err.value());
+          for (int i = 0; i < nc; i++)
+          {
+            auto client_or_err = vio::tcp_create(el);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-          auto addr = vio::ip4_addr("127.0.0.1", p);
-          REQUIRE_EXPECTED(addr);
-          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-          REQUIRE_EXPECTED(connect_result);
+            auto addr = vio::ip4_addr("127.0.0.1", p);
+            REQUIRE_EXPECTED(addr);
+            auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+            REQUIRE_EXPECTED(connect_result);
 
-          std::string msg = "client_" + std::to_string(i);
-          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
-          REQUIRE_EXPECTED(write_result);
+            std::string msg = "client_" + std::to_string(i);
+            auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
+            REQUIRE_EXPECTED(write_result);
 
-          auto reader_or_err = vio::tcp_create_reader(client);
-          REQUIRE_EXPECTED(reader_or_err);
-          auto reader = std::move(reader_or_err.value());
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          auto &data = read_result.value();
-          std::string_view sv(data->base, data->len);
-          REQUIRE(sv == msg);
-          cr++;
-        }
-      }(event_loop, port, num_clients, clients_replied);
+            auto reader_or_err = vio::tcp_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            auto &data = read_result.value();
+            std::string_view sv(data->base, data->len);
+            REQUIRE(sv == msg);
+            cr++;
+          }
+        }(event_loop, port, num_clients, clients_replied);
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, num_clients, clients_served, clients_replied));
+  });
 
   event_loop.run();
   REQUIRE(clients_served == num_clients);
@@ -578,57 +599,60 @@ TEST_CASE("tcp cancel reader")
   vio::event_loop_t event_loop;
   bool reader_cancelled = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &reader_cancelled) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-      }(std::move(server_tcp_pair->first));
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
 
-      co_await [](vio::event_loop_t &el, int p, bool &cancelled) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+        {
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+        }(std::move(server_tcp_pair->first));
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
+        co_await [](vio::event_loop_t &el, int p, bool &cancelled) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        reader.cancel();
-        REQUIRE(reader.is_cancelled());
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
 
-        auto read_result = co_await reader;
-        REQUIRE(!read_result.has_value());
-        REQUIRE(read_result.error().code == UV_ECANCELED);
-        cancelled = true;
-      }(event_loop, port, reader_cancelled);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+          reader.cancel();
+          REQUIRE(reader.is_cancelled());
+
+          auto read_result = co_await reader;
+          REQUIRE(!read_result.has_value());
+          REQUIRE(read_result.error().code == UV_ECANCELED);
+          cancelled = true;
+        }(event_loop, port, reader_cancelled);
+
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, reader_cancelled));
+  });
 
   event_loop.run();
   REQUIRE(reader_cancelled);
@@ -639,51 +663,54 @@ TEST_CASE("tcp cannot create multiple active readers")
   vio::event_loop_t event_loop;
   bool error_caught = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &error_caught) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-      }(std::move(server_tcp_pair->first));
+        auto *ev = &event_loop;
 
-      co_await [](vio::event_loop_t &el, int p, bool &ec) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+        {
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+        }(std::move(server_tcp_pair->first));
 
-        auto reader1 = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader1);
+        co_await [](vio::event_loop_t &el, int p, bool &ec) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        auto reader2 = vio::tcp_create_reader(client);
-        REQUIRE(!reader2.has_value());
-        ec = true;
-      }(event_loop, port, error_caught);
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+          auto reader1 = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader1);
+
+          auto reader2 = vio::tcp_create_reader(client);
+          REQUIRE(!reader2.has_value());
+          ec = true;
+        }(event_loop, port, error_caught);
+
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, error_caught));
+  });
 
   event_loop.run();
   REQUIRE(error_caught);
@@ -694,23 +721,25 @@ TEST_CASE("tcp connect to unreachable address")
   vio::event_loop_t event_loop;
   bool connect_failed = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-      auto *cf = &connect_failed;
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &connect_failed) -> vio::task_t<void>
+      {
+        auto *ev = &event_loop;
 
-      auto client_or_err = vio::tcp_create(*ev);
-      REQUIRE_EXPECTED(client_or_err);
-      auto client = std::move(client_or_err.value());
+        auto client_or_err = vio::tcp_create(*ev);
+        REQUIRE_EXPECTED(client_or_err);
+        auto client = std::move(client_or_err.value());
 
-      auto addr = vio::ip4_addr("127.0.0.1", 1);
-      REQUIRE_EXPECTED(addr);
-      auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-      REQUIRE(!connect_result.has_value());
-      *cf = true;
-      ev->stop();
-    });
+        auto addr = vio::ip4_addr("127.0.0.1", 1);
+        REQUIRE_EXPECTED(addr);
+        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+        REQUIRE(!connect_result.has_value());
+        connect_failed = true;
+        ev->stop();
+      }(event_loop, connect_failed));
+  });
 
   event_loop.run();
   REQUIRE(connect_failed);
@@ -721,70 +750,73 @@ TEST_CASE("tcp write then read on same connection")
   vio::event_loop_t event_loop;
   bool verified = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        std::string msg = "server_first";
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
-        REQUIRE_EXPECTED(write_result);
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-        auto &data = read_result.value();
-        std::string_view sv(data->base, data->len);
-        REQUIRE(sv == "client_response");
-      }(std::move(server_tcp_pair->first));
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+        {
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-      co_await [](vio::event_loop_t &el, int p, bool &v) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          std::string msg = "server_first";
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
+          REQUIRE_EXPECTED(write_result);
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+          REQUIRE_EXPECTED(read_result);
+          auto &data = read_result.value();
+          std::string_view sv(data->base, data->len);
+          REQUIRE(sv == "client_response");
+        }(std::move(server_tcp_pair->first));
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-        auto &data = read_result.value();
-        std::string_view sv(data->base, data->len);
-        REQUIRE(sv == "server_first");
+        co_await [](vio::event_loop_t &el, int p, bool &v) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        reader.cancel();
-        { auto temp = std::move(reader); }
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
 
-        std::string msg = "client_response";
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
-        REQUIRE_EXPECTED(write_result);
-        v = true;
-      }(event_loop, port, verified);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+          REQUIRE_EXPECTED(read_result);
+          auto &data = read_result.value();
+          std::string_view sv(data->base, data->len);
+          REQUIRE(sv == "server_first");
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+          reader.cancel();
+          { auto temp = std::move(reader); }
+
+          std::string msg = "client_response";
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
+          REQUIRE_EXPECTED(write_result);
+          v = true;
+        }(event_loop, port, verified);
+
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, verified));
+  });
 
   event_loop.run();
   REQUIRE(verified);
@@ -795,84 +827,87 @@ TEST_CASE("tcp reader destroyed then new reader created")
   vio::event_loop_t event_loop;
   bool verified = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        std::string msg1 = "first";
-        auto write1 = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg1.data()), msg1.size());
-        REQUIRE_EXPECTED(write1);
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
 
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
         {
-          auto reader_or_err = vio::tcp_create_reader(client);
-          REQUIRE_EXPECTED(reader_or_err);
-          auto reader = std::move(reader_or_err.value());
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-        }
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        std::string msg2 = "second";
-        auto write2 = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg2.data()), msg2.size());
-        REQUIRE_EXPECTED(write2);
-      }(std::move(server_tcp_pair->first));
+          std::string msg1 = "first";
+          auto write1 = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg1.data()), msg1.size());
+          REQUIRE_EXPECTED(write1);
 
-      co_await [](vio::event_loop_t &el, int p, bool &v) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          {
+            auto reader_or_err = vio::tcp_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+          }
 
-        auto addr = vio::ip4_addr("127.0.0.1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+          std::string msg2 = "second";
+          auto write2 = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg2.data()), msg2.size());
+          REQUIRE_EXPECTED(write2);
+        }(std::move(server_tcp_pair->first));
 
+        co_await [](vio::event_loop_t &el, int p, bool &v) -> vio::task_t<void>
         {
-          auto reader_or_err = vio::tcp_create_reader(client);
-          REQUIRE_EXPECTED(reader_or_err);
-          auto reader = std::move(reader_or_err.value());
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          auto &data = read_result.value();
-          std::string_view sv(data->base, data->len);
-          REQUIRE(sv == "first");
-        }
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        std::string ack = "ack";
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(ack.data()), ack.size());
-        REQUIRE_EXPECTED(write_result);
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
 
-        {
-          auto reader_or_err = vio::tcp_create_reader(client);
-          REQUIRE_EXPECTED(reader_or_err);
-          auto reader = std::move(reader_or_err.value());
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          auto &data = read_result.value();
-          std::string_view sv(data->base, data->len);
-          REQUIRE(sv == "second");
-        }
+          {
+            auto reader_or_err = vio::tcp_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            auto &data = read_result.value();
+            std::string_view sv(data->base, data->len);
+            REQUIRE(sv == "first");
+          }
 
-        v = true;
-      }(event_loop, port, verified);
+          std::string ack = "ack";
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(ack.data()), ack.size());
+          REQUIRE_EXPECTED(write_result);
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+          {
+            auto reader_or_err = vio::tcp_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            auto &data = read_result.value();
+            std::string_view sv(data->base, data->len);
+            REQUIRE(sv == "second");
+          }
+
+          v = true;
+        }(event_loop, port, verified);
+
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, verified));
+  });
 
   event_loop.run();
   REQUIRE(verified);
@@ -883,73 +918,76 @@ TEST_CASE("tcp ipv6 loopback")
   vio::event_loop_t event_loop;
   bool verified = false;
 
-  event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
-    {
-      auto *ev = &event_loop;
-
-      auto addr_or_err = vio::ip6_addr("::1", 0);
-      REQUIRE_EXPECTED(addr_or_err);
-      auto server_tcp = vio::tcp_create_server(*ev);
-      REQUIRE_EXPECTED(server_tcp);
-      auto bind_res = vio::tcp_bind(server_tcp.value(), reinterpret_cast<const sockaddr *>(&addr_or_err.value()));
-      REQUIRE_EXPECTED(bind_res);
-
-      auto sockname_result = vio::sockname(server_tcp->tcp);
-      REQUIRE_EXPECTED(sockname_result);
-      sockaddr_storage sa_storage = sockname_result.value();
-      const auto *sa_in6 = reinterpret_cast<sockaddr_in6 *>(&sa_storage);
-      int port = ntohs(sa_in6->sin6_port);
-
-      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
       {
-        auto server = std::move(s);
-        auto listen_result = co_await vio::tcp_listen(server, 10);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::tcp_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto *ev = &event_loop;
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
+        auto addr_or_err = vio::ip6_addr("::1", 0);
+        REQUIRE_EXPECTED(addr_or_err);
+        auto server_tcp = vio::tcp_create_server(*ev);
+        REQUIRE_EXPECTED(server_tcp);
+        auto bind_res = vio::tcp_bind(server_tcp.value(), reinterpret_cast<const sockaddr *>(&addr_or_err.value()));
+        REQUIRE_EXPECTED(bind_res);
 
-        auto &data = read_result.value();
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(data->base), data->len);
-        REQUIRE_EXPECTED(write_result);
-      }(std::move(server_tcp.value()));
+        auto sockname_result = vio::sockname(server_tcp->tcp);
+        REQUIRE_EXPECTED(sockname_result);
+        sockaddr_storage sa_storage = sockname_result.value();
+        const auto *sa_in6 = reinterpret_cast<sockaddr_in6 *>(&sa_storage);
+        int port = ntohs(sa_in6->sin6_port);
 
-      co_await [](vio::event_loop_t &el, int p, bool &v) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::tcp_create(el);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+        {
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-        auto addr = vio::ip6_addr("::1", p);
-        REQUIRE_EXPECTED(addr);
-        auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
-        REQUIRE_EXPECTED(connect_result);
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+          REQUIRE_EXPECTED(read_result);
 
-        std::string msg = "ipv6_test";
-        auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
-        REQUIRE_EXPECTED(write_result);
+          auto &data = read_result.value();
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(data->base), data->len);
+          REQUIRE_EXPECTED(write_result);
+        }(std::move(server_tcp.value()));
 
-        auto reader_or_err = vio::tcp_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-        auto &data = read_result.value();
-        std::string_view sv(data->base, data->len);
-        REQUIRE(sv == "ipv6_test");
-        v = true;
-      }(event_loop, port, verified);
+        co_await [](vio::event_loop_t &el, int p, bool &v) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
 
-      co_await std::move(server_task);
-      ev->stop();
-    });
+          auto addr = vio::ip6_addr("::1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
+
+          std::string msg = "ipv6_test";
+          auto write_result = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(msg.data()), msg.size());
+          REQUIRE_EXPECTED(write_result);
+
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto read_result = co_await reader;
+          REQUIRE_EXPECTED(read_result);
+          auto &data = read_result.value();
+          std::string_view sv(data->base, data->len);
+          REQUIRE(sv == "ipv6_test");
+          v = true;
+        }(event_loop, port, verified);
+
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, verified));
+  });
 
   event_loop.run();
   REQUIRE(verified);

@@ -1,3 +1,4 @@
+#include <optional>
 #include <ostream>
 
 #include <doctest/doctest.h>
@@ -200,18 +201,23 @@ TEST_CASE("test basic tls server")
   auto certs = generate_test_certs();
   const vio::ssl_config_t server_config{.ca_mem = certs.ca_cert, .cert_mem = certs.cert, .key_mem = certs.key};
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&event_loop, &server_got_data, &server_wrote_msg, &client_got_server_reply, client_config, server_config]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_got_data, bool &server_wrote_msg, bool &client_got_server_reply) -> vio::task_t<void>
+        {
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
 
-      auto server = test_tls_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, server_config, server_got_data, server_wrote_msg);
-      co_await test_tls_client(*ev, server_tcp_pair->second, client_config, client_got_server_reply);
-      co_await std::move(server);
+          auto server = test_tls_server(*ev, std::move(server_tcp_pair->first), server_tcp_pair->second, server_config, server_got_data, server_wrote_msg);
+          co_await test_tls_client(*ev, server_tcp_pair->second, client_config, client_got_server_reply);
+          co_await std::move(server);
 
-      ev->stop();
+          ev->stop();
+        }(event_loop, server_config, client_config, server_got_data, server_wrote_msg, client_got_server_reply));
     });
 
   event_loop.run();
@@ -272,75 +278,80 @@ TEST_CASE("tls echo multiple messages")
   int server_received = 0;
   int client_received = 0;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, int nm, int &sr) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
-
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-
-        for (int i = 0; i < nm; i++)
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, int num_messages, int &server_received, int &client_received) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          sr++;
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-          auto &data = read_result.value();
-          uv_buf_t buf = uv_buf_init(data->base, data->len);
-          auto write_result = co_await vio::ssl_server_client_write(client, buf);
-          REQUIRE_EXPECTED(write_result);
-        }
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port, num_messages, server_received);
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, int nm, int &sr) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, int nm, int &cr) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
+            auto reader_or_err = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
 
-        auto reader_or_err = vio::ssl_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
+            for (int i = 0; i < nm; i++)
+            {
+              auto read_result = co_await reader;
+              REQUIRE_EXPECTED(read_result);
+              sr++;
 
-        for (int i = 0; i < nm; i++)
-        {
-          std::string msg = "tls_msg_" + std::to_string(i);
-          uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-          auto write_result = co_await vio::ssl_client_write(client, buf);
-          REQUIRE_EXPECTED(write_result);
+              auto &data = read_result.value();
+              uv_buf_t buf = uv_buf_init(data->base, data->len);
+              auto write_result = co_await vio::ssl_server_client_write(client, buf);
+              REQUIRE_EXPECTED(write_result);
+            }
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port, num_messages, server_received);
 
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          auto &data = read_result.value();
-          std::string_view sv(data->base, data->len);
-          REQUIRE(sv == msg);
-          cr++;
-        }
-      }(event_loop, client_config, port, num_messages, client_received);
+          auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, int nm, int &cr) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-      co_await std::move(client_task);
-      co_await std::move(server_task);
-      ev->stop();
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
+
+            auto reader_or_err = vio::ssl_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+
+            for (int i = 0; i < nm; i++)
+            {
+              std::string msg = "tls_msg_" + std::to_string(i);
+              uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+              auto write_result = co_await vio::ssl_client_write(client, buf);
+              REQUIRE_EXPECTED(write_result);
+
+              auto read_result = co_await reader;
+              REQUIRE_EXPECTED(read_result);
+              auto &data = read_result.value();
+              std::string_view sv(data->base, data->len);
+              REQUIRE(sv == msg);
+              cr++;
+            }
+          }(event_loop, client_config, port, num_messages, client_received);
+
+          co_await std::move(client_task);
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, num_messages, server_received, client_received));
     });
 
   event_loop.run();
@@ -358,89 +369,94 @@ TEST_CASE("tls large data round trip")
   constexpr size_t data_size = 128 * 1024; // 128KB
   bool data_verified = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, size_t ds) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
-
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-
-        // Read known amount of data and echo it back
-        size_t total_read = 0;
-        std::vector<char> received;
-        received.reserve(ds);
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        while (total_read < ds)
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, size_t data_size, bool &data_verified) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
-            break;
-          auto &data = read_result.value();
-          received.insert(received.end(), data->base, data->base + data->len);
-          total_read += data->len;
-        }
-        REQUIRE(total_read == ds);
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-        uv_buf_t buf = uv_buf_init(received.data(), received.size());
-        auto write_result = co_await vio::ssl_server_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port, data_size);
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, size_t ds) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, size_t ds, bool &dv) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
+            // Read known amount of data and echo it back
+            size_t total_read = 0;
+            std::vector<char> received;
+            received.reserve(ds);
+            auto reader_or_err = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            while (total_read < ds)
+            {
+              auto read_result = co_await reader;
+              if (!read_result.has_value())
+                break;
+              auto &data = read_result.value();
+              received.insert(received.end(), data->base, data->base + data->len);
+              total_read += data->len;
+            }
+            REQUIRE(total_read == ds);
 
-        std::vector<uint8_t> send_data(ds);
-        std::iota(send_data.begin(), send_data.end(), uint8_t(0));
+            uv_buf_t buf = uv_buf_init(received.data(), received.size());
+            auto write_result = co_await vio::ssl_server_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port, data_size);
 
-        uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(send_data.data()), send_data.size());
-        auto write_result = co_await vio::ssl_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
+          auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, size_t ds, bool &dv) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        // Read back the echo
-        size_t total_read = 0;
-        std::vector<char> received;
-        received.reserve(ds);
-        auto reader_or_err = vio::ssl_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        while (total_read < ds)
-        {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
-            break;
-          auto &data = read_result.value();
-          received.insert(received.end(), data->base, data->base + data->len);
-          total_read += data->len;
-        }
-        REQUIRE(total_read == ds);
-        REQUIRE(std::memcmp(received.data(), send_data.data(), ds) == 0);
-        dv = true;
-      }(event_loop, client_config, port, data_size, data_verified);
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
 
-      co_await std::move(client_task);
-      co_await std::move(server_task);
-      ev->stop();
+            std::vector<uint8_t> send_data(ds);
+            std::iota(send_data.begin(), send_data.end(), uint8_t(0));
+
+            uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(send_data.data()), send_data.size());
+            auto write_result = co_await vio::ssl_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
+
+            // Read back the echo
+            size_t total_read = 0;
+            std::vector<char> received;
+            received.reserve(ds);
+            auto reader_or_err = vio::ssl_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            while (total_read < ds)
+            {
+              auto read_result = co_await reader;
+              if (!read_result.has_value())
+                break;
+              auto &data = read_result.value();
+              received.insert(received.end(), data->base, data->base + data->len);
+              total_read += data->len;
+            }
+            REQUIRE(total_read == ds);
+            REQUIRE(std::memcmp(received.data(), send_data.data(), ds) == 0);
+            dv = true;
+          }(event_loop, client_config, port, data_size, data_verified);
+
+          co_await std::move(client_task);
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, data_size, data_verified));
     });
 
   event_loop.run();
@@ -455,68 +471,73 @@ TEST_CASE("tls client disconnect causes server read error")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool server_got_error = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, bool &sge) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
-
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-
-        // Read until we get an error (client disconnects)
-        while (true)
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_got_error) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
+
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, bool &sge) -> vio::task_t<void>
           {
-            sge = true;
-            break;
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
+
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
+
+            auto reader_or_err = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+
+            // Read until we get an error (client disconnects)
+            while (true)
+            {
+              auto read_result = co_await reader;
+              if (!read_result.has_value())
+              {
+                sge = true;
+                break;
+              }
+            }
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port, server_got_error);
+
+          // Client as named task: write then disconnect
+          auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
+
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
+
+            // Write one message then disconnect
+            std::string msg = "goodbye";
+            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto write_result = co_await vio::ssl_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
+          }(event_loop, client_config, port);
+
+          co_await std::move(client_task);
+          // Explicitly destroy the client task to tear down the coroutine frame
+          // (and thus the ssl_client_t inside it), closing the TLS connection.
+          {
+            auto destroy = std::move(client_task);
           }
-        }
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port, server_got_error);
 
-      // Client as named task: write then disconnect
-      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
-
-        // Write one message then disconnect
-        std::string msg = "goodbye";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
-      }(event_loop, client_config, port);
-
-      co_await std::move(client_task);
-      // Explicitly destroy the client task to tear down the coroutine frame
-      // (and thus the ssl_client_t inside it), closing the TLS connection.
-      {
-        auto destroy = std::move(client_task);
-      }
-
-      co_await std::move(server_task);
-      ev->stop();
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, server_got_error));
     });
 
   event_loop.run();
@@ -531,82 +552,87 @@ TEST_CASE("tls server disconnect causes client read error")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool client_got_error = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      // Server as named task: starts first so it's listening before the client connects
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
-
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-
-        // Read one message then destroy
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-
-        // Server client destroyed here
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port);
-
-      // Client as named task (waits for server disconnect error)
-      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &cge) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
-
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
-
-        std::string msg = "ping";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
-
-        auto reader_or_err = vio::ssl_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-
-        // Read until error (server disconnect)
-        while (true)
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &client_got_error) -> vio::task_t<void>
         {
-          auto read_result = co_await reader;
-          if (!read_result.has_value())
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
+
+          // Server as named task: starts first so it's listening before the client connects
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
           {
-            cge = true;
-            break;
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
+
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
+
+            // Read one message then destroy
+            auto reader_or_err = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+
+            // Server client destroyed here
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port);
+
+          // Client as named task (waits for server disconnect error)
+          auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &cge) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
+
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
+
+            std::string msg = "ping";
+            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto write_result = co_await vio::ssl_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
+
+            auto reader_or_err = vio::ssl_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+
+            // Read until error (server disconnect)
+            while (true)
+            {
+              auto read_result = co_await reader;
+              if (!read_result.has_value())
+              {
+                cge = true;
+                break;
+              }
+            }
+          }(event_loop, client_config, port, client_got_error);
+
+          co_await std::move(server_task);
+          // Explicitly destroy the server task to tear down the coroutine frame
+          // (and thus the server client inside it), closing the TLS connection.
+          {
+            auto destroy = std::move(server_task);
           }
-        }
-      }(event_loop, client_config, port, client_got_error);
 
-      co_await std::move(server_task);
-      // Explicitly destroy the server task to tear down the coroutine frame
-      // (and thus the server client inside it), closing the TLS connection.
-      {
-        auto destroy = std::move(server_task);
-      }
-
-      co_await std::move(client_task);
-      // Explicitly destroy the client task to close TLS/TCP handles
-      // so the event loop can exit cleanly.
-      {
-        auto destroy = std::move(client_task);
-      }
-      ev->stop();
+          co_await std::move(client_task);
+          // Explicitly destroy the client task to close TLS/TCP handles
+          // so the event loop can exit cleanly.
+          {
+            auto destroy = std::move(client_task);
+          }
+          ev->stop();
+        }(event_loop, server_config, client_config, client_got_error));
     });
 
   event_loop.run();
@@ -624,73 +650,78 @@ TEST_CASE("tls multiple clients to same server")
   int clients_served = 0;
   int clients_replied = 0;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
-
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, int nc, int &cs) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
-
-        for (int i = 0; i < nc; i++)
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, int num_clients, int &clients_served, int &clients_replied) -> vio::task_t<void>
         {
-          auto listen_result = co_await vio::ssl_server_listen(server, p);
-          REQUIRE_EXPECTED(listen_result);
-          auto client_or_err = vio::ssl_server_accept(server);
-          REQUIRE_EXPECTED(client_or_err);
-          auto client = std::move(client_or_err.value());
-          server.handle->tcp.tcp.handle->listen.done = false;
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-          auto reader_or_err = vio::ssl_server_client_create_reader(client);
-          REQUIRE_EXPECTED(reader_or_err);
-          auto reader = std::move(reader_or_err.value());
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          cs++;
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, int nc, int &cs) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-          auto &data = read_result.value();
-          uv_buf_t buf = uv_buf_init(data->base, data->len);
-          auto write_result = co_await vio::ssl_server_client_write(client, buf);
-          REQUIRE_EXPECTED(write_result);
-        }
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port, num_clients, clients_served);
+            for (int i = 0; i < nc; i++)
+            {
+              auto listen_result = co_await vio::ssl_server_listen(server, p);
+              REQUIRE_EXPECTED(listen_result);
+              auto client_or_err = vio::ssl_server_accept(server);
+              REQUIRE_EXPECTED(client_or_err);
+              auto client = std::move(client_or_err.value());
+              server.handle->tcp.tcp.handle->listen.done = false;
 
-      co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, int nc, int &cr) -> vio::task_t<void>
-      {
-        for (int i = 0; i < nc; i++)
-        {
-          auto client_or_err = vio::ssl_client_create(el, cc);
-          REQUIRE_EXPECTED(client_or_err);
-          auto client = std::move(client_or_err.value());
+              auto reader_or_err = vio::ssl_server_client_create_reader(client);
+              REQUIRE_EXPECTED(reader_or_err);
+              auto reader = std::move(reader_or_err.value());
+              auto read_result = co_await reader;
+              REQUIRE_EXPECTED(read_result);
+              cs++;
 
-          auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-          REQUIRE_EXPECTED(connect_result);
+              auto &data = read_result.value();
+              uv_buf_t buf = uv_buf_init(data->base, data->len);
+              auto write_result = co_await vio::ssl_server_client_write(client, buf);
+              REQUIRE_EXPECTED(write_result);
+            }
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port, num_clients, clients_served);
 
-          std::string msg = "tls_client_" + std::to_string(i);
-          uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-          auto write_result = co_await vio::ssl_client_write(client, buf);
-          REQUIRE_EXPECTED(write_result);
+          co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, int nc, int &cr) -> vio::task_t<void>
+          {
+            for (int i = 0; i < nc; i++)
+            {
+              auto client_or_err = vio::ssl_client_create(el, cc);
+              REQUIRE_EXPECTED(client_or_err);
+              auto client = std::move(client_or_err.value());
 
-          auto reader_or_err = vio::ssl_client_create_reader(client);
-          REQUIRE_EXPECTED(reader_or_err);
-          auto reader = std::move(reader_or_err.value());
-          auto read_result = co_await reader;
-          REQUIRE_EXPECTED(read_result);
-          auto &data = read_result.value();
-          std::string_view sv(data->base, data->len);
-          REQUIRE(sv == msg);
-          cr++;
-        }
-      }(event_loop, client_config, port, num_clients, clients_replied);
+              auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+              REQUIRE_EXPECTED(connect_result);
 
-      co_await std::move(server_task);
-      ev->stop();
+              std::string msg = "tls_client_" + std::to_string(i);
+              uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+              auto write_result = co_await vio::ssl_client_write(client, buf);
+              REQUIRE_EXPECTED(write_result);
+
+              auto reader_or_err = vio::ssl_client_create_reader(client);
+              REQUIRE_EXPECTED(reader_or_err);
+              auto reader = std::move(reader_or_err.value());
+              auto read_result = co_await reader;
+              REQUIRE_EXPECTED(read_result);
+              auto &data = read_result.value();
+              std::string_view sv(data->base, data->len);
+              REQUIRE(sv == msg);
+              cr++;
+            }
+          }(event_loop, client_config, port, num_clients, clients_replied);
+
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, num_clients, clients_served, clients_replied));
     });
 
   event_loop.run();
@@ -706,52 +737,57 @@ TEST_CASE("tls cannot create multiple active readers on client")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool error_caught = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &error_caught) -> vio::task_t<void>
+        {
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE(!read_result.has_value());
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port);
+            auto reader_or_err = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE(!read_result.has_value());
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port);
 
-      co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &ec) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &ec) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
 
-        auto reader1 = vio::ssl_client_create_reader(client);
-        REQUIRE_EXPECTED(reader1);
+            auto reader1 = vio::ssl_client_create_reader(client);
+            REQUIRE_EXPECTED(reader1);
 
-        auto reader2 = vio::ssl_client_create_reader(client);
-        REQUIRE(!reader2.has_value());
-        ec = true;
-      }(event_loop, client_config, port, error_caught);
+            auto reader2 = vio::ssl_client_create_reader(client);
+            REQUIRE(!reader2.has_value());
+            ec = true;
+          }(event_loop, client_config, port, error_caught);
 
-      co_await std::move(server_task);
-      ev->stop();
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, error_caught));
     });
 
   event_loop.run();
@@ -766,49 +802,54 @@ TEST_CASE("tls cannot create multiple active readers on server client")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool error_caught = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &error_caught) -> vio::task_t<void>
+        {
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, bool &ec) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, bool &ec) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto reader1 = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader1);
+            auto reader1 = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader1);
 
-        auto reader2 = vio::ssl_server_client_create_reader(client);
-        REQUIRE(!reader2.has_value());
-        ec = true;
+            auto reader2 = vio::ssl_server_client_create_reader(client);
+            REQUIRE(!reader2.has_value());
+            ec = true;
 
-        auto read_result = co_await reader1.value();
-        REQUIRE(!read_result.has_value());
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port, error_caught);
+            auto read_result = co_await reader1.value();
+            REQUIRE(!read_result.has_value());
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port, error_caught);
 
-      co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
-      }(event_loop, client_config, port);
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
+          }(event_loop, client_config, port);
 
-      co_await std::move(server_task);
-      ev->stop();
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, error_caught));
     });
 
   event_loop.run();
@@ -842,73 +883,78 @@ TEST_CASE("tls server write then client read")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool verified = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &verified) -> vio::task_t<void>
+        {
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        // Server writes first
-        std::string msg = "server_speaks_first";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_server_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
+            // Server writes first
+            std::string msg = "server_speaks_first";
+            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto write_result = co_await vio::ssl_server_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
 
-        // Then reads client's response
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-        auto &data = read_result.value();
-        std::string_view sv(data->base, data->len);
-        REQUIRE(sv == "client_ack");
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port);
+            // Then reads client's response
+            auto reader_or_err = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            auto &data = read_result.value();
+            std::string_view sv(data->base, data->len);
+            REQUIRE(sv == "client_ack");
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port);
 
-      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &v) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &v) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
 
-        // Client reads server's message first
-        auto reader_or_err = vio::ssl_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-        auto &data = read_result.value();
-        std::string_view sv(data->base, data->len);
-        REQUIRE(sv == "server_speaks_first");
+            // Client reads server's message first
+            auto reader_or_err = vio::ssl_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            auto &data = read_result.value();
+            std::string_view sv(data->base, data->len);
+            REQUIRE(sv == "server_speaks_first");
 
-        // Then responds
-        std::string msg = "client_ack";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
-        v = true;
-      }(event_loop, client_config, port, verified);
+            // Then responds
+            std::string msg = "client_ack";
+            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto write_result = co_await vio::ssl_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
+            v = true;
+          }(event_loop, client_config, port, verified);
 
-      co_await std::move(client_task);
-      co_await std::move(server_task);
-      ev->stop();
+          co_await std::move(client_task);
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, verified));
     });
 
   event_loop.run();
@@ -923,64 +969,69 @@ TEST_CASE("tls exact buffer read with stream_reader_t::read()")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool verified = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &verified) -> vio::task_t<void>
+        {
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        // Send exactly 100 bytes of known pattern
-        std::vector<char> data(100);
-        std::iota(data.begin(), data.end(), char(0));
-        uv_buf_t buf = uv_buf_init(data.data(), data.size());
-        auto write_result = co_await vio::ssl_server_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port);
+            // Send exactly 100 bytes of known pattern
+            std::vector<char> data(100);
+            std::iota(data.begin(), data.end(), char(0));
+            uv_buf_t buf = uv_buf_init(data.data(), data.size());
+            auto write_result = co_await vio::ssl_server_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port);
 
-      co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &v) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          co_await [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &v) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
 
-        auto reader_or_err = vio::ssl_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
+            auto reader_or_err = vio::ssl_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
 
-        // Use the exact buffer read to get exactly 100 bytes
-        std::vector<char> buffer(100);
-        uv_buf_t read_buf;
-        read_buf.base = buffer.data();
-        read_buf.len = buffer.size();
-        auto read_result = co_await reader.read(read_buf);
-        REQUIRE_EXPECTED(read_result);
+            // Use the exact buffer read to get exactly 100 bytes
+            std::vector<char> buffer(100);
+            uv_buf_t read_buf;
+            read_buf.base = buffer.data();
+            read_buf.len = buffer.size();
+            auto read_result = co_await reader.read(read_buf);
+            REQUIRE_EXPECTED(read_result);
 
-        // Verify the pattern
-        std::vector<char> expected(100);
-        std::iota(expected.begin(), expected.end(), char(0));
-        REQUIRE(std::memcmp(buffer.data(), expected.data(), 100) == 0);
-        v = true;
-      }(event_loop, client_config, port, verified);
+            // Verify the pattern
+            std::vector<char> expected(100);
+            std::iota(expected.begin(), expected.end(), char(0));
+            REQUIRE(std::memcmp(buffer.data(), expected.data(), 100) == 0);
+            v = true;
+          }(event_loop, client_config, port, verified);
 
-      co_await std::move(server_task);
-      ev->stop();
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, verified));
     });
 
   event_loop.run();
@@ -996,72 +1047,77 @@ TEST_CASE("tls bidirectional concurrent read and write")
   bool server_verified = false;
   bool client_verified = false;
 
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
-    [&]() -> vio::task_t<void>
+    [&]
     {
-      auto *ev = &event_loop;
-      auto server_tcp_pair = get_ephemeral_port(*ev);
-      REQUIRE_EXPECTED(server_tcp_pair);
-      int port = server_tcp_pair->second;
+      task.emplace(
+        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_verified, bool &client_verified) -> vio::task_t<void>
+        {
+          auto *ev = &event_loop;
+          auto server_tcp_pair = get_ephemeral_port(*ev);
+          REQUIRE_EXPECTED(server_tcp_pair);
+          int port = server_tcp_pair->second;
 
-      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, bool &sv) -> vio::task_t<void>
-      {
-        auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
-        REQUIRE_EXPECTED(server_create_result);
-        auto server = std::move(server_create_result.value());
+          auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, bool &sv) -> vio::task_t<void>
+          {
+            auto server_create_result = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+            REQUIRE_EXPECTED(server_create_result);
+            auto server = std::move(server_create_result.value());
 
-        auto listen_result = co_await vio::ssl_server_listen(server, p);
-        REQUIRE_EXPECTED(listen_result);
-        auto client_or_err = vio::ssl_server_accept(server);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+            auto listen_result = co_await vio::ssl_server_listen(server, p);
+            REQUIRE_EXPECTED(listen_result);
+            auto client_or_err = vio::ssl_server_accept(server);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        // Write and read at the same time (write first to avoid deadlock in coroutine)
-        std::string msg = "from_server";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_server_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
+            // Write and read at the same time (write first to avoid deadlock in coroutine)
+            std::string msg = "from_server";
+            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto write_result = co_await vio::ssl_server_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
 
-        auto reader_or_err = vio::ssl_server_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-        auto &data = read_result.value();
-        std::string_view sv2(data->base, data->len);
-        REQUIRE(sv2 == "from_client");
-        sv = true;
-      }(event_loop, std::move(server_tcp_pair->first), server_config, port, server_verified);
+            auto reader_or_err = vio::ssl_server_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            auto &data = read_result.value();
+            std::string_view sv2(data->base, data->len);
+            REQUIRE(sv2 == "from_client");
+            sv = true;
+          }(event_loop, std::move(server_tcp_pair->first), server_config, port, server_verified);
 
-      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &cv) -> vio::task_t<void>
-      {
-        auto client_or_err = vio::ssl_client_create(el, cc);
-        REQUIRE_EXPECTED(client_or_err);
-        auto client = std::move(client_or_err.value());
+          auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &cv) -> vio::task_t<void>
+          {
+            auto client_or_err = vio::ssl_client_create(el, cc);
+            REQUIRE_EXPECTED(client_or_err);
+            auto client = std::move(client_or_err.value());
 
-        auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
-        REQUIRE_EXPECTED(connect_result);
+            auto connect_result = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+            REQUIRE_EXPECTED(connect_result);
 
-        // Write and read (write first to match server's read)
-        std::string msg = "from_client";
-        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
-        auto write_result = co_await vio::ssl_client_write(client, buf);
-        REQUIRE_EXPECTED(write_result);
+            // Write and read (write first to match server's read)
+            std::string msg = "from_client";
+            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto write_result = co_await vio::ssl_client_write(client, buf);
+            REQUIRE_EXPECTED(write_result);
 
-        auto reader_or_err = vio::ssl_client_create_reader(client);
-        REQUIRE_EXPECTED(reader_or_err);
-        auto reader = std::move(reader_or_err.value());
-        auto read_result = co_await reader;
-        REQUIRE_EXPECTED(read_result);
-        auto &data = read_result.value();
-        std::string_view sv2(data->base, data->len);
-        REQUIRE(sv2 == "from_server");
-        cv = true;
-      }(event_loop, client_config, port, client_verified);
+            auto reader_or_err = vio::ssl_client_create_reader(client);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto read_result = co_await reader;
+            REQUIRE_EXPECTED(read_result);
+            auto &data = read_result.value();
+            std::string_view sv2(data->base, data->len);
+            REQUIRE(sv2 == "from_server");
+            cv = true;
+          }(event_loop, client_config, port, client_verified);
 
-      co_await std::move(client_task);
-      co_await std::move(server_task);
-      ev->stop();
+          co_await std::move(client_task);
+          co_await std::move(server_task);
+          ev->stop();
+        }(event_loop, server_config, client_config, server_verified, client_verified));
     });
 
   event_loop.run();

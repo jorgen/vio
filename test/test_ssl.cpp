@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <optional>
 #include <ostream>
 
 #include <doctest/doctest.h>
@@ -94,7 +95,8 @@ TEST_SUITE("TLS Client")
 TEST_CASE("test ssl toy http client")
 {
   vio::event_loop_t event_loop;
-  event_loop.run_in_loop([&event_loop] { test_ssl_client_connect(event_loop); });
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] { task.emplace(test_ssl_client_connect(event_loop)); });
   event_loop.run();
 }
 } // TEST_SUITE

@@ -60,6 +60,26 @@ cmake --build cmake-build-msan
 ./cmake-build-msan/test/vio_tests
 ```
 
+## Docker (Sanitizer Builds)
+
+A Docker image (`ghcr.io/jorgen/vio-ci:latest`) provides a consistent environment for sanitizer
+builds. CI uses this image automatically. For local use:
+
+```bash
+# Build the image
+docker build -t vio-ci .
+
+# Run a sanitizer build inside the container
+docker run --rm -v $(pwd):/workspace -w /workspace vio-ci bash -c \
+  "cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+    -DCMAKE_C_FLAGS='-fsanitize=address -fno-omit-frame-pointer' \
+    -DCMAKE_CXX_FLAGS='-fsanitize=address -fno-omit-frame-pointer' \
+    -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address' && \
+  cmake --build build && \
+  ./build/test/vio_tests"
+```
+
 ## Clang-Tidy
 
 The project uses CLion's bundled clang-tidy. Run it via `run-clang-tidy` with the CLion binary:
@@ -135,17 +155,24 @@ coroutines still need `event_loop.stop()` before `event_loop.run()` for cleanup.
 
 ### Coroutine test pattern
 
-Tests use `event_loop.run_in_loop()` with a lambda returning `task_t<void>`. Server and client
-tasks run as concurrent coroutines within the same event loop. The pattern is:
+Tests use `event_loop.run_in_loop()` with a non-coroutine lambda that stores the coroutine
+`task_t` in a `std::optional`. This keeps the coroutine frame alive until after `event_loop.run()`
+returns, preventing memory leaks. The inner lambda coroutine uses **parameters** (not captures)
+to avoid dangling-this UB:
 
 ```cpp
-event_loop.run_in_loop([&]() -> vio::task_t<void> {
-    auto server_task = [](args...) -> vio::task_t<void> { ... }(captured_args);
-    co_await [](args...) -> vio::task_t<void> { ... }(captured_args); // client
-    co_await std::move(server_task);
-    ev->stop();
+std::optional<vio::task_t<void>> task;
+event_loop.run_in_loop([&] {
+    task.emplace(
+      [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void> {
+          auto server_task = [](args...) -> vio::task_t<void> { ... }(captured_args);
+          co_await [](args...) -> vio::task_t<void> { ... }(captured_args); // client
+          co_await std::move(server_task);
+          event_loop.stop();
+      }(event_loop, verified));
 });
 event_loop.run();
+// ~optional destroys task_t, which sees _coro.done()==true and calls _coro.destroy()
 ```
 
 ### Avoiding dangling-this UB in lambda coroutines
