@@ -23,6 +23,7 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include <coroutine>
+#include <cstring>
 #include <expected>
 
 #include <uv.h>

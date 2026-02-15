@@ -1,8 +1,8 @@
 #include "require_expected.h"
 
 #include <chrono>
+#include <cstdio>
 #include <doctest/doctest.h>
-#include <print>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
 #include <vio/operation/file.h>
@@ -18,7 +18,7 @@ static vio::task_t<void> write_a_test_file(vio::event_loop_t &event_loop)
   auto write_result = co_await vio::write_file(event_loop, *file, reinterpret_cast<uint8_t *>(to_write.data()), to_write.size(), 0);
   if (!write_result.has_value())
   {
-    std::println(stderr, "Write operation failed: {}", write_result.error().msg);
+    fprintf(stderr, "Write operation failed: %s\n", write_result.error().msg.c_str());
   }
   REQUIRE(write_result.has_value());
   REQUIRE(write_result.value() == to_write.size());
