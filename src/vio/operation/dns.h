@@ -28,6 +28,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/uv_coro.h"
 
 #include <coroutine>
+#include <cstring>
 #include <expected>
 #include <string>
 #include <vector>

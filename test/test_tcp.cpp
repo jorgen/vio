@@ -1,3 +1,4 @@
+#include <cstring>
 #include <ostream>
 
 #include <doctest/doctest.h>
