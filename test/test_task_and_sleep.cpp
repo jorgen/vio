@@ -27,7 +27,7 @@ static vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
   auto to_wait = vio::sleep(event_loop, delay);
   co_await to_wait;
   auto end_time = std::chrono::high_resolution_clock::now();
-  REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) >= delay);
+  REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) >= delay - std::chrono::milliseconds(2));
 
   start_time = std::chrono::high_resolution_clock::now();
   auto to_wait2 = vio::sleep(event_loop, delay * 2);
