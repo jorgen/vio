@@ -6,8 +6,35 @@ on:
   pull_request:
     branches: [master]
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: jorgen/vio-ci
+
 jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
   sanitizers:
+    needs: docker
     runs-on: ubuntu-24.04
     container: ghcr.io/jorgen/vio-ci:latest
     strategy:
