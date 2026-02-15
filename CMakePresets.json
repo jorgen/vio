@@ -50,6 +50,18 @@
         "CMAKE_CXX_FLAGS": "-fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=undefined"
       }
+    },
+    {
+      "name": "msan",
+      "displayName": "Debug with MemorySanitizer",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/cmake-build-msan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins",
+        "CMAKE_CXX_FLAGS": "-fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=memory"
+      }
     }
   ],
   "buildPresets": [
@@ -68,6 +80,10 @@
     {
       "name": "ubsan",
       "configurePreset": "ubsan"
+    },
+    {
+      "name": "msan",
+      "configurePreset": "msan"
     }
   ],
   "testPresets": [
@@ -86,6 +102,10 @@
     {
       "name": "ubsan",
       "configurePreset": "ubsan"
+    },
+    {
+      "name": "msan",
+      "configurePreset": "msan"
     }
   ]
 }

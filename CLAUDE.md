@@ -53,6 +53,11 @@ cmake --build cmake-build-tsan
 cmake --preset ubsan
 cmake --build cmake-build-ubsan
 ./cmake-build-ubsan/test/vio_tests
+
+# MemorySanitizer (requires clang)
+CC=clang CXX=clang++ cmake --preset msan
+cmake --build cmake-build-msan
+./cmake-build-msan/test/vio_tests
 ```
 
 ## Clang-Tidy

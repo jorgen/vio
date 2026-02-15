@@ -14,14 +14,29 @@ jobs:
       matrix:
         include:
           - name: asan
+            cc: cc
+            cxx: c++
+            c_flags: -fsanitize=address -fno-omit-frame-pointer
             cxx_flags: -fsanitize=address -fno-omit-frame-pointer
             linker_flags: -fsanitize=address
           - name: tsan
+            cc: cc
+            cxx: c++
+            c_flags: -fsanitize=thread -fno-omit-frame-pointer
             cxx_flags: -fsanitize=thread -fno-omit-frame-pointer
             linker_flags: -fsanitize=thread
           - name: ubsan
+            cc: cc
+            cxx: c++
+            c_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
             cxx_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
             linker_flags: -fsanitize=undefined
+          - name: msan
+            cc: clang
+            cxx: clang++
+            c_flags: -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins
+            cxx_flags: -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins
+            linker_flags: -fsanitize=memory
 
     name: ${{ matrix.name }}
 
@@ -40,6 +55,9 @@ jobs:
         run: |
           cmake -G Ninja -B build \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_C_FLAGS="${{ matrix.c_flags }}" \
             -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
             -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}"
 
