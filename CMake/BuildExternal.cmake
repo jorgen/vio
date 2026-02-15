@@ -14,6 +14,9 @@ function(BuildExternalCMake name version source_dir cmake_args build_targets)
 
     set(cmake_arg_complete "${cmake_arg_complete}-DCMAKE_INSTALL_PREFIX=${INSTALL_INT_CONFIG};-DCMAKE_INSTALL_MESSAGE=LAZY;")
     set(cmake_arg_complete "${cmake_arg_complete}-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM};")
+    if (CMAKE_C_COMPILER)
+        set(cmake_arg_complete "${cmake_arg_complete}-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER};")
+    endif ()
     set(cmake_arg_complete "${cmake_arg_complete}-DCMAKE_C_FLAGS=${CMAKE_C_FLAGS};-DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
 
     foreach (build_target ${build_targets})

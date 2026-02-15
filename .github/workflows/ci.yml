@@ -14,29 +14,33 @@ jobs:
       matrix:
         include:
           - name: asan
-            cc: cc
-            cxx: c++
+            cc: gcc-14
+            cxx: g++-14
             c_flags: -fsanitize=address -fno-omit-frame-pointer
             cxx_flags: -fsanitize=address -fno-omit-frame-pointer
             linker_flags: -fsanitize=address
+            packages: g++-14
           - name: tsan
-            cc: cc
-            cxx: c++
+            cc: gcc-14
+            cxx: g++-14
             c_flags: -fsanitize=thread -fno-omit-frame-pointer
             cxx_flags: -fsanitize=thread -fno-omit-frame-pointer
             linker_flags: -fsanitize=thread
+            packages: g++-14
           - name: ubsan
-            cc: cc
-            cxx: c++
+            cc: gcc-14
+            cxx: g++-14
             c_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
             cxx_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
             linker_flags: -fsanitize=undefined
+            packages: g++-14
           - name: msan
-            cc: clang
-            cxx: clang++
+            cc: clang-18
+            cxx: clang++-18
             c_flags: -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins
-            cxx_flags: -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins
-            linker_flags: -fsanitize=memory
+            cxx_flags: -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins -stdlib=libc++
+            linker_flags: -fsanitize=memory -stdlib=libc++ -lc++abi
+            packages: clang-18 libc++-18-dev libc++abi-18-dev
 
     name: ${{ matrix.name }}
 
@@ -46,7 +50,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build
+          sudo apt-get install -y ninja-build ${{ matrix.packages }}
 
       - name: Install CMake
         run: pip install cmake
