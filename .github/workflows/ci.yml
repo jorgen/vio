@@ -110,14 +110,18 @@ jobs:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           ccache --zero-stats
+          ignorelist_flag=""
+          if [ "${{ matrix.name }}" = "msan" ] && [ -f sanitizer-ignorelist.txt ]; then
+            ignorelist_flag="-fsanitize-ignorelist=$(pwd)/sanitizer-ignorelist.txt"
+          fi
           cmake -G Ninja -B build \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
-            -DCMAKE_C_FLAGS="${{ matrix.c_flags }}" \
-            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+            -DCMAKE_C_FLAGS="${{ matrix.c_flags }} $ignorelist_flag" \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }} $ignorelist_flag" \
             -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}"
 
       - name: Build
