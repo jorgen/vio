@@ -51,15 +51,13 @@ TEST_SUITE("Event Pipe")
     vio::awaitable_event_pipe_t<int, int> pipe(caller_loop, handler_thread.event_loop(), [](int x) -> int { return x * 2; });
 
     int result = 0; // NOLINT(misc-const-correctness)
-    caller_loop.run_in_loop(
-      [&caller_loop, &result, &pipe]() -> vio::task_t<void>
-      {
-        auto *ev = &caller_loop;
-        auto *r = &result;
-        auto *p = &pipe;
-        *r = co_await p->call(21);
-        ev->stop();
-      });
+    caller_loop.run_in_loop([&] {
+      return [](vio::event_loop_t &caller_loop, int &result, vio::awaitable_event_pipe_t<int, int> &pipe) -> vio::task_t<void>
+        {
+          result = co_await pipe.call(21);
+          caller_loop.stop();
+        }(caller_loop, result, pipe);
+    });
     caller_loop.run();
 
     REQUIRE(result == 42);
@@ -80,15 +78,13 @@ TEST_SUITE("Event Pipe")
                                                });
 
     int result = 0; // NOLINT(misc-const-correctness)
-    caller_loop.run_in_loop(
-      [&caller_loop, &result, &pipe]() -> vio::task_t<void>
-      {
-        auto *ev = &caller_loop;
-        auto *r = &result;
-        auto *p = &pipe;
-        *r = co_await p->call(21);
-        ev->stop();
-      });
+    caller_loop.run_in_loop([&] {
+      return [](vio::event_loop_t &caller_loop, int &result, vio::awaitable_event_pipe_t<int, int> &pipe) -> vio::task_t<void>
+        {
+          result = co_await pipe.call(21);
+          caller_loop.stop();
+        }(caller_loop, result, pipe);
+    });
     caller_loop.run();
 
     REQUIRE(result == 42);
@@ -102,18 +98,16 @@ TEST_SUITE("Event Pipe")
     vio::awaitable_event_pipe_t<int, int> pipe(caller_loop, handler_thread.event_loop(), [](int x) -> int { return x * 2; });
 
     int sum = 0; // NOLINT(misc-const-correctness)
-    caller_loop.run_in_loop(
-      [&caller_loop, &sum, &pipe]() -> vio::task_t<void>
-      {
-        auto *ev = &caller_loop;
-        auto *s = &sum;
-        auto *p = &pipe;
-        for (int i = 0; i < 10; i++)
+    caller_loop.run_in_loop([&] {
+      return [](vio::event_loop_t &caller_loop, int &sum, vio::awaitable_event_pipe_t<int, int> &pipe) -> vio::task_t<void>
         {
-          *s += co_await p->call(i);
-        }
-        ev->stop();
-      });
+          for (int i = 0; i < 10; i++)
+          {
+            sum += co_await pipe.call(i);
+          }
+          caller_loop.stop();
+        }(caller_loop, sum, pipe);
+    });
     caller_loop.run();
 
     REQUIRE(sum == 90);
@@ -127,15 +121,13 @@ TEST_SUITE("Event Pipe")
     vio::awaitable_event_pipe_t<std::string, std::string, int> pipe(caller_loop, handler_thread.event_loop(), [](std::string s, int n) -> std::string { return s + std::to_string(n); });
 
     std::string result; // NOLINT(misc-const-correctness)
-    caller_loop.run_in_loop(
-      [&caller_loop, &result, &pipe]() -> vio::task_t<void>
-      {
-        auto *ev = &caller_loop;
-        auto *r = &result;
-        auto *p = &pipe;
-        *r = co_await p->call(std::string("hello"), 42);
-        ev->stop();
-      });
+    caller_loop.run_in_loop([&] {
+      return [](vio::event_loop_t &caller_loop, std::string &result, vio::awaitable_event_pipe_t<std::string, std::string, int> &pipe) -> vio::task_t<void>
+        {
+          result = co_await pipe.call(std::string("hello"), 42);
+          caller_loop.stop();
+        }(caller_loop, result, pipe);
+    });
     caller_loop.run();
 
     REQUIRE(result == "hello42");
@@ -147,15 +139,13 @@ TEST_SUITE("Event Pipe")
     vio::awaitable_event_pipe_t<int, int> pipe(loop, loop, [](int x) -> int { return x * 2; });
 
     int result = 0; // NOLINT(misc-const-correctness)
-    loop.run_in_loop(
-      [&loop, &result, &pipe]() -> vio::task_t<void>
-      {
-        auto *ev = &loop;
-        auto *r = &result;
-        auto *p = &pipe;
-        *r = co_await p->call(21);
-        ev->stop();
-      });
+    loop.run_in_loop([&] {
+      return [](vio::event_loop_t &loop, int &result, vio::awaitable_event_pipe_t<int, int> &pipe) -> vio::task_t<void>
+        {
+          result = co_await pipe.call(21);
+          loop.stop();
+        }(loop, result, pipe);
+    });
     loop.run();
 
     REQUIRE(result == 42);

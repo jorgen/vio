@@ -1,4 +1,3 @@
-#include <optional>
 #include <ostream>
 
 #include <doctest/doctest.h>
@@ -201,12 +200,10 @@ TEST_CASE("test basic tls server")
   auto certs = generate_test_certs();
   const vio::ssl_config_t server_config{.ca_mem = certs.ca_cert, .cert_mem = certs.cert, .key_mem = certs.key};
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_got_data, bool &server_wrote_msg, bool &client_got_server_reply) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_got_data, bool &server_wrote_msg, bool &client_got_server_reply) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -217,7 +214,7 @@ TEST_CASE("test basic tls server")
           co_await std::move(server);
 
           ev->stop();
-        }(event_loop, server_config, client_config, server_got_data, server_wrote_msg, client_got_server_reply));
+        }(event_loop, server_config, client_config, server_got_data, server_wrote_msg, client_got_server_reply);
     });
 
   event_loop.run();
@@ -278,12 +275,10 @@ TEST_CASE("tls echo multiple messages")
   int server_received = 0;
   int client_received = 0;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, int num_messages, int &server_received, int &client_received) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, int num_messages, int &server_received, int &client_received) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -351,7 +346,7 @@ TEST_CASE("tls echo multiple messages")
           co_await std::move(client_task);
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, num_messages, server_received, client_received));
+        }(event_loop, server_config, client_config, num_messages, server_received, client_received);
     });
 
   event_loop.run();
@@ -369,12 +364,10 @@ TEST_CASE("tls large data round trip")
   constexpr size_t data_size = 128 * 1024; // 128KB
   bool data_verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, size_t data_size, bool &data_verified) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, size_t data_size, bool &data_verified) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -456,7 +449,7 @@ TEST_CASE("tls large data round trip")
           co_await std::move(client_task);
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, data_size, data_verified));
+        }(event_loop, server_config, client_config, data_size, data_verified);
     });
 
   event_loop.run();
@@ -471,12 +464,10 @@ TEST_CASE("tls client disconnect causes server read error")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool server_got_error = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_got_error) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_got_error) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -537,7 +528,7 @@ TEST_CASE("tls client disconnect causes server read error")
 
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, server_got_error));
+        }(event_loop, server_config, client_config, server_got_error);
     });
 
   event_loop.run();
@@ -552,12 +543,10 @@ TEST_CASE("tls server disconnect causes client read error")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool client_got_error = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &client_got_error) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &client_got_error) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -632,7 +621,7 @@ TEST_CASE("tls server disconnect causes client read error")
             auto destroy = std::move(client_task);
           }
           ev->stop();
-        }(event_loop, server_config, client_config, client_got_error));
+        }(event_loop, server_config, client_config, client_got_error);
     });
 
   event_loop.run();
@@ -650,12 +639,10 @@ TEST_CASE("tls multiple clients to same server")
   int clients_served = 0;
   int clients_replied = 0;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, int num_clients, int &clients_served, int &clients_replied) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, int num_clients, int &clients_served, int &clients_replied) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -721,7 +708,7 @@ TEST_CASE("tls multiple clients to same server")
 
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, num_clients, clients_served, clients_replied));
+        }(event_loop, server_config, client_config, num_clients, clients_served, clients_replied);
     });
 
   event_loop.run();
@@ -737,12 +724,10 @@ TEST_CASE("tls cannot create multiple active readers on client")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool error_caught = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &error_caught) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &error_caught) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -787,7 +772,7 @@ TEST_CASE("tls cannot create multiple active readers on client")
 
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, error_caught));
+        }(event_loop, server_config, client_config, error_caught);
     });
 
   event_loop.run();
@@ -802,12 +787,10 @@ TEST_CASE("tls cannot create multiple active readers on server client")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool error_caught = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &error_caught) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &error_caught) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -849,7 +832,7 @@ TEST_CASE("tls cannot create multiple active readers on server client")
 
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, error_caught));
+        }(event_loop, server_config, client_config, error_caught);
     });
 
   event_loop.run();
@@ -883,12 +866,10 @@ TEST_CASE("tls server write then client read")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &verified) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &verified) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -954,7 +935,7 @@ TEST_CASE("tls server write then client read")
           co_await std::move(client_task);
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, verified));
+        }(event_loop, server_config, client_config, verified);
     });
 
   event_loop.run();
@@ -969,12 +950,10 @@ TEST_CASE("tls exact buffer read with stream_reader_t::read()")
   const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   bool verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &verified) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &verified) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -1031,7 +1010,7 @@ TEST_CASE("tls exact buffer read with stream_reader_t::read()")
 
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, verified));
+        }(event_loop, server_config, client_config, verified);
     });
 
   event_loop.run();
@@ -1047,12 +1026,10 @@ TEST_CASE("tls bidirectional concurrent read and write")
   bool server_verified = false;
   bool client_verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
-      task.emplace(
-        [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_verified, bool &client_verified) -> vio::task_t<void>
+      return [](vio::event_loop_t &event_loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, bool &server_verified, bool &client_verified) -> vio::task_t<void>
         {
           auto *ev = &event_loop;
           auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -1117,7 +1094,7 @@ TEST_CASE("tls bidirectional concurrent read and write")
           co_await std::move(client_task);
           co_await std::move(server_task);
           ev->stop();
-        }(event_loop, server_config, client_config, server_verified, client_verified));
+        }(event_loop, server_config, client_config, server_verified, client_verified);
     });
 
   event_loop.run();

@@ -68,6 +68,16 @@ struct tls_native_server_ctx_t
     return tls_server_client_tls_t{client};
   }
 
+  void close()
+  {
+    if (tls_ctx)
+    {
+      tls_close(tls_ctx);
+      tls_free(tls_ctx);
+      tls_ctx = nullptr;
+    }
+  }
+
   tls *tls_ctx = nullptr;
 };
 
@@ -127,6 +137,7 @@ inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t 
   ret.handle.on_destroy(
     [state_raw = &ret.handle.data()]()
     {
+      state_raw->tls_ctx.close();
       // Cancel any pending listen operation
       auto &tcp_handle = state_raw->tcp.tcp.handle;
       auto &listen = tcp_handle->listen;

@@ -1,5 +1,4 @@
 #include <cstring>
-#include <optional>
 #include <ostream>
 
 #include <doctest/doctest.h>
@@ -111,10 +110,8 @@ TEST_CASE("test basic tcp")
   server_wrote_msg = false;
   client_got_server_reply = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &server_got_data, bool &server_wrote_msg, bool &client_got_server_reply) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &server_got_data, bool &server_wrote_msg, bool &client_got_server_reply) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
         auto server_tcp_pair = get_ephemeral_port(*ev);
@@ -125,7 +122,7 @@ TEST_CASE("test basic tcp")
         co_await std::move(server);
 
         ev->stop();
-      }(event_loop, server_got_data, server_wrote_msg, client_got_server_reply));
+      }(event_loop, server_got_data, server_wrote_msg, client_got_server_reply);
   });
 
   event_loop.run();
@@ -140,10 +137,8 @@ TEST_CASE("tcp echo multiple messages")
   vio::event_loop_t event_loop;
   bool data_verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &data_verified) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &data_verified) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -214,7 +209,7 @@ TEST_CASE("tcp echo multiple messages")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, data_verified));
+      }(event_loop, data_verified);
   });
 
   event_loop.run();
@@ -227,10 +222,8 @@ TEST_CASE("tcp large data transfer")
   constexpr size_t data_size = 1024 * 1024; // 1MB
   bool data_verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, size_t data_size, bool &data_verified) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, size_t data_size, bool &data_verified) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -284,7 +277,7 @@ TEST_CASE("tcp large data transfer")
         co_await std::move(server_task);
         data_verified = true;
         ev->stop();
-      }(event_loop, data_size, data_verified));
+      }(event_loop, data_size, data_verified);
   });
 
   event_loop.run();
@@ -297,10 +290,8 @@ TEST_CASE("tcp large data round trip")
   constexpr size_t data_size = 256 * 1024; // 256KB
   bool data_verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, size_t data_size, bool &data_verified) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, size_t data_size, bool &data_verified) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -377,7 +368,7 @@ TEST_CASE("tcp large data round trip")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, data_size, data_verified));
+      }(event_loop, data_size, data_verified);
   });
 
   event_loop.run();
@@ -389,10 +380,8 @@ TEST_CASE("tcp client disconnect causes server EOF")
   vio::event_loop_t event_loop;
   bool server_got_eof = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &server_got_eof) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &server_got_eof) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -433,7 +422,7 @@ TEST_CASE("tcp client disconnect causes server EOF")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, server_got_eof));
+      }(event_loop, server_got_eof);
   });
 
   event_loop.run();
@@ -445,10 +434,8 @@ TEST_CASE("tcp server disconnect causes client EOF")
   vio::event_loop_t event_loop;
   bool client_got_eof = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &client_got_eof) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &client_got_eof) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -504,7 +491,7 @@ TEST_CASE("tcp server disconnect causes client EOF")
 
         co_await std::move(client_task);
         ev->stop();
-      }(event_loop, client_got_eof));
+      }(event_loop, client_got_eof);
   });
 
   event_loop.run();
@@ -518,10 +505,8 @@ TEST_CASE("tcp multiple clients to same server")
   int clients_served = 0;
   int clients_replied = 0;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, int num_clients, int &clients_served, int &clients_replied) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, int num_clients, int &clients_served, int &clients_replied) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -586,7 +571,7 @@ TEST_CASE("tcp multiple clients to same server")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, num_clients, clients_served, clients_replied));
+      }(event_loop, num_clients, clients_served, clients_replied);
   });
 
   event_loop.run();
@@ -599,10 +584,8 @@ TEST_CASE("tcp cancel reader")
   vio::event_loop_t event_loop;
   bool reader_cancelled = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &reader_cancelled) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &reader_cancelled) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -651,7 +634,7 @@ TEST_CASE("tcp cancel reader")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, reader_cancelled));
+      }(event_loop, reader_cancelled);
   });
 
   event_loop.run();
@@ -663,10 +646,8 @@ TEST_CASE("tcp cannot create multiple active readers")
   vio::event_loop_t event_loop;
   bool error_caught = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &error_caught) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &error_caught) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -709,7 +690,7 @@ TEST_CASE("tcp cannot create multiple active readers")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, error_caught));
+      }(event_loop, error_caught);
   });
 
   event_loop.run();
@@ -721,10 +702,8 @@ TEST_CASE("tcp connect to unreachable address")
   vio::event_loop_t event_loop;
   bool connect_failed = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &connect_failed) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &connect_failed) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -738,7 +717,7 @@ TEST_CASE("tcp connect to unreachable address")
         REQUIRE(!connect_result.has_value());
         connect_failed = true;
         ev->stop();
-      }(event_loop, connect_failed));
+      }(event_loop, connect_failed);
   });
 
   event_loop.run();
@@ -750,10 +729,8 @@ TEST_CASE("tcp write then read on same connection")
   vio::event_loop_t event_loop;
   bool verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -815,7 +792,7 @@ TEST_CASE("tcp write then read on same connection")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, verified));
+      }(event_loop, verified);
   });
 
   event_loop.run();
@@ -827,10 +804,8 @@ TEST_CASE("tcp reader destroyed then new reader created")
   vio::event_loop_t event_loop;
   bool verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -906,7 +881,7 @@ TEST_CASE("tcp reader destroyed then new reader created")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, verified));
+      }(event_loop, verified);
   });
 
   event_loop.run();
@@ -918,10 +893,8 @@ TEST_CASE("tcp ipv6 loopback")
   vio::event_loop_t event_loop;
   bool verified = false;
 
-  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop([&] {
-    task.emplace(
-      [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
       {
         auto *ev = &event_loop;
 
@@ -986,7 +959,7 @@ TEST_CASE("tcp ipv6 loopback")
 
         co_await std::move(server_task);
         ev->stop();
-      }(event_loop, verified));
+      }(event_loop, verified);
   });
 
   event_loop.run();

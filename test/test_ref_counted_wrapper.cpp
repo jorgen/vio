@@ -63,9 +63,10 @@ TEST_CASE("reference_counted_t basic operations")
     {
     };
     auto *obj = new dummy_t();
-    const vio::reference_counted_t ref([obj]() { delete obj; });
+    vio::reference_counted_t ref([obj]() { delete obj; });
 
     CHECK(ref.ref_count == 1);
+    ref.dec();
   }
 
   SUBCASE("inc increases ref count")
@@ -105,6 +106,7 @@ TEST_CASE("reference_counted_t basic operations")
     result = ref.dec();
     CHECK_FALSE(result);
     CHECK(ref.ref_count == 1);
+    ref.dec();
   }
 
   SUBCASE("dec to zero triggers deletion")
@@ -131,6 +133,7 @@ TEST_CASE("reference_counted_t basic operations")
     const bool result = ref->dec();
     CHECK(result);
     CHECK(destroyed);
+    delete ref;
   }
 
   SUBCASE("destroy callbacks are called in reverse order")
@@ -152,6 +155,7 @@ TEST_CASE("reference_counted_t basic operations")
     CHECK(order[0] == 3);
     CHECK(order[1] == 2);
     CHECK(order[2] == 1);
+    delete ref;
   }
 
   SUBCASE("callback can increment ref count to postpone destruction")
@@ -176,6 +180,7 @@ TEST_CASE("reference_counted_t basic operations")
     CHECK(ref->ref_count == 1);
 
     ref->dec();
+    delete ref;
   }
 }
 

@@ -268,4 +268,30 @@ inline task_t<void>::awaiter_t task_t<void>::operator co_await() && noexcept
   return awaiter_t{_coro};
 }
 
+struct detached_task_t
+{
+  struct promise_type // NOLINT(readability-identifier-naming)
+  {
+    detached_task_t get_return_object()
+    {
+      return {};
+    }
+    std::suspend_never initial_suspend()
+    {
+      return {};
+    }
+    std::suspend_never final_suspend() noexcept
+    {
+      return {};
+    }
+    void return_void()
+    {
+    }
+    void unhandled_exception()
+    {
+      std::terminate();
+    }
+  };
+};
+
 } // namespace vio

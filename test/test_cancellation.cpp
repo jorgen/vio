@@ -24,9 +24,9 @@ TEST_CASE("cancel sleep before it completes")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         vio::cancellation_t cancel;
         auto sleep_future = vio::sleep(ev, long_delay, &cancel);
@@ -44,9 +44,9 @@ TEST_CASE("cancel already-completed sleep is a no-op")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         vio::cancellation_t cancel;
         auto result = co_await vio::sleep(ev, std::chrono::milliseconds(0), &cancel);
@@ -63,9 +63,9 @@ TEST_CASE("cancel before await returns immediately")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         vio::cancellation_t cancel;
         cancel.cancel();
@@ -130,9 +130,9 @@ TEST_CASE("cancel DNS lookup")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         // DNS for localhost may resolve before uv_cancel takes effect.
         // uv_cancel on getaddrinfo may also produce platform-specific errors.
@@ -153,9 +153,9 @@ TEST_CASE("cancel DNS lookup before await")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         vio::cancellation_t cancel;
         cancel.cancel();
@@ -172,9 +172,9 @@ TEST_CASE("cancel file read")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto tmp = vio::mkstemp_file(ev, "test_cancel_read_XXXXXX");
         REQUIRE(tmp.has_value());
@@ -198,7 +198,7 @@ TEST_CASE("cancel file read")
         CHECK(read_result.error().code == vio::vio_cancelled);
 
         file = vio::make_auto_close_file({.event_loop = &ev, .handle = -1});
-        vio::unlink_file(ev, path);
+        auto _ = vio::unlink_file(ev, path);
         ev.stop();
       }(event_loop);
     });
@@ -209,9 +209,9 @@ TEST_CASE("cancel file write")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto tmp = vio::mkstemp_file(ev, "test_cancel_write_XXXXXX");
         REQUIRE(tmp.has_value());
@@ -226,7 +226,7 @@ TEST_CASE("cancel file write")
         CHECK(result.error().code == vio::vio_cancelled);
 
         file = vio::make_auto_close_file({.event_loop = &ev, .handle = -1});
-        vio::unlink_file(ev, path);
+        auto _ = vio::unlink_file(ev, path);
         ev.stop();
       }(event_loop);
     });
@@ -237,9 +237,9 @@ TEST_CASE("multiple operations with one cancellation")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         vio::cancellation_t cancel;
 
@@ -270,9 +270,9 @@ TEST_CASE("multiple tasks in vector with cancellation")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         vio::cancellation_t cancel;
         int cancelled_count = 0;
@@ -308,9 +308,9 @@ TEST_CASE("sleep without cancellation still works")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto result = co_await vio::sleep(ev, short_delay);
         CHECK(result.has_value());
@@ -346,9 +346,9 @@ TEST_CASE("cancel tcp_connect before await (pre-cancelled)")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto tcp = vio::tcp_create(ev);
         REQUIRE_EXPECTED(tcp);
@@ -370,9 +370,9 @@ TEST_CASE("cancel tcp_connect while connecting")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto tcp = vio::tcp_create(ev);
         REQUIRE_EXPECTED(tcp);
@@ -399,9 +399,9 @@ TEST_CASE("cancel tcp_listen before await (pre-cancelled)")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         {
           auto server_pair = get_ephemeral_port(ev);
@@ -423,9 +423,9 @@ TEST_CASE("cancel tcp_listen after starting")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         {
           auto server_pair = get_ephemeral_port(ev);
@@ -451,9 +451,9 @@ TEST_CASE("cancel ssl_client_connect before await (pre-cancelled)")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto ssl_client = vio::ssl_client_create(ev);
         REQUIRE_EXPECTED(ssl_client);
@@ -473,9 +473,9 @@ TEST_CASE("cancel ssl_client_connect during DNS phase")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto ssl_client = vio::ssl_client_create(ev);
         REQUIRE_EXPECTED(ssl_client);
@@ -496,9 +496,9 @@ TEST_CASE("cancel ssl_client_connect with direct IP (pre-cancelled)")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto ssl_client = vio::ssl_client_create(ev);
         REQUIRE_EXPECTED(ssl_client);
@@ -518,9 +518,9 @@ TEST_CASE("cancel ssl_client_connect with direct IP while connecting")
 {
   vio::event_loop_t event_loop;
   event_loop.run_in_loop(
-    [&event_loop]
+    [&]
     {
-      [](vio::event_loop_t &ev) -> vio::task_t<void>
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
         auto ssl_client = vio::ssl_client_create(ev);
         REQUIRE_EXPECTED(ssl_client);

@@ -1,4 +1,3 @@
-#include <optional>
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/operation/dns.h>
@@ -113,8 +112,7 @@ TEST_CASE("DNS address info lookup")
     bool test_completed = false;
     INFO("Testing DNS resolution for localhost"); // NOLINT(misc-const-correctness) doctest macro
 
-    std::optional<vio::task_t<void>> task;
-    event_loop.run_in_loop([&] { task.emplace(dns_lookup_localhost(event_loop, test_completed)); });
+    event_loop.run_in_loop([&] { return dns_lookup_localhost(event_loop, test_completed); });
 
     event_loop.run();
     REQUIRE(test_completed);
@@ -125,8 +123,7 @@ TEST_CASE("DNS address info lookup")
     bool test_completed = false;
     INFO("Testing DNS resolution for invalid hostname"); // NOLINT(misc-const-correctness) doctest macro
 
-    std::optional<vio::task_t<void>> task;
-    event_loop.run_in_loop([&] { task.emplace(dns_lookup_invalid(event_loop, test_completed)); });
+    event_loop.run_in_loop([&] { return dns_lookup_invalid(event_loop, test_completed); });
 
     event_loop.run();
     REQUIRE(test_completed);
@@ -137,8 +134,7 @@ TEST_CASE("DNS address info lookup")
     bool test_completed = false;
     INFO("Testing IPv4-specific DNS resolution"); // NOLINT(misc-const-correctness) doctest macro
 
-    std::optional<vio::task_t<void>> task;
-    event_loop.run_in_loop([&] { task.emplace(dns_lookup_ipv4(event_loop, test_completed)); });
+    event_loop.run_in_loop([&] { return dns_lookup_ipv4(event_loop, test_completed); });
 
     event_loop.run();
     REQUIRE(test_completed);
@@ -149,8 +145,7 @@ TEST_CASE("DNS address info lookup")
     bool test_completed = false;
     INFO("Testing that we can lookup google"); // NOLINT(misc-const-correctness) doctest macro
 
-    std::optional<vio::task_t<void>> task;
-    event_loop.run_in_loop([&] { task.emplace(dns_lookup_google(event_loop, test_completed)); });
+    event_loop.run_in_loop([&] { return dns_lookup_google(event_loop, test_completed); });
 
     event_loop.run();
     REQUIRE(test_completed);

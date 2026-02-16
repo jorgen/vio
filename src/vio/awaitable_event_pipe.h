@@ -34,32 +34,6 @@
 namespace vio
 {
 
-struct detached_task_t
-{
-  struct promise_type // NOLINT(readability-identifier-naming)
-  {
-    detached_task_t get_return_object()
-    {
-      return {};
-    }
-    std::suspend_never initial_suspend()
-    {
-      return {};
-    }
-    std::suspend_never final_suspend() noexcept
-    {
-      return {};
-    }
-    void return_void()
-    {
-    }
-    void unhandled_exception()
-    {
-      std::terminate();
-    }
-  };
-};
-
 template <typename Result, typename... ARGS>
 class awaitable_event_pipe_t
 {

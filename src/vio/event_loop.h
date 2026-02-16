@@ -26,15 +26,20 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <uv.h>
 
 #include "event_pipe.h"
+#include "task.h"
 #include "thread_pool.h"
 #include "worker.h"
 
 #include <barrier>
 #include <cassert>
+#ifndef _WIN32
+#include <csignal>
+#endif
 
 namespace vio
 {
@@ -73,6 +78,9 @@ public:
     , _run_in_loop([](std::function<void()> &&event) { event(); })
     , _thread_id(std::this_thread::get_id())
   {
+#if !defined(_WIN32) && !defined(VIO_NO_SIGPIPE_IGNORE)
+    signal(SIGPIPE, SIG_IGN);
+#endif
     _to_close_handles.reserve(16);
     _loop = new uv_loop_t();
     uv_loop_init(_loop);
@@ -109,6 +117,17 @@ public:
   void run_in_loop(std::function<void()> &&event)
   {
     _run_in_loop.post_event(std::move(event));
+  }
+
+  template <typename F>
+    requires std::is_same_v<std::invoke_result_t<F>, task_t<void>>
+  void run_in_loop(F &&f)
+  {
+    _run_in_loop.post_event(
+      [func = std::forward<F>(f)]() mutable
+      {
+        [](task_t<void> t) -> detached_task_t { co_await std::move(t); }(func());
+      });
   }
 
   void override_thread_id(std::thread::id thread_id)

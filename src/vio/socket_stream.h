@@ -141,7 +141,17 @@ struct socket_stream_t
     poll_req.data = this;
   }
 
-  ~socket_stream_t() = default;
+  ~socket_stream_t()
+  {
+    while (!buffer_queue.empty())
+    {
+      auto item = buffer_queue.pop_front();
+      if (item.has_value() && item.value().dealloc_cb)
+      {
+        item.value().dealloc_cb(user_alloc_ptr, &item.value().buf);
+      }
+    }
+  }
   socket_stream_t(socket_stream_t &) = delete;
   socket_stream_t &operator=(socket_stream_t &) = delete;
   socket_stream_t(socket_stream_t &&) = delete;

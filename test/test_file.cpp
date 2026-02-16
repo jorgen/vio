@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <cstdio>
-#include <optional>
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
@@ -42,8 +41,7 @@ TEST_SUITE("File I/O")
 TEST_CASE("test basic file")
 {
   vio::event_loop_t event_loop;
-  std::optional<vio::task_t<void>> task;
-  event_loop.run_in_loop([&] { task.emplace(write_a_test_file(event_loop)); });
+  event_loop.run_in_loop([&] { return write_a_test_file(event_loop); });
   event_loop.run();
 }
 
@@ -161,24 +159,21 @@ TEST_CASE("test extra file functions")
   SUBCASE("test_sync_file_ops")
   {
     vio::event_loop_t event_loop;
-    std::optional<vio::task_t<void>> task;
-    event_loop.run_in_loop([&] { task.emplace(test_sync_file_ops(event_loop)); });
+    event_loop.run_in_loop([&] { return test_sync_file_ops(event_loop); });
     event_loop.run();
   }
 
   SUBCASE("test_mkdir_rmdir")
   {
     vio::event_loop_t event_loop;
-    std::optional<vio::task_t<void>> task;
-    event_loop.run_in_loop([&] { task.emplace(test_mkdir_rmdir(event_loop)); });
+    event_loop.run_in_loop([&] { return test_mkdir_rmdir(event_loop); });
     event_loop.run();
   }
 
   SUBCASE("test_send_file")
   {
     vio::event_loop_t event_loop;
-    std::optional<vio::task_t<void>> task;
-    event_loop.run_in_loop([&] { task.emplace(test_send_file(event_loop)); });
+    event_loop.run_in_loop([&] { return test_send_file(event_loop); });
     event_loop.run();
   }
 }
