@@ -12,29 +12,29 @@ static vio::task_t<int> sleep_task_2(vio::event_loop_t &event_loop)
 {
 
   auto to_wait = vio::sleep(event_loop, delay);
-  co_await to_wait;
+  auto _ = co_await to_wait;
   co_return 1;
 }
 
 static vio::task_t<void> sleep_task_3(vio::event_loop_t &event_loop)
 {
   auto to_wait = vio::sleep(event_loop, delay * 2);
-  co_await to_wait;
+  auto _ = co_await to_wait;
 }
 
 static vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
 {
   auto start_time = std::chrono::high_resolution_clock::now();
   auto to_wait = vio::sleep(event_loop, delay);
-  co_await to_wait;
+  auto _ = co_await to_wait;
   auto end_time = std::chrono::high_resolution_clock::now();
   REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) >= delay - std::chrono::milliseconds(2));
 
   start_time = std::chrono::high_resolution_clock::now();
   auto to_wait2 = vio::sleep(event_loop, delay * 2);
   auto to_wait3 = vio::sleep(event_loop, delay);
-  co_await to_wait2;
-  co_await to_wait3;
+  _ = co_await to_wait2;
+  _ = co_await to_wait3;
   end_time = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
   auto expected_max_duration = (delay * 2) + (delay / 2);
@@ -49,7 +49,7 @@ static vio::task_t<int> sleep_task(vio::event_loop_t &event_loop)
   REQUIRE(result == 1);
 
   start_time = std::chrono::high_resolution_clock::now();
-  co_await vio::sleep(event_loop, std::chrono::milliseconds(0));
+  _ = co_await vio::sleep(event_loop, std::chrono::milliseconds(0));
   end_time = std::chrono::high_resolution_clock::now();
   duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
   expected_max_duration = std::chrono::milliseconds(delay);
