@@ -95,13 +95,25 @@ jobs:
           path: 3rdparty
           key: 3rdparty-${{ hashFiles('CMake/3rdPartyPackages.cmake') }}
 
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.name }}-
+
       - name: Fetch dependencies
         run: cmake -P CMake/FetchDependencies.cmake
 
       - name: Configure
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
+          ccache --zero-stats
           cmake -G Ninja -B build \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
             -DCMAKE_C_FLAGS="${{ matrix.c_flags }}" \
@@ -109,7 +121,11 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}"
 
       - name: Build
-        run: cmake --build build
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          cmake --build build
+          ccache --show-stats
 
       - name: Test
         run: ./build/test/vio_tests
