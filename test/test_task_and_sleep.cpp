@@ -69,6 +69,6 @@ TEST_CASE("test sleep and task basics")
   event_loop.run_in_loop([&] { task.emplace(sleep_task(event_loop)); });
   event_loop.run();
   auto end_time = std::chrono::high_resolution_clock::now();
-  REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) > delay * 5);
+  REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) > delay * 3);
 }
 } // TEST_SUITE

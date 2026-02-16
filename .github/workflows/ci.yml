@@ -71,6 +71,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache 3rdparty dependencies
+        uses: actions/cache@v4
+        with:
+          path: 3rdparty
+          key: 3rdparty-${{ hashFiles('CMake/3rdPartyPackages.cmake') }}
+
+      - name: Fetch dependencies
+        run: cmake -P CMake/FetchDependencies.cmake
+
       - name: Configure
         run: |
           cmake -G Ninja -B build \
