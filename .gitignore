@@ -1,5 +1,4 @@
 .idea
 cmake-build-*
-src/default_certs
 3rdparty
 
