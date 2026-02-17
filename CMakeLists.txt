@@ -21,7 +21,8 @@ endif()
 
 include(FetchContent)
 FetchContent_Declare(cmake-dep
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../cmake-dep"
+    GIT_REPOSITORY https://github.com/jorgen/cmake-dep.git
+    GIT_TAG 2667e3f
 )
 FetchContent_MakeAvailable(cmake-dep)
 list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")
