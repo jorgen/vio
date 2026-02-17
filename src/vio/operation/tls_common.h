@@ -24,6 +24,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <vio/socket_stream.h>
 #include <vio/ssl_config_t.h>
+#include <vio/vio_export.h>
 
 #include <string>
 
@@ -32,7 +33,7 @@ Copyright (c) 2025 Jørgen Lind
 namespace vio
 {
 
-std::string get_default_ca_certificates();
+VIO_EXPORT std::string get_default_ca_certificates();
 
 using tls_config_ptr_t = std::unique_ptr<tls_config, decltype(&tls_config_free)>;
 static std::expected<tls_config_ptr_t, error_t> create_tls_config(const ssl_config_t &config, const std::string &default_ca_certificates)

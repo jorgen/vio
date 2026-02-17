@@ -6,23 +6,27 @@
 #  define VIO_EXPORT
 #  define VIO_NO_EXPORT
 #else
-#  ifndef VIO_EXPORT
+#  ifdef _WIN32
 #    ifdef vio_EXPORTS
-        /* We are building this library */
-#      define VIO_EXPORT 
+       /* We are building this library */
+#      define VIO_EXPORT __declspec(dllexport)
 #    else
-        /* We are using this library */
-#      define VIO_EXPORT 
+       /* We are using this library */
+#      define VIO_EXPORT __declspec(dllimport)
 #    endif
-#  endif
-
-#  ifndef VIO_NO_EXPORT
-#    define VIO_NO_EXPORT 
+#    define VIO_NO_EXPORT
+#  else
+#    define VIO_EXPORT __attribute__((visibility("default")))
+#    define VIO_NO_EXPORT __attribute__((visibility("hidden")))
 #  endif
 #endif
 
 #ifndef VIO_DEPRECATED
-#  define VIO_DEPRECATED __declspec(deprecated)
+#  ifdef _MSC_VER
+#    define VIO_DEPRECATED __declspec(deprecated)
+#  else
+#    define VIO_DEPRECATED __attribute__((deprecated))
+#  endif
 #endif
 
 #ifndef VIO_DEPRECATED_EXPORT
@@ -31,13 +35,6 @@
 
 #ifndef VIO_DEPRECATED_NO_EXPORT
 #  define VIO_DEPRECATED_NO_EXPORT VIO_NO_EXPORT VIO_DEPRECATED
-#endif
-
-/* NOLINTNEXTLINE(readability-avoid-unconditional-preprocessor-if) */
-#if 0 /* DEFINE_NO_DEPRECATED */
-#  ifndef VIO_NO_DEPRECATED
-#    define VIO_NO_DEPRECATED
-#  endif
 #endif
 
 #endif /* VIO_EXPORT_H */

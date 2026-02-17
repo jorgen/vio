@@ -19,12 +19,19 @@ if(VIO_BUILD_SHARED)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
-include(CMake/Fetch3rdParty.cmake)
-Fetch3rdParty()
+include(FetchContent)
+FetchContent_Declare(cmake-dep
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../cmake-dep"
+)
+FetchContent_MakeAvailable(cmake-dep)
+list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")
+include(CmDepMain)
+
+set(CMDEP_3RD_PARTY_PACKAGES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/CMake/3rdPartyPackages.cmake")
+CmDepFetch3rdParty()
+
 include(CMake/Build3rdParty.cmake)
 Build3rdParty()
-include(CMake/BuildExternalTargetLinkLibrary.cmake)
-
 
 add_subdirectory(src)
 

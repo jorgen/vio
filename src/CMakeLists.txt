@@ -26,12 +26,12 @@ endif()
 
 # Dependencies are PUBLIC because vio's inline header code calls libuv/libressl directly.
 # Phase 2 (PIMPL) will allow switching to PRIVATE for full symbol hiding.
-BuildExternalTargetLinkLibrary(vio PUBLIC LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto ada::ada)
+CmDepBuildExternalTargetLinkLibrary(vio PUBLIC LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto ada::ada)
 if (WIN32)
-    BuildExternalTargetLinkLibrary(vio PUBLIC crypt32 bcrypt)
+    CmDepBuildExternalTargetLinkLibrary(vio PUBLIC crypt32 bcrypt)
 endif ()
 
-target_include_directories(vio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(vio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(vio PRIVATE vio::default_certs)
 

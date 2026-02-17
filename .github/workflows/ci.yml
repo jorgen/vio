@@ -102,6 +102,12 @@ jobs:
           key: ccache-${{ matrix.name }}-${{ github.sha }}
           restore-keys: ccache-${{ matrix.name }}-
 
+      - name: Checkout cmake-dep
+        uses: actions/checkout@v4
+        with:
+          repository: jorgen/cmake-dep
+          path: ../cmake-dep
+
       - name: Fetch dependencies
         run: cmake -P CMake/FetchDependencies.cmake
 

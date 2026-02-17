@@ -80,6 +80,26 @@
         "CMAKE_C_FLAGS": "/fsanitize=address",
         "CMAKE_CXX_FLAGS": "/EHsc /fsanitize=address"
       }
+    },
+    {
+      "name": "shared",
+      "displayName": "Shared Library (Release)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-shared",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "VIO_BUILD_SHARED": "ON"
+      }
+    },
+    {
+      "name": "shared-debug",
+      "displayName": "Shared Library (Debug)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-shared-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VIO_BUILD_SHARED": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -106,6 +126,14 @@
     {
       "name": "msvc-asan",
       "configurePreset": "msvc-asan"
+    },
+    {
+      "name": "shared",
+      "configurePreset": "shared"
+    },
+    {
+      "name": "shared-debug",
+      "configurePreset": "shared-debug"
     }
   ],
   "testPresets": [
@@ -132,6 +160,14 @@
     {
       "name": "msvc-asan",
       "configurePreset": "msvc-asan"
+    },
+    {
+      "name": "shared",
+      "configurePreset": "shared"
+    },
+    {
+      "name": "shared-debug",
+      "configurePreset": "shared-debug"
     }
   ]
 }

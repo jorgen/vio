@@ -1,16 +1,13 @@
-include(BuildExternal)
-include(GetPackageInstallDir)
-
 macro(Build3rdParty)
     include(${cmakerc_SOURCE_DIR}/CMakeRC.cmake)
 
     if(VIO_USE_SYSTEM_LIBRESSL)
         find_package(LibreSSL REQUIRED)
     else()
-        GetPackageInstallDir(LIBRESSL_INSTALL_DIR libressl ${libressl_VERSION})
+        CmDepGetPackageInstallDir(LIBRESSL_INSTALL_DIR libressl ${libressl_VERSION})
         list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/CMake/FindPackage/libressl)
         Find_Package(libressl REQUIRED)
-        BuildExternalCMake(libressl ${libressl_VERSION} ${libressl_SOURCE_DIR} "" "LibreSSL::Crypto;LibreSSL::SSL;LibreSSL::TLS")
+        CmDepBuildExternalCMake(libressl ${libressl_VERSION} ${libressl_SOURCE_DIR} "" "LibreSSL::Crypto;LibreSSL::SSL;LibreSSL::TLS")
     endif()
 
     if(NOT VIO_USE_SYSTEM_LIBUV)
