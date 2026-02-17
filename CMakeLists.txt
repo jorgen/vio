@@ -29,8 +29,8 @@ FetchContent_MakeAvailable(cmake-dep)
 list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")
 include(CmDepMain)
 
-set(CMDEP_3RD_PARTY_PACKAGES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/CMake/3rdPartyPackages.cmake")
-CmDepFetch3rdParty()
+set(CMDEP_PACKAGES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/CMake/3rdPartyPackages.cmake")
+CmDepFetch()
 
 include(CMake/Build3rdParty.cmake)
 Build3rdParty()

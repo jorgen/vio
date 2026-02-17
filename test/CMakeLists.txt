@@ -16,7 +16,7 @@ add_executable(vio_tests
     test_work.cpp
 )
 
-CmDepBuildExternalTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
 
 if(VIO_USE_SYSTEM_DOCTEST)
     target_link_libraries(vio_tests PRIVATE doctest::doctest)

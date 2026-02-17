@@ -1,6 +1,6 @@
 function(add_vio_example name)
     add_executable(${name} ${name}.cpp)
-    CmDepBuildExternalTargetLinkLibrary(${name} PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+    CmDepTargetLinkLibrary(${name} PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
     target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endfunction()
 
