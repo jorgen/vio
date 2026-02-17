@@ -102,14 +102,11 @@ jobs:
           key: ccache-${{ matrix.name }}-${{ github.sha }}
           restore-keys: ccache-${{ matrix.name }}-
 
-      - name: Checkout cmake-dep
-        uses: actions/checkout@v4
-        with:
-          repository: jorgen/cmake-dep
-          path: ../cmake-dep
+      - name: Fetch cmake-dep
+        run: git clone --depth 1 https://github.com/jorgen/cmake-dep.git 3rdparty/cmake-dep
 
       - name: Fetch dependencies
-        run: cmake -P CMake/FetchDependencies.cmake
+        run: cmake -DCMDEP_PACKAGES_FILE=CMake/3rdPartyPackages.cmake -P 3rdparty/cmake-dep/cmake/CmDepFetchDependencies.cmake
 
       - name: Configure
         env:
