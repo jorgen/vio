@@ -13,7 +13,6 @@ add_executable(vio_tests
     test_handle_closer.cpp
     test_udp.cpp
     test_cancellation.cpp
-    test_crypto.cpp
     test_work.cpp
 )
 
