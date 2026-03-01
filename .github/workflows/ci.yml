@@ -93,7 +93,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: 3rdparty
-          key: 3rdparty-${{ hashFiles('CMake/3rdPartyPackages.cmake') }}
+          key: 3rdparty-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -101,12 +101,6 @@ jobs:
           path: .ccache
           key: ccache-${{ matrix.name }}-${{ github.sha }}
           restore-keys: ccache-${{ matrix.name }}-
-
-      - name: Fetch cmake-dep
-        run: git clone --depth 1 https://github.com/jorgen/cmake-dep.git 3rdparty/cmake-dep
-
-      - name: Fetch dependencies
-        run: cmake -DCMDEP_PACKAGES_FILE=CMake/3rdPartyPackages.cmake -P 3rdparty/cmake-dep/cmake/CmDepFetchDependencies.cmake
 
       - name: Configure
         env:
