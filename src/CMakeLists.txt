@@ -1,12 +1,10 @@
 if(VIO_BUILD_SHARED)
     add_library(vio SHARED
         library.cpp
-        crypto.cpp
     )
 else()
     add_library(vio STATIC
         library.cpp
-        crypto.cpp
     )
     target_compile_definitions(vio PUBLIC VIO_STATIC_DEFINE)
 endif()
