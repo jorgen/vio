@@ -33,7 +33,6 @@
 #include "event_pipe.h"
 #include "task.h"
 #include "thread_pool.h"
-#include "worker.h"
 
 #include <barrier>
 #include <cassert>
@@ -180,16 +179,6 @@ public:
     _run_in_loop.post_event([this, listener] { _about_to_block_listeners.erase(std::remove(_about_to_block_listeners.begin(), _about_to_block_listeners.end(), listener), _about_to_block_listeners.end()); });
   }
 
-  void add_worker_done(worker_t *done)
-  {
-    _run_in_loop.post_event(
-      [done]
-      {
-        done->mark_done();
-        done->after_work(worker_t::completion_t::completed);
-      });
-  }
-
   [[nodiscard]] uv_loop_t *loop() const
   {
     return _loop;
@@ -213,8 +202,6 @@ private:
   static void exit_event_loop_cb(uv_async_t *handle)
   {
     auto *event_loop = static_cast<event_loop_t *>(handle->data);
-    for (auto *cancel_handle : event_loop->_to_cancel_work_handles)
-      uv_cancel((uv_req_t *)cancel_handle);
     for (auto close_handle : event_loop->_to_close_handles)
     {
       uv_close(close_handle, nullptr);
@@ -228,7 +215,6 @@ private:
   uv_async_t _async_stop;
   std::mutex _mutex;
   std::vector<uv_handle_t *> _to_close_handles;
-  std::vector<uv_work_t *> _to_cancel_work_handles;
   event_pipe_t<std::function<uv_handle_t *(uv_loop_t *)>> _add_pipe;
   event_pipe_t<std::function<void()>> _run_in_loop;
 
@@ -236,8 +222,6 @@ private:
   std::vector<about_to_block_t *> _about_to_block_listeners;
 
   std::thread::id _thread_id;
-
-  friend class worker_t;
 };
 
 class thread_with_event_loop_t
