@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.30)
-project(vio LANGUAGES CXX)
+project(vio LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,11 +19,12 @@ if(VIO_BUILD_SHARED)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
+set(CMDEP_TAG f61ffba)
 include(FetchContent)
 FetchContent_Declare(cmake-dep
     GIT_REPOSITORY https://github.com/jorgen/cmake-dep.git
-    GIT_TAG 9519cd0
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cmake-dep"
+    GIT_TAG ${CMDEP_TAG}
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cmake-dep-${CMDEP_TAG}"
 )
 FetchContent_MakeAvailable(cmake-dep)
 list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")
