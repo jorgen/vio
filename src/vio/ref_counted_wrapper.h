@@ -32,7 +32,7 @@ struct reference_counted_t
 
   bool dec()
   {
-    if (ref_count.fetch_sub(1, std::memory_order_acquire) == 1)
+    if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1)
     {
       if (in_destroy_sequence)
       {
