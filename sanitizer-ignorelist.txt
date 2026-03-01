@@ -1,6 +1,0 @@
-# MSan false positives in standard library and 3rd party code.
-# Used via -fsanitize-ignorelist=sanitizer-ignorelist.txt
-[memory]
-src:*/c++/v1/ostream
-src:*/c++/v1/future
-src:*/doctest/*

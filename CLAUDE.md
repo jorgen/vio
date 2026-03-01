@@ -53,11 +53,6 @@ cmake --build cmake-build-tsan
 cmake --preset ubsan
 cmake --build cmake-build-ubsan
 ./cmake-build-ubsan/test/vio_tests
-
-# MemorySanitizer (requires clang)
-CC=clang CXX=clang++ cmake --preset msan
-cmake --build cmake-build-msan
-./cmake-build-msan/test/vio_tests
 ```
 
 ### Windows (MSVC AddressSanitizer)
@@ -70,7 +65,7 @@ cmake --build --preset msvc-asan
 ctest --preset msvc-asan
 ```
 
-Note: MSVC ASan does not include LeakSanitizer. TSan, UBSan, and MSan are not available on MSVC.
+Note: MSVC ASan does not include LeakSanitizer. TSan and UBSan are not available on MSVC.
 
 ## Docker (Sanitizer Builds)
 

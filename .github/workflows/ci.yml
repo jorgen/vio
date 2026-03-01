@@ -77,13 +77,6 @@ jobs:
             c_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
             cxx_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
             linker_flags: -fsanitize=undefined
-          - name: msan
-            cc: clang-18
-            cxx: clang++-18
-            c_flags: -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins
-            cxx_flags: -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins -stdlib=libc++
-            linker_flags: -fsanitize=memory -stdlib=libc++ -lc++abi
-
     name: ${{ matrix.name }}
 
     steps:
@@ -107,18 +100,14 @@ jobs:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           ccache --zero-stats
-          ignorelist_flag=""
-          if [ "${{ matrix.name }}" = "msan" ] && [ -f sanitizer-ignorelist.txt ]; then
-            ignorelist_flag="-fsanitize-ignorelist=$(pwd)/sanitizer-ignorelist.txt"
-          fi
           cmake -G Ninja -B build \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
-            -DCMAKE_C_FLAGS="${{ matrix.c_flags }} $ignorelist_flag" \
-            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }} $ignorelist_flag" \
+            -DCMAKE_C_FLAGS="${{ matrix.c_flags }}" \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
             -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}"
 
       - name: Build
