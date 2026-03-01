@@ -12,6 +12,8 @@ option(VIO_USE_SYSTEM_LIBRESSL "Use system-installed LibreSSL instead of bundled
 option(VIO_USE_SYSTEM_ADA "Use system-installed ada-url instead of bundled" OFF)
 option(VIO_USE_SYSTEM_DOCTEST "Use system-installed doctest instead of bundled" OFF)
 option(VIO_BUILD_SHARED "Build vio as a shared library" OFF)
+option(VIO_BUILD_TESTS "Build vio tests" ON)
+option(VIO_BUILD_EXAMPLES "Build vio examples" ON)
 
 if(VIO_BUILD_SHARED)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -38,6 +40,11 @@ Build3rdParty()
 
 add_subdirectory(src)
 
-enable_testing()
-add_subdirectory(test)
-add_subdirectory(examples)
+if (VIO_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+endif ()
+
+if (VIO_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif ()
