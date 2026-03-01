@@ -14,6 +14,7 @@ add_executable(vio_tests
     test_udp.cpp
     test_cancellation.cpp
     test_crypto.cpp
+    test_work.cpp
 )
 
 BuildExternalTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
