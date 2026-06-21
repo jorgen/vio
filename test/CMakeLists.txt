@@ -9,6 +9,7 @@ add_executable(vio_tests
     test_ssl.cpp
     test_ssl_config.cpp
     test_dns.cpp
+    test_dns_leak.cpp
     test_elastic_index_storage.cpp
     test_ring_buffer.cpp
     test_tls_server.cpp

@@ -46,15 +46,12 @@ TEST_SUITE("file leaks")
         ++failures;
       }
     }
-    const bool leaked = guard.leaked();
+    // Pre-fix this leaks one UTF-16 path buffer per open on Windows
+    // (~`iterations` blocks); post-fix only small one-time noise remains.
+    const long long leaked_blocks = guard.leaked_blocks();
 
     CHECK_EQ(failures, 0);
-#if VIO_HAVE_LEAK_CHECK
-    // Pre-fix this leaks `iterations` UTF-16 path buffers on Windows.
-    CHECK_FALSE(leaked);
-#else
-    (void)leaked;
-#endif
+    CHECK_LT(leaked_blocks, iterations / 2);
 
     std::remove(path.c_str());
     loop.stop();

@@ -177,6 +177,10 @@ inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, con
   auto r = uv_getaddrinfo(event_loop.loop(), req, callback, host.c_str(), nullptr, &hints_converted);
   if (r < 0)
   {
+    // The callback never runs on synchronous failure, so recover the ref parked
+    // into req->data above (mirrors write_file) to avoid leaking the state.
+    future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
+    ret.state_ptr->req.data = nullptr;
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     return ret;
@@ -272,6 +276,10 @@ inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, cons
   auto r = uv_getnameinfo(event_loop.loop(), req, callback, addr.get_sockaddr(), hints);
   if (r < 0)
   {
+    // The callback never runs on synchronous failure, so recover the ref parked
+    // into req->data above (mirrors write_file) to avoid leaking the state.
+    future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
+    ret.state_ptr->req.data = nullptr;
     ret.state_ptr->done = true;
     ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     return ret;
