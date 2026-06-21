@@ -10,6 +10,7 @@ add_executable(vio_tests
     test_tcp_write_guard.cpp
     test_ssl.cpp
     test_ssl_config.cpp
+    test_ca_certificates.cpp
     test_dns.cpp
     test_dns_leak.cpp
     test_elastic_index_storage.cpp

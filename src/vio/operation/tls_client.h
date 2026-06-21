@@ -45,7 +45,6 @@ namespace vio
 {
 struct tls_client_connection_handler_t
 {
-  std::string cert_data;
   tls *stream_tls_ctx = nullptr;
 
   error_t initialize(const ssl_config_t &config)
@@ -56,8 +55,9 @@ struct tls_client_connection_handler_t
       return error_t{.code = -1, .msg = "Failed to create TLS client"};
     }
 
-    cert_data = get_default_ca_certificates();
-    return apply_ssl_config_to_tls_ctx(config, cert_data, stream_tls_ctx);
+    // libressl copies the CA bytes into its own config, so passing the
+    // program-lifetime default bundle by reference avoids a per-connection copy.
+    return apply_ssl_config_to_tls_ctx(config, get_default_ca_certificates(), stream_tls_ctx);
   }
 
   [[nodiscard]] error_t connect(const int socket_fd, const std::string &host)

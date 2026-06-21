@@ -33,7 +33,7 @@ Copyright (c) 2025 Jørgen Lind
 namespace vio
 {
 
-VIO_EXPORT std::string get_default_ca_certificates();
+VIO_EXPORT const std::string &get_default_ca_certificates();
 
 using tls_config_ptr_t = std::unique_ptr<tls_config, decltype(&tls_config_free)>;
 static std::expected<tls_config_ptr_t, error_t> create_tls_config(const ssl_config_t &config, const std::string &default_ca_certificates)
