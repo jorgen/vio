@@ -4,6 +4,7 @@ add_executable(vio_tests
     test_task_and_sleep.cpp
     test_file.cpp
     test_tcp.cpp
+    test_tcp_read_cb.cpp
     test_ssl.cpp
     test_dns.cpp
     test_elastic_index_storage.cpp

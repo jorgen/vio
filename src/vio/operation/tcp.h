@@ -420,6 +420,18 @@ public:
     auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
     ref_ptr_releaser_t releaser(tcp_state);
 
+    if (nread == 0)
+    {
+      // Per libuv's uv_read_cb contract, nread == 0 is equivalent to EAGAIN /
+      // EWOULDBLOCK -- it does NOT indicate EOF or an error. Treat it as a
+      // no-op (just release the buffer) instead of fabricating an end-of-stream.
+      if (buf != nullptr && buf->base != nullptr)
+      {
+        tcp_state->read.dealloc_buffer_cb(tcp_state->read.alloc_cb_data, const_cast<uv_buf_t *>(buf));
+      }
+      return;
+    }
+
     if (nread > 0)
     {
       uv_buf_t sized_buf = *buf;
