@@ -17,6 +17,7 @@ add_executable(vio_tests
     test_ring_buffer.cpp
     test_tls_server.cpp
     test_event_pipe.cpp
+    test_event_pipe_drain.cpp
     test_ref_counted_wrapper.cpp
     test_handle_closer.cpp
     test_udp.cpp

@@ -31,16 +31,7 @@ public:
 
   uv_handle_t *initialize_in_loop(uv_loop_t *loop)
   {
-    auto on_event = [](uv_async_t *handle)
-    {
-      auto *event_pipe = static_cast<event_pipe_t *>(handle->data);
-      std::vector<tuple_t> event_vec;
-      event_pipe->swap_events(event_vec);
-      for (auto &event : event_vec)
-      {
-        std::apply(event_pipe->_event_callback, std::move(event));
-      }
-    };
+    auto on_event = [](uv_async_t *handle) { static_cast<event_pipe_t *>(handle->data)->drain_events(); };
     uv_async_init(loop, &_pipe, on_event);
 
     return reinterpret_cast<uv_handle_t *>(&_pipe);
@@ -58,16 +49,27 @@ public:
     post_event(std::forward<ARGS>(args)...);
   }
 
-  void swap_events(std::vector<tuple_t> &to_swap)
+  void drain_events()
   {
-    std::unique_lock<std::mutex> lock(_mutex);
-    std::swap(_events, to_swap);
-    _events.reserve(to_swap.capacity());
+    // Swap accumulated events into a reusable scratch buffer, holding the mutex
+    // only for the swap. Events are processed without the lock held (so a
+    // callback may re-enter post_event), and the scratch buffer's capacity is
+    // reused across drains instead of being reallocated on every wakeup.
+    {
+      std::unique_lock<std::mutex> lock(_mutex);
+      std::swap(_events, _drain_buffer);
+    }
+    for (auto &event : _drain_buffer)
+    {
+      std::apply(_event_callback, std::move(event));
+    }
+    _drain_buffer.clear();
   }
 
 private:
   std::function<void(ARGS &&...args)> _event_callback;
   std::vector<tuple_t> _events;
+  std::vector<tuple_t> _drain_buffer; // loop-thread only; reused across drains
   uv_async_t _pipe{};
   std::mutex _mutex;
 };
