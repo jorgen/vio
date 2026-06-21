@@ -24,6 +24,7 @@ add_executable(vio_tests
     test_reader_cancel.cpp
     test_cancellation.cpp
     test_work.cpp
+    test_thread_pool.cpp
 )
 
 CmDepTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)

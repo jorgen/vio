@@ -99,6 +99,25 @@ public:
     return res;
   }
 
+  // Fire-and-forget enqueue for tasks whose result is not needed. Stores the
+  // (copyable) callable directly in the queue, avoiding the packaged_task /
+  // shared future-state allocation that enqueue() pays to return a std::future.
+  template <typename T>
+  void enqueue_detached(T &&task)
+  {
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex);
+
+      if (stop)
+      {
+        abort(); // invalid state. Enqueing after stop.
+      }
+
+      tasks.emplace(std::forward<T>(task));
+    }
+    condition.notify_one();
+  }
+
 private:
   std::vector<std::thread> workers;
   std::queue<std::function<void()>> tasks;

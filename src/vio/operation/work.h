@@ -107,7 +107,9 @@ future_t<work_batch_state_t<T, E>> schedule_work(event_loop_t &event_loop, threa
   for (size_t i = 0; i < count; ++i)
   {
     auto state_copy = shared_state;
-    pool.enqueue([i, on_failure, state_copy, work_fn = std::move(work_items[i])]() mutable
+    // Fire-and-forget: the batch tracks completion via its own atomic counter,
+    // so we don't need (and previously discarded) enqueue()'s std::future.
+    pool.enqueue_detached([i, on_failure, state_copy, work_fn = std::move(work_items[i])]() mutable
     {
       if (state_copy->cancelled.load(std::memory_order_acquire))
       {
