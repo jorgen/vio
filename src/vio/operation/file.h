@@ -78,6 +78,7 @@ inline void close_file(file_t *file)
   {
     uv_fs_t request = {};
     uv_fs_close(file->event_loop->loop(), &request, file->handle, nullptr);
+    uv_fs_req_cleanup(&request);
   }
 }
 
@@ -97,9 +98,11 @@ inline std::expected<auto_close_file_t, error_t> open_file(event_loop_t &event_l
   {
     // Construct an error_t with code and a UV error message.
     const error_t err{.code = result, .msg = uv_strerror(result)};
+    uv_fs_req_cleanup(&request);
     return std::unexpected(err);
   }
 
+  uv_fs_req_cleanup(&request);
   return make_auto_close_file({&event_loop, static_cast<uv_file>(result)});
 }
 

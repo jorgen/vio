@@ -3,6 +3,7 @@ add_executable(vio_tests
     test_basic.cpp
     test_task_and_sleep.cpp
     test_file.cpp
+    test_file_leak.cpp
     test_tcp.cpp
     test_tcp_read_cb.cpp
     test_ssl.cpp
