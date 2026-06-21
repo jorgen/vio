@@ -6,6 +6,7 @@ add_executable(vio_tests
     test_file_leak.cpp
     test_tcp.cpp
     test_tcp_read_cb.cpp
+    test_tcp_server_listen.cpp
     test_ssl.cpp
     test_ssl_config.cpp
     test_dns.cpp

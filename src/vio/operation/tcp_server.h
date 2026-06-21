@@ -73,6 +73,10 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog, cancell
     if (!stream->data)
       return;
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
+    // Consume the parked ref exactly once: null stream->data immediately so a
+    // subsequent connection (uv_listen stays armed) hits the guard above instead
+    // of re-consuming the same raw pointer. Re-arming via tcp_listen re-parks.
+    stream->data = nullptr;
     state_ref->listen.cancel_registration.reset();
     if (state_ref->listen.done)
       return;
@@ -98,6 +102,7 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog, cancell
     ret.handle->listen.done = true;
     ret.handle->listen.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     ref_ptr_t<tcp_state_t>::from_raw(ret.handle->uv_handle.data);
+    ret.handle->uv_handle.data = nullptr;
   }
   else if (cancel)
   {
