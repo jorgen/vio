@@ -23,6 +23,8 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include <array>
+#include <cassert>
+#include <utility>
 
 namespace vio
 {
@@ -94,12 +96,13 @@ struct ring_buffer_t
   }
 
   template <typename... Args>
-  T &emplace(Args... args)
+  T &emplace(Args &&...args)
   {
     assert(!full());
-    _buffer_queue[_buffer_back] = T(args...);
+    auto inserted = _buffer_back;
+    _buffer_queue[inserted] = T(std::forward<Args>(args)...);
     _buffer_back = (_buffer_back + 1) % size;
-    return _buffer_queue[_buffer_back];
+    return _buffer_queue[inserted];
   }
 
   T &replace_back(T &&value)
