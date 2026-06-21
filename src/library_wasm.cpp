@@ -20,24 +20,5 @@
   THE SOFTWARE.
 */
 
-#pragma once
-
-#include <functional>
-
-namespace vio
-{
-struct event_bind_t
-{
-  template <typename Ret, typename Class, typename... Args>
-  static std::function<void(Args &&...)> bind(Class &ref, Ret (Class::*f)(Args &&...))
-  {
-    return [&ref, f](Args &&...args) { return ((*static_cast<Class *>(&ref)).*f)(std::forward<Args>(args)...); };
-  }
-};
-} // namespace vio
-
-#ifdef __EMSCRIPTEN__
-#include "vio/platform/wasm/event_pipe_impl.h"
-#else
-#include "vio/platform/uv/event_pipe_impl.h"
-#endif
+#include "vio/event_loop.h"
+#include "vio/operation/sleep.h"

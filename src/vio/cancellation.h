@@ -29,16 +29,15 @@
 #include <functional>
 #include <vector>
 
-#include <uv.h>
-
 namespace vio
 {
 
 constexpr int vio_cancelled = 0xca9ce1;
+constexpr int vio_uv_ecanceled = -4081;
 
 inline bool is_cancelled(const error_t &err)
 {
-  return err.code == vio_cancelled || err.code == UV_ECANCELED;
+  return err.code == vio_cancelled || err.code == vio_uv_ecanceled;
 }
 
 class cancellation_t;

@@ -23,6 +23,9 @@ using task_result_t = typename task_result<T>::type;
 template <typename F>
 inline auto run(F &&f)
 {
+#ifdef __EMSCRIPTEN__
+  static_assert(!sizeof(F *), "vio::run() is not available on WASM. Use event_loop_t::run() directly with run_in_loop().");
+#endif
   using result_t = task_result_t<std::invoke_result_t<F, event_loop_t &>>;
 
   if constexpr (std::is_void_v<result_t>)

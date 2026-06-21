@@ -88,6 +88,18 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "VIO_BUILD_SHARED": "ON"
       }
+    },
+    {
+      "name": "emscripten",
+      "displayName": "Emscripten (WASM)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-emscripten",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VIO_BUILD_TESTS": "OFF",
+        "VIO_BUILD_EXAMPLES": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -118,6 +130,10 @@
     {
       "name": "shared-debug",
       "configurePreset": "shared-debug"
+    },
+    {
+      "name": "emscripten",
+      "configurePreset": "emscripten"
     }
   ],
   "testPresets": [

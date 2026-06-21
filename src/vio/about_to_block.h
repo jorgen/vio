@@ -26,18 +26,24 @@
 
 namespace vio
 {
-struct event_bind_t
+
+class about_to_block_t
 {
+public:
+  about_to_block_t() = default;
+  about_to_block_t(const about_to_block_t &) = default;
+  about_to_block_t(about_to_block_t &&) = default;
+  about_to_block_t &operator=(const about_to_block_t &) = default;
+  about_to_block_t &operator=(about_to_block_t &&) = default;
+  virtual ~about_to_block_t() = default;
+
+  virtual void about_to_block() = 0;
+
   template <typename Ret, typename Class, typename... Args>
-  static std::function<void(Args &&...)> bind(Class &ref, Ret (Class::*f)(Args &&...))
+  std::function<void(Args &&...)> bind(Ret (Class::*f)(Args &&...))
   {
-    return [&ref, f](Args &&...args) { return ((*static_cast<Class *>(&ref)).*f)(std::forward<Args>(args)...); };
+    return [this, f](Args &&...args) { return ((*static_cast<Class *>(this)).*f)(std::move(args)...); };
   }
 };
-} // namespace vio
 
-#ifdef __EMSCRIPTEN__
-#include "vio/platform/wasm/event_pipe_impl.h"
-#else
-#include "vio/platform/uv/event_pipe_impl.h"
-#endif
+} // namespace vio

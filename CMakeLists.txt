@@ -21,30 +21,32 @@ if(VIO_BUILD_SHARED)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
-set(CMDEP_TAG f61ffba)
-include(FetchContent)
-FetchContent_Declare(cmake-dep
-    GIT_REPOSITORY https://github.com/jorgen/cmake-dep.git
-    GIT_TAG ${CMDEP_TAG}
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cmake-dep-${CMDEP_TAG}"
-)
-FetchContent_MakeAvailable(cmake-dep)
-list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")
-include(CmDepMain)
+if(NOT EMSCRIPTEN)
+    set(CMDEP_TAG f61ffba)
+    include(FetchContent)
+    FetchContent_Declare(cmake-dep
+        GIT_REPOSITORY https://github.com/jorgen/cmake-dep.git
+        GIT_TAG ${CMDEP_TAG}
+        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cmake-dep-${CMDEP_TAG}"
+    )
+    FetchContent_MakeAvailable(cmake-dep)
+    list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")
+    include(CmDepMain)
 
-set(CMDEP_PACKAGES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/CMake/3rdPartyPackages.cmake")
-CmDepFetch()
+    set(CMDEP_PACKAGES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/CMake/3rdPartyPackages.cmake")
+    CmDepFetch()
 
-include(CMake/Build3rdParty.cmake)
-Build3rdParty()
+    include(CMake/Build3rdParty.cmake)
+    Build3rdParty()
+endif()
 
 add_subdirectory(src)
 
-if (VIO_BUILD_TESTS)
+if (VIO_BUILD_TESTS AND NOT EMSCRIPTEN)
     enable_testing()
     add_subdirectory(test)
 endif ()
 
-if (VIO_BUILD_EXAMPLES)
+if (VIO_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
     add_subdirectory(examples)
 endif ()
