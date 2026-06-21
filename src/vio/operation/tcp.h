@@ -278,6 +278,18 @@ using tcp_write_future_t = tcp_future_t<tcp_write_state_t>;
 inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length)
 {
   tcp_write_future_t ret(tcp.handle, tcp.handle->write);
+
+  // tcp_state_t has a single embedded uv_write_t. Reject a second write while
+  // one is in flight instead of overwriting the in-flight request (UB) and
+  // leaking its parked ref. Mirrors the guard in tcp_connect. For concurrent
+  // writes use socket_stream, which gives each write its own state slot.
+  if (ret.handle->write.started && !ret.handle->write.done)
+  {
+    ret.handle->write.done = true;
+    ret.handle->write.result = std::unexpected(error_t{.code = -1, .msg = "A write is already in progress on this socket"});
+    return ret;
+  }
+
   ret.handle->write.started = true;
   ret.handle->write.done = false;
   ret.handle->write.result = {};
