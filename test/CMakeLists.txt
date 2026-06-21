@@ -18,6 +18,7 @@ add_executable(vio_tests
     test_ref_counted_wrapper.cpp
     test_handle_closer.cpp
     test_udp.cpp
+    test_reader_cancel.cpp
     test_cancellation.cpp
     test_work.cpp
 )

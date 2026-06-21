@@ -362,6 +362,17 @@ public:
 
     handle->recv.is_cancelled = true;
 
+    // Stop uv from delivering (and allocating buffers for) more datagrams after
+    // the reader is cancelled. Mirrors the destructor so its started guard won't
+    // reclaim the parked ref a second time.
+    if (handle->recv.started)
+    {
+      auto state = ref_ptr_t<udp_state_t>::from_raw(handle->get_udp()->data);
+      uv_udp_recv_stop(handle->get_udp());
+      state->recv.started = false;
+      state->recv.active = false;
+    }
+
     handle->recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"}));
 
     if (handle->recv.continuation)

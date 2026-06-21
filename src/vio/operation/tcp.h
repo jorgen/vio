@@ -358,6 +358,17 @@ public:
 
     handle->read.is_cancelled = true;
 
+    // Stop uv from delivering (and allocating buffers for) more data after the
+    // reader is cancelled. Mirrors the destructor's teardown so the destructor's
+    // started guard won't reclaim the parked ref a second time.
+    if (handle->read.started)
+    {
+      auto state = ref_ptr_t<tcp_state_t>::from_raw(handle->get_stream()->data);
+      uv_read_stop(handle->get_stream());
+      state->read.started = false;
+      state->read.active = false;
+    }
+
     handle->read.buffer_queue.emplace_back(std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"}));
 
     if (handle->read.continuation)
