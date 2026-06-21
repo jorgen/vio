@@ -6,6 +6,7 @@ add_executable(vio_tests
     test_tcp.cpp
     test_tcp_read_cb.cpp
     test_ssl.cpp
+    test_ssl_config.cpp
     test_dns.cpp
     test_elastic_index_storage.cpp
     test_ring_buffer.cpp

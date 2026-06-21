@@ -42,7 +42,7 @@ struct ssl_config_t
   std::optional<std::string> ciphers;
   std::optional<std::string> alpn;
   std::optional<bool> verify_client;
-  std::optional<bool> verify_depth;
+  std::optional<int> verify_depth;
   std::optional<bool> verify_optional;
   std::optional<uint32_t> protocols;
   std::optional<uint32_t> dheparams;
