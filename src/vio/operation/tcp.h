@@ -59,6 +59,8 @@ struct tcp_write_state_t
   uv_write_t req = {};
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
+  registration_t cancel_registration;
+  std::vector<uint8_t> owned_buffer;
   bool started = false;
   bool done = false;
 };
@@ -67,7 +69,6 @@ struct tcp_read_state_t
   bool active = false;
   bool started = false;
   bool is_cancelled = false;
-  bool cancelled = false;
   std::vector<std::expected<unique_buf_t, error_t>> buffer_queue;
   std::coroutine_handle<> continuation;
   alloc_cb_t alloc_buffer_cb = default_alloc;
@@ -275,15 +276,17 @@ inline std::expected<sockaddr_storage, error_t> sockname(tcp_t &tcp)
 }
 
 using tcp_write_future_t = tcp_future_t<tcp_write_state_t>;
-inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length)
+inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length, cancellation_t *cancel = nullptr)
 {
   tcp_write_future_t ret(tcp.handle, tcp.handle->write);
 
   // tcp_state_t has a single embedded uv_write_t. Reject a second write while
-  // one is in flight instead of overwriting the in-flight request (UB) and
-  // leaking its parked ref. Mirrors the guard in tcp_connect. For concurrent
-  // writes use socket_stream, which gives each write its own state slot.
-  if (ret.handle->write.started && !ret.handle->write.done)
+  // one is physically in flight instead of overwriting the in-flight request
+  // (UB) and leaking its parked ref. `started` is cleared only by the real
+  // uv_write callback, so a cancelled-but-still-in-flight write (done==true,
+  // started==true) is correctly rejected. For concurrent writes use
+  // socket_stream, which gives each write its own state slot.
+  if (ret.handle->write.started)
   {
     ret.handle->write.done = true;
     ret.handle->write.result = std::unexpected(error_t{.code = -1, .msg = "A write is already in progress on this socket"});
@@ -294,16 +297,37 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   ret.handle->write.done = false;
   ret.handle->write.result = {};
 
-  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
+  if (cancel && cancel->is_cancelled())
+  {
+    ret.handle->write.started = false;
+    ret.handle->write.done = true;
+    ret.handle->write.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
+  }
+
+  uv_buf_t buf;
+  if (cancel != nullptr)
+  {
+    ret.handle->write.owned_buffer.assign(data, data + length);
+    buf = uv_buf_init(reinterpret_cast<char *>(ret.handle->write.owned_buffer.data()), static_cast<unsigned int>(length));
+  }
+  else
+  {
+    buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
+  }
 
   auto callback = [](uv_write_t *req, int status)
   {
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
+    state_ref->write.cancel_registration.reset();
+    if (state_ref->write.done)
+      return;
     if (status < 0)
     {
       state_ref->write.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
     }
     state_ref->write.done = true;
+    state_ref->write.started = false;
     if (state_ref->write.continuation)
     {
       auto continuation = state_ref->write.continuation;
@@ -319,8 +343,28 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   if (r < 0)
   {
     ret.handle->write.done = true;
+    ret.handle->write.started = false;
     ret.handle->write.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
     ref_ptr_t<tcp_state_t>::from_raw(ret.handle->write.req.data);
+  }
+  else if (cancel)
+  {
+    auto *state_raw = &ret.handle.data();
+    ret.handle->write.cancel_registration = cancel->register_callback(
+      [state_raw]()
+      {
+        if (state_raw->write.done)
+          return;
+        state_raw->write.done = true;
+        state_raw->write.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+        state_raw->write.cancel_registration.reset();
+        if (state_raw->write.continuation)
+        {
+          auto cont = state_raw->write.continuation;
+          state_raw->write.continuation = {};
+          cont.resume();
+        }
+      });
   }
 
   return ret;

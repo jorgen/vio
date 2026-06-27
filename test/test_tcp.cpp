@@ -990,6 +990,84 @@ TEST_CASE("tcp sockname returns correct address")
   event_loop.stop();
   event_loop.run();
 }
+
+TEST_CASE("tcp write cancel")
+{
+  vio::event_loop_t event_loop;
+  bool verified = false;
+
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
+      {
+        auto *ev = &event_loop;
+        auto server_tcp_pair = get_ephemeral_port(*ev);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        int port = server_tcp_pair->second;
+
+        auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+        {
+          auto server = std::move(s);
+          auto listen_result = co_await vio::tcp_listen(server, 10);
+          REQUIRE_EXPECTED(listen_result);
+          auto client_or_err = vio::tcp_accept(server);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
+
+          auto reader_or_err = vio::tcp_create_reader(client);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          while (true)
+          {
+            auto read_result = co_await reader;
+            if (!read_result.has_value())
+              break;
+          }
+        }(std::move(server_tcp_pair->first));
+
+        auto client_task = [](vio::event_loop_t &el, int p, bool &v) -> vio::task_t<void>
+        {
+          auto client_or_err = vio::tcp_create(el);
+          REQUIRE_EXPECTED(client_or_err);
+          auto client = std::move(client_or_err.value());
+
+          auto addr = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(addr);
+          auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
+          REQUIRE_EXPECTED(connect_result);
+
+          std::vector<uint8_t> small(16, 0x42);
+          {
+            vio::cancellation_t pre;
+            pre.cancel();
+            auto fut = vio::write_tcp(client, small.data(), small.size(), &pre);
+            auto result = co_await fut;
+            REQUIRE(!result.has_value());
+            REQUIRE(vio::is_cancelled(result.error()));
+          }
+
+          std::vector<uint8_t> payload(64u * 1024u, 0x41);
+          {
+            vio::cancellation_t token;
+            auto fut = vio::write_tcp(client, payload.data(), payload.size(), &token);
+            token.cancel();
+            auto result = co_await fut;
+            REQUIRE(!result.has_value());
+            REQUIRE(vio::is_cancelled(result.error()));
+          }
+
+          v = true;
+        }(event_loop, port, verified);
+
+        co_await std::move(client_task);
+        { auto destroy = std::move(client_task); }
+        co_await std::move(server_task);
+        ev->stop();
+      }(event_loop, verified);
+  });
+
+  event_loop.run();
+  REQUIRE(verified);
+}
 } // TEST_SUITE
 
 } // namespace

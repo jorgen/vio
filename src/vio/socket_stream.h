@@ -104,6 +104,8 @@ struct stream_reader_t
   bool await_ready() noexcept;
   void await_suspend(std::coroutine_handle<> continuation) noexcept;
   auto await_resume() noexcept -> std::expected<unique_buf_t, error_t>;
+  void cancel() noexcept;
+  [[nodiscard]] bool is_cancelled() const noexcept;
   stream_read_awaitable_t<REF_PTR_T, STREAM> read(uv_buf_t buf);
 };
 
@@ -177,6 +179,7 @@ struct socket_stream_t
   bool write_got_poll_in = false;
   bool poll_running = false;
   bool reader_active = false;
+  bool read_cancelled = false;
   bool closed = false;
   std::function<void()> close_continuation = {};
   std::coroutine_handle<> read_continuation = {};
@@ -571,7 +574,7 @@ template <typename REF_PTR_T, typename STREAM>
 bool stream_reader_t<REF_PTR_T, STREAM>::await_ready() noexcept
 {
   assert(ref_ptr && "Invalid state in await_ready");
-  return stream->has_buffer_with_data_or_error();
+  return stream->read_cancelled || stream->has_buffer_with_data_or_error();
 }
 
 template <typename REF_PTR_T, typename STREAM>
@@ -585,6 +588,10 @@ template <typename REF_PTR_T, typename STREAM>
 auto stream_reader_t<REF_PTR_T, STREAM>::await_resume() noexcept -> std::expected<unique_buf_t, error_t>
 {
   assert(ref_ptr && "Invalid state in await_resume");
+  if (stream->read_cancelled)
+  {
+    return std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"});
+  }
   assert(stream->has_buffer_with_data_or_error() && "Empty buffer in await_resume");
   auto ret = stream->buffer_queue.pop_front();
 
@@ -593,6 +600,31 @@ auto stream_reader_t<REF_PTR_T, STREAM>::await_resume() noexcept -> std::expecte
     return std::unexpected(ret.error());
   }
   return unique_buf_t(ret.value().buf, ret.value().dealloc_cb, stream->user_alloc_ptr);
+}
+
+template <typename REF_PTR_T, typename STREAM>
+void stream_reader_t<REF_PTR_T, STREAM>::cancel() noexcept
+{
+  assert(ref_ptr && "Invalid state in cancel");
+  if (stream->read_cancelled)
+  {
+    return;
+  }
+  stream->read_cancelled = true;
+
+  if (stream->read_continuation)
+  {
+    auto continuation = stream->read_continuation;
+    stream->read_continuation = {};
+    continuation.resume();
+  }
+}
+
+template <typename REF_PTR_T, typename STREAM>
+bool stream_reader_t<REF_PTR_T, STREAM>::is_cancelled() const noexcept
+{
+  assert(ref_ptr && "Invalid state in is_cancelled");
+  return stream->read_cancelled;
 }
 
 template <typename REF_PTR_T, typename STREAM>
