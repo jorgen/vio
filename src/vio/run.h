@@ -60,17 +60,19 @@ inline auto run(F &&f)
 } // namespace vio
 
 // Generates main() for a vio program: the body that follows the macro is a
-// task_t<int> coroutine with `loop` in scope, run on a fresh event loop.
+// task_t<int> coroutine with `loop`, `argc`, and `argv` in scope, run on a fresh
+// event loop.
 //
-//   VIO_MAIN(loop)
+//   VIO_MAIN(loop, argc, argv)
 //   {
 //     co_await something(loop);
 //     co_return 0;
 //   }
-#define VIO_MAIN(loop)                                            \
-  static vio::task_t<int> vio_main_impl(vio::event_loop_t &loop); \
-  int main()                                                      \
-  {                                                               \
-    return vio::run(vio_main_impl);                               \
-  }                                                               \
-  vio::task_t<int> vio_main_impl(vio::event_loop_t &loop)
+#define VIO_MAIN(loop, argc, argv)                                                       \
+  static vio::task_t<int> vio_main_impl(vio::event_loop_t &loop, int argc, char **argv); \
+  int main(int argc, char **argv)                                                        \
+  {                                                                                      \
+    return vio::run([argc, argv](vio::event_loop_t &loop) -> vio::task_t<int>            \
+                    { return vio_main_impl(loop, argc, argv); });                        \
+  }                                                                                      \
+  vio::task_t<int> vio_main_impl(vio::event_loop_t &loop, [[maybe_unused]] int argc, [[maybe_unused]] char **argv)
