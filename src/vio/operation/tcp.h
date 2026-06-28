@@ -60,7 +60,7 @@ struct tcp_write_state_t
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
   registration_t cancel_registration;
-  std::vector<uint8_t> owned_buffer;
+  std::string owned_buffer;
   bool started = false;
   bool done = false;
 };
@@ -276,10 +276,8 @@ inline std::expected<sockaddr_storage, error_t> sockname(tcp_t &tcp)
 }
 
 using tcp_write_future_t = tcp_future_t<tcp_write_state_t>;
-inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length, cancellation_t *cancel = nullptr)
+inline bool write_tcp_begin(tcp_write_future_t &ret, cancellation_t *cancel)
 {
-  tcp_write_future_t ret(tcp.handle, tcp.handle->write);
-
   // tcp_state_t has a single embedded uv_write_t. Reject a second write while
   // one is physically in flight instead of overwriting the in-flight request
   // (UB) and leaking its parked ref. `started` is cleared only by the real
@@ -290,7 +288,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   {
     ret.handle->write.done = true;
     ret.handle->write.result = std::unexpected(error_t{.code = -1, .msg = "A write is already in progress on this socket"});
-    return ret;
+    return false;
   }
 
   ret.handle->write.started = true;
@@ -302,20 +300,13 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
     ret.handle->write.started = false;
     ret.handle->write.done = true;
     ret.handle->write.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-    return ret;
+    return false;
   }
+  return true;
+}
 
-  uv_buf_t buf;
-  if (cancel != nullptr)
-  {
-    ret.handle->write.owned_buffer.assign(data, data + length);
-    buf = uv_buf_init(reinterpret_cast<char *>(ret.handle->write.owned_buffer.data()), static_cast<unsigned int>(length));
-  }
-  else
-  {
-    buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
-  }
-
+inline void write_tcp_arm(tcp_write_future_t &ret, tcp_t &tcp, uv_buf_t buf, cancellation_t *cancel)
+{
   auto callback = [](uv_write_t *req, int status)
   {
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
@@ -366,7 +357,44 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
         }
       });
   }
+}
 
+inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length, cancellation_t *cancel = nullptr)
+{
+  tcp_write_future_t ret(tcp.handle, tcp.handle->write);
+  if (!write_tcp_begin(ret, cancel))
+  {
+    return ret;
+  }
+
+  uv_buf_t buf;
+  if (cancel != nullptr)
+  {
+    // A cancelled write resumes the awaiter early while the uv_write is still
+    // in flight and reading the buffer, so vio must own the bytes. Pass via the
+    // std::string&& overload to move instead of copy.
+    ret.handle->write.owned_buffer.assign(reinterpret_cast<const char *>(data), length);
+    buf = uv_buf_init(ret.handle->write.owned_buffer.data(), static_cast<unsigned int>(length));
+  }
+  else
+  {
+    buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
+  }
+  write_tcp_arm(ret, tcp, buf, cancel);
+  return ret;
+}
+
+inline tcp_write_future_t write_tcp(tcp_t &tcp, std::string &&data, cancellation_t *cancel = nullptr)
+{
+  tcp_write_future_t ret(tcp.handle, tcp.handle->write);
+  if (!write_tcp_begin(ret, cancel))
+  {
+    return ret;
+  }
+
+  ret.handle->write.owned_buffer = std::move(data);
+  uv_buf_t buf = uv_buf_init(ret.handle->write.owned_buffer.data(), static_cast<unsigned int>(ret.handle->write.owned_buffer.size()));
+  write_tcp_arm(ret, tcp, buf, cancel);
   return ret;
 }
 
