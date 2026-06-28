@@ -58,3 +58,19 @@ inline auto run(F &&f)
 }
 
 } // namespace vio
+
+// Generates main() for a vio program: the body that follows the macro is a
+// task_t<int> coroutine with `loop` in scope, run on a fresh event loop.
+//
+//   VIO_MAIN(loop)
+//   {
+//     co_await something(loop);
+//     co_return 0;
+//   }
+#define VIO_MAIN(loop)                                            \
+  static vio::task_t<int> vio_main_impl(vio::event_loop_t &loop); \
+  int main()                                                      \
+  {                                                               \
+    return vio::run(vio_main_impl);                               \
+  }                                                               \
+  vio::task_t<int> vio_main_impl(vio::event_loop_t &loop)
