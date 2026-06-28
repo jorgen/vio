@@ -28,9 +28,14 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/unique_buf.h"
 #include "vio/uv_coro.h"
 
+#include <concepts>
 #include <coroutine>
+#include <cstdint>
 #include <expected>
+#include <memory>
+#include <ranges>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <uv.h>
 
@@ -54,13 +59,37 @@ struct tcp_connect_state_t
   bool done = false;
 };
 
+// A cancellable write resumes its awaiter early while the in-flight uv_write is
+// still reading the buffer, so vio must keep the bytes alive until the real
+// write callback fires. owned_payload_t type-erases the lifetime of an arbitrary
+// moved-in buffer (std::string, std::vector, or any owning contiguous byte
+// range); the write reads a uv_buf_t computed from it at submit time.
+struct owned_payload_t
+{
+  virtual ~owned_payload_t() = default;
+};
+
+template <typename T>
+struct owned_payload_impl_t : owned_payload_t
+{
+  T value;
+  explicit owned_payload_impl_t(T &&v)
+    : value(std::move(v))
+  {
+  }
+};
+
+template <typename T>
+concept owned_byte_range = std::ranges::contiguous_range<T> && std::ranges::sized_range<T> && std::move_constructible<T> && sizeof(std::ranges::range_value_t<T>) == 1 &&
+                           std::is_trivially_copyable_v<std::ranges::range_value_t<T>> && !std::ranges::view<std::remove_cvref_t<T>>;
+
 struct tcp_write_state_t
 {
   uv_write_t req = {};
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
   registration_t cancel_registration;
-  std::string owned_buffer;
+  std::unique_ptr<owned_payload_t> owned;
   bool started = false;
   bool done = false;
 };
@@ -370,11 +399,12 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   uv_buf_t buf;
   if (cancel != nullptr)
   {
-    // A cancelled write resumes the awaiter early while the uv_write is still
-    // in flight and reading the buffer, so vio must own the bytes. Pass via the
-    // std::string&& overload to move instead of copy.
-    ret.handle->write.owned_buffer.assign(reinterpret_cast<const char *>(data), length);
-    buf = uv_buf_init(ret.handle->write.owned_buffer.data(), static_cast<unsigned int>(length));
+    // The pointer is borrowed, so a cancellable write must copy into an owned
+    // payload. Callers that already hold a movable buffer should use the owning
+    // overload to transfer it without the copy.
+    auto holder = std::make_unique<owned_payload_impl_t<std::string>>(std::string(reinterpret_cast<const char *>(data), length));
+    buf = uv_buf_init(holder->value.data(), static_cast<unsigned int>(holder->value.size()));
+    ret.handle->write.owned = std::move(holder);
   }
   else
   {
@@ -384,7 +414,14 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
   return ret;
 }
 
-inline tcp_write_future_t write_tcp(tcp_t &tcp, std::string &&data, cancellation_t *cancel = nullptr)
+// Takes ownership of any moved-in contiguous byte range (std::string,
+// std::vector<uint8_t>, std::vector<std::byte>, ...) and keeps it alive for the
+// duration of the write, with no copy. Only rvalues bind: ownership must be
+// transferred explicitly, which also keeps borrowed views (string_view, span)
+// from matching.
+template <typename Bytes>
+  requires owned_byte_range<std::remove_cvref_t<Bytes>> && (!std::is_lvalue_reference_v<Bytes>)
+tcp_write_future_t write_tcp(tcp_t &tcp, Bytes &&data, cancellation_t *cancel = nullptr)
 {
   tcp_write_future_t ret(tcp.handle, tcp.handle->write);
   if (!write_tcp_begin(ret, cancel))
@@ -392,8 +429,9 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, std::string &&data, cancellation
     return ret;
   }
 
-  ret.handle->write.owned_buffer = std::move(data);
-  uv_buf_t buf = uv_buf_init(ret.handle->write.owned_buffer.data(), static_cast<unsigned int>(ret.handle->write.owned_buffer.size()));
+  auto holder = std::make_unique<owned_payload_impl_t<std::remove_cvref_t<Bytes>>>(std::forward<Bytes>(data));
+  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(std::ranges::data(holder->value)), static_cast<unsigned int>(std::ranges::size(holder->value)));
+  ret.handle->write.owned = std::move(holder);
   write_tcp_arm(ret, tcp, buf, cancel);
   return ret;
 }
