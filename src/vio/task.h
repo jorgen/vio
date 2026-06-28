@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <coroutine>
+#include <exception>
 
 namespace vio
 {
