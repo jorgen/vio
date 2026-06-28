@@ -340,6 +340,7 @@ inline void write_tcp_arm(tcp_write_future_t &ret, tcp_t &tcp, uv_buf_t buf, can
   {
     auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
     state_ref->write.cancel_registration.reset();
+    state_ref->write.owned.reset();
     if (state_ref->write.done)
       return;
     if (status < 0)
@@ -420,7 +421,7 @@ inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t
 // transferred explicitly, which also keeps borrowed views (string_view, span)
 // from matching.
 template <typename Bytes>
-  requires owned_byte_range<std::remove_cvref_t<Bytes>> && (!std::is_lvalue_reference_v<Bytes>)
+  requires owned_byte_range<std::remove_cvref_t<Bytes>> && (!std::is_lvalue_reference_v<Bytes>) && (!std::is_const_v<std::remove_reference_t<Bytes>>)
 tcp_write_future_t write_tcp(tcp_t &tcp, Bytes &&data, cancellation_t *cancel = nullptr)
 {
   tcp_write_future_t ret(tcp.handle, tcp.handle->write);
