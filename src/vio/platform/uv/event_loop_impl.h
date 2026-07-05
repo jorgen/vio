@@ -212,8 +212,19 @@ public:
 
   ~thread_with_event_loop_t() // NOLINT(modernize-use-equals-default)
   {
-    _event_loop.stop();
-    _thread->join();
+    stop_and_join();
+  }
+
+  // Stop the loop and join the thread. Idempotent. Call this before destroying
+  // any event_pipe registered on this loop: otherwise the loop thread may still
+  // be draining the pipe while the pipe's storage is torn down (a data race).
+  void stop_and_join()
+  {
+    if (_thread && _thread->joinable())
+    {
+      _event_loop.stop();
+      _thread->join();
+    }
   }
 
   [[nodiscard]] event_loop_t &event_loop()

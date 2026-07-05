@@ -38,6 +38,7 @@ TEST_SUITE("Event Pipe")
     std::function<void()> run_in_main = [&event_from_main_thread_been_called]() { event_from_main_thread_been_called(44); };
     primary_event_loop.run_in_loop(std::move(run_in_main));
     primary_event_loop.run();
+    secondary_event_loop.stop_and_join(); // join before the pipes on it are destroyed
 
     REQUIRE(has_event_from_secondary_been_called);
     REQUIRE(has_event_from_main_thread_been_called);
@@ -59,6 +60,7 @@ TEST_SUITE("Event Pipe")
         }(caller_loop, result, pipe);
     });
     caller_loop.run();
+    handler_thread.stop_and_join(); // join before the awaitable pipe on it is destroyed
 
     REQUIRE(result == 42);
   }
@@ -86,6 +88,7 @@ TEST_SUITE("Event Pipe")
         }(caller_loop, result, pipe);
     });
     caller_loop.run();
+    handler_thread.stop_and_join(); // join before the awaitable pipe on it is destroyed
 
     REQUIRE(result == 42);
   }
@@ -109,6 +112,7 @@ TEST_SUITE("Event Pipe")
         }(caller_loop, sum, pipe);
     });
     caller_loop.run();
+    handler_thread.stop_and_join();
 
     REQUIRE(sum == 90);
   }
@@ -129,6 +133,7 @@ TEST_SUITE("Event Pipe")
         }(caller_loop, result, pipe);
     });
     caller_loop.run();
+    handler_thread.stop_and_join();
 
     REQUIRE(result == "hello42");
   }
