@@ -31,9 +31,24 @@ else()
         set_target_properties(vio_default_certs PROPERTIES POSITION_INDEPENDENT_CODE ON)
     endif()
 
+    # Select the SSL backend. PUBLIC so the define propagates to header-only
+    # consumers (the seam #errors on a missing/ambiguous backend, catching a
+    # header/library mismatch at compile time).
+    if(VIO_SSL_BACKEND STREQUAL "libressl")
+        target_compile_definitions(vio PUBLIC VIO_SSL_BACKEND_LIBRESSL)
+    elseif(VIO_SSL_BACKEND STREQUAL "openssl")
+        target_compile_definitions(vio PUBLIC VIO_SSL_BACKEND_OPENSSL)
+    elseif(VIO_SSL_BACKEND STREQUAL "boringssl")
+        target_compile_definitions(vio PUBLIC VIO_SSL_BACKEND_BORINGSSL)
+    else()
+        message(FATAL_ERROR "Unknown VIO_SSL_BACKEND '${VIO_SSL_BACKEND}' (expected libressl|openssl|boringssl)")
+    endif()
+
     # Dependencies are PUBLIC because vio's inline header code calls libuv/libressl directly.
     # Phase 2 (PIMPL) will allow switching to PRIVATE for full symbol hiding.
-    CmDepTargetLinkLibrary(vio PUBLIC LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto ada::ada)
+    # vio now speaks only the OpenSSL SSL_*/BIO API (the memory-BIO engine), so libtls
+    # (LibreSSL::TLS) is no longer linked -- only the SSL and Crypto libraries.
+    CmDepTargetLinkLibrary(vio PUBLIC LibreSSL::SSL LibreSSL::Crypto ada::ada)
     if (WIN32)
         CmDepTargetLinkLibrary(vio PUBLIC crypt32 bcrypt)
     endif ()

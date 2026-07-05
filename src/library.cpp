@@ -27,9 +27,9 @@
 
 #include <cmrc/cmrc.hpp>
 #include <span>
-#include <tls.h>
 
 #ifdef _WIN32
+#include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>

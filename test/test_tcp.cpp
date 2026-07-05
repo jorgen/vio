@@ -1035,11 +1035,11 @@ TEST_CASE("tcp write cancel")
           auto connect_result = co_await vio::tcp_connect(client, reinterpret_cast<const sockaddr *>(&addr.value()));
           REQUIRE_EXPECTED(connect_result);
 
-          std::vector<uint8_t> small(16, 0x42);
+          std::vector<uint8_t> small_payload(16, 0x42);
           {
             vio::cancellation_t pre;
             pre.cancel();
-            auto fut = vio::write_tcp(client, small.data(), small.size(), &pre);
+            auto fut = vio::write_tcp(client, small_payload.data(), small_payload.size(), &pre);
             auto result = co_await fut;
             REQUIRE(!result.has_value());
             REQUIRE(vio::is_cancelled(result.error()));

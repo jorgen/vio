@@ -30,64 +30,29 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/ref_counted_wrapper.h"
 #include "vio/socket_stream.h"
 #include "vio/ssl_config_t.h"
+#include "vio/ssl_context.h"
+#include "vio/ssl_engine.h"
 #include "vio/unique_buf.h"
 
 #include <coroutine>
+#include <cstring>
 #include <expected>
-#include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
-#include <tls.h>
 #include <uv.h>
-#include <vector>
 
 namespace vio
 {
-struct tls_client_connection_handler_t
-{
-  tls *stream_tls_ctx = nullptr;
+using tls_client_socket_stream_t = uv_tls_stream_t;
 
-  error_t initialize(const ssl_config_t &config)
-  {
-    stream_tls_ctx = tls_client();
-    if (stream_tls_ctx == nullptr)
-    {
-      return error_t{.code = -1, .msg = "Failed to create TLS client"};
-    }
-
-    // libressl copies the CA bytes into its own config, so passing the
-    // program-lifetime default bundle by reference avoids a per-connection copy.
-    return apply_ssl_config_to_tls_ctx(config, get_default_ca_certificates(), stream_tls_ctx);
-  }
-
-  [[nodiscard]] error_t connect(const int socket_fd, const std::string &host)
-  {
-    auto tls_result = tls_connect_socket(stream_tls_ctx, socket_fd, host.c_str());
-    if (tls_result != 0)
-    {
-      return error_t{.code = tls_result, .msg = tls_error(stream_tls_ctx)};
-    }
-    return {};
-  }
-
-  void close() const
-  {
-    assert(stream_tls_ctx);
-    tls_close(stream_tls_ctx);
-    tls_free(stream_tls_ctx);
-  }
-};
-
-using tls_native_client_stream_t = tls_stream_t<tls_client_connection_handler_t>;
-using tls_client_socket_stream_t = vio::socket_stream_t<tls_native_client_stream_t>;
 struct ssl_client_state_t
 {
   uv_tcp_t tcp_handle = {};
 
   ssl_client_state_t(event_loop_t &event_loop, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
     : event_loop(event_loop)
-    , native_stream(connection_handler)
-    , socket_stream(native_stream, event_loop, alloc_cb, dealloc_cb, user_alloc_ptr)
+    , socket_stream(engine, alloc_cb, dealloc_cb, user_alloc_ptr)
   {
   }
 
@@ -96,7 +61,6 @@ struct ssl_client_state_t
   std::string port;
   uv_getaddrinfo_t getaddrinfo_req = {};
   uv_connect_t connect_req = {};
-  int socket_fd = -1;
 
   std::coroutine_handle<> connect_continuation;
   std::expected<void, error_t> connect_result;
@@ -108,9 +72,11 @@ struct ssl_client_state_t
   bool resolved_done = false;
   registration_t cancel_registration;
 
-  tls_client_connection_handler_t connection_handler;
-  tls_native_client_stream_t native_stream;
-  tls_client_socket_stream_t socket_stream;
+  // ssl_ctx built once from config; engine is the per-connection codec; declared
+  // before socket_stream, which binds engine by reference.
+  ssl_context_t ssl_ctx;
+  ssl_engine_t engine;
+  uv_tls_stream_t socket_stream;
 
   uv_tcp_t *get_tcp()
   {
@@ -157,32 +123,45 @@ struct ssl_client_state_t
         return;
       }
 
-      state->cancel_registration.reset();
-      state->connecting = false;
-      uv_os_fd_t socket;
-      if (uv_fileno(state->get_tcp_handle(), &socket) == 0)
+      // TCP is connected. Bring up the TLS engine and drive the handshake to
+      // completion; connect only resolves once the handshake finishes (so ALPN
+      // and certificate verification are known to the caller at connect time).
+      if (auto err = state->engine.init(state->ssl_ctx, false, state->host); err.code != 0)
       {
-        state->socket_fd = *reinterpret_cast<int *>(&socket);
-        if (auto socket_err = state->connection_handler.connect(state->socket_fd, state->host); socket_err.code == 0)
+        state->cancel_registration.reset();
+        state->connecting = false;
+        state->connect_result = std::unexpected(std::move(err));
+        if (state->connect_continuation)
         {
-          state->connected = true;
-          state->connect_result = {};
-          state->socket_stream.connect(state->socket_fd);
+          state->connect_continuation.resume();
+        }
+        return;
+      }
+
+      auto *state_raw = &state.data();
+      state->socket_stream.on_handshake_complete = [state_raw](std::optional<error_t> err)
+      {
+        if (!state_raw->connecting)
+          return;
+        state_raw->cancel_registration.reset();
+        state_raw->connecting = false;
+        if (err)
+        {
+          state_raw->connect_result = std::unexpected(std::move(*err));
         }
         else
         {
-          state->connect_result = std::unexpected(std::move(socket_err));
+          state_raw->connected = true;
+          state_raw->connect_result = {};
         }
-      }
-      else
-      {
-        state->connect_result = std::unexpected(error_t{.code = -1, .msg = "Failed to get socket fd"});
-      }
-
-      if (state->connect_continuation)
-      {
-        state->connect_continuation.resume();
-      }
+        if (state_raw->connect_continuation)
+        {
+          auto cont = state_raw->connect_continuation;
+          state_raw->connect_continuation = {};
+          cont.resume();
+        }
+      };
+      state->socket_stream.begin_handshake();
     };
     auto connect_result = uv_tcp_connect(&state->connect_req, state->get_tcp(), state->addresses[state->address_index].get_sockaddr(), on_connect);
     if (connect_result < 0)
@@ -236,13 +215,11 @@ struct ssl_client_t
   ref_ptr_t<ssl_client_state_t> state;
 };
 
-void set_poll_state(ssl_client_state_t &state);
-
 inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &event_loop, const ssl_config_t &config = {}, alloc_cb_t alloc_cb = default_alloc, dealloc_cb_t dealloc_cb = default_dealloc,
                                                               void *user_alloc_ptr = nullptr)
 {
   ssl_client_t ret{ref_ptr_t<ssl_client_state_t>{event_loop, alloc_cb, dealloc_cb, user_alloc_ptr}};
-  if (auto error = ret.state->connection_handler.initialize(config); error.code != 0)
+  if (auto error = ret.state->ssl_ctx.init(false, config, get_default_ca_certificates()); error.code != 0)
   {
     return std::unexpected(std::move(error));
   }
@@ -252,18 +229,9 @@ inline std::expected<ssl_client_t, error_t> ssl_client_create(event_loop_t &even
     return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   ret.state.register_handle(&ret.state->tcp_handle);
+  ret.state->socket_stream.bind(ret.state->get_tcp_stream(), ret.state.ref_counted());
 
-  ret.state.on_destroy(
-    [state_raw = &ret.state.data(), rc = ret.state.ref_counted()]()
-    {
-      state_raw->connection_handler.close();
-      if (state_raw->socket_stream.connected && !uv_is_closing(reinterpret_cast<uv_handle_t *>(&state_raw->socket_stream.poll_req)))
-      {
-        state_raw->socket_stream.closed = true;
-        uv_poll_stop(&state_raw->socket_stream.poll_req);
-        rc->register_closable_handle(reinterpret_cast<uv_handle_t *>(&state_raw->socket_stream.poll_req));
-      }
-    });
+  ret.state.on_destroy([state_raw = &ret.state.data()]() { state_raw->socket_stream.begin_teardown(); });
 
   return ret;
 }
@@ -465,9 +433,43 @@ inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_bu
   auto write_state_index = client.state->socket_stream.write_queue.activate();
   client.state->socket_stream.write_queue[write_state_index].buf = buffer;
 
-  client.state->socket_stream.write();
-  client.state->socket_stream.set_poll_state();
+  client.state->socket_stream.begin_write(write_state_index);
   return {client.state, &client.state->socket_stream, write_state_index};
+}
+
+// Vectored write: coalesce several buffers into one TLS record + one uv_write.
+inline tls_client_write_awaitable_t ssl_client_writev(ssl_client_t &client, std::span<const uv_buf_t> buffers)
+{
+  assert(client.state.ref_counted() != nullptr && "Can not write to a closed client");
+  assert(client.state->connected && "Can not write to a client that is not connected");
+  auto write_state_index = client.state->socket_stream.write_queue.activate();
+  client.state->socket_stream.begin_writev(write_state_index, buffers.data(), buffers.size());
+  return {client.state, &client.state->socket_stream, write_state_index};
+}
+
+// Half-close: send close_notify but keep reading. Resolves when it is on the wire.
+inline tls_client_write_awaitable_t ssl_client_shutdown(ssl_client_t &client)
+{
+  assert(client.state.ref_counted() != nullptr && "Can not shut down a closed client");
+  auto write_state_index = client.state->socket_stream.write_queue.activate();
+  client.state->socket_stream.begin_shutdown(write_state_index);
+  return {client.state, &client.state->socket_stream, write_state_index};
+}
+
+// Negotiated ALPN protocol, available after the handshake (i.e. after connect
+// resolves). Returns nullopt if none was negotiated.
+inline std::optional<std::string> ssl_client_alpn_selected(const ssl_client_t &client)
+{
+  if (client.state.ref_counted() == nullptr || !client.state->connected)
+  {
+    return std::nullopt;
+  }
+  auto s = client.state->engine.alpn_selected();
+  if (s.empty())
+  {
+    return std::nullopt;
+  }
+  return s;
 }
 
 } // namespace vio

@@ -9,6 +9,7 @@ add_executable(vio_tests
     test_tcp_server_listen.cpp
     test_tcp_write_guard.cpp
     test_ssl.cpp
+    test_ssl_alpn.cpp
     test_ssl_config.cpp
     test_ca_certificates.cpp
     test_dns.cpp

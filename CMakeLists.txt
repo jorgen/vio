@@ -15,6 +15,12 @@ option(VIO_BUILD_SHARED "Build vio as a shared library" OFF)
 option(VIO_BUILD_TESTS "Build vio tests" ON)
 option(VIO_BUILD_EXAMPLES "Build vio examples" ON)
 
+# SSL backend selection. vio speaks the OpenSSL SSL_*/BIO API through a compile-time
+# seam (src/vio/ssl_backend.h); only the bundled LibreSSL backend is wired & tested
+# today, with openssl/boringssl reserved as drop-in options.
+set(VIO_SSL_BACKEND "libressl" CACHE STRING "SSL backend: libressl, openssl, or boringssl")
+set_property(CACHE VIO_SSL_BACKEND PROPERTY STRINGS libressl openssl boringssl)
+
 if(VIO_BUILD_SHARED)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
     # Place all executables and DLLs in the same directory so they can find each other

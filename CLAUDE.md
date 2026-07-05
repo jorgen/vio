@@ -134,22 +134,37 @@ continuation (the caller that `co_await`ed). The destructor only destroys the fr
 2. `uv_close` is called on all registered closable handles
 3. Storage is freed only after all close callbacks have fired (via `close_pending` counter)
 
-The `on_destroy` callbacks may register additional closable handles (e.g. the poll handle for
-socket_stream). The `in_destroy_sequence` flag prevents re-entrant destruction if callbacks
-temporarily increment/decrement the ref count.
+The `on_destroy` callbacks may register additional closable handles (e.g. the `uv_tcp_t` for a
+TLS connection). The `in_destroy_sequence` flag prevents re-entrant destruction if callbacks
+temporarily increment/decrement the ref count. A parked ref that a callback holds (e.g. an
+in-flight `uv_write` during teardown, see `begin_teardown`) defers the final destruction until
+that callback releases it — which is how a best-effort close_notify write is flushed on close.
 
-### socket_stream_t event processing
+### TLS transport: uv_tls_stream_t + ssl_engine_t (memory BIOs)
 
-`on_poll_event` processes events in order: WRITABLE, then READABLE, then `set_poll_state()`.
-A write completion can resume a coroutine chain that destroys the socket_stream owner, so
-defensive `closed` checks are required between each phase:
+TLS rides libuv's **stream API** (`uv_read_start` / `uv_write` on the `uv_tcp_t`), not `uv_poll`.
+vio issues no raw `recv`/`send`, so libuv's backend (io_uring/IOCP) is invisible to the crypto
+layer. The pieces (all in `src/vio/`):
 
-```
-WRITABLE → check closed → READABLE → check closed → set_poll_state
-```
+- `ssl_backend.h` — compile-time backend seam (`VIO_SSL_BACKEND`); only bundled LibreSSL is wired.
+  Portable in-memory cert/key/CA loading (`BIO_new_mem_buf` + `PEM_read_bio_*`), feature-gated on
+  `LIBRESSL_VERSION_NUMBER` (never the fake `OPENSSL_VERSION_NUMBER = 0x20000000L`).
+- `ssl_context.h` — `ssl_context_t`: a shared `SSL_CTX` built once from `ssl_config_t` (verify,
+  ALPN, keylog, session cache). Server ALPN selection is hand-rolled (server preference, empty-list
+  CVE-2024-5535 guard, `NOACK` on no overlap).
+- `ssl_engine.h` — `ssl_engine_t`: a per-connection **socket-free** codec (`SSL*` + rbio/wbio
+  `BIO_s_mem`). `feed_ciphertext`→rbio, `SSL_read`→plaintext; `SSL_write`→drain wbio→ciphertext.
+- `socket_stream.h` — `uv_tls_stream_t`: the driver. `read_cb` feeds rbio then `pump()`s;
+  `pump()` is **handshake-then-fall-through** (a segment carrying Finished + app data decrypts
+  both in one pass). After every SSL op it drains wbio (so KeyUpdate/alert control records are
+  sent). Writes are producer-throttled: over the write high-water mark, `SSL_write` is deferred and
+  the awaitable stays suspended (natural backpressure); a bounded `buffer_queue` + `uv_read_stop`
+  applies read backpressure. The handshake is driven to completion at connect/accept.
 
-Within READABLE, if `write_got_poll_in` is set, `write()` is called first (TLS needs read events
-to complete writes). Another `closed` check is needed after that `write()` call.
+Reentrancy: `read_cb`/`write_cb` hold a callback-duration ref (`rc->inc()/dec()`) so a resumed
+coroutine that drops the last user ref cannot free the state mid-callback; each in-flight
+`uv_write` parks a ref released in `write_cb`. Never hold a `write_queue[idx]` reference across a
+`continuation.resume()` (the vector may reallocate) — re-index after resuming.
 
 ### event_loop_t
 
@@ -212,31 +227,22 @@ simply creates and co_awaits sub-tasks that follow the parameter pattern.
 
 ### TLS disconnect detection
 
-TLS disconnect detection works via two mechanisms in `tls_stream_t::read()`:
+Because vio now owns the TCP read (`uv_read_start`), disconnects are detected directly — the old
+`recv(..., MSG_PEEK)` probe is gone. Distinct, stable `error_t` codes let a downstream (HTTP/2)
+branch on the kind of close (defined in `ssl_engine.h`):
 
-1. **Clean TLS shutdown (`tls_read` returns 0):** When the peer sends `close_notify`, `tls_read`
-   returns 0. This is mapped to an error (`"TLS connection closed"`).
-2. **Unclean TCP close (`tls_read` returns `TLS_WANT_POLLIN`):** When the peer closes TCP without
-   `close_notify`, `tls_read` returns `TLS_WANT_POLLIN`. A `recv(fd, buf, 1, MSG_PEEK)` check
-   distinguishes between "no data yet" (`recv` returns -1/EAGAIN) and "peer closed" (`recv`
-   returns 0). The latter maps to an error (`"Connection closed by peer"`).
+1. **Clean shutdown (`vio_tls_clean_shutdown`):** the peer sent `close_notify`, so `SSL_read`
+   returns `SSL_ERROR_ZERO_RETURN` (or the read callback delivers `UV_EOF` after `close_notify`).
+2. **Unclean truncation (`vio_tls_truncated`):** the read callback delivers `UV_EOF` before any
+   `close_notify` — the connection was cut mid-stream.
+3. **Transport error:** any other negative `nread` maps to the libuv error code.
 
-### socket_stream.h defensive guards
+### on_destroy teardown (begin_teardown)
 
-Several guards were added to `socket_stream_t` to prevent crashes when a write completion
-destroys the stream during `on_poll_event` processing:
-
-- `uv_is_closing` check at top of `on_poll_event`
-- `if (state->closed) return;` between WRITABLE and READABLE processing
-- `if (state->closed) return;` after `write()` call within READABLE branch
-- `if (!closed)` guard before `uv_poll_stop` in `read()` error path
-- `if (state->closed) return;` after READABLE branch before `set_poll_state`
-
-### on_destroy uv_is_closing guards
-
-Both `tls_client.h` and `tls_server.h` have `uv_is_closing` guards in their `on_destroy`
-callbacks to prevent calling `uv_poll_stop` on an already-closing handle:
-
-```cpp
-if (state_raw->socket_stream.connected && !uv_is_closing(...poll_req...))
-```
+`tls_client.h` and `tls_server.h` `on_destroy` callbacks call `uv_tls_stream_t::begin_teardown()`:
+best-effort one-way `close_notify` (its fire-and-forget `uv_write` parks a ref, deferring final
+destruction until the flush completes), then `uv_read_stop`. The `SSL*`/BIOs are freed by the
+`ssl_engine_t` destructor when the state's storage is deleted — after the close_notify ciphertext
+has already been copied out of `wbio`. Guarded to be a no-op when the engine was never initialized
+(e.g. a client dropped before connecting). `ssl_server_create`'s `on_destroy` additionally cancels
+a pending listen and consumes the raw ref `tcp_listen` parked in `stream->data`.

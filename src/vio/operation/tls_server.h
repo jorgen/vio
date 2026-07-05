@@ -29,60 +29,17 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/event_loop.h"
 #include "vio/ref_counted_wrapper.h"
 #include "vio/ssl_config_t.h"
+#include "vio/ssl_context.h"
+#include "vio/ssl_engine.h"
 
+#include <coroutine>
 #include <expected>
-#include <tls.h>
+#include <optional>
 
 namespace vio
 {
 
-struct tls_server_client_tls_t
-{
-  tls *stream_tls_ctx = nullptr;
-  void close() const
-  {
-    tls_close(stream_tls_ctx);
-    tls_free(stream_tls_ctx);
-  }
-};
-
-struct tls_native_server_ctx_t
-{
-  error_t initialize(const ssl_config_t &config)
-  {
-    tls_ctx = tls_server();
-    if (tls_ctx == nullptr)
-    {
-      return error_t{.code = -1, .msg = "failed to create tls_server handle."};
-    }
-    return apply_ssl_config_to_tls_ctx(config, get_default_ca_certificates(), tls_ctx);
-  }
-
-  [[nodiscard]] std::expected<tls_server_client_tls_t, error_t> accept(int socket_fd) const
-  {
-    tls *client = nullptr;
-    if (auto result = tls_accept_socket(tls_ctx, &client, socket_fd); result < 0)
-    {
-      return std::unexpected(error_t{.code = result, .msg = tls_error(tls_ctx)});
-    }
-    return tls_server_client_tls_t{client};
-  }
-
-  void close()
-  {
-    if (tls_ctx)
-    {
-      tls_close(tls_ctx);
-      tls_free(tls_ctx);
-      tls_ctx = nullptr;
-    }
-  }
-
-  tls *tls_ctx = nullptr;
-};
-
-template <typename NATIVE_SERVER_CTX>
-struct ssl_server_state_t
+struct tls_server_state_t
 {
   event_loop_t &event_loop;
   vio::tcp_server_t tcp;
@@ -90,29 +47,28 @@ struct ssl_server_state_t
   alloc_cb_t alloc_cb;
   dealloc_cb_t dealloc_cb;
   void *user_alloc_ptr;
-  NATIVE_SERVER_CTX tls_ctx;
+  ssl_context_t ssl_ctx; // shared server SSL_CTX; the accepted SSL* references it
 };
 
-using tls_server_state_t = ssl_server_state_t<tls_native_server_ctx_t>;
+using tls_server_socket_stream_t = uv_tls_stream_t;
 
-using tls_native_server_stream_t = tls_stream_t<tls_server_client_tls_t>;
-using tls_server_socket_stream_t = vio::socket_stream_t<tls_native_server_stream_t>;
 struct ssl_server_client_state_t
 {
-  ssl_server_client_state_t(event_loop_t &event_loop, tcp_t &&tcp, tls_server_client_tls_t &&tls, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
+  ssl_server_client_state_t(event_loop_t &event_loop, tcp_t &&tcp, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
     : event_loop(event_loop)
     , tcp(std::move(tcp))
-    , connection_handler(tls)
-    , native_stream(connection_handler)
-    , socket_stream(native_stream, event_loop, alloc_cb, dealloc_cb, user_alloc_ptr)
+    , socket_stream(engine, alloc_cb, dealloc_cb, user_alloc_ptr)
   {
   }
   event_loop_t &event_loop;
   tcp_t tcp;
 
-  tls_server_client_tls_t connection_handler;
-  tls_native_server_stream_t native_stream;
-  tls_server_socket_stream_t socket_stream;
+  ssl_engine_t engine;
+  uv_tls_stream_t socket_stream;
+
+  bool handshake_done = false;
+  std::coroutine_handle<> handshake_continuation;
+  std::expected<void, error_t> handshake_result;
 };
 
 struct ssl_server_t
@@ -129,7 +85,7 @@ inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t 
                                                               dealloc_cb_t dealloc_cb = default_dealloc, void *user_alloc_ptr = nullptr)
 {
   auto ret = ssl_server_t{ref_ptr_t<tls_server_state_t>(event_loop, std::move(server), host, alloc_cb, dealloc_cb, user_alloc_ptr)};
-  if (auto error = ret.handle->tls_ctx.initialize(config); error.code != 0)
+  if (auto error = ret.handle->ssl_ctx.init(true, config, get_default_ca_certificates()); error.code != 0)
   {
     return std::unexpected(std::move(error));
   }
@@ -137,8 +93,8 @@ inline std::expected<ssl_server_t, error_t> ssl_server_create(vio::event_loop_t 
   ret.handle.on_destroy(
     [state_raw = &ret.handle.data()]()
     {
-      state_raw->tls_ctx.close();
-      // Cancel any pending listen operation
+      // Cancel any pending listen operation (the SSL_CTX is freed by ssl_ctx's
+      // destructor). Preserved verbatim from the libtls path.
       auto &tcp_handle = state_raw->tcp.tcp.handle;
       auto &listen = tcp_handle->listen;
       if (!listen.done)
@@ -183,36 +139,65 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
   }
 
   auto client_tcp = std::move(tcp_accept_result.value());
-  uv_os_fd_t socket{};
-  if (uv_fileno(client_tcp.get_handle(), &socket) != 0)
+
+  auto server_client = ssl_server_client_t{ref_ptr_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
+
+  auto &state = server_client.handle;
+  if (auto err = state->engine.init(server.handle->ssl_ctx, true, std::string{}); err.code != 0)
   {
-    return std::unexpected(error_t{.code = -1, .msg = "Failed to get socket file descriptor"});
+    return std::unexpected(std::move(err));
   }
-  int socket_fd = *reinterpret_cast<int *>(&socket);
+  state->socket_stream.bind(state->tcp.get_stream(), state.ref_counted());
 
-  auto tls_client = server.handle->tls_ctx.accept(socket_fd);
-
-  if (!tls_client.has_value())
+  auto *state_raw = &state.data();
+  state->socket_stream.on_handshake_complete = [state_raw](std::optional<error_t> err)
   {
-    return std::unexpected(tls_client.error());
-  }
-
-  auto server_client = ssl_server_client_t{
-    ref_ptr_t<ssl_server_client_state_t>(server.handle->event_loop, std::move(client_tcp), std::move(tls_client.value()), server.handle->alloc_cb, server.handle->dealloc_cb, server.handle->user_alloc_ptr)};
-  server_client.handle->socket_stream.connect(socket_fd);
-
-  server_client.handle.on_destroy(
-    [state_raw = &server_client.handle.data(), rc = server_client.handle.ref_counted()]()
+    state_raw->handshake_done = true;
+    state_raw->handshake_result = err ? std::expected<void, error_t>{std::unexpect, std::move(*err)} : std::expected<void, error_t>{};
+    if (state_raw->handshake_continuation)
     {
-      state_raw->connection_handler.close();
-      if (state_raw->socket_stream.connected && !uv_is_closing(reinterpret_cast<uv_handle_t *>(&state_raw->socket_stream.poll_req)))
-      {
-        state_raw->socket_stream.closed = true;
-        uv_poll_stop(&state_raw->socket_stream.poll_req);
-        rc->register_closable_handle(reinterpret_cast<uv_handle_t *>(&state_raw->socket_stream.poll_req));
-      }
-    });
+      auto cont = state_raw->handshake_continuation;
+      state_raw->handshake_continuation = {};
+      cont.resume();
+    }
+  };
+  // Drive the handshake lazily: reads are armed and the handshake advances as the
+  // ClientHello arrives. A write or reader issued before completion still works
+  // (server-speaks-first) because SSL_write is retried once the handshake finishes.
+  state->socket_stream.begin_handshake();
+
+  state.on_destroy([state_raw]() { state_raw->socket_stream.begin_teardown(); });
   return std::move(server_client);
+}
+
+// Finish the TLS handshake (SSL_accept) before reading, so the negotiated ALPN
+// protocol and client-certificate verification are known up front. Optional --
+// a reader created before completion drives the handshake lazily.
+struct tls_server_client_handshake_future_t
+{
+  ref_ptr_t<ssl_server_client_state_t> handle;
+
+  bool await_ready() noexcept
+  {
+    return handle.ref_counted() == nullptr || handle->handshake_done;
+  }
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    handle->handshake_continuation = continuation;
+  }
+  std::expected<void, error_t> await_resume() noexcept
+  {
+    if (handle.ref_counted() == nullptr)
+    {
+      return std::unexpected(error_t{.code = vio_tls_error, .msg = "Closed"});
+    }
+    return handle->handshake_result;
+  }
+};
+
+inline tls_server_client_handshake_future_t ssl_server_client_handshake(ssl_server_client_t &client)
+{
+  return {client.handle};
 }
 
 using tls_server_client_reader_t = stream_reader_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
@@ -238,9 +223,40 @@ inline tls_server_client_write_awaitable_t ssl_server_client_write(ssl_server_cl
   auto write_state_index = client.handle->socket_stream.write_queue.activate();
   client.handle->socket_stream.write_queue[write_state_index].buf = buffer;
 
-  client.handle->socket_stream.write();
-  client.handle->socket_stream.set_poll_state();
+  client.handle->socket_stream.begin_write(write_state_index);
   return {client.handle, &client.handle->socket_stream, write_state_index};
+}
+
+// Vectored write: coalesce several buffers into one TLS record + one uv_write.
+inline tls_server_client_write_awaitable_t ssl_server_client_writev(ssl_server_client_t &client, std::span<const uv_buf_t> buffers)
+{
+  assert(client.handle.ref_counted() != nullptr && "Can not write to a closed client");
+  auto write_state_index = client.handle->socket_stream.write_queue.activate();
+  client.handle->socket_stream.begin_writev(write_state_index, buffers.data(), buffers.size());
+  return {client.handle, &client.handle->socket_stream, write_state_index};
+}
+
+// Half-close: send close_notify but keep reading. Resolves when it is on the wire.
+inline tls_server_client_write_awaitable_t ssl_server_client_shutdown(ssl_server_client_t &client)
+{
+  assert(client.handle.ref_counted() != nullptr && "Can not shut down a closed client");
+  auto write_state_index = client.handle->socket_stream.write_queue.activate();
+  client.handle->socket_stream.begin_shutdown(write_state_index);
+  return {client.handle, &client.handle->socket_stream, write_state_index};
+}
+
+inline std::optional<std::string> ssl_server_client_alpn_selected(const ssl_server_client_t &client)
+{
+  if (client.handle.ref_counted() == nullptr || !client.handle->handshake_done)
+  {
+    return std::nullopt;
+  }
+  auto s = client.handle->engine.alpn_selected();
+  if (s.empty())
+  {
+    return std::nullopt;
+  }
+  return s;
 }
 
 } // namespace vio
