@@ -106,7 +106,27 @@ Configuration is in `.clang-tidy` at the project root.
 - `src/vio/` - Library headers and source (most code is in headers)
 - `src/vio/operation/` - Async operation implementations (tcp, tls, dns, file, sleep)
 - `test/` - Tests using doctest
-- `3rdparty/` - libuv, libressl, doctest, cmakerc
+- `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
+
+## Dependencies (toggles & install)
+
+Every dependency is togglable between the bundled fetch and a pre-installed copy:
+`VIO_USE_SYSTEM_{LIBUV,LIBRESSL,ADA,DOCTEST,CMAKERC}` (default `OFF`). When `ON`,
+`CMake/Build3rdParty.cmake` / `src/CMakeLists.txt` call `find_package` and
+`CMake/3rdPartyPackages.cmake` skips that fetch. Each dep also exposes
+`VIO_<DEP>_VERSION` / `VIO_<DEP>_URL` / `VIO_<DEP>_SHA256` cache variables to fetch
+a different version without editing the packages file (e.g. a newer LibreSSL). The
+system-libuv path links `libuv::uv_a`; `find_package(LibreSSL)` uses the config a
+CMake-built LibreSSL installs (`lib/cmake/LibreSSL/LibreSSLConfig.cmake`).
+
+`VIO_INSTALL` (default `ON`) installs headers + the `vio` lib and, **when built
+against system deps**, a relocatable `find_package(vio)` package config
+(`vio::vio`, from `CMake/vioConfig.cmake.in`, which `find_dependency`s
+libuv/LibreSSL/ada and exports the bundled `cmrc-base`/`vio_default_certs`). A
+bundled-deps build vendors targets that aren't installed, so it installs lib +
+headers only (no config). `vio::vio` is aliased in-tree so consumers use one name
+either way. A downstream that `add_subdirectory`s vio (e.g. prism) should force
+`VIO_INSTALL OFF`.
 
 ## Key Architecture
 

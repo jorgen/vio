@@ -53,13 +53,16 @@ else()
         CmDepTargetLinkLibrary(vio PUBLIC crypt32 bcrypt)
     endif ()
 
-    target_include_directories(vio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(vio PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
 
     target_link_libraries(vio PRIVATE vio::default_certs)
 
     if (VIO_USE_SYSTEM_LIBUV)
-        find_package(libuv REQUIRED)
-        target_link_libraries(vio PUBLIC uv_a)
+        find_package(libuv CONFIG REQUIRED)
+        target_link_libraries(vio PUBLIC libuv::uv_a)
     else ()
         target_link_libraries(vio PUBLIC uv_a)
         target_include_directories(vio PUBLIC ${libuv_SOURCE_DIR}/include)
@@ -67,5 +70,57 @@ else()
 
     if(VIO_BUILD_SHARED AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_options(vio PRIVATE "-Wl,--exclude-libs,ALL")
+    endif()
+endif()
+
+add_library(vio::vio ALIAS vio)
+
+if(VIO_INSTALL AND NOT EMSCRIPTEN)
+    include(CMakePackageConfigHelpers)
+
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/vio
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h")
+
+    if(VIO_USE_SYSTEM_LIBUV AND VIO_USE_SYSTEM_LIBRESSL AND VIO_USE_SYSTEM_ADA)
+        set(_vio_export_targets vio vio_default_certs)
+        set(VIO_CONFIG_DEPS "")
+        string(APPEND VIO_CONFIG_DEPS "find_dependency(libuv CONFIG)\n")
+        string(APPEND VIO_CONFIG_DEPS "find_dependency(LibreSSL)\n")
+        string(APPEND VIO_CONFIG_DEPS "find_dependency(ada CONFIG)\n")
+        if(VIO_USE_SYSTEM_CMAKERC)
+            string(APPEND VIO_CONFIG_DEPS "find_dependency(CMakeRC CONFIG)\n")
+        else()
+            list(APPEND _vio_export_targets cmrc-base)
+        endif()
+
+        install(TARGETS ${_vio_export_targets}
+            EXPORT vioTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+        install(EXPORT vioTargets
+            NAMESPACE vio::
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vio
+            FILE vioTargets.cmake)
+        configure_package_config_file(
+            ${PROJECT_SOURCE_DIR}/CMake/vioConfig.cmake.in
+            ${CMAKE_CURRENT_BINARY_DIR}/vioConfig.cmake
+            INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vio)
+        write_basic_package_version_file(
+            ${CMAKE_CURRENT_BINARY_DIR}/vioConfigVersion.cmake
+            VERSION ${PROJECT_VERSION}
+            COMPATIBILITY SameMajorVersion)
+        install(FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/vioConfig.cmake
+            ${CMAKE_CURRENT_BINARY_DIR}/vioConfigVersion.cmake
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vio)
+    else()
+        install(TARGETS vio vio_default_certs
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+        message(STATUS "vio: VIO_INSTALL is on but vio is built with bundled dependencies; installing library + headers only (no find_package config). Configure with VIO_USE_SYSTEM_LIBUV/LIBRESSL/ADA=ON for a relocatable package config.")
     endif()
 endif()

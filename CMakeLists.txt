@@ -1,19 +1,22 @@
 cmake_minimum_required(VERSION 3.30)
-project(vio LANGUAGES C CXX)
+project(vio VERSION 0.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
+include(GNUInstallDirs)
 
 option(VIO_USE_SYSTEM_LIBUV "Don't use the version specifed by vio cmake" OFF)
 option(VIO_USE_SYSTEM_LIBRESSL "Use system-installed LibreSSL instead of bundled" OFF)
 option(VIO_USE_SYSTEM_ADA "Use system-installed ada-url instead of bundled" OFF)
 option(VIO_USE_SYSTEM_DOCTEST "Use system-installed doctest instead of bundled" OFF)
+option(VIO_USE_SYSTEM_CMAKERC "Use system-installed CMakeRC instead of bundled" OFF)
 option(VIO_BUILD_SHARED "Build vio as a shared library" OFF)
 option(VIO_BUILD_TESTS "Build vio tests" ON)
 option(VIO_BUILD_EXAMPLES "Build vio examples" ON)
+option(VIO_INSTALL "Generate install and package-config rules for vio" ON)
 
 # SSL backend selection. vio speaks the OpenSSL SSL_*/BIO API through a compile-time
 # seam (src/vio/ssl_backend.h); only the bundled LibreSSL backend is wired & tested

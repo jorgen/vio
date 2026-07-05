@@ -1,5 +1,9 @@
 macro(Build3rdParty)
-    include(${cmakerc_SOURCE_DIR}/CMakeRC.cmake)
+    if (VIO_USE_SYSTEM_CMAKERC)
+        find_package(CMakeRC CONFIG REQUIRED)
+    else ()
+        include(${cmakerc_SOURCE_DIR}/CMakeRC.cmake)
+    endif ()
 
     if (VIO_USE_SYSTEM_LIBRESSL)
         find_package(LibreSSL REQUIRED)

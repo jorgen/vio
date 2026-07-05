@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+@VIO_CONFIG_DEPS@
+include("${CMAKE_CURRENT_LIST_DIR}/vioTargets.cmake")
+
+check_required_components(vio)
