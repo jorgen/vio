@@ -237,6 +237,23 @@ branch on the kind of close (defined in `ssl_engine.h`):
    `close_notify` — the connection was cut mid-stream.
 3. **Transport error:** any other negative `nread` maps to the libuv error code.
 
+### TLS extras: OCSP stapling, session resumption, writev backpressure
+
+- **OCSP stapling** (`ssl_config_t.ocsp_staple_mem`/`ocsp_staple_file`, server): the DER
+  response is stored in `ssl_context_t` and stapled via `SSL_CTX_set_tlsext_status_cb`
+  (BoringSSL uses `SSL_CTX_set_ocsp_response`, gated in `ssl_context.h`). A client sets
+  `request_ocsp_staple` and reads it back with `ssl_client_ocsp_response()`.
+- **Client session resumption** (`ssl_config_t.session_cache` → `ssl_session_cache_t`, app-owned,
+  keyed by host): wired via `SSL_CTX_sess_set_new_cb` (fires when a ticket arrives) +
+  `SSL_set_session` (before handshake). The peer host is stashed in SSL ex_data (`&engine.peer_name`)
+  to key the cache. `ssl_client_session_reused()` reports the result. **Caveat:** verified on
+  TLS 1.2 (ticket is in-handshake); TLS 1.3 post-handshake ticket delivery with the bundled
+  LibreSSL does not currently produce a reusable session through the memory-BIO path — a follow-up.
+- **`ssl_*_writev` / `ssl_*_shutdown`**: vectored writes coalesce buffers into one TLS record and
+  go through the same producer high-water throttle as `begin_write` (the coalesced plaintext is
+  owned in the write slot, so it survives being parked for backpressure); half-close sends a
+  one-way `close_notify` and keeps reading.
+
 ### on_destroy teardown (begin_teardown)
 
 `tls_client.h` and `tls_server.h` `on_destroy` callbacks call `uv_tls_stream_t::begin_teardown()`:

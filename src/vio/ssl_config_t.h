@@ -31,6 +31,10 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+// Forward-declared so this header stays free of OpenSSL includes. Defined in
+// ssl_context.h. An app-owned, shared client session cache for TLS resumption.
+struct ssl_session_cache_t;
+
 // TLS protocol version bounds. TLS 1.0/1.1 are intentionally unrepresentable:
 // they are compiled out of LibreSSL, so TLS 1.2 is the floor for every backend.
 enum class tls_protocol_version
@@ -90,6 +94,15 @@ struct ssl_config_t
 
   // Enable cross-connection session resumption caching (SSL_CTX_set_session_cache_mode).
   bool enable_session_cache = false;
+
+  // Client-only: an app-owned shared cache for TLS session resumption. When set,
+  // a successful handshake's session is stored keyed by host, and a later
+  // connection to the same host resumes it. Must outlive every client using it.
+  ssl_session_cache_t *session_cache = nullptr;
+
+  // Client-only: request an OCSP staple (status_request extension). The server's
+  // stapled response is then readable via ssl_client_ocsp_response().
+  bool request_ocsp_staple = false;
 
   // --- deprecated libtls-shaped fields (kept for aggregate compatibility) ---
   std::optional<bool> verify_client;   // deprecated: use peer_verify

@@ -75,6 +75,12 @@ struct stream_write_state_t
   bool pending_handshake = false;
   std::string error_msg;
   std::coroutine_handle<> continuation = {};
+  // For a vectored write, the coalesced plaintext is owned here so it survives
+  // being parked for backpressure (a std::vector move preserves its heap pointer,
+  // so this stays valid across write_queue reallocation). Empty for a scalar
+  // write, whose plaintext is borrowed via `buf` and kept alive by the suspended
+  // awaiter.
+  std::vector<char> owned_plain;
 };
 
 struct stream_client_buffer_t
@@ -369,32 +375,34 @@ struct uv_tls_stream_t
       finish_write_error(idx, error_t{.code = vio_tls_error, .msg = "Can not writev before the handshake completes"});
       return;
     }
+    auto &ws = write_queue[idx];
+    ws.buf = uv_buf_t{};
+    ws.bytes_written = 0;
+    ws.owned_plain.clear();
     size_t total = 0;
     for (size_t i = 0; i < n; ++i)
     {
       total += bufs[i].len;
     }
-    write_queue[idx].buf = uv_buf_t{};
-    write_queue[idx].bytes_written = 0;
     if (total == 0)
     {
       finish_write_ok(idx);
       return;
     }
-    std::vector<char> plain;
-    plain.reserve(total);
+    ws.owned_plain.reserve(total);
     for (size_t i = 0; i < n; ++i)
     {
-      plain.insert(plain.end(), bufs[i].base, bufs[i].base + bufs[i].len);
+      ws.owned_plain.insert(ws.owned_plain.end(), bufs[i].base, bufs[i].base + bufs[i].len);
     }
-    int out = 0;
-    const ssl_status st = engine.write_plaintext(plain.data(), static_cast<int>(plain.size()), out);
-    if (st != ssl_status::ok)
+    // Same producer backpressure as begin_write: the coalesced plaintext is owned
+    // in the slot, so the write can be parked over the high-water mark and
+    // encrypted only when the socket drains -- no unbounded ciphertext buildup.
+    if (tcp_stream != nullptr && uv_stream_get_write_queue_size(tcp_stream) >= write_high_water)
     {
-      finish_write_error(idx, st == ssl_status::closed ? error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"} : engine.make_error());
+      submit_waiters.push(idx);
       return;
     }
-    submit_app_write(idx);
+    pump_write(idx);
   }
 
   // Half-close: send a one-way close_notify and keep reading (HTTP/2 GOAWAY /
@@ -660,8 +668,11 @@ private:
   void pump_write(size_t idx)
   {
     auto &ws = write_queue[idx];
+    // Scalar writes borrow `buf`; vectored writes own the coalesced plaintext.
+    const char *src = ws.owned_plain.empty() ? ws.buf.base : ws.owned_plain.data();
+    const size_t src_len = ws.owned_plain.empty() ? ws.buf.len : ws.owned_plain.size();
     int n = 0;
-    const ssl_status st = engine.write_plaintext(ws.buf.base + ws.bytes_written, static_cast<int>(ws.buf.len - ws.bytes_written), n);
+    const ssl_status st = engine.write_plaintext(src + ws.bytes_written, static_cast<int>(src_len - ws.bytes_written), n);
     if (st == ssl_status::want_read)
     {
       // Handshake not finished yet -- retry after it completes.

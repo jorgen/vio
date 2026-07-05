@@ -472,4 +472,22 @@ inline std::optional<std::string> ssl_client_alpn_selected(const ssl_client_t &c
   return s;
 }
 
+// True if the connection resumed a cached TLS session (requires a session_cache
+// in the config and a prior connection to the same host). Valid after connect.
+inline bool ssl_client_session_reused(const ssl_client_t &client)
+{
+  return client.state.ref_counted() != nullptr && client.state->connected && client.state->engine.session_reused();
+}
+
+// The server's stapled OCSP response (requires request_ocsp_staple in the config).
+// Empty if none was received. Valid after connect.
+inline std::vector<uint8_t> ssl_client_ocsp_response(const ssl_client_t &client)
+{
+  if (client.state.ref_counted() == nullptr || !client.state->connected)
+  {
+    return {};
+  }
+  return client.state->engine.ocsp_response();
+}
+
 } // namespace vio

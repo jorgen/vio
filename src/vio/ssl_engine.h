@@ -74,6 +74,7 @@ struct ssl_engine_t
   BIO *wbio = nullptr; // outbound ciphertext (SSL writes, vio drains)
   bool server = false;
   bool shutdown_sent = false;
+  std::string peer_name; // client: SNI/verification host, also keys the session cache
 
   ssl_engine_t() = default;
   ssl_engine_t(const ssl_engine_t &) = delete;
@@ -147,6 +148,10 @@ struct ssl_engine_t
     else
     {
       SSL_set_connect_state(ssl);
+      peer_name = host;
+      // Stable pointer used by the session-cache new-session callback to key the
+      // stored session; valid for the SSL's lifetime (engine outlives the SSL).
+      SSL_set_ex_data(ssl, detail::session_host_ssl_index(), &peer_name);
       if (!host.empty())
       {
         if (is_ip_literal(host))
@@ -158,6 +163,18 @@ struct ssl_engine_t
           SSL_set_tlsext_host_name(ssl, host.c_str());
           SSL_set1_host(ssl, host.c_str());
         }
+      }
+      // Resume a cached session for this host, if one is available.
+      if (auto *cache = static_cast<ssl_session_cache_t *>(SSL_CTX_get_ex_data(context.ctx, detail::session_cache_ctx_index())))
+      {
+        if (SSL_SESSION *cached = cache->get(host))
+        {
+          SSL_set_session(ssl, cached);
+        }
+      }
+      if (context.client_request_ocsp)
+      {
+        SSL_set_tlsext_status_type(ssl, TLSEXT_STATUSTYPE_ocsp);
       }
     }
     return {};
@@ -310,6 +327,28 @@ struct ssl_engine_t
       return {};
     }
     return std::string(reinterpret_cast<const char *>(data), len);
+  }
+
+  // True if this connection resumed a previous session (abbreviated handshake).
+  [[nodiscard]] bool session_reused() const
+  {
+    return ssl != nullptr && SSL_session_reused(ssl) == 1;
+  }
+
+  // The peer's stapled OCSP response (client side), empty if none was received.
+  [[nodiscard]] std::vector<uint8_t> ocsp_response() const
+  {
+    if (ssl == nullptr)
+    {
+      return {};
+    }
+    const unsigned char *resp = nullptr;
+    const long n = SSL_get_tlsext_status_ocsp_resp(ssl, &resp);
+    if (resp == nullptr || n <= 0)
+    {
+      return {};
+    }
+    return std::vector<uint8_t>(resp, resp + n);
   }
 };
 

@@ -33,6 +33,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <vio/error.h>
@@ -41,6 +42,60 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+
+// App-owned cache of TLS sessions for client-side resumption, keyed by peer
+// host. Single-threaded (event-loop) use. Holds one reference per stored
+// SSL_SESSION and frees it on eviction / destruction. Must outlive every client
+// configured with it.
+struct ssl_session_cache_t
+{
+  std::unordered_map<std::string, SSL_SESSION *> sessions;
+
+  ssl_session_cache_t() = default;
+  ssl_session_cache_t(const ssl_session_cache_t &) = delete;
+  ssl_session_cache_t &operator=(const ssl_session_cache_t &) = delete;
+  ssl_session_cache_t(ssl_session_cache_t &&) = delete;
+  ssl_session_cache_t &operator=(ssl_session_cache_t &&) = delete;
+  ~ssl_session_cache_t()
+  {
+    for (auto &[host, session] : sessions)
+    {
+      SSL_SESSION_free(session);
+    }
+  }
+
+  // Takes ownership of `session` (a reference produced by the new-session
+  // callback), replacing and freeing any prior entry for `host`.
+  void put(const std::string &host, SSL_SESSION *session)
+  {
+    auto it = sessions.find(host);
+    if (it != sessions.end())
+    {
+      SSL_SESSION_free(it->second);
+      it->second = session;
+    }
+    else
+    {
+      sessions.emplace(host, session);
+    }
+  }
+
+  // Borrowed pointer (not ref-counted); valid until the next put/clear for host.
+  SSL_SESSION *get(const std::string &host) const
+  {
+    auto it = sessions.find(host);
+    return it == sessions.end() ? nullptr : it->second;
+  }
+
+  void clear()
+  {
+    for (auto &[host, session] : sessions)
+    {
+      SSL_SESSION_free(session);
+    }
+    sessions.clear();
+  }
+};
 
 namespace detail
 {
@@ -58,6 +113,54 @@ inline void keylog_trampoline(const SSL *ssl, const char *line)
   {
     (*fn)(std::string_view(line));
   }
+}
+
+// SSL_CTX ex_data slot holding the ssl_session_cache_t*, and SSL ex_data slot
+// holding the per-connection peer-host std::string* (both client-side).
+inline int session_cache_ctx_index()
+{
+  static int idx = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+  return idx;
+}
+
+inline int session_host_ssl_index()
+{
+  static int idx = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+  return idx;
+}
+
+// Fires when a resumable session (incl. a TLS 1.3 NewSessionTicket, delivered
+// post-handshake) becomes available. Stores it in the app cache keyed by host.
+inline int new_session_cb(SSL *ssl, SSL_SESSION *session)
+{
+  SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
+  auto *cache = static_cast<ssl_session_cache_t *>(SSL_CTX_get_ex_data(ctx, session_cache_ctx_index()));
+  auto *host = static_cast<std::string *>(SSL_get_ex_data(ssl, session_host_ssl_index()));
+  if (cache != nullptr && host != nullptr)
+  {
+    cache->put(*host, session);
+    return 1; // took ownership of the session's reference
+  }
+  return 0; // let the library free its reference
+}
+
+// Server-side OCSP stapling: hand the peer a copy of the configured DER response
+// (OpenSSL/LibreSSL take ownership of the malloc'd copy and free it).
+inline int ocsp_status_cb(SSL *ssl, void *arg)
+{
+  auto *der = static_cast<std::vector<uint8_t> *>(arg);
+  if (der == nullptr || der->empty())
+  {
+    return SSL_TLSEXT_ERR_NOACK;
+  }
+  void *copy = OPENSSL_malloc(der->size());
+  if (copy == nullptr)
+  {
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+  }
+  std::memcpy(copy, der->data(), der->size());
+  SSL_set_tlsext_status_ocsp_resp(ssl, static_cast<unsigned char *>(copy), static_cast<long>(der->size()));
+  return SSL_TLSEXT_ERR_OK;
 }
 
 // Server-side ALPN selection. Hand-rolled (server preference wins) rather than
@@ -134,8 +237,10 @@ struct ssl_context_t
 {
   SSL_CTX *ctx = nullptr;
   bool is_server = false;
+  bool client_request_ocsp = false; // client: request an OCSP staple per connection
   // Stable storage referenced by the SSL_CTX for the context's lifetime.
   std::vector<uint8_t> alpn_wire;
+  std::vector<uint8_t> ocsp_response; // server: DER OCSP staple, referenced by the status cb
   std::function<void(std::string_view)> keylog;
 
   ssl_context_t() = default;
@@ -155,6 +260,7 @@ struct ssl_context_t
   error_t init(bool server, const ssl_config_t &config, const std::string &default_ca)
   {
     is_server = server;
+    client_request_ocsp = !server && config.request_ocsp_staple;
     ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
     if (ctx == nullptr)
     {
@@ -185,10 +291,11 @@ struct ssl_context_t
     configure_verify(server, config);
     configure_alpn(server, config);
     configure_keylog(config);
-    if (config.enable_session_cache)
+    if (auto err = configure_ocsp(server, config); err.code != 0)
     {
-      SSL_CTX_set_session_cache_mode(ctx, server ? SSL_SESS_CACHE_SERVER : SSL_SESS_CACHE_CLIENT);
+      return err;
     }
+    configure_session_cache(server, config);
     return {};
   }
 
@@ -341,6 +448,71 @@ private:
       keylog = config.keylog_callback;
       SSL_CTX_set_ex_data(ctx, detail::keylog_ex_index(), &keylog);
       SSL_CTX_set_keylog_callback(ctx, detail::keylog_trampoline);
+    }
+  }
+
+  error_t configure_ocsp(bool server, const ssl_config_t &config)
+  {
+    if (!server)
+    {
+      return {}; // client requests OCSP per-connection in ssl_engine_t::init
+    }
+    if (config.ocsp_staple_mem)
+    {
+      ocsp_response = *config.ocsp_staple_mem;
+    }
+    else if (config.ocsp_staple_file)
+    {
+      BIO *bio = BIO_new_file(config.ocsp_staple_file->c_str(), "rb");
+      if (bio == nullptr)
+      {
+        return error_t{.code = -1, .msg = "Failed to open OCSP staple file"};
+      }
+      char buf[4096];
+      int n = 0;
+      while ((n = BIO_read(bio, buf, static_cast<int>(sizeof(buf)))) > 0)
+      {
+        ocsp_response.insert(ocsp_response.end(), reinterpret_cast<uint8_t *>(buf), reinterpret_cast<uint8_t *>(buf) + n);
+      }
+      BIO_free(bio);
+    }
+    if (ocsp_response.empty())
+    {
+      return {};
+    }
+#if defined(VIO_SSL_BACKEND_BORINGSSL)
+    // BoringSSL sets the stapled response directly on the SSL_CTX.
+    SSL_CTX_set_ocsp_response(ctx, ocsp_response.data(), ocsp_response.size());
+#else
+    SSL_CTX_set_tlsext_status_cb(ctx, detail::ocsp_status_cb);
+    SSL_CTX_set_tlsext_status_arg(ctx, &ocsp_response);
+#endif
+    return {};
+  }
+
+  void configure_session_cache(bool server, const ssl_config_t &config)
+  {
+    if (server)
+    {
+      if (config.enable_session_cache)
+      {
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+        // Ensure TLS 1.3 NewSessionTickets are issued (the default count can be 0).
+        SSL_CTX_set_num_tickets(ctx, 2);
+      }
+      return;
+    }
+    if (config.session_cache == nullptr && !config.enable_session_cache)
+    {
+      return;
+    }
+    // Client resumption: disable the internal store and route new sessions to the
+    // app cache via the callback (fires post-handshake for TLS 1.3 tickets).
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    if (config.session_cache != nullptr)
+    {
+      SSL_CTX_set_ex_data(ctx, detail::session_cache_ctx_index(), config.session_cache);
+      SSL_CTX_sess_set_new_cb(ctx, detail::new_session_cb);
     }
   }
 };

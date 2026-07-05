@@ -1,10 +1,6 @@
 #include <doctest/doctest.h>
 
-#include <numeric>
-#include <openssl/err.h>
-#include <openssl/pem.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -16,99 +12,16 @@
 #include <vio/task.h>
 
 #include "require_expected.h"
-#include "vio/operation/tcp_server.h"
+#include "tls_test_helpers.h"
 
 namespace
 {
-struct test_certificates_t
+using vio_test::get_ephemeral_port;
+
+// A CA + leaf(CN=localhost) with fast EC keys, via the shared helper.
+inline vio_test::cert_set_t generate_test_certs()
 {
-  std::vector<uint8_t> ca_cert;
-  std::vector<uint8_t> cert;
-  std::vector<uint8_t> key;
-};
-
-test_certificates_t generate_test_certs()
-{
-  X509 *ca_cert = X509_new();
-  EVP_PKEY *ca_pkey = EVP_PKEY_new();
-  EVP_PKEY_CTX *ca_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
-  EVP_PKEY_keygen_init(ca_ctx);
-  EVP_PKEY_CTX_set_rsa_keygen_bits(ca_ctx, 2048);
-  EVP_PKEY_keygen(ca_ctx, &ca_pkey);
-  EVP_PKEY_CTX_free(ca_ctx);
-
-  X509_set_version(ca_cert, 2);
-  ASN1_INTEGER_set(X509_get_serialNumber(ca_cert), 1);
-  X509_gmtime_adj(X509_get_notBefore(ca_cert), 0);
-  X509_gmtime_adj(X509_get_notAfter(ca_cert), 31536000L);
-  X509_set_pubkey(ca_cert, ca_pkey);
-  auto *ca_name = X509_get_subject_name(ca_cert);
-  X509_NAME_add_entry_by_txt(ca_name, "CN", MBSTRING_ASC, (unsigned char *)"vio CA", -1, -1, 0);
-  X509_set_issuer_name(ca_cert, ca_name);
-  X509_sign(ca_cert, ca_pkey, EVP_sha256());
-
-  X509 *cert = X509_new();
-  EVP_PKEY *pkey = EVP_PKEY_new();
-  EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
-  EVP_PKEY_keygen_init(ctx);
-  EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048);
-  EVP_PKEY_keygen(ctx, &pkey);
-  EVP_PKEY_CTX_free(ctx);
-
-  X509_set_version(cert, 2);
-  ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
-  X509_gmtime_adj(X509_get_notBefore(cert), 0);
-  X509_gmtime_adj(X509_get_notAfter(cert), 31536000L);
-  X509_set_pubkey(cert, pkey);
-  auto *name = X509_get_subject_name(cert);
-  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"localhost", -1, -1, 0);
-  X509_set_issuer_name(cert, ca_name);
-  X509_sign(cert, ca_pkey, EVP_sha256());
-
-  auto to_pem_cert = [](X509 *c)
-  {
-    BIO *bio = BIO_new(BIO_s_mem());
-    PEM_write_bio_X509(bio, c);
-    std::vector<uint8_t> data(BIO_pending(bio));
-    BIO_read(bio, data.data(), static_cast<int>(data.size()));
-    BIO_free(bio);
-    return data;
-  };
-  auto to_pem_key = [](EVP_PKEY *k)
-  {
-    BIO *bio = BIO_new(BIO_s_mem());
-    PEM_write_bio_PrivateKey(bio, k, nullptr, nullptr, 0, nullptr, nullptr);
-    std::vector<uint8_t> data(BIO_pending(bio));
-    BIO_read(bio, data.data(), static_cast<int>(data.size()));
-    BIO_free(bio);
-    return data;
-  };
-
-  test_certificates_t out{.ca_cert = to_pem_cert(ca_cert), .cert = to_pem_cert(cert), .key = to_pem_key(pkey)};
-  X509_free(ca_cert);
-  EVP_PKEY_free(ca_pkey);
-  X509_free(cert);
-  EVP_PKEY_free(pkey);
-  return out;
-}
-
-std::expected<std::pair<vio::tcp_server_t, int>, vio::error_t> get_ephemeral_port(vio::event_loop_t &event_loop)
-{
-  auto addr = vio::ip4_addr("127.0.0.1", 0);
-  if (!addr.has_value())
-    return std::unexpected(addr.error());
-  auto tcp_server = vio::tcp_create_server(event_loop);
-  if (!tcp_server.has_value())
-    return std::unexpected(tcp_server.error());
-  auto bind_res = vio::tcp_bind(tcp_server.value(), reinterpret_cast<const sockaddr *>(&addr.value()));
-  if (!bind_res.has_value())
-    return std::unexpected(bind_res.error());
-  auto sockname_result = vio::sockname(tcp_server->tcp);
-  if (!sockname_result.has_value())
-    return std::unexpected(sockname_result.error());
-  sockaddr_storage sa_storage = sockname_result.value();
-  const auto *sa_in = reinterpret_cast<sockaddr_in *>(&sa_storage);
-  return std::make_pair(std::move(tcp_server.value()), static_cast<int>(ntohs(sa_in->sin_port)));
+  return vio_test::make_cert_set("localhost");
 }
 
 TEST_SUITE("TLS ALPN + duplex")
