@@ -246,9 +246,14 @@ branch on the kind of close (defined in `ssl_engine.h`):
 - **Client session resumption** (`ssl_config_t.session_cache` → `ssl_session_cache_t`, app-owned,
   keyed by host): wired via `SSL_CTX_sess_set_new_cb` (fires when a ticket arrives) +
   `SSL_set_session` (before handshake). The peer host is stashed in SSL ex_data (`&engine.peer_name`)
-  to key the cache. `ssl_client_session_reused()` reports the result. **Caveat:** verified on
-  TLS 1.2 (ticket is in-handshake); TLS 1.3 post-handshake ticket delivery with the bundled
-  LibreSSL does not currently produce a reusable session through the memory-BIO path — a follow-up.
+  to key the cache. `ssl_client_session_reused()` reports the result. **Caveat (root-caused, not a
+  vio bug):** the bundled **LibreSSL 4.1.0 TLS 1.3 *server* does not issue NewSessionTicket
+  messages** — a standalone LibreSSL probe over memory BIOs shows `num_tickets` defaults to 0 and
+  setting it to 2 (+ `SSL_SESS_CACHE_SERVER`) still produces no ticket bytes. So LibreSSL↔LibreSSL
+  TLS 1.3 resumption is impossible regardless of vio. The client-side resumption plumbing here is
+  correct: it is verified on TLS 1.2 (ticket in-handshake) and will resume over TLS 1.3 against any
+  server that issues tickets (OpenSSL/BoringSSL, or real-world servers). `SSL_CTX_set_num_tickets(2)`
+  is kept because it is correct for the backends that honor it.
 - **`ssl_*_writev` / `ssl_*_shutdown`**: vectored writes coalesce buffers into one TLS record and
   go through the same producer high-water throttle as `begin_write` (the coalesced plaintext is
   owned in the write slot, so it survives being parked for backpressure); half-close sends a

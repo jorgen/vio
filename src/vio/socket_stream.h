@@ -45,6 +45,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <uv.h>
 
+#include <vio/cancellation.h>
 #include <vio/elastic_index_storage.h>
 #include <vio/error.h>
 #include <vio/ref_counted_wrapper.h>
@@ -75,6 +76,7 @@ struct stream_write_state_t
   bool pending_handshake = false;
   std::string error_msg;
   std::coroutine_handle<> continuation = {};
+  registration_t cancel_registration; // fires cancel_write(idx) when the caller's cancellation triggers
   // For a vectored write, the coalesced plaintext is owned here so it survives
   // being parked for backpressure (a std::vector move preserves its heap pointer,
   // so this stays valid across write_queue reallocation). Empty for a scalar
@@ -403,6 +405,55 @@ struct uv_tls_stream_t
       return;
     }
     pump_write(idx);
+  }
+
+  // Register a cancellation for an in-progress write. Call after begin_write/
+  // begin_writev. If the write already completed synchronously, this is a no-op.
+  void arm_write_cancel(size_t idx, cancellation_t &cancel)
+  {
+    if (!write_queue.is_active(idx) || write_queue[idx].done)
+    {
+      return;
+    }
+    auto *self = this;
+    write_queue[idx].cancel_registration = cancel.register_callback([self, idx]() { self->cancel_write(idx); });
+  }
+
+  // Resolve a pending write with vio_cancelled. If a uv_write is already in flight
+  // its owned ciphertext stays alive until write_cb (which releases the operation
+  // hold); otherwise this releases it. A cancelled TLS write leaves a partial
+  // record on the wire, so the caller is expected to close the connection.
+  void cancel_write(size_t idx)
+  {
+    if (!write_queue.is_active(idx) || write_queue[idx].done)
+    {
+      return;
+    }
+    bool in_flight = false;
+    std::coroutine_handle<> c = {};
+    {
+      auto &ws = write_queue[idx];
+      ws.error_code = vio_cancelled;
+      ws.error_msg = "cancelled";
+      ws.done = true;
+      // Deregister before the caller's coroutine (which owns the cancellation_t)
+      // can resume and destroy that token -- otherwise the registration's later
+      // destructor would dereference a freed cancellation_t.
+      ws.cancel_registration.reset();
+      in_flight = ws.in_flight;
+      c = ws.continuation;
+      ws.continuation = {};
+    }
+    if (c)
+    {
+      c.resume(); // may reallocate write_queue -- re-index afterwards
+    }
+    // A submitted write's operation hold is released by write_cb; for a deferred
+    // or never-submitted write, release it here.
+    if (!in_flight && write_queue.is_active(idx) && --write_queue[idx].ref == 0)
+    {
+      write_queue.deactivate(idx);
+    }
   }
 
   // Half-close: send a one-way close_notify and keep reading (HTTP/2 GOAWAY /
@@ -760,6 +811,7 @@ private:
   {
     auto &ws = write_queue[idx];
     ws.done = true;
+    ws.cancel_registration.reset();
     std::coroutine_handle<> c = ws.continuation;
     ws.continuation = {};
     if (c)
@@ -778,6 +830,7 @@ private:
     ws.error_code = err.code != 0 ? err.code : vio_tls_error;
     ws.error_msg = std::move(err.msg);
     ws.done = true;
+    ws.cancel_registration.reset();
     std::coroutine_handle<> c = ws.continuation;
     ws.continuation = {};
     if (c)
@@ -813,6 +866,10 @@ private:
 
   void drain_waiters()
   {
+    if (closed)
+    {
+      return;
+    }
     while (!submit_waiters.empty() && tcp_stream != nullptr && uv_stream_get_write_queue_size(tcp_stream) < write_low_water)
     {
       const size_t idx = submit_waiters.front();
@@ -891,6 +948,7 @@ private:
             ws.error_msg = uv_strerror(status);
           }
           ws.done = true;
+          ws.cancel_registration.reset();
         }
         std::coroutine_handle<> c = {};
         {

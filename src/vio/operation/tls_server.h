@@ -216,24 +216,47 @@ inline std::expected<tls_server_client_reader_t, error_t> ssl_server_client_crea
 }
 
 using tls_server_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_server_client_state_t>, tls_server_socket_stream_t>;
-inline tls_server_client_write_awaitable_t ssl_server_client_write(ssl_server_client_t &client, uv_buf_t buffer)
+
+// A cancellation resolves the write with vio_cancelled (e.g. a write_timeout
+// bounding a slow reader). A cancelled TLS write may leave a partial record on
+// the wire, so the caller should close the connection afterwards.
+inline tls_server_client_write_awaitable_t ssl_server_client_write(ssl_server_client_t &client, uv_buf_t buffer, cancellation_t *cancel = nullptr)
 {
   assert(client.handle.ref_counted() != nullptr && "Can not write to a closed client");
 
-  auto write_state_index = client.handle->socket_stream.write_queue.activate();
-  client.handle->socket_stream.write_queue[write_state_index].buf = buffer;
-
-  client.handle->socket_stream.begin_write(write_state_index);
-  return {client.handle, &client.handle->socket_stream, write_state_index};
+  auto &ss = client.handle->socket_stream;
+  auto idx = ss.write_queue.activate();
+  ss.write_queue[idx].buf = buffer;
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    ss.cancel_write(idx);
+    return {client.handle, &ss, idx};
+  }
+  ss.begin_write(idx);
+  if (cancel != nullptr)
+  {
+    ss.arm_write_cancel(idx, *cancel);
+  }
+  return {client.handle, &ss, idx};
 }
 
 // Vectored write: coalesce several buffers into one TLS record + one uv_write.
-inline tls_server_client_write_awaitable_t ssl_server_client_writev(ssl_server_client_t &client, std::span<const uv_buf_t> buffers)
+inline tls_server_client_write_awaitable_t ssl_server_client_writev(ssl_server_client_t &client, std::span<const uv_buf_t> buffers, cancellation_t *cancel = nullptr)
 {
   assert(client.handle.ref_counted() != nullptr && "Can not write to a closed client");
-  auto write_state_index = client.handle->socket_stream.write_queue.activate();
-  client.handle->socket_stream.begin_writev(write_state_index, buffers.data(), buffers.size());
-  return {client.handle, &client.handle->socket_stream, write_state_index};
+  auto &ss = client.handle->socket_stream;
+  auto idx = ss.write_queue.activate();
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    ss.cancel_write(idx);
+    return {client.handle, &ss, idx};
+  }
+  ss.begin_writev(idx, buffers.data(), buffers.size());
+  if (cancel != nullptr)
+  {
+    ss.arm_write_cancel(idx, *cancel);
+  }
+  return {client.handle, &ss, idx};
 }
 
 // Half-close: send close_notify but keep reading. Resolves when it is on the wire.

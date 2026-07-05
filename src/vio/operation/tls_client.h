@@ -425,26 +425,49 @@ inline std::expected<tls_client_reader_t, error_t> ssl_client_create_reader(ssl_
 }
 
 using tls_client_write_awaitable_t = stream_write_awaitable_t<ref_ptr_t<ssl_client_state_t>, tls_client_socket_stream_t>;
-inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer)
+
+// A cancellation resolves the write with vio_cancelled (e.g. a write_timeout
+// bounding a slow reader). Because a cancelled TLS write may leave a partial
+// record on the wire, the caller should close the connection afterwards.
+inline tls_client_write_awaitable_t ssl_client_write(ssl_client_t &client, uv_buf_t buffer, cancellation_t *cancel = nullptr)
 {
   assert(client.state.ref_counted() != nullptr && "Can not write to a closed client");
   assert(client.state->connected && "Can not write to a client that is not connected");
 
-  auto write_state_index = client.state->socket_stream.write_queue.activate();
-  client.state->socket_stream.write_queue[write_state_index].buf = buffer;
-
-  client.state->socket_stream.begin_write(write_state_index);
-  return {client.state, &client.state->socket_stream, write_state_index};
+  auto &ss = client.state->socket_stream;
+  auto idx = ss.write_queue.activate();
+  ss.write_queue[idx].buf = buffer;
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    ss.cancel_write(idx);
+    return {client.state, &ss, idx};
+  }
+  ss.begin_write(idx);
+  if (cancel != nullptr)
+  {
+    ss.arm_write_cancel(idx, *cancel);
+  }
+  return {client.state, &ss, idx};
 }
 
 // Vectored write: coalesce several buffers into one TLS record + one uv_write.
-inline tls_client_write_awaitable_t ssl_client_writev(ssl_client_t &client, std::span<const uv_buf_t> buffers)
+inline tls_client_write_awaitable_t ssl_client_writev(ssl_client_t &client, std::span<const uv_buf_t> buffers, cancellation_t *cancel = nullptr)
 {
   assert(client.state.ref_counted() != nullptr && "Can not write to a closed client");
   assert(client.state->connected && "Can not write to a client that is not connected");
-  auto write_state_index = client.state->socket_stream.write_queue.activate();
-  client.state->socket_stream.begin_writev(write_state_index, buffers.data(), buffers.size());
-  return {client.state, &client.state->socket_stream, write_state_index};
+  auto &ss = client.state->socket_stream;
+  auto idx = ss.write_queue.activate();
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    ss.cancel_write(idx);
+    return {client.state, &ss, idx};
+  }
+  ss.begin_writev(idx, buffers.data(), buffers.size());
+  if (cancel != nullptr)
+  {
+    ss.arm_write_cancel(idx, *cancel);
+  }
+  return {client.state, &ss, idx};
 }
 
 // Half-close: send close_notify but keep reading. Resolves when it is on the wire.

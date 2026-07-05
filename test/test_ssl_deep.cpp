@@ -410,6 +410,81 @@ TEST_CASE("OCSP staple: the server's stapled response is delivered to a requesti
   REQUIRE(received == staple);
 }
 
+TEST_CASE("a pre-cancelled TLS write resolves with vio_cancelled")
+{
+  auto certs = make_cert_set("localhost");
+  vio::ssl_config_t server_config{.ca_mem = certs.ca_cert, .cert_mem = certs.cert, .key_mem = certs.key};
+  vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
+  bool cancelled = false;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = echo_server(el, std::move(pair->first), server_config, port, false);
+      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &cancelled) -> vio::task_t<void>
+      {
+        auto c = vio::ssl_client_create(el, cc);
+        REQUIRE_EXPECTED(c);
+        auto client = std::move(c.value());
+        auto cr = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+        REQUIRE_EXPECTED(cr);
+        vio::cancellation_t cancel;
+        cancel.cancel();
+        std::string msg = "never-sent";
+        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+        auto wr = co_await vio::ssl_client_write(client, buf, &cancel);
+        cancelled = !wr.has_value() && vio::is_cancelled(wr.error());
+      }(el, client_config, port, cancelled);
+      co_await std::move(client_task);
+      { auto destroy = std::move(client_task); }
+      co_await std::move(server_task);
+      el.stop();
+    });
+  REQUIRE(cancelled);
+}
+
+TEST_CASE("an in-flight TLS write cancelled before completion resolves with vio_cancelled")
+{
+  auto certs = make_cert_set("localhost");
+  vio::ssl_config_t server_config{.ca_mem = certs.ca_cert, .cert_mem = certs.cert, .key_mem = certs.key};
+  vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
+  bool cancelled = false;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = echo_server(el, std::move(pair->first), server_config, port, false);
+      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &cancelled) -> vio::task_t<void>
+      {
+        auto c = vio::ssl_client_create(el, cc);
+        REQUIRE_EXPECTED(c);
+        auto client = std::move(c.value());
+        auto cr = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+        REQUIRE_EXPECTED(cr);
+        vio::cancellation_t cancel;
+        std::string msg = "in-flight";
+        uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+        // Submit the write, then cancel before the loop runs its write callback.
+        auto w = vio::ssl_client_write(client, buf, &cancel);
+        cancel.cancel();
+        auto wr = co_await std::move(w);
+        cancelled = !wr.has_value() && vio::is_cancelled(wr.error());
+        // A cancelled TLS write leaves the stream unusable -> close (done by scope exit).
+      }(el, client_config, port, cancelled);
+      co_await std::move(client_task);
+      { auto destroy = std::move(client_task); }
+      co_await std::move(server_task);
+      el.stop();
+    });
+  REQUIRE(cancelled);
+}
+
 TEST_CASE("many sequential connections keep their data intact (no cross-connection leakage)")
 {
   auto certs = make_cert_set("localhost");
