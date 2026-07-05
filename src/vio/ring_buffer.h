@@ -24,6 +24,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <utility>
 
 namespace vio
