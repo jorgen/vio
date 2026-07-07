@@ -197,6 +197,31 @@ The event loop has always-active internal handles (async, prepare, event pipes).
 be called, which sends an async signal that closes all internal handles. Tests that don't use
 coroutines still need `event_loop.stop()` before `event_loop.run()` for cleanup.
 
+### Socket reads: queue, read_into (zero-copy), pause/resume
+
+`tcp_reader_t` (`operation/tcp.h`) supports three modes over one persistent
+`uv_read_start`:
+- `co_await reader` — the queue path: libuv allocs a buffer, `read_cb` enqueues an
+  owned `unique_buf_t`, the awaiter hands it over by move.
+- `reader.read_into(std::span<std::byte> dst)` — **true zero-copy** scatter read:
+  the alloc callback hands libuv the caller's `dst` (with a no-op deallocator) so
+  bytes land directly in `dst`; resolves to `std::expected<std::size_t, error_t>`
+  (0 = EOF). If bytes are already queued it copies from the front buffer
+  (partial-consume tracked via `read.front_consumed`) instead. After a direct
+  read it leaves the reader **paused**, so libuv doesn't buffer ahead — the pull
+  cadence is the backpressure.
+- `reader.pause()` / `reader.resume()` — transient `uv_read_stop`/`uv_read_start`.
+  Critical: these must **not** reclaim the ref parked in `stream->data` by
+  `tcp_create_reader` (only teardown — dtor/`cancel()`, gated on `read.started` —
+  does), so `read.started` stays true across pause; a separate `read.paused`
+  flag tracks the armed state. The alloc trampoline + `read_cb` are hoisted to
+  static members so `resume()` re-arms with the same callbacks.
+
+TLS (`stream_reader_t`, `socket_stream.h`) already had exact-fill decrypt-into-
+caller-buffer (`read(uv_buf_t)`) and automatic ring-buffer backpressure
+(`arm_reads`/`disarm_reads`); it cannot be truly zero-copy since libuv only sees
+ciphertext. (These vio APIs back prism's streaming request bodies.)
+
 ## Writing Tests
 
 ### Coroutine test pattern

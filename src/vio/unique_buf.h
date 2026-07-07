@@ -96,4 +96,13 @@ inline void default_dealloc(void * /*user_ptr*/, uv_buf_t *data)
   data->len = 0;
 }
 
+// Deallocator for buffers whose memory is owned by the caller (e.g. a span
+// handed to a scatter read). It must never free the memory; it only clears the
+// view so unique_buf_t's destructor is a no-op.
+inline void noop_dealloc(void * /*user_ptr*/, uv_buf_t *data)
+{
+  data->base = nullptr;
+  data->len = 0;
+}
+
 } // namespace vio

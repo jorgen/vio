@@ -28,12 +28,15 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/unique_buf.h"
 #include "vio/uv_coro.h"
 
+#include <algorithm>
 #include <concepts>
 #include <coroutine>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <memory>
 #include <ranges>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -97,8 +100,10 @@ struct tcp_read_state_t
 {
   bool active = false;
   bool started = false;
+  bool paused = false;
   bool is_cancelled = false;
   std::vector<std::expected<unique_buf_t, error_t>> buffer_queue;
+  std::size_t front_consumed = 0;
   std::coroutine_handle<> continuation;
   alloc_cb_t alloc_buffer_cb = default_alloc;
   dealloc_cb_t dealloc_buffer_cb = default_dealloc;
@@ -523,6 +528,24 @@ public:
 
     std::expected<unique_buf_t, error_t> await_resume()
     {
+      auto &front = state->read.buffer_queue.front();
+      if (front.has_value() && state->read.front_consumed > 0)
+      {
+        // A prior read_into() partially drained this queued buffer. Hand back
+        // only the remainder as a fresh owned buffer (we cannot shift the
+        // original base pointer -- default_dealloc would delete[] the middle).
+        uv_buf_t &src = front.value().buf;
+        const std::size_t offset = state->read.front_consumed;
+        const std::size_t remaining = src.len - offset;
+        uv_buf_t copy_buf{};
+        copy_buf.base = new char[remaining];
+        copy_buf.len = static_cast<decltype(copy_buf.len)>(remaining);
+        std::memcpy(copy_buf.base, src.base + offset, remaining);
+        unique_buf_t out(copy_buf, default_dealloc, nullptr);
+        state->read.front_consumed = 0;
+        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
+        return out;
+      }
       auto result = std::move(state->read.buffer_queue.front());
       state->read.buffer_queue.erase(state->read.buffer_queue.begin());
       return result;
@@ -532,6 +555,162 @@ public:
   auto operator co_await()
   {
     return awaiter_t{this->handle};
+  }
+
+  // libuv alloc trampoline: forwards to the (swappable) read.alloc_buffer_cb.
+  // Hoisted out of tcp_create_reader so resume() can re-arm uv_read_start with
+  // the same callback pair.
+  static void alloc_cb(uv_handle_t *handle, size_t size, uv_buf_t *buf)
+  {
+    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
+    tcp_state->read.alloc_buffer_cb(tcp_state->read.alloc_cb_data, size, buf);
+    tcp_state.release_to_raw();
+  }
+
+  // Transient stop/start for backpressure. These MUST NOT reclaim the ref parked
+  // in stream->data by tcp_create_reader -- only teardown (dtor/cancel) does,
+  // gated on read.started, which stays true across pause/resume.
+  static void pause_reading(ref_ptr_t<tcp_state_t> &handle)
+  {
+    if (handle->read.started && !handle->read.paused)
+    {
+      uv_read_stop(handle->get_stream());
+      handle->read.paused = true;
+    }
+  }
+
+  static void resume_reading(ref_ptr_t<tcp_state_t> &handle)
+  {
+    if (handle->read.started && handle->read.paused)
+    {
+      uv_read_start(handle->get_stream(), &tcp_reader_t::alloc_cb, &tcp_reader_t::read_cb);
+      handle->read.paused = false;
+    }
+  }
+
+  void pause()
+  {
+    if (_is_valid)
+    {
+      pause_reading(handle);
+    }
+  }
+
+  void resume()
+  {
+    if (_is_valid)
+    {
+      resume_reading(handle);
+    }
+  }
+
+  struct read_into_ctx_t
+  {
+    char *base = nullptr;
+    std::size_t len = 0;
+  };
+
+  // Alloc that hands libuv the caller's buffer, so the socket read lands there
+  // directly (true zero-copy). Paired with noop_dealloc.
+  static void alloc_into(void *user, size_t /*suggested*/, uv_buf_t *buf)
+  {
+    auto *ctx = static_cast<read_into_ctx_t *>(user);
+    buf->base = ctx->base;
+    buf->len = static_cast<decltype(buf->len)>(ctx->len);
+  }
+
+  struct read_into_awaiter_t
+  {
+    ref_ptr_t<tcp_state_t> state;
+    std::span<std::byte> dst;
+    read_into_ctx_t ctx{};
+    alloc_cb_t saved_alloc = nullptr;
+    dealloc_cb_t saved_dealloc = nullptr;
+    void *saved_alloc_data = nullptr;
+    bool armed_into = false;
+
+    [[nodiscard]] bool await_ready() const
+    {
+      return dst.empty() || !state->read.buffer_queue.empty();
+    }
+
+    void await_suspend(std::coroutine_handle<> h)
+    {
+      state->read.continuation = h;
+      ctx.base = reinterpret_cast<char *>(dst.data());
+      ctx.len = dst.size();
+      saved_alloc = state->read.alloc_buffer_cb;
+      saved_dealloc = state->read.dealloc_buffer_cb;
+      saved_alloc_data = state->read.alloc_cb_data;
+      state->read.alloc_buffer_cb = &tcp_reader_t::alloc_into;
+      state->read.dealloc_buffer_cb = &noop_dealloc;
+      state->read.alloc_cb_data = &ctx;
+      armed_into = true;
+      resume_reading(state);
+    }
+
+    std::expected<std::size_t, error_t> await_resume()
+    {
+      if (armed_into)
+      {
+        state->read.alloc_buffer_cb = saved_alloc;
+        state->read.dealloc_buffer_cb = saved_dealloc;
+        state->read.alloc_cb_data = saved_alloc_data;
+        pause_reading(state);
+        auto front = std::move(state->read.buffer_queue.front());
+        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
+        if (!front.has_value())
+        {
+          if (front.error().code == UV_EOF)
+          {
+            return std::size_t{0};
+          }
+          return std::unexpected(front.error());
+        }
+        return static_cast<std::size_t>(front.value().buf.len);
+      }
+
+      if (dst.empty())
+      {
+        return std::size_t{0};
+      }
+
+      auto &front = state->read.buffer_queue.front();
+      if (!front.has_value())
+      {
+        error_t err = front.error();
+        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
+        state->read.front_consumed = 0;
+        if (err.code == UV_EOF)
+        {
+          return std::size_t{0};
+        }
+        return std::unexpected(err);
+      }
+      uv_buf_t &src = front.value().buf;
+      const std::size_t offset = state->read.front_consumed;
+      const std::size_t avail = src.len - offset;
+      const std::size_t n = std::min(avail, dst.size());
+      std::memcpy(dst.data(), src.base + offset, n);
+      state->read.front_consumed += n;
+      if (state->read.front_consumed >= src.len)
+      {
+        state->read.front_consumed = 0;
+        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
+      }
+      return n;
+    }
+  };
+
+  // Read up to dst.size() bytes into the caller's buffer. Returns the number of
+  // bytes written (0 == EOF). When the reader's queue is empty this reads
+  // directly into dst with no copy; if bytes are already queued it copies from
+  // the front buffer (partial-consume tracked) and returns without a socket read
+  // (the caller loops). After a direct read the reader is left paused, so libuv
+  // does not buffer ahead -- the pull cadence is the backpressure.
+  read_into_awaiter_t read_into(std::span<std::byte> dst)
+  {
+    return read_into_awaiter_t{this->handle, dst};
   }
 
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
@@ -619,15 +798,9 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
     return std::unexpected(error_t{.code = 1, .msg = "Can not create multiple active readers for a socket. Destroy other reader, before making a new one."});
   }
 
-  auto alloc_cb = [](uv_handle_t *handle, size_t size, uv_buf_t *buf)
-  {
-    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
-    tcp_state->read.alloc_buffer_cb(tcp_state->read.alloc_cb_data, size, buf);
-    tcp_state.release_to_raw();
-  };
   auto copy = tcp.handle;
   tcp.get_stream()->data = copy.release_to_raw();
-  if (const auto r = uv_read_start(tcp.get_stream(), alloc_cb, &tcp_reader_t::read_cb); r >= 0)
+  if (const auto r = uv_read_start(tcp.get_stream(), &tcp_reader_t::alloc_cb, &tcp_reader_t::read_cb); r >= 0)
   {
     tcp.handle->read.active = true;
     tcp.handle->read.started = true;
