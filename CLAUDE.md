@@ -110,14 +110,18 @@ Configuration is in `.clang-tidy` at the project root.
 
 ## Dependencies (toggles & install)
 
-Every dependency is togglable between the bundled fetch and a pre-installed copy:
-`VIO_USE_SYSTEM_{LIBUV,LIBRESSL,ADA,DOCTEST,CMAKERC}` (default `OFF`). When `ON`,
-`CMake/Build3rdParty.cmake` / `src/CMakeLists.txt` call `find_package` and
-`CMake/3rdPartyPackages.cmake` skips that fetch. Each dep also exposes
-`VIO_<DEP>_VERSION` / `VIO_<DEP>_URL` / `VIO_<DEP>_SHA256` cache variables to fetch
-a different version without editing the packages file (e.g. a newer LibreSSL). The
-system-libuv path links `libuv::uv_a`; `find_package(LibreSSL)` uses the config a
-CMake-built LibreSSL installs (`lib/cmake/LibreSSL/LibreSSLConfig.cmake`).
+Every dependency is togglable between the bundled fetch and a pre-installed copy.
+The knobs are **auto-declared by cmake-dep** from each `CmDepFetchPackage` call in
+`CMake/3rdPartyPackages.cmake`, prefixed by the project name (uppercased
+`PROJECT_NAME` → `VIO`): `VIO_USE_SYSTEM_{LIBUV,LIBRESSL,ADA,DOCTEST,CMAKERC}`
+(default `OFF`) and `VIO_<DEP>_{VERSION,URL,SHA256}` overrides to fetch a different
+version/URL/hash without editing the packages file (e.g. a newer LibreSSL). When a
+toggle is `ON`, cmake-dep skips the fetch; `CMake/Build3rdParty.cmake` then drives
+libuv/ada/doctest through `CmDepAddPackage` (which owns the find-vs-build branch),
+while cmakerc (`include()`-based) and libressl (ExternalProject) branch by hand on
+the `${name}_USE_SYSTEM` signal, and `src/CMakeLists.txt` handles the system-libuv
+link (`libuv::uv_a`). `find_package(LibreSSL)` uses the config a CMake-built
+LibreSSL installs (`lib/cmake/LibreSSL/LibreSSLConfig.cmake`).
 
 `VIO_INSTALL` (default `ON`) installs headers + the `vio` lib and, **when built
 against system deps**, a relocatable `find_package(vio)` package config
