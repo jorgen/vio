@@ -1,6 +1,7 @@
 add_executable(vio_tests
     test_main.cpp
     test_basic.cpp
+    test_crypto.cpp
     test_task_and_sleep.cpp
     test_file.cpp
     test_file_leak.cpp

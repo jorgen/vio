@@ -22,12 +22,16 @@
 
 #pragma once
 
+#include "vio/error.h"
 #include "vio/vio_export.h"
 
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <span>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace vio::crypto
 {
@@ -46,5 +50,12 @@ VIO_EXPORT sha512_digest_t sha512(std::span<const uint8_t> data);
 VIO_EXPORT sha256_digest_t hmac_sha256(std::span<const uint8_t> key, std::span<const uint8_t> data);
 VIO_EXPORT sha512_digest_t hmac_sha512(std::span<const uint8_t> key, std::span<const uint8_t> data);
 
+VIO_EXPORT sha256_digest_t pbkdf2_hmac_sha256(std::span<const uint8_t> password, std::span<const uint8_t> salt, uint32_t iterations);
+
+VIO_EXPORT std::expected<void, error_t> random_bytes(std::span<uint8_t> out);
+
 VIO_EXPORT std::string to_hex(std::span<const uint8_t> data);
+
+VIO_EXPORT std::string base64_encode(std::span<const uint8_t> data);
+VIO_EXPORT std::expected<std::vector<uint8_t>, error_t> base64_decode(std::string_view text);
 } // namespace vio::crypto

@@ -112,4 +112,84 @@ TEST_CASE("to_hex empty")
   auto hex = vio::crypto::to_hex(data);
   CHECK(hex.empty());
 }
+
+TEST_CASE("PBKDF2-HMAC-SHA-256 password/salt c=1")
+{
+  auto password = to_bytes("password");
+  auto salt = to_bytes("salt");
+  auto digest = vio::crypto::pbkdf2_hmac_sha256(password, salt, 1);
+  auto hex = vio::crypto::to_hex(digest);
+  CHECK(hex == "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+}
+
+TEST_CASE("PBKDF2-HMAC-SHA-256 password/salt c=2")
+{
+  auto password = to_bytes("password");
+  auto salt = to_bytes("salt");
+  auto digest = vio::crypto::pbkdf2_hmac_sha256(password, salt, 2);
+  auto hex = vio::crypto::to_hex(digest);
+  CHECK(hex == "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+}
+
+TEST_CASE("PBKDF2-HMAC-SHA-256 password/salt c=4096")
+{
+  auto password = to_bytes("password");
+  auto salt = to_bytes("salt");
+  auto digest = vio::crypto::pbkdf2_hmac_sha256(password, salt, 4096);
+  auto hex = vio::crypto::to_hex(digest);
+  CHECK(hex == "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+}
+
+TEST_CASE("base64 encode RFC 4648 vectors")
+{
+  CHECK(vio::crypto::base64_encode(to_bytes("")) == "");
+  CHECK(vio::crypto::base64_encode(to_bytes("f")) == "Zg==");
+  CHECK(vio::crypto::base64_encode(to_bytes("fo")) == "Zm8=");
+  CHECK(vio::crypto::base64_encode(to_bytes("foo")) == "Zm9v");
+  CHECK(vio::crypto::base64_encode(to_bytes("foob")) == "Zm9vYg==");
+  CHECK(vio::crypto::base64_encode(to_bytes("fooba")) == "Zm9vYmE=");
+  CHECK(vio::crypto::base64_encode(to_bytes("foobar")) == "Zm9vYmFy");
+}
+
+TEST_CASE("base64 decode RFC 4648 vectors")
+{
+  auto expect = [](const char *b64, const char *plain)
+  {
+    auto decoded = vio::crypto::base64_decode(b64);
+    REQUIRE(decoded.has_value());
+    CHECK(*decoded == to_bytes(plain));
+  };
+  expect("", "");
+  expect("Zg==", "f");
+  expect("Zm8=", "fo");
+  expect("Zm9v", "foo");
+  expect("Zm9vYg==", "foob");
+  expect("Zm9vYmE=", "fooba");
+  expect("Zm9vYmFy", "foobar");
+}
+
+TEST_CASE("base64 decode rejects malformed input")
+{
+  CHECK_FALSE(vio::crypto::base64_decode("Zm9").has_value());
+  CHECK_FALSE(vio::crypto::base64_decode("Z!==").has_value());
+  CHECK_FALSE(vio::crypto::base64_decode("Z===").has_value());
+}
+
+TEST_CASE("random_bytes fills the buffer and succeeds")
+{
+  std::vector<uint8_t> a(32, 0);
+  std::vector<uint8_t> b(32, 0);
+  CHECK(vio::crypto::random_bytes(a).has_value());
+  CHECK(vio::crypto::random_bytes(b).has_value());
+  bool all_zero = true;
+  for (auto byte : a)
+  {
+    if (byte != 0)
+    {
+      all_zero = false;
+    }
+  }
+  CHECK_FALSE(all_zero);
+  CHECK(a != b);
+}
 } // TEST_SUITE
