@@ -26,6 +26,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/cancellation.h"
 #include "vio/elastic_index_storage.h"
 #include "vio/error.h"
+#include "vio/operation/tcp.h"
 #include "vio/operation/tls_common.h"
 #include "vio/ref_counted_wrapper.h"
 #include "vio/socket_stream.h"
@@ -77,6 +78,10 @@ struct ssl_client_state_t
   ssl_context_t ssl_ctx;
   ssl_engine_t engine;
   uv_tls_stream_t socket_stream;
+
+  // Set only on the ssl_client_upgrade path, where an already-connected socket is
+  // adopted instead of the embedded tcp_handle. Keeps the adopted uv handle alive.
+  std::optional<tcp_t> adopted;
 
   uv_tcp_t *get_tcp()
   {
@@ -403,6 +408,115 @@ inline ssl_client_connecting_future_t ssl_client_connect(ssl_client_t &client, c
       });
   }
   return {client.state};
+}
+
+struct ssl_client_upgrade_future_t
+{
+  ssl_client_t client;
+
+  bool await_ready() noexcept
+  {
+    return client.state->connected || !client.state->connecting;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    client.state->connect_continuation = continuation;
+  }
+
+  std::expected<ssl_client_t, error_t> await_resume() noexcept
+  {
+    if (!client.state->connect_result.has_value())
+    {
+      return std::unexpected(std::move(client.state->connect_result.error()));
+    }
+    return std::move(client);
+  }
+};
+
+// Upgrade an already-connected plaintext tcp_t to a TLS client stream in place
+// (PostgreSQL sslmode: plaintext SSLRequest + 'S'/'N', then TLS on the same
+// socket). The caller MUST have torn down any plaintext tcp_reader_t on this
+// socket first (bind() overwrites stream->data). host drives SNI + certificate
+// hostname verification. Resolves after the handshake, so ALPN / verification are
+// known when co_await returns.
+inline ssl_client_upgrade_future_t ssl_client_upgrade(tcp_t &&tcp, const ssl_config_t &config, const std::string &host, cancellation_t *cancel = nullptr, alloc_cb_t alloc_cb = default_alloc,
+                                                       dealloc_cb_t dealloc_cb = default_dealloc, void *user_alloc_ptr = nullptr)
+{
+  event_loop_t &event_loop = tcp.handle->event_loop;
+  ssl_client_t ret{ref_ptr_t<ssl_client_state_t>{event_loop, alloc_cb, dealloc_cb, user_alloc_ptr}};
+
+  if (auto error = ret.state->ssl_ctx.init(false, config, get_default_ca_certificates()); error.code != 0)
+  {
+    ret.state->connect_result = std::unexpected(std::move(error));
+    return {std::move(ret)};
+  }
+
+  ret.state->host = host;
+  ret.state->adopted.emplace(std::move(tcp));
+  ret.state->connecting = true;
+
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    ret.state->connecting = false;
+    ret.state->connect_result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return {std::move(ret)};
+  }
+
+  if (auto error = ret.state->engine.init(ret.state->ssl_ctx, false, ret.state->host); error.code != 0)
+  {
+    ret.state->connecting = false;
+    ret.state->connect_result = std::unexpected(std::move(error));
+    return {std::move(ret)};
+  }
+
+  auto *state_raw = &ret.state.data();
+  ret.state->socket_stream.on_handshake_complete = [state_raw](std::optional<error_t> err)
+  {
+    if (!state_raw->connecting)
+      return;
+    state_raw->cancel_registration.reset();
+    state_raw->connecting = false;
+    if (err)
+    {
+      state_raw->connect_result = std::unexpected(std::move(*err));
+    }
+    else
+    {
+      state_raw->connected = true;
+      state_raw->connect_result = {};
+    }
+    if (state_raw->connect_continuation)
+    {
+      auto cont = state_raw->connect_continuation;
+      state_raw->connect_continuation = {};
+      cont.resume();
+    }
+  };
+  ret.state.on_destroy([state_raw]() { state_raw->socket_stream.begin_teardown(); });
+  ret.state->socket_stream.bind(ret.state->adopted->get_stream(), ret.state.ref_counted());
+  ret.state->socket_stream.begin_handshake();
+
+  if (cancel != nullptr && ret.state->connecting)
+  {
+    ret.state->cancel_registration = cancel->register_callback(
+      [state_raw]()
+      {
+        if (!state_raw->connecting)
+          return;
+        state_raw->connecting = false;
+        state_raw->connect_result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+        state_raw->cancel_registration.reset();
+        if (state_raw->connect_continuation)
+        {
+          auto cont = state_raw->connect_continuation;
+          state_raw->connect_continuation = {};
+          cont.resume();
+        }
+      });
+  }
+
+  return {std::move(ret)};
 }
 
 using tls_client_reader_t = stream_reader_t<ref_ptr_t<ssl_client_state_t>, tls_client_socket_stream_t>;
