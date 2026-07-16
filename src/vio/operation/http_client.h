@@ -36,6 +36,8 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/cancellation.h>
 #include <vio/error.h>
 #include <vio/event_loop.h>
+#include <vio/operation/dns.h>
+#include <vio/operation/tcp.h>
 #include <vio/operation/tls_client.h>
 #include <vio/task.h>
 
@@ -69,7 +71,8 @@ struct request_t
   std::string url;
   std::vector<header_t> headers;
   std::string body;
-  int max_redirects = 0; // 0 = do not follow redirects (the default single-shot behaviour)
+  int max_redirects = 0;        // 0 = do not follow redirects (the default single-shot behaviour)
+  bool allow_plaintext = false; // opt-in: permit http:// (plain HTTP is refused by default)
 };
 
 struct response_t
@@ -169,12 +172,15 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
     co_return std::unexpected(error_t{.code = -1, .msg = "http: invalid url"});
   const ada::url_aggregator &url = *parsed;
 
-  if (url.get_protocol() != "https:")
+  const bool is_https = url.get_protocol() == "https:";
+  const bool is_http = url.get_protocol() == "http:";
+  if (!is_https && !(is_http && request.allow_plaintext))
     co_return std::unexpected(error_t{.code = -1, .msg = "http: only https is supported"});
 
   std::string host(url.get_hostname());
   std::string_view port_sv = url.get_port();
-  std::uint16_t port = port_sv.empty() ? std::uint16_t{443} : static_cast<std::uint16_t>(std::atoi(std::string(port_sv).c_str()));
+  const std::uint16_t default_port = is_https ? std::uint16_t{443} : std::uint16_t{80};
+  std::uint16_t port = port_sv.empty() ? default_port : static_cast<std::uint16_t>(std::atoi(std::string(port_sv).c_str()));
 
   std::string target(url.get_pathname());
   if (target.empty())
@@ -195,33 +201,83 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
   wire.append("\r\n");
   wire.append(request.body);
 
-  auto client = ssl_client_create(loop);
-  if (!client)
-    co_return std::unexpected(client.error());
-
-  auto connected = co_await ssl_client_connect(client.value(), host, port, cancel);
-  if (!connected)
-    co_return std::unexpected(connected.error());
-
-  uv_buf_t buf;
-  buf.base = wire.data();
-  buf.len = static_cast<decltype(buf.len)>(wire.size());
-  auto written = co_await ssl_client_write(client.value(), buf, cancel);
-  if (!written)
-    co_return std::unexpected(written.error());
-
-  auto reader_result = ssl_client_create_reader(client.value());
-  if (!reader_result)
-    co_return std::unexpected(reader_result.error());
-  auto reader = std::move(reader_result.value());
-
   std::string raw;
-  while (true)
+
+  if (is_https)
   {
-    auto chunk = co_await reader;
-    if (!chunk)
-      break;
-    raw.append(chunk.value().buf.base, chunk.value().buf.len);
+    auto client = ssl_client_create(loop);
+    if (!client)
+      co_return std::unexpected(client.error());
+
+    auto connected = co_await ssl_client_connect(client.value(), host, port, cancel);
+    if (!connected)
+      co_return std::unexpected(connected.error());
+
+    uv_buf_t buf;
+    buf.base = wire.data();
+    buf.len = static_cast<decltype(buf.len)>(wire.size());
+    auto written = co_await ssl_client_write(client.value(), buf, cancel);
+    if (!written)
+      co_return std::unexpected(written.error());
+
+    auto reader_result = ssl_client_create_reader(client.value());
+    if (!reader_result)
+      co_return std::unexpected(reader_result.error());
+    auto reader = std::move(reader_result.value());
+
+    while (true)
+    {
+      auto chunk = co_await reader;
+      if (!chunk)
+        break;
+      raw.append(chunk.value().buf.base, chunk.value().buf.len);
+    }
+  }
+  else
+  {
+    // Plaintext HTTP (opt-in): resolve the host, stamp the port onto the address, and drive a plain
+    // TCP connection with the same request wire. Used for same-host reverse proxying to an internal
+    // backend; unreachable unless request.allow_plaintext was set.
+    address_info_t hints;
+    hints.socktype = SOCK_STREAM;
+    auto resolved = co_await get_addrinfo(loop, host, hints, cancel);
+    if (!resolved)
+      co_return std::unexpected(resolved.error());
+    if (resolved->empty())
+      co_return std::unexpected(error_t{.code = -1, .msg = "http: host did not resolve"});
+
+    sockaddr *sa = resolved->front().get_sockaddr();
+    if (sa == nullptr)
+      co_return std::unexpected(error_t{.code = -1, .msg = "http: no address for host"});
+    if (sa->sa_family == AF_INET)
+      reinterpret_cast<sockaddr_in *>(sa)->sin_port = htons(port);
+    else if (sa->sa_family == AF_INET6)
+      reinterpret_cast<sockaddr_in6 *>(sa)->sin6_port = htons(port);
+
+    auto tcp = tcp_create(loop);
+    if (!tcp)
+      co_return std::unexpected(tcp.error());
+
+    auto connected = co_await tcp_connect(tcp.value(), sa, cancel);
+    if (!connected)
+      co_return std::unexpected(connected.error());
+
+    auto written = co_await write_tcp(tcp.value(), reinterpret_cast<const uint8_t *>(wire.data()), wire.size(), cancel);
+    if (!written)
+      co_return std::unexpected(written.error());
+
+    auto reader_result = tcp_create_reader(tcp.value());
+    if (!reader_result)
+      co_return std::unexpected(reader_result.error());
+    auto reader = std::move(reader_result.value());
+
+    while (true)
+    {
+      auto chunk = co_await reader;
+      if (!chunk)
+        break;
+      raw.append(chunk.value().buf.base, chunk.value().buf.len);
+    }
   }
 
   co_return detail::parse_response(raw);
