@@ -26,6 +26,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -73,6 +74,9 @@ struct request_t
   std::string body;
   int max_redirects = 0;        // 0 = do not follow redirects (the default single-shot behaviour)
   bool allow_plaintext = false; // opt-in: permit http:// (plain HTTP is refused by default)
+  // Verify the https peer against this PEM CA bundle instead of the system trust
+  // store (e.g. a private/test ACME CA like Pebble). Unset => the default bundle.
+  std::optional<std::vector<uint8_t>> ca_mem;
 };
 
 struct response_t
@@ -190,7 +194,10 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
   std::string wire;
   wire.reserve(256 + request.body.size());
   wire.append(request.method).append(" ").append(target).append(" HTTP/1.1\r\n");
-  wire.append("Host: ").append(host).append("\r\n");
+  wire.append("Host: ").append(host);
+  if ((is_https && port != 443) || (is_http && port != 80))
+    wire.append(":").append(std::to_string(port));
+  wire.append("\r\n");
   wire.append("User-Agent: vio-http/0.1\r\n");
   wire.append("Accept-Encoding: identity\r\n");
   wire.append("Connection: close\r\n");
@@ -205,7 +212,10 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
 
   if (is_https)
   {
-    auto client = ssl_client_create(loop);
+    ssl_config_t tls_config;
+    if (request.ca_mem)
+      tls_config.ca_mem = request.ca_mem;
+    auto client = ssl_client_create(loop, tls_config);
     if (!client)
       co_return std::unexpected(client.error());
 

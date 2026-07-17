@@ -202,4 +202,53 @@ std::expected<std::vector<uint8_t>, error_t> base64_decode(std::string_view text
   return out;
 }
 
+std::string base64url_encode(std::span<const uint8_t> data)
+{
+  std::string out = base64_encode(data);
+  size_t n = out.size();
+  while (n > 0 && out[n - 1] == '=')
+  {
+    --n;
+  }
+  out.resize(n);
+  for (char &c : out)
+  {
+    if (c == '+')
+    {
+      c = '-';
+    }
+    else if (c == '/')
+    {
+      c = '_';
+    }
+  }
+  return out;
+}
+
+std::expected<std::vector<uint8_t>, error_t> base64url_decode(std::string_view text)
+{
+  std::string std_b64;
+  std_b64.reserve(text.size() + 3);
+  for (char c : text)
+  {
+    if (c == '-')
+    {
+      std_b64.push_back('+');
+    }
+    else if (c == '_')
+    {
+      std_b64.push_back('/');
+    }
+    else if (c != '=')
+    {
+      std_b64.push_back(c);
+    }
+  }
+  while (std_b64.size() % 4 != 0)
+  {
+    std_b64.push_back('=');
+  }
+  return base64_decode(std_b64);
+}
+
 } // namespace vio::crypto

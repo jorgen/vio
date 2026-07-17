@@ -28,6 +28,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/ssl_engine.h>
 #include <vio/vio_export.h>
 
+#include <memory>
 #include <string>
 
 namespace vio
@@ -37,5 +38,14 @@ namespace vio
 // Windows). Returned by reference so the program-lifetime bundle is loaded into
 // each SSL_CTX without a per-connection copy.
 VIO_EXPORT const std::string &get_default_ca_certificates();
+
+// Create an SNI certificate store seeded with the default trust bundle. Pass the
+// listener's base ssl_config_t (ALPN / protocol bounds / verify policy); assign
+// the result to ssl_config_t::sni_store before listen, then add per-hostname
+// certificates with set_certificate(). See sni_cert_store_t in ssl_context.h.
+inline std::shared_ptr<sni_cert_store_t> make_sni_cert_store(const ssl_config_t &base_config)
+{
+  return sni_cert_store_t::create(base_config, get_default_ca_certificates());
+}
 
 } // namespace vio

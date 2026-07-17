@@ -58,4 +58,10 @@ VIO_EXPORT std::string to_hex(std::span<const uint8_t> data);
 
 VIO_EXPORT std::string base64_encode(std::span<const uint8_t> data);
 VIO_EXPORT std::expected<std::vector<uint8_t>, error_t> base64_decode(std::string_view text);
+
+// URL-safe base64 (RFC 4648 §5): '+'/'/' become '-'/'_' and trailing '=' padding
+// is omitted. Used by JOSE/JWS (base64url) in the ACME client. Decode is lenient:
+// it accepts optional padding and restores it before decoding.
+VIO_EXPORT std::string base64url_encode(std::span<const uint8_t> data);
+VIO_EXPORT std::expected<std::vector<uint8_t>, error_t> base64url_decode(std::string_view text);
 } // namespace vio::crypto

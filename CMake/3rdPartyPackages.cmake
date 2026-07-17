@@ -21,9 +21,9 @@ if(VIO_BUILD_TESTS)
         SHA256=73381c7aa4dee704bd935609668cf41880ea7f19fa0504a200e13b74999c2d70)
 endif()
 
-CmDepFetchPackage(libressl 4.1.0
-    https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.1.0.tar.gz
-    SHA256=0f71c16bd34bdaaccdcb96a5d94a4921bfb612ec6e0eba7a80d8854eefd8bb61)
+CmDepFetchPackage(libressl 4.3.2
+    https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz
+    SHA256=edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5)
 
 CmDepFetchPackage(ada 3.2.4
     https://github.com/ada-url/ada/archive/refs/tags/v3.2.4.tar.gz

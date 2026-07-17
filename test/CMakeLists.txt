@@ -14,6 +14,7 @@ add_executable(vio_tests
     test_tcp_write_guard.cpp
     test_ssl.cpp
     test_ssl_alpn.cpp
+    test_ssl_sni.cpp
     test_ssl_deep.cpp
     test_ssl_config.cpp
     test_ca_certificates.cpp

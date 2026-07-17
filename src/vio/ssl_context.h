@@ -30,6 +30,9 @@ Copyright (c) 2025 Jørgen Lind
 #include <cstring>
 #include <expected>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -231,6 +234,11 @@ inline std::vector<std::string> effective_alpn(const ssl_config_t &config)
   }
   return out;
 }
+
+// Server SNI servername callback: pick the per-hostname SSL_CTX from the store
+// (arg) and switch the connection onto it. Declared here, defined below once
+// sni_cert_store_t is complete. `arg` is a stable sni_cert_store_t*.
+int sni_servername_trampoline(SSL *ssl, int *al, void *arg);
 } // namespace detail
 
 struct ssl_context_t
@@ -242,6 +250,9 @@ struct ssl_context_t
   std::vector<uint8_t> alpn_wire;
   std::vector<uint8_t> ocsp_response; // server: DER OCSP staple, referenced by the status cb
   std::function<void(std::string_view)> keylog;
+  // Server: kept alive here so the SNI servername callback's arg (a raw pointer
+  // into this store) stays valid for the SSL_CTX's lifetime.
+  std::shared_ptr<sni_cert_store_t> sni_store;
 
   ssl_context_t() = default;
   ssl_context_t(const ssl_context_t &) = delete;
@@ -296,6 +307,7 @@ struct ssl_context_t
       return err;
     }
     configure_session_cache(server, config);
+    configure_sni(server, config);
     return {};
   }
 
@@ -515,6 +527,125 @@ private:
       SSL_CTX_sess_set_new_cb(ctx, detail::new_session_cb);
     }
   }
+
+  void configure_sni(bool server, const ssl_config_t &config)
+  {
+    if (!server || !config.sni_store)
+    {
+      return;
+    }
+    sni_store = config.sni_store;
+    SSL_CTX_set_tlsext_servername_callback(ctx, detail::sni_servername_trampoline);
+    SSL_CTX_set_tlsext_servername_arg(ctx, sni_store.get());
+  }
 };
+
+// A server-side registry of per-hostname certificates selected by SNI at
+// handshake time. Each entry is a full SSL_CTX built from a base ssl_config_t
+// (so ALPN / protocol bounds / verify policy match the listener) with that host's
+// certificate + key. Thread-safe: one shared store backs every worker's SSL_CTX,
+// and set_certificate() adds or replaces a host's certificate live -- an
+// in-flight connection keeps the SSL_CTX it already selected (SSL_set_SSL_CTX
+// took its own reference), so issuance and renewal never drop a connection.
+struct sni_cert_store_t
+{
+  // base_config supplies ALPN / protocol bounds / verify policy for every
+  // per-hostname context; its own cert/key and sni_store fields are ignored (the
+  // per-host certificate is supplied to set_certificate). default_ca seeds each
+  // context's trust store (unused unless the listener verifies client certs).
+  static std::shared_ptr<sni_cert_store_t> create(const ssl_config_t &base_config, std::string default_ca)
+  {
+    auto store = std::shared_ptr<sni_cert_store_t>(new sni_cert_store_t());
+    store->base_config = base_config;
+    store->base_config.sni_store.reset();
+    store->base_config.cert_mem.reset();
+    store->base_config.key_mem.reset();
+    store->base_config.cert_file.reset();
+    store->base_config.key_file.reset();
+    store->default_ca = std::move(default_ca);
+    return store;
+  }
+
+  // Build (or rebuild) the certificate context for `host` from PEM material and
+  // install it atomically. Safe to call from any thread while handshakes run.
+  std::expected<void, error_t> set_certificate(std::string_view host, std::span<const uint8_t> cert_pem, std::span<const uint8_t> key_pem)
+  {
+    ssl_config_t cfg = base_config;
+    cfg.cert_mem = std::vector<uint8_t>(cert_pem.begin(), cert_pem.end());
+    cfg.key_mem = std::vector<uint8_t>(key_pem.begin(), key_pem.end());
+    auto context = std::make_shared<ssl_context_t>();
+    if (auto err = context->init(true, cfg, default_ca); err.code != 0)
+    {
+      return std::unexpected(std::move(err));
+    }
+    std::string key = normalize(host);
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      hosts[std::move(key)] = std::move(context);
+    }
+    return {};
+  }
+
+  // The context for `host`, or nullptr if none is registered. Returns a shared_ptr
+  // so the caller (the servername callback) keeps the context alive across the
+  // SSL_set_SSL_CTX switch even if another thread replaces the entry meanwhile.
+  std::shared_ptr<ssl_context_t> resolve(std::string_view host) const
+  {
+    std::string key = normalize(host);
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = hosts.find(key);
+    return it == hosts.end() ? nullptr : it->second;
+  }
+
+  bool contains(std::string_view host) const
+  {
+    std::string key = normalize(host);
+    std::lock_guard<std::mutex> lock(mutex);
+    return hosts.find(key) != hosts.end();
+  }
+
+private:
+  sni_cert_store_t() = default;
+
+  static std::string normalize(std::string_view host)
+  {
+    std::string out(host);
+    for (char &c : out)
+    {
+      if (c >= 'A' && c <= 'Z')
+      {
+        c = static_cast<char>(c - 'A' + 'a');
+      }
+    }
+    return out;
+  }
+
+  ssl_config_t base_config;
+  std::string default_ca;
+  mutable std::mutex mutex;
+  std::unordered_map<std::string, std::shared_ptr<ssl_context_t>> hosts;
+};
+
+namespace detail
+{
+inline int sni_servername_trampoline(SSL *ssl, int * /*al*/, void *arg)
+{
+  auto *store = static_cast<sni_cert_store_t *>(arg);
+  if (store == nullptr)
+  {
+    return SSL_TLSEXT_ERR_OK;
+  }
+  const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+  if (name == nullptr)
+  {
+    return SSL_TLSEXT_ERR_OK;
+  }
+  if (auto context = store->resolve(name); context && context->ctx != nullptr)
+  {
+    SSL_set_SSL_CTX(ssl, context->ctx);
+  }
+  return SSL_TLSEXT_ERR_OK;
+}
+} // namespace detail
 
 } // namespace vio

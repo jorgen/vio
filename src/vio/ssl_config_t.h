@@ -24,6 +24,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,6 +35,11 @@ namespace vio
 // Forward-declared so this header stays free of OpenSSL includes. Defined in
 // ssl_context.h. An app-owned, shared client session cache for TLS resumption.
 struct ssl_session_cache_t;
+
+// Forward-declared (defined in ssl_context.h). A server-side, thread-safe
+// registry of per-hostname certificates selected at handshake time by SNI, with
+// live add/replace for issuance and renewal. See sni_store below.
+struct sni_cert_store_t;
 
 // TLS protocol version bounds. TLS 1.0/1.1 are intentionally unrepresentable:
 // they are compiled out of LibreSSL, so TLS 1.2 is the floor for every backend.
@@ -103,6 +109,14 @@ struct ssl_config_t
   // Client-only: request an OCSP staple (status_request extension). The server's
   // stapled response is then readable via ssl_client_ocsp_response().
   bool request_ocsp_staple = false;
+
+  // Server-only: per-hostname certificate selection by SNI. When set, the server
+  // wires an SNI servername callback that swaps the connection onto the matching
+  // host's SSL_CTX (falling back to this config's own cert on no match). The store
+  // is shared and thread-safe: the same store backs every worker, and certificates
+  // can be added/replaced live (ACME issuance/renewal) without dropping in-flight
+  // connections. cert_file/key_file (or cert_mem/key_mem) here are the fallback.
+  std::shared_ptr<sni_cert_store_t> sni_store;
 
   // --- deprecated libtls-shaped fields (kept for aggregate compatibility) ---
   std::optional<bool> verify_client;   // deprecated: use peer_verify

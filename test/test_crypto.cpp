@@ -175,6 +175,45 @@ TEST_CASE("base64 decode rejects malformed input")
   CHECK_FALSE(vio::crypto::base64_decode("Z===").has_value());
 }
 
+TEST_CASE("base64url encode omits padding and uses the url-safe alphabet")
+{
+  CHECK(vio::crypto::base64url_encode(to_bytes("")) == "");
+  CHECK(vio::crypto::base64url_encode(to_bytes("f")) == "Zg");
+  CHECK(vio::crypto::base64url_encode(to_bytes("fo")) == "Zm8");
+  CHECK(vio::crypto::base64url_encode(to_bytes("foo")) == "Zm9v");
+  CHECK(vio::crypto::base64url_encode(to_bytes("foob")) == "Zm9vYg");
+  CHECK(vio::crypto::base64url_encode(to_bytes("fooba")) == "Zm9vYmE");
+  CHECK(vio::crypto::base64url_encode(to_bytes("foobar")) == "Zm9vYmFy");
+  // Bytes 0xFB 0xFF exercise the two chars that differ from standard base64
+  // ('+' -> '-', '/' -> '_'): standard base64("\xfb\xff") == "+/8=".
+  const std::vector<uint8_t> hi{0xFB, 0xFF};
+  CHECK(vio::crypto::base64_encode(hi) == "+/8=");
+  CHECK(vio::crypto::base64url_encode(hi) == "-_8");
+}
+
+TEST_CASE("base64url decode accepts unpadded url-safe input and round-trips")
+{
+  auto expect = [](const char *b64url, const char *plain)
+  {
+    auto decoded = vio::crypto::base64url_decode(b64url);
+    REQUIRE(decoded.has_value());
+    CHECK(*decoded == to_bytes(plain));
+  };
+  expect("", "");
+  expect("Zg", "f");
+  expect("Zm8", "fo");
+  expect("Zm9v", "foo");
+  expect("Zm9vYg", "foob");
+  expect("Zm9vYmE", "fooba");
+  expect("Zm9vYmFy", "foobar");
+  // Tolerates optional padding on input too.
+  expect("Zg==", "f");
+  const std::vector<uint8_t> hi{0xFB, 0xFF};
+  auto decoded = vio::crypto::base64url_decode("-_8");
+  REQUIRE(decoded.has_value());
+  CHECK(*decoded == hi);
+}
+
 TEST_CASE("random_bytes fills the buffer and succeeds")
 {
   std::vector<uint8_t> a(32, 0);
