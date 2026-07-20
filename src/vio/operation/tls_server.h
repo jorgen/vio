@@ -21,6 +21,8 @@ Copyright (c) 2025 Jørgen Lind
 */
 
 #pragma once
+
+#include "vio/operation/tcp.h"
 #include "tcp.h"
 #include "tcp_server.h"
 #include "tls_client.h"
@@ -280,6 +282,17 @@ inline std::optional<std::string> ssl_server_client_alpn_selected(const ssl_serv
     return std::nullopt;
   }
   return s;
+}
+
+// The remote peer's IP address for an accepted TLS client (its underlying TCP
+// connection). Empty if unavailable.
+inline std::string ssl_server_client_peer_ip(ssl_server_client_t &client)
+{
+  if (client.handle.ref_counted() == nullptr)
+  {
+    return {};
+  }
+  return peer_ip(client.handle->tcp.get_tcp());
 }
 
 } // namespace vio
