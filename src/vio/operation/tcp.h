@@ -44,6 +44,32 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+// The remote peer's IP address of a connected TCP handle, as a string (IPv4
+// dotted-quad or bracket-less IPv6). Empty if unavailable.
+inline std::string peer_ip(uv_tcp_t *tcp)
+{
+  if (tcp == nullptr)
+  {
+    return {};
+  }
+  sockaddr_storage storage{};
+  int namelen = static_cast<int>(sizeof(storage));
+  if (uv_tcp_getpeername(tcp, reinterpret_cast<sockaddr *>(&storage), &namelen) != 0)
+  {
+    return {};
+  }
+  char buffer[64] = {};
+  if (storage.ss_family == AF_INET)
+  {
+    uv_ip4_name(reinterpret_cast<sockaddr_in *>(&storage), buffer, sizeof(buffer));
+  }
+  else if (storage.ss_family == AF_INET6)
+  {
+    uv_ip6_name(reinterpret_cast<sockaddr_in6 *>(&storage), buffer, sizeof(buffer));
+  }
+  return std::string(buffer);
+}
+
 struct tcp_listen_state_t
 {
   std::coroutine_handle<> continuation;

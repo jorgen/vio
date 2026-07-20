@@ -1,0 +1,2259 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/usr/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+      - "/bin/"
+    searched_directories:
+      - "/home/jlind/.local/bin/uname"
+      - "/usr/local/sbin/uname"
+      - "/usr/local/bin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:6 (project)"
+    message: |
+      The system is: Linux - 7.0.14-arch1-1 - x86_64
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerId.cmake:468 (find_file)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerId.cmake:506 (CMAKE_DETERMINE_COMPILER_ID_WRITE)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerId.cmake:8 (CMAKE_DETERMINE_COMPILER_ID_BUILD)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:122 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "file"
+    variable: "src_in"
+    description: "Path to a file."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "CMakeCCompilerId.c.in"
+    candidate_directories:
+      - "/usr/share/cmake/Modules/"
+    found: "/usr/share/cmake/Modules/CMakeCCompilerId.c.in"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:122 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:6 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: /usr/bin/cc 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      0
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "a.out"
+      
+      The C compiler identification is GNU, found in:
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/4.3.4/CompilerIdC/a.out
+      
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_AR"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "ar"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/ar"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_RANLIB"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "ranlib"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/ranlib"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_STRIP"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "strip"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/strip"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_LINKER"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "ld"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/ld"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_NM"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "nm"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/nm"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_OBJDUMP"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "objdump"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/objdump"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_OBJCOPY"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "objcopy"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/objcopy"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_READELF"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "readelf"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/readelf"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_DLLTOOL"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "dlltool"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    searched_directories:
+      - "/usr/bin/dlltool"
+      - "/home/jlind/.local/bin/dlltool"
+      - "/usr/local/sbin/dlltool"
+      - "/usr/local/bin/dlltool"
+      - "/opt/cuda/bin/dlltool"
+      - "/var/lib/flatpak/exports/bin/dlltool"
+      - "/usr/lib/jvm/default/bin/dlltool"
+      - "/usr/bin/site_perl/dlltool"
+      - "/usr/bin/vendor_perl/dlltool"
+      - "/usr/bin/core_perl/dlltool"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/dlltool"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_ADDR2LINE"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "addr2line"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    found: "/usr/bin/addr2line"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_TAPI"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "tapi"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    searched_directories:
+      - "/usr/bin/tapi"
+      - "/home/jlind/.local/bin/tapi"
+      - "/usr/local/sbin/tapi"
+      - "/usr/local/bin/tapi"
+      - "/opt/cuda/bin/tapi"
+      - "/var/lib/flatpak/exports/bin/tapi"
+      - "/usr/lib/jvm/default/bin/tapi"
+      - "/usr/bin/site_perl/tapi"
+      - "/usr/bin/vendor_perl/tapi"
+      - "/usr/bin/core_perl/tapi"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/tapi"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/Compiler/GNU-FindBinUtils.cmake:18 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:201 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_C_COMPILER_AR"
+    description: "A wrapper around 'ar' adding the appropriate '--plugin' option for the GCC compiler"
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "gcc-ar-16.1"
+      - "gcc-ar-16"
+      - "gcc-ar16"
+      - "gcc-ar"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    searched_directories:
+      - "/usr/bin/gcc-ar-16.1"
+      - "/home/jlind/.local/bin/gcc-ar-16.1"
+      - "/usr/local/sbin/gcc-ar-16.1"
+      - "/usr/local/bin/gcc-ar-16.1"
+      - "/opt/cuda/bin/gcc-ar-16.1"
+      - "/var/lib/flatpak/exports/bin/gcc-ar-16.1"
+      - "/usr/lib/jvm/default/bin/gcc-ar-16.1"
+      - "/usr/bin/site_perl/gcc-ar-16.1"
+      - "/usr/bin/vendor_perl/gcc-ar-16.1"
+      - "/usr/bin/core_perl/gcc-ar-16.1"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ar-16.1"
+      - "/usr/bin/gcc-ar-16"
+      - "/home/jlind/.local/bin/gcc-ar-16"
+      - "/usr/local/sbin/gcc-ar-16"
+      - "/usr/local/bin/gcc-ar-16"
+      - "/opt/cuda/bin/gcc-ar-16"
+      - "/var/lib/flatpak/exports/bin/gcc-ar-16"
+      - "/usr/lib/jvm/default/bin/gcc-ar-16"
+      - "/usr/bin/site_perl/gcc-ar-16"
+      - "/usr/bin/vendor_perl/gcc-ar-16"
+      - "/usr/bin/core_perl/gcc-ar-16"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ar-16"
+      - "/usr/bin/gcc-ar16"
+      - "/home/jlind/.local/bin/gcc-ar16"
+      - "/usr/local/sbin/gcc-ar16"
+      - "/usr/local/bin/gcc-ar16"
+      - "/opt/cuda/bin/gcc-ar16"
+      - "/var/lib/flatpak/exports/bin/gcc-ar16"
+      - "/usr/lib/jvm/default/bin/gcc-ar16"
+      - "/usr/bin/site_perl/gcc-ar16"
+      - "/usr/bin/vendor_perl/gcc-ar16"
+      - "/usr/bin/core_perl/gcc-ar16"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ar16"
+    found: "/usr/bin/gcc-ar"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/Compiler/GNU-FindBinUtils.cmake:30 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCCompiler.cmake:201 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_C_COMPILER_RANLIB"
+    description: "A wrapper around 'ranlib' adding the appropriate '--plugin' option for the GCC compiler"
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "gcc-ranlib-16.1"
+      - "gcc-ranlib-16"
+      - "gcc-ranlib16"
+      - "gcc-ranlib"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    searched_directories:
+      - "/usr/bin/gcc-ranlib-16.1"
+      - "/home/jlind/.local/bin/gcc-ranlib-16.1"
+      - "/usr/local/sbin/gcc-ranlib-16.1"
+      - "/usr/local/bin/gcc-ranlib-16.1"
+      - "/opt/cuda/bin/gcc-ranlib-16.1"
+      - "/var/lib/flatpak/exports/bin/gcc-ranlib-16.1"
+      - "/usr/lib/jvm/default/bin/gcc-ranlib-16.1"
+      - "/usr/bin/site_perl/gcc-ranlib-16.1"
+      - "/usr/bin/vendor_perl/gcc-ranlib-16.1"
+      - "/usr/bin/core_perl/gcc-ranlib-16.1"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ranlib-16.1"
+      - "/usr/bin/gcc-ranlib-16"
+      - "/home/jlind/.local/bin/gcc-ranlib-16"
+      - "/usr/local/sbin/gcc-ranlib-16"
+      - "/usr/local/bin/gcc-ranlib-16"
+      - "/opt/cuda/bin/gcc-ranlib-16"
+      - "/var/lib/flatpak/exports/bin/gcc-ranlib-16"
+      - "/usr/lib/jvm/default/bin/gcc-ranlib-16"
+      - "/usr/bin/site_perl/gcc-ranlib-16"
+      - "/usr/bin/vendor_perl/gcc-ranlib-16"
+      - "/usr/bin/core_perl/gcc-ranlib-16"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ranlib-16"
+      - "/usr/bin/gcc-ranlib16"
+      - "/home/jlind/.local/bin/gcc-ranlib16"
+      - "/usr/local/sbin/gcc-ranlib16"
+      - "/usr/local/bin/gcc-ranlib16"
+      - "/opt/cuda/bin/gcc-ranlib16"
+      - "/var/lib/flatpak/exports/bin/gcc-ranlib16"
+      - "/usr/lib/jvm/default/bin/gcc-ranlib16"
+      - "/usr/bin/site_perl/gcc-ranlib16"
+      - "/usr/bin/vendor_perl/gcc-ranlib16"
+      - "/usr/bin/core_perl/gcc-ranlib16"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ranlib16"
+    found: "/usr/bin/gcc-ranlib"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineCompiler.cmake:54 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineASMCompiler.cmake:61 (_cmake_find_compiler)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_ASM_COMPILER"
+    description: "ASM compiler"
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "/usr/bin/cc"
+    candidate_directories:
+      - "/usr/bin/"
+    found: "/usr/bin/cc"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerId.cmake:1296 (message)"
+      - "/usr/share/cmake/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "CMakeLists.txt:6 (project)"
+    message: |
+      Checking whether the ASM compiler is GNU using "--version" matched "(GNU assembler)|(GCC)|(Free Software Foundation)":
+      cc (GCC) 16.1.1 20260625
+      Copyright (C) 2026 Free Software Foundation, Inc.
+      This is free software; see the source for copying conditions.  There is NO
+      warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+      
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/Compiler/GNU-FindBinUtils.cmake:18 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineASMCompiler.cmake:268 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_ASM_COMPILER_AR"
+    description: "A wrapper around 'ar' adding the appropriate '--plugin' option for the GCC compiler"
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "gcc-ar-"
+      - "gcc-ar-"
+      - "gcc-ar"
+      - "gcc-ar"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    searched_directories:
+      - "/usr/bin/gcc-ar-"
+      - "/home/jlind/.local/bin/gcc-ar-"
+      - "/usr/local/sbin/gcc-ar-"
+      - "/usr/local/bin/gcc-ar-"
+      - "/opt/cuda/bin/gcc-ar-"
+      - "/var/lib/flatpak/exports/bin/gcc-ar-"
+      - "/usr/lib/jvm/default/bin/gcc-ar-"
+      - "/usr/bin/site_perl/gcc-ar-"
+      - "/usr/bin/vendor_perl/gcc-ar-"
+      - "/usr/bin/core_perl/gcc-ar-"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ar-"
+      - "/usr/bin/gcc-ar-"
+      - "/home/jlind/.local/bin/gcc-ar-"
+      - "/usr/local/sbin/gcc-ar-"
+      - "/usr/local/bin/gcc-ar-"
+      - "/opt/cuda/bin/gcc-ar-"
+      - "/var/lib/flatpak/exports/bin/gcc-ar-"
+      - "/usr/lib/jvm/default/bin/gcc-ar-"
+      - "/usr/bin/site_perl/gcc-ar-"
+      - "/usr/bin/vendor_perl/gcc-ar-"
+      - "/usr/bin/core_perl/gcc-ar-"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ar-"
+    found: "/usr/bin/gcc-ar"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/Compiler/GNU-FindBinUtils.cmake:30 (find_program)"
+      - "/usr/share/cmake/Modules/CMakeDetermineASMCompiler.cmake:268 (include)"
+      - "CMakeLists.txt:6 (project)"
+    mode: "program"
+    variable: "CMAKE_ASM_COMPILER_RANLIB"
+    description: "A wrapper around 'ranlib' adding the appropriate '--plugin' option for the GCC compiler"
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "gcc-ranlib-"
+      - "gcc-ranlib-"
+      - "gcc-ranlib"
+      - "gcc-ranlib"
+    candidate_directories:
+      - "/usr/bin/"
+      - "/home/jlind/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/opt/cuda/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/"
+    searched_directories:
+      - "/usr/bin/gcc-ranlib-"
+      - "/home/jlind/.local/bin/gcc-ranlib-"
+      - "/usr/local/sbin/gcc-ranlib-"
+      - "/usr/local/bin/gcc-ranlib-"
+      - "/opt/cuda/bin/gcc-ranlib-"
+      - "/var/lib/flatpak/exports/bin/gcc-ranlib-"
+      - "/usr/lib/jvm/default/bin/gcc-ranlib-"
+      - "/usr/bin/site_perl/gcc-ranlib-"
+      - "/usr/bin/vendor_perl/gcc-ranlib-"
+      - "/usr/bin/core_perl/gcc-ranlib-"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ranlib-"
+      - "/usr/bin/gcc-ranlib-"
+      - "/home/jlind/.local/bin/gcc-ranlib-"
+      - "/usr/local/sbin/gcc-ranlib-"
+      - "/usr/local/bin/gcc-ranlib-"
+      - "/opt/cuda/bin/gcc-ranlib-"
+      - "/var/lib/flatpak/exports/bin/gcc-ranlib-"
+      - "/usr/lib/jvm/default/bin/gcc-ranlib-"
+      - "/usr/bin/site_perl/gcc-ranlib-"
+      - "/usr/bin/vendor_perl/gcc-ranlib-"
+      - "/usr/bin/core_perl/gcc-ranlib-"
+      - "/home/jlind/.local/share/JetBrains/Toolbox/scripts/gcc-ranlib-"
+    found: "/usr/bin/gcc-ranlib"
+    search_context:
+      ENV{PATH}:
+        - "/home/jlind/.local/bin"
+        - "/home/jlind/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/cuda/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/jlind/.local/share/JetBrains/Toolbox/scripts"
+      CMAKE_INSTALL_PREFIX: "/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install"
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:83 (try_compile)"
+      - "/usr/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:6 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-PPBfA5"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-PPBfA5"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-PPBfA5'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_496e7
+        [1/2] /usr/bin/cc   -v -o CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake/Modules/CMakeCCompilerABI.c
+        Using built-in specs.
+        COLLECT_GCC=/usr/bin/cc
+        Target: x86_64-pc-linux-gnu
+        Configured with: ../gcc/configure --enable-languages=ada,c,c++,d,fortran,go,lto,m2,objc,obj-c++,rust,cobol --enable-bootstrap --prefix=/usr --libdir=/usr/lib --libexecdir=/usr/lib --mandir=/usr/share/man --infodir=/usr/share/info --with-bugurl=https://gitlab.archlinux.org/archlinux/packaging/packages/gcc/-/issues --with-build-config=bootstrap-lto --with-gcc-major-version-only --with-linker-hash-style=gnu --with-system-zlib --enable-cet=auto --enable-checking=release --enable-clocale=gnu --enable-default-pie --enable-default-ssp --enable-gnu-indirect-function --enable-gnu-unique-object --enable-libstdcxx-backtrace --enable-link-serialization=1 --enable-linker-build-id --enable-lto --enable-multilib --enable-plugin --enable-shared --enable-threads=posix --disable-fixincludes --disable-libssp --disable-libstdcxx-pch --disable-werror
+        Thread model: posix
+        Supported LTO compression algorithms: zlib zstd
+        gcc version 16.1.1 20260625 (GCC) 
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_496e7.dir/'
+         /usr/lib/gcc/x86_64-pc-linux-gnu/16/cc1 -quiet -v /usr/share/cmake/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_496e7.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -mtune=generic -march=x86-64 -version -o /tmp/ccgfs6ap.s
+        GNU C23 (GCC) version 16.1.1 20260625 (x86_64-pc-linux-gnu)
+        	compiled by GNU C version 16.1.1 20260625, GMP version 6.3.0, MPFR version 4.2.2, MPC version 1.4.1, isl version isl-0.27-GMP
+        
+        GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+        ignoring nonexistent directory "/usr/lib/gcc/x86_64-pc-linux-gnu/16/include-fixed"
+        ignoring nonexistent directory "/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../x86_64-pc-linux-gnu/include"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /usr/lib/gcc/x86_64-pc-linux-gnu/16/include
+         /usr/local/include
+         /usr/include
+        End of search list.
+        Compiler executable checksum: 513320b9f75de00455fdfff1fcba9e5b
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_496e7.dir/'
+         as -v --64 -o CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o /tmp/ccgfs6ap.s
+        GNU assembler version 2.46.1 (x86_64-pc-linux-gnu) using BFD version (GNU Binutils) 2.46.1
+        COMPILER_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/
+        LIBRARY_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/:/lib/../lib/:/usr/lib/../lib/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../:/lib/:/usr/lib/
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.'
+        [2/2] : && /usr/bin/cc  -v -Wl,-v CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -o cmTC_496e7   && :
+        Using built-in specs.
+        COLLECT_GCC=/usr/bin/cc
+        COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-pc-linux-gnu/16/lto-wrapper
+        Target: x86_64-pc-linux-gnu
+        Configured with: ../gcc/configure --enable-languages=ada,c,c++,d,fortran,go,lto,m2,objc,obj-c++,rust,cobol --enable-bootstrap --prefix=/usr --libdir=/usr/lib --libexecdir=/usr/lib --mandir=/usr/share/man --infodir=/usr/share/info --with-bugurl=https://gitlab.archlinux.org/archlinux/packaging/packages/gcc/-/issues --with-build-config=bootstrap-lto --with-gcc-major-version-only --with-linker-hash-style=gnu --with-system-zlib --enable-cet=auto --enable-checking=release --enable-clocale=gnu --enable-default-pie --enable-default-ssp --enable-gnu-indirect-function --enable-gnu-unique-object --enable-libstdcxx-backtrace --enable-link-serialization=1 --enable-linker-build-id --enable-lto --enable-multilib --enable-plugin --enable-shared --enable-threads=posix --disable-fixincludes --disable-libssp --disable-libstdcxx-pch --disable-werror
+        Thread model: posix
+        Supported LTO compression algorithms: zlib zstd
+        gcc version 16.1.1 20260625 (GCC) 
+        COMPILER_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/
+        LIBRARY_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/:/lib/../lib/:/usr/lib/../lib/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../:/lib/:/usr/lib/
+        COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_496e7' '-mtune=generic' '-march=x86-64' '-dumpdir' 'cmTC_496e7.'
+         /usr/lib/gcc/x86_64-pc-linux-gnu/16/collect2 -plugin /usr/lib/gcc/x86_64-pc-linux-gnu/16/liblto_plugin.so -plugin-opt=/usr/lib/gcc/x86_64-pc-linux-gnu/16/lto-wrapper -plugin-opt=-fresolution=/tmp/ccs0Y65X.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded -plugin-opt=-pass-through=-latomic_asneeded -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded --build-id --eh-frame-hdr --hash-style=gnu -m elf_x86_64 -dynamic-linker /lib64/ld-linux-x86-64.so.2 -pie -o cmTC_496e7 /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/Scrt1.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crti.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtbeginS.o -L/usr/lib/gcc/x86_64-pc-linux-gnu/16 -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib -L/lib/../lib -L/usr/lib/../lib -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -lgcc -lgcc_s_asneeded -latomic_asneeded -lc -lgcc -lgcc_s_asneeded /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtendS.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crtn.o
+        collect2 version 16.1.1 20260625
+        /usr/bin/ld -plugin /usr/lib/gcc/x86_64-pc-linux-gnu/16/liblto_plugin.so -plugin-opt=/usr/lib/gcc/x86_64-pc-linux-gnu/16/lto-wrapper -plugin-opt=-fresolution=/tmp/ccs0Y65X.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded -plugin-opt=-pass-through=-latomic_asneeded -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded --build-id --eh-frame-hdr --hash-style=gnu -m elf_x86_64 -dynamic-linker /lib64/ld-linux-x86-64.so.2 -pie -o cmTC_496e7 /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/Scrt1.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crti.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtbeginS.o -L/usr/lib/gcc/x86_64-pc-linux-gnu/16 -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib -L/lib/../lib -L/usr/lib/../lib -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -lgcc -lgcc_s_asneeded -latomic_asneeded -lc -lgcc -lgcc_s_asneeded /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtendS.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crtn.o
+        GNU ld (GNU Binutils) 2.46.1
+        COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_496e7' '-mtune=generic' '-march=x86-64' '-dumpdir' 'cmTC_496e7.'
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:217 (message)"
+      - "/usr/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:6 (project)"
+    message: |
+      Parsed C implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [/usr/lib/gcc/x86_64-pc-linux-gnu/16/include]
+          add: [/usr/local/include]
+          add: [/usr/include]
+        end of search list found
+        collapse include dir [/usr/lib/gcc/x86_64-pc-linux-gnu/16/include] ==> [/usr/lib/gcc/x86_64-pc-linux-gnu/16/include]
+        collapse include dir [/usr/local/include] ==> [/usr/local/include]
+        collapse include dir [/usr/include] ==> [/usr/include]
+        implicit include dirs: [/usr/lib/gcc/x86_64-pc-linux-gnu/16/include;/usr/local/include;/usr/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:253 (message)"
+      - "/usr/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:6 (project)"
+    message: |
+      Parsed C implicit link information:
+        link line regex: [^( *|.*[/\\])(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        linker tool regex: [^[ 	]*(->|"|[0-9]+>[ 	-]*Build:[ 	0-9]+ ms[ 	]*)?[ 	]*(([^"]*[/\\])?(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)))("|,| |$)]
+        ignore line: [Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-PPBfA5']
+        ignore line: []
+        ignore line: [Run Build Command(s): /usr/bin/ninja -v cmTC_496e7]
+        ignore line: [[1/2] /usr/bin/cc   -v -o CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake/Modules/CMakeCCompilerABI.c]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/usr/bin/cc]
+        ignore line: [Target: x86_64-pc-linux-gnu]
+        ignore line: [Configured with: ../gcc/configure --enable-languages=ada c c++ d fortran go lto m2 objc obj-c++ rust cobol --enable-bootstrap --prefix=/usr --libdir=/usr/lib --libexecdir=/usr/lib --mandir=/usr/share/man --infodir=/usr/share/info --with-bugurl=https://gitlab.archlinux.org/archlinux/packaging/packages/gcc/-/issues --with-build-config=bootstrap-lto --with-gcc-major-version-only --with-linker-hash-style=gnu --with-system-zlib --enable-cet=auto --enable-checking=release --enable-clocale=gnu --enable-default-pie --enable-default-ssp --enable-gnu-indirect-function --enable-gnu-unique-object --enable-libstdcxx-backtrace --enable-link-serialization=1 --enable-linker-build-id --enable-lto --enable-multilib --enable-plugin --enable-shared --enable-threads=posix --disable-fixincludes --disable-libssp --disable-libstdcxx-pch --disable-werror]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib zstd]
+        ignore line: [gcc version 16.1.1 20260625 (GCC) ]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_496e7.dir/']
+        ignore line: [ /usr/lib/gcc/x86_64-pc-linux-gnu/16/cc1 -quiet -v /usr/share/cmake/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_496e7.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -mtune=generic -march=x86-64 -version -o /tmp/ccgfs6ap.s]
+        ignore line: [GNU C23 (GCC) version 16.1.1 20260625 (x86_64-pc-linux-gnu)]
+        ignore line: [	compiled by GNU C version 16.1.1 20260625  GMP version 6.3.0  MPFR version 4.2.2  MPC version 1.4.1  isl version isl-0.27-GMP]
+        ignore line: []
+        ignore line: [GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/x86_64-pc-linux-gnu/16/include-fixed"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../x86_64-pc-linux-gnu/include"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ /usr/lib/gcc/x86_64-pc-linux-gnu/16/include]
+        ignore line: [ /usr/local/include]
+        ignore line: [ /usr/include]
+        ignore line: [End of search list.]
+        ignore line: [Compiler executable checksum: 513320b9f75de00455fdfff1fcba9e5b]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_496e7.dir/']
+        ignore line: [ as -v --64 -o CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o /tmp/ccgfs6ap.s]
+        ignore line: [GNU assembler version 2.46.1 (x86_64-pc-linux-gnu) using BFD version (GNU Binutils) 2.46.1]
+        ignore line: [COMPILER_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/]
+        ignore line: [LIBRARY_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/:/lib/../lib/:/usr/lib/../lib/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../:/lib/:/usr/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.']
+        ignore line: [[2/2] : && /usr/bin/cc  -v -Wl -v CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -o cmTC_496e7   && :]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/usr/bin/cc]
+        ignore line: [COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-pc-linux-gnu/16/lto-wrapper]
+        ignore line: [Target: x86_64-pc-linux-gnu]
+        ignore line: [Configured with: ../gcc/configure --enable-languages=ada c c++ d fortran go lto m2 objc obj-c++ rust cobol --enable-bootstrap --prefix=/usr --libdir=/usr/lib --libexecdir=/usr/lib --mandir=/usr/share/man --infodir=/usr/share/info --with-bugurl=https://gitlab.archlinux.org/archlinux/packaging/packages/gcc/-/issues --with-build-config=bootstrap-lto --with-gcc-major-version-only --with-linker-hash-style=gnu --with-system-zlib --enable-cet=auto --enable-checking=release --enable-clocale=gnu --enable-default-pie --enable-default-ssp --enable-gnu-indirect-function --enable-gnu-unique-object --enable-libstdcxx-backtrace --enable-link-serialization=1 --enable-linker-build-id --enable-lto --enable-multilib --enable-plugin --enable-shared --enable-threads=posix --disable-fixincludes --disable-libssp --disable-libstdcxx-pch --disable-werror]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib zstd]
+        ignore line: [gcc version 16.1.1 20260625 (GCC) ]
+        ignore line: [COMPILER_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/]
+        ignore line: [LIBRARY_PATH=/usr/lib/gcc/x86_64-pc-linux-gnu/16/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/:/lib/../lib/:/usr/lib/../lib/:/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../:/lib/:/usr/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_496e7' '-mtune=generic' '-march=x86-64' '-dumpdir' 'cmTC_496e7.']
+        link line: [ /usr/lib/gcc/x86_64-pc-linux-gnu/16/collect2 -plugin /usr/lib/gcc/x86_64-pc-linux-gnu/16/liblto_plugin.so -plugin-opt=/usr/lib/gcc/x86_64-pc-linux-gnu/16/lto-wrapper -plugin-opt=-fresolution=/tmp/ccs0Y65X.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded -plugin-opt=-pass-through=-latomic_asneeded -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded --build-id --eh-frame-hdr --hash-style=gnu -m elf_x86_64 -dynamic-linker /lib64/ld-linux-x86-64.so.2 -pie -o cmTC_496e7 /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/Scrt1.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crti.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtbeginS.o -L/usr/lib/gcc/x86_64-pc-linux-gnu/16 -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib -L/lib/../lib -L/usr/lib/../lib -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -lgcc -lgcc_s_asneeded -latomic_asneeded -lc -lgcc -lgcc_s_asneeded /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtendS.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crtn.o]
+          arg [/usr/lib/gcc/x86_64-pc-linux-gnu/16/collect2] ==> ignore
+          arg [-plugin] ==> ignore
+          arg [/usr/lib/gcc/x86_64-pc-linux-gnu/16/liblto_plugin.so] ==> ignore
+          arg [-plugin-opt=/usr/lib/gcc/x86_64-pc-linux-gnu/16/lto-wrapper] ==> ignore
+          arg [-plugin-opt=-fresolution=/tmp/ccs0Y65X.res] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc_s_asneeded] ==> ignore
+          arg [-plugin-opt=-pass-through=-latomic_asneeded] ==> ignore
+          arg [-plugin-opt=-pass-through=-lc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc_s_asneeded] ==> ignore
+          arg [--build-id] ==> ignore
+          arg [--eh-frame-hdr] ==> ignore
+          arg [--hash-style=gnu] ==> ignore
+          arg [-m] ==> ignore
+          arg [elf_x86_64] ==> ignore
+          arg [-dynamic-linker] ==> ignore
+          arg [/lib64/ld-linux-x86-64.so.2] ==> ignore
+          arg [-pie] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_496e7] ==> ignore
+          arg [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/Scrt1.o] ==> obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/Scrt1.o]
+          arg [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crti.o] ==> obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crti.o]
+          arg [/usr/lib/gcc/x86_64-pc-linux-gnu/16/crtbeginS.o] ==> obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/crtbeginS.o]
+          arg [-L/usr/lib/gcc/x86_64-pc-linux-gnu/16] ==> dir [/usr/lib/gcc/x86_64-pc-linux-gnu/16]
+          arg [-L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib] ==> dir [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib]
+          arg [-L/lib/../lib] ==> dir [/lib/../lib]
+          arg [-L/usr/lib/../lib] ==> dir [/usr/lib/../lib]
+          arg [-L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../..] ==> dir [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../..]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/lib] ==> dir [/usr/lib]
+          arg [-v] ==> ignore
+          arg [CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o] ==> ignore
+          arg [-lgcc] ==> lib [gcc]
+          arg [-lgcc_s_asneeded] ==> lib [gcc_s_asneeded]
+          arg [-latomic_asneeded] ==> lib [atomic_asneeded]
+          arg [-lc] ==> lib [c]
+          arg [-lgcc] ==> lib [gcc]
+          arg [-lgcc_s_asneeded] ==> lib [gcc_s_asneeded]
+          arg [/usr/lib/gcc/x86_64-pc-linux-gnu/16/crtendS.o] ==> obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/crtendS.o]
+          arg [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crtn.o] ==> obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crtn.o]
+        ignore line: [collect2 version 16.1.1 20260625]
+        ignore line: [/usr/bin/ld -plugin /usr/lib/gcc/x86_64-pc-linux-gnu/16/liblto_plugin.so -plugin-opt=/usr/lib/gcc/x86_64-pc-linux-gnu/16/lto-wrapper -plugin-opt=-fresolution=/tmp/ccs0Y65X.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded -plugin-opt=-pass-through=-latomic_asneeded -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s_asneeded --build-id --eh-frame-hdr --hash-style=gnu -m elf_x86_64 -dynamic-linker /lib64/ld-linux-x86-64.so.2 -pie -o cmTC_496e7 /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/Scrt1.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crti.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtbeginS.o -L/usr/lib/gcc/x86_64-pc-linux-gnu/16 -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib -L/lib/../lib -L/usr/lib/../lib -L/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_496e7.dir/CMakeCCompilerABI.c.o -lgcc -lgcc_s_asneeded -latomic_asneeded -lc -lgcc -lgcc_s_asneeded /usr/lib/gcc/x86_64-pc-linux-gnu/16/crtendS.o /usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crtn.o]
+        linker tool for 'C': /usr/bin/ld
+        collapse obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/Scrt1.o] ==> [/usr/lib/Scrt1.o]
+        collapse obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crti.o] ==> [/usr/lib/crti.o]
+        collapse obj [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib/crtn.o] ==> [/usr/lib/crtn.o]
+        collapse library dir [/usr/lib/gcc/x86_64-pc-linux-gnu/16] ==> [/usr/lib/gcc/x86_64-pc-linux-gnu/16]
+        collapse library dir [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../../../lib] ==> [/usr/lib]
+        collapse library dir [/lib/../lib] ==> [/lib]
+        collapse library dir [/usr/lib/../lib] ==> [/usr/lib]
+        collapse library dir [/usr/lib/gcc/x86_64-pc-linux-gnu/16/../../..] ==> [/usr/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/lib] ==> [/usr/lib]
+        implicit libs: [gcc;gcc_s_asneeded;atomic_asneeded;c;gcc;gcc_s_asneeded]
+        implicit objs: [/usr/lib/Scrt1.o;/usr/lib/crti.o;/usr/lib/gcc/x86_64-pc-linux-gnu/16/crtbeginS.o;/usr/lib/gcc/x86_64-pc-linux-gnu/16/crtendS.o;/usr/lib/crtn.o]
+        implicit dirs: [/usr/lib/gcc/x86_64-pc-linux-gnu/16;/usr/lib;/lib]
+        implicit fwks: []
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/Internal/CMakeDetermineLinkerId.cmake:38 (message)"
+      - "/usr/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:299 (cmake_determine_linker_id)"
+      - "/usr/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:6 (project)"
+    message: |
+      Running the C compiler's linker: "/usr/bin/ld" "-v"
+      GNU ld (GNU Binutils) 2.46.1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckFunctionExists.cmake:167 (try_compile)"
+      - "CMakeLists.txt:208 (check_function_exists)"
+    checks:
+      - "Looking for asprintf"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-2h5AB1"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-2h5AB1"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_ASPRINTF"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-2h5AB1'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_a2643
+        [1/2] /usr/bin/cc   -Wall -DCHECK_FUNCTION_EXISTS=asprintf -fPIE -o CMakeFiles/cmTC_a2643.dir/CheckFunctionExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-2h5AB1/CheckFunctionExists.c
+        [2/2] : && /usr/bin/cc -Wall -DCHECK_FUNCTION_EXISTS=asprintf  CMakeFiles/cmTC_a2643.dir/CheckFunctionExists.c.o -o cmTC_a2643   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:213 (check_symbol_exists)"
+    checks:
+      - "Looking for getdelim"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AIiPol"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AIiPol"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_GETDELIM"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AIiPol'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_05245
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_05245.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AIiPol/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_05245.dir/CheckSymbolExists.c.o -o cmTC_05245   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:218 (check_symbol_exists)"
+    checks:
+      - "Looking for getline"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-zCq4sG"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-zCq4sG"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_GETLINE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-zCq4sG'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_bf367
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_bf367.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-zCq4sG/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_bf367.dir/CheckSymbolExists.c.o -o cmTC_bf367   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:223 (check_symbol_exists)"
+    checks:
+      - "Looking for getopt"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AEqGDz"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AEqGDz"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_GETOPT"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AEqGDz'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_74643
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_74643.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-AEqGDz/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_74643.dir/CheckSymbolExists.c.o -o cmTC_74643   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:228 (check_symbol_exists)"
+    checks:
+      - "Looking for reallocarray"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y2DlnL"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y2DlnL"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_REALLOCARRAY"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y2DlnL'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_7ba11
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_7ba11.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y2DlnL/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_7ba11.dir/CheckSymbolExists.c.o -o cmTC_7ba11   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckFunctionExists.cmake:167 (try_compile)"
+      - "CMakeLists.txt:234 (check_function_exists)"
+    checks:
+      - "Looking for strcasecmp"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-fV3TsO"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-fV3TsO"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STRCASECMP"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-fV3TsO'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_49f8a
+        [1/2] /usr/bin/cc   -Wall -DCHECK_FUNCTION_EXISTS=strcasecmp -fPIE -o CMakeFiles/cmTC_49f8a.dir/CheckFunctionExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-fV3TsO/CheckFunctionExists.c
+        <command-line>: warning: conflicting types for built-in function ‘strcasecmp’; expected ‘int(const char *, const char *)’ [-Wbuiltin-declaration-mismatch]
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-fV3TsO/CheckFunctionExists.c:7:3: note: in expansion of macro ‘CHECK_FUNCTION_EXISTS’
+            7 |   CHECK_FUNCTION_EXISTS(void);
+              |   ^~~~~~~~~~~~~~~~~~~~~
+        [2/2] : && /usr/bin/cc -Wall -DCHECK_FUNCTION_EXISTS=strcasecmp  CMakeFiles/cmTC_49f8a.dir/CheckFunctionExists.c.o -o cmTC_49f8a   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:241 (check_symbol_exists)"
+    checks:
+      - "Looking for strlcat"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-M84qL3"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-M84qL3"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STRLCAT"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-M84qL3'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_54312
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_54312.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-M84qL3/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_54312.dir/CheckSymbolExists.c.o -o cmTC_54312   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:246 (check_symbol_exists)"
+    checks:
+      - "Looking for strlcpy"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-CS4UB7"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-CS4UB7"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STRLCPY"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-CS4UB7'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_7c147
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_7c147.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-CS4UB7/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_7c147.dir/CheckSymbolExists.c.o -o cmTC_7c147   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:252 (check_symbol_exists)"
+    checks:
+      - "Looking for strndup"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-qE83KA"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-qE83KA"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STRNDUP"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-qE83KA'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_f0721
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_f0721.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-qE83KA/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_f0721.dir/CheckSymbolExists.c.o -o cmTC_f0721   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:261 (check_symbol_exists)"
+    checks:
+      - "Looking for strnlen"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-hKAf2w"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-hKAf2w"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STRNLEN"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-hKAf2w'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_3671f
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_3671f.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-hKAf2w/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_3671f.dir/CheckSymbolExists.c.o -o cmTC_3671f   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:267 (check_symbol_exists)"
+    checks:
+      - "Looking for strsep"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-c7jPTC"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-c7jPTC"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STRSEP"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-c7jPTC'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_d7336
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_d7336.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-c7jPTC/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_d7336.dir/CheckSymbolExists.c.o -o cmTC_d7336   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:272 (check_symbol_exists)"
+    checks:
+      - "Looking for strtonum"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STRTONUM"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_680e0
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_680e0.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4/CheckSymbolExists.c
+        FAILED: [code=1] CMakeFiles/cmTC_680e0.dir/CheckSymbolExists.c.o 
+        /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_680e0.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4/CheckSymbolExists.c
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4/CheckSymbolExists.c: In function ‘main’:
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4/CheckSymbolExists.c:8:19: error: ‘strtonum’ undeclared (first use in this function); did you mean ‘strtouq’?
+            8 |   return ((int*)(&strtonum))[argc];
+              |                   ^~~~~~~~
+              |                   strtouq
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-i8jYt4/CheckSymbolExists.c:8:19: note: each undeclared identifier is reported only once for each function it appears in
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:277 (check_symbol_exists)"
+    checks:
+      - "Looking for arc4random_buf"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-xjwyic"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-xjwyic"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_ARC4RANDOM_BUF"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-xjwyic'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_e95f7
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_e95f7.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-xjwyic/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_e95f7.dir/CheckSymbolExists.c.o -o cmTC_e95f7   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:282 (check_symbol_exists)"
+    checks:
+      - "Looking for arc4random_uniform"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-nNxZf8"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-nNxZf8"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_ARC4RANDOM_UNIFORM"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-nNxZf8'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_2f19e
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_2f19e.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-nNxZf8/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_2f19e.dir/CheckSymbolExists.c.o -o cmTC_2f19e   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:287 (check_symbol_exists)"
+    checks:
+      - "Looking for explicit_bzero"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-6aoFnz"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-6aoFnz"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_EXPLICIT_BZERO"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-6aoFnz'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_b8ebf
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_b8ebf.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-6aoFnz/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_b8ebf.dir/CheckSymbolExists.c.o -o cmTC_b8ebf   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:292 (check_symbol_exists)"
+    checks:
+      - "Looking for getauxval"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-lN7EDe"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-lN7EDe"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_GETAUXVAL"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-lN7EDe'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_e9736
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_e9736.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-lN7EDe/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_e9736.dir/CheckSymbolExists.c.o -o cmTC_e9736   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckFunctionExists.cmake:167 (try_compile)"
+      - "CMakeLists.txt:298 (check_function_exists)"
+    checks:
+      - "Looking for getentropy"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-x7DZbS"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-x7DZbS"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_GETENTROPY"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-x7DZbS'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_3045d
+        [1/2] /usr/bin/cc   -Wall -DCHECK_FUNCTION_EXISTS=getentropy -fPIE -o CMakeFiles/cmTC_3045d.dir/CheckFunctionExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-x7DZbS/CheckFunctionExists.c
+        [2/2] : && /usr/bin/cc -Wall -DCHECK_FUNCTION_EXISTS=getentropy  CMakeFiles/cmTC_3045d.dir/CheckFunctionExists.c.o -o cmTC_3045d   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:303 (check_symbol_exists)"
+    checks:
+      - "Looking for getpagesize"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-Ly4NjI"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-Ly4NjI"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_GETPAGESIZE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-Ly4NjI'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_17a06
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_17a06.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-Ly4NjI/CheckSymbolExists.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_17a06.dir/CheckSymbolExists.c.o -o cmTC_17a06   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:308 (check_symbol_exists)"
+    checks:
+      - "Looking for getprogname"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_GETPROGNAME"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_55313
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_55313.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l/CheckSymbolExists.c
+        FAILED: [code=1] CMakeFiles/cmTC_55313.dir/CheckSymbolExists.c.o 
+        /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_55313.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l/CheckSymbolExists.c
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l/CheckSymbolExists.c: In function ‘main’:
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l/CheckSymbolExists.c:8:19: error: ‘getprogname’ undeclared (first use in this function)
+            8 |   return ((int*)(&getprogname))[argc];
+              |                   ^~~~~~~~~~~
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-9fXB0l/CheckSymbolExists.c:8:19: note: each undeclared identifier is reported only once for each function it appears in
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:313 (check_symbol_exists)"
+    checks:
+      - "Looking for syslog_r"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_SYSLOG_R"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_e8f81
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_e8f81.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl/CheckSymbolExists.c
+        FAILED: [code=1] CMakeFiles/cmTC_e8f81.dir/CheckSymbolExists.c.o 
+        /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_e8f81.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl/CheckSymbolExists.c
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl/CheckSymbolExists.c: In function ‘main’:
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl/CheckSymbolExists.c:9:19: error: ‘syslog_r’ undeclared (first use in this function); did you mean ‘syslog’?
+            9 |   return ((int*)(&syslog_r))[argc];
+              |                   ^~~~~~~~
+              |                   syslog
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-jIJNkl/CheckSymbolExists.c:9:19: note: each undeclared identifier is reported only once for each function it appears in
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckFunctionExists.cmake:167 (try_compile)"
+      - "CMakeLists.txt:319 (check_function_exists)"
+    checks:
+      - "Looking for syslog"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y32090"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y32090"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_SYSLOG"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y32090'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_d3497
+        [1/2] /usr/bin/cc   -Wall -DCHECK_FUNCTION_EXISTS=syslog -fPIE -o CMakeFiles/cmTC_d3497.dir/CheckFunctionExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-y32090/CheckFunctionExists.c
+        [2/2] : && /usr/bin/cc -Wall -DCHECK_FUNCTION_EXISTS=syslog  CMakeFiles/cmTC_d3497.dir/CheckFunctionExists.c.o -o cmTC_d3497   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:324 (check_symbol_exists)"
+    checks:
+      - "Looking for timespecsub"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_TIMESPECSUB"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_13e6f
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_13e6f.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb/CheckSymbolExists.c
+        FAILED: [code=1] CMakeFiles/cmTC_13e6f.dir/CheckSymbolExists.c.o 
+        /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_13e6f.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb/CheckSymbolExists.c
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb/CheckSymbolExists.c: In function ‘main’:
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb/CheckSymbolExists.c:8:19: error: ‘timespecsub’ undeclared (first use in this function); did you mean ‘timespec’?
+            8 |   return ((int*)(&timespecsub))[argc];
+              |                   ^~~~~~~~~~~
+              |                   timespec
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-mCgstb/CheckSymbolExists.c:8:19: note: each undeclared identifier is reported only once for each function it appears in
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:329 (check_symbol_exists)"
+    checks:
+      - "Looking for timingsafe_bcmp"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_TIMINGSAFE_BCMP"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_f6a08
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_f6a08.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi/CheckSymbolExists.c
+        FAILED: [code=1] CMakeFiles/cmTC_f6a08.dir/CheckSymbolExists.c.o 
+        /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_f6a08.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi/CheckSymbolExists.c
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi/CheckSymbolExists.c: In function ‘main’:
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi/CheckSymbolExists.c:8:19: error: ‘timingsafe_bcmp’ undeclared (first use in this function)
+            8 |   return ((int*)(&timingsafe_bcmp))[argc];
+              |                   ^~~~~~~~~~~~~~~
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-V8QjTi/CheckSymbolExists.c:8:19: note: each undeclared identifier is reported only once for each function it appears in
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:193 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckSymbolExists.cmake:98 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "CMakeLists.txt:334 (check_symbol_exists)"
+    checks:
+      - "Looking for timingsafe_memcmp"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_TIMINGSAFE_MEMCMP"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_764cd
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_764cd.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy/CheckSymbolExists.c
+        FAILED: [code=1] CMakeFiles/cmTC_764cd.dir/CheckSymbolExists.c.o 
+        /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_764cd.dir/CheckSymbolExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy/CheckSymbolExists.c
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy/CheckSymbolExists.c: In function ‘main’:
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy/CheckSymbolExists.c:8:19: error: ‘timingsafe_memcmp’ undeclared (first use in this function)
+            8 |   return ((int*)(&timingsafe_memcmp))[argc];
+              |                   ^~~~~~~~~~~~~~~~~
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-BR8BPy/CheckSymbolExists.c:8:19: note: each undeclared identifier is reported only once for each function it appears in
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckFunctionExists.cmake:167 (try_compile)"
+      - "CMakeLists.txt:340 (check_function_exists)"
+    checks:
+      - "Looking for memmem"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-HzKooz"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-HzKooz"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_MEMMEM"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-HzKooz'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_6d130
+        [1/2] /usr/bin/cc   -Wall -DCHECK_FUNCTION_EXISTS=memmem -fPIE -o CMakeFiles/cmTC_6d130.dir/CheckFunctionExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-HzKooz/CheckFunctionExists.c
+        [2/2] : && /usr/bin/cc -Wall -DCHECK_FUNCTION_EXISTS=memmem  CMakeFiles/cmTC_6d130.dir/CheckFunctionExists.c.o -o cmTC_6d130   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckIncludeFiles.cmake:201 (try_compile)"
+      - "CMakeLists.txt:345 (check_include_files)"
+    checks:
+      - "Looking for include file endian.h"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-npdRb3"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-npdRb3"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_ENDIAN_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-npdRb3'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_88795
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_88795.dir/HAVE_ENDIAN_H.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-npdRb3/HAVE_ENDIAN_H.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_88795.dir/HAVE_ENDIAN_H.c.o -o cmTC_88795   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckIncludeFiles.cmake:201 (try_compile)"
+      - "CMakeLists.txt:350 (check_include_files)"
+    checks:
+      - "Looking for include file machine/endian.h"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-DaTV3g"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-DaTV3g"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_MACHINE_ENDIAN_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-DaTV3g'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_26fb3
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_26fb3.dir/HAVE_MACHINE_ENDIAN_H.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-DaTV3g/HAVE_MACHINE_ENDIAN_H.c
+        FAILED: [code=1] CMakeFiles/cmTC_26fb3.dir/HAVE_MACHINE_ENDIAN_H.c.o 
+        /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_26fb3.dir/HAVE_MACHINE_ENDIAN_H.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-DaTV3g/HAVE_MACHINE_ENDIAN_H.c
+        /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-DaTV3g/HAVE_MACHINE_ENDIAN_H.c:2:10: fatal error: machine/endian.h: No such file or directory
+            2 | #include <machine/endian.h>
+              |          ^~~~~~~~~~~~~~~~~~
+        compilation terminated.
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckIncludeFiles.cmake:201 (try_compile)"
+      - "CMakeLists.txt:355 (check_include_files)"
+    checks:
+      - "Looking for include file err.h"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-7yThuz"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-7yThuz"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_ERR_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-7yThuz'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_64eab
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_64eab.dir/HAVE_ERR_H.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-7yThuz/HAVE_ERR_H.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_64eab.dir/HAVE_ERR_H.c.o -o cmTC_64eab   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckIncludeFiles.cmake:201 (try_compile)"
+      - "CMakeLists.txt:360 (check_include_files)"
+    checks:
+      - "Looking for 3 include files sys/types.h, ..., netinet/ip.h"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-YoLwNW"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-YoLwNW"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_NETINET_IP_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-YoLwNW'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_ccc11
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_ccc11.dir/HAVE_NETINET_IP_H.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-YoLwNW/HAVE_NETINET_IP_H.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_ccc11.dir/HAVE_NETINET_IP_H.c.o -o cmTC_ccc11   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckLibraryExists.cmake:154 (try_compile)"
+      - "CMakeLists.txt:428 (check_library_exists)"
+    checks:
+      - "Looking for clock_gettime in rt"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-A79ofw"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-A79ofw"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_CLOCK_GETTIME"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-A79ofw'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_270e4
+        [1/2] /usr/bin/cc   -Wall -DCHECK_FUNCTION_EXISTS=clock_gettime -fPIE -o CMakeFiles/cmTC_270e4.dir/CheckFunctionExists.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-A79ofw/CheckFunctionExists.c
+        [2/2] : && /usr/bin/cc -Wall -DCHECK_FUNCTION_EXISTS=clock_gettime  CMakeFiles/cmTC_270e4.dir/CheckFunctionExists.c.o -o cmTC_270e4 -L/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-A79ofw/time.h -Wl,-rpath,/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-A79ofw/time.h  -lrt && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckIncludeFile.cmake:174 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckTypeSize.cmake:462 (check_include_file)"
+      - "CMakeLists.txt:440 (check_type_size)"
+    checks:
+      - "Looking for sys/types.h"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ATYQqb"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ATYQqb"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_SYS_TYPES_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ATYQqb'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_c71a2
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_c71a2.dir/CheckIncludeFile.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ATYQqb/CheckIncludeFile.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_c71a2.dir/CheckIncludeFile.c.o -o cmTC_c71a2   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckIncludeFile.cmake:174 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckTypeSize.cmake:463 (check_include_file)"
+      - "CMakeLists.txt:440 (check_type_size)"
+    checks:
+      - "Looking for stdint.h"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-NcCoCo"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-NcCoCo"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STDINT_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-NcCoCo'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_e6480
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_e6480.dir/CheckIncludeFile.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-NcCoCo/CheckIncludeFile.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_e6480.dir/CheckIncludeFile.c.o -o cmTC_e6480   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckIncludeFile.cmake:174 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckTypeSize.cmake:464 (check_include_file)"
+      - "CMakeLists.txt:440 (check_type_size)"
+    checks:
+      - "Looking for stddef.h"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-k2PFTE"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-k2PFTE"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_STDDEF_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-k2PFTE'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_1217a
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_1217a.dir/CheckIncludeFile.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-k2PFTE/CheckIncludeFile.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_1217a.dir/CheckIncludeFile.c.o -o cmTC_1217a   && :
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CheckTypeSize.cmake:348 (try_compile)"
+      - "/usr/share/cmake/Modules/CheckTypeSize.cmake:481 (__check_type_size_impl)"
+      - "CMakeLists.txt:440 (check_type_size)"
+    checks:
+      - "Check size of time_t"
+    directories:
+      source: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ExokNG"
+      binary: "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ExokNG"
+    cmakeVariables:
+      CMAKE_C_FLAGS: " -Wall"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/jlind/dev/vio/3rdparty/libressl-4.1.0"
+      CMAKE_POSITION_INDEPENDENT_CODE: "true"
+    buildResult:
+      variable: "HAVE_SIZEOF_TIME_T"
+      cached: true
+      stdout: |
+        Change Dir: '/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ExokNG'
+        
+        Run Build Command(s): /usr/bin/ninja -v cmTC_c7cd4
+        [1/2] /usr/bin/cc   -Wall  -fPIE -o CMakeFiles/cmTC_c7cd4.dir/SIZEOF_TIME_T.c.o -c /home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-build/CMakeFiles/CMakeScratch/TryCompile-ExokNG/SIZEOF_TIME_T.c
+        [2/2] : && /usr/bin/cc -Wall  CMakeFiles/cmTC_c7cd4.dir/SIZEOF_TIME_T.c.o -o cmTC_c7cd4   && :
+        
+      exitCode: 0
+...

@@ -1,0 +1,506 @@
+[
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/fs-poll.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/fs-poll.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/fs-poll.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/fs-poll.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/idna.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/idna.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/idna.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/idna.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/inet.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/inet.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/inet.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/inet.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/random.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/random.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/random.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/random.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/strscpy.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/strscpy.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/strscpy.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/strscpy.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/strtok.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/strtok.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/strtok.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/strtok.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/thread-common.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/thread-common.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/thread-common.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/thread-common.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/threadpool.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/threadpool.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/threadpool.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/threadpool.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/timer.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/timer.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/timer.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/timer.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/uv-common.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/uv-common.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/uv-common.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/uv-common.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/uv-data-getter-setters.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/uv-data-getter-setters.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/uv-data-getter-setters.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/uv-data-getter-setters.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/version.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/version.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/version.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/version.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/async.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/async.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/async.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/async.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/core.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/core.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/core.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/core.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/dl.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/dl.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/dl.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/dl.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/fs.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/fs.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/fs.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/fs.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/getaddrinfo.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/getaddrinfo.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/getaddrinfo.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/getaddrinfo.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/getnameinfo.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/getnameinfo.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/getnameinfo.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/getnameinfo.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/loop-watcher.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/loop-watcher.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/loop-watcher.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/loop-watcher.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/loop.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/loop.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/loop.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/loop.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/pipe.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/pipe.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/pipe.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/pipe.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/poll.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/poll.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/poll.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/poll.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/process.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/process.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/process.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/process.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/random-devurandom.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/random-devurandom.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/random-devurandom.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/random-devurandom.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/signal.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/signal.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/signal.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/signal.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/stream.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/stream.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/stream.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/stream.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/tcp.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/tcp.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/tcp.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/tcp.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/thread.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/thread.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/thread.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/thread.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/tty.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/tty.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/tty.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/tty.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/udp.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/udp.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/udp.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/udp.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/proctitle.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/proctitle.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/proctitle.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/proctitle.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/linux.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/linux.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/linux.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/linux.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/procfs-exepath.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/procfs-exepath.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/procfs-exepath.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/procfs-exepath.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/random-getrandom.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/random-getrandom.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/random-getrandom.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/random-getrandom.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/cc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -I/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src -O3 -DNDEBUG -std=gnu11 -fvisibility=hidden -Wstrict-prototypes -Wextra -Wall -Wno-unused-parameter -fno-strict-aliasing -o 3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/random-sysctl-linux.c.o -c /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/random-sysctl-linux.c",
+  "file": "/home/jlind/dev/vio/3rdparty/libuv-v1.51.0/src/unix/random-sysctl-linux.c",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/libuv-v1.51.0/CMakeFiles/uv_a.dir/src/unix/random-sysctl-linux.c.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DADA_INCLUDE_URL_PATTERN=1 -I/home/jlind/dev/vio/3rdparty/ada-3.2.4/src -I/home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -Weffc++ -Wsuggest-override -Wfatal-errors -Wsign-compare -Wshadow -Wwrite-strings -Wpointer-arith -Winit-self -Wconversion -Wno-sign-conversion -mno-avx256-split-unaligned-load -mno-avx256-split-unaligned-store -o 3rdparty/ada-3.2.4/src/CMakeFiles/ada.dir/ada.cpp.o -c /home/jlind/dev/vio/3rdparty/ada-3.2.4/src/ada.cpp",
+  "file": "/home/jlind/dev/vio/3rdparty/ada-3.2.4/src/ada.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/ada-3.2.4/src/CMakeFiles/ada.dir/ada.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -O3 -DNDEBUG -std=c++20 -o 3rdparty/ada-3.2.4/singleheader/CMakeFiles/ada-singleheader-lib.dir/ada.cpp.o -c /home/jlind/dev/vio/build-linux/3rdparty/ada-3.2.4/singleheader/ada.cpp",
+  "file": "/home/jlind/dev/vio/build-linux/3rdparty/ada-3.2.4/singleheader/ada.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/ada-3.2.4/singleheader/CMakeFiles/ada-singleheader-lib.dir/ada.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DDOCTEST_CONFIG_IMPLEMENT_WITH_MAIN -isystem /home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -O3 -DNDEBUG -std=gnu++11 -o 3rdparty/doctest-v2.4.11/CMakeFiles/doctest_with_main.dir/doctest/parts/doctest.cpp.o -c /home/jlind/dev/vio/3rdparty/doctest-v2.4.11/doctest/parts/doctest.cpp",
+  "file": "/home/jlind/dev/vio/3rdparty/doctest-v2.4.11/doctest/parts/doctest.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/3rdparty/doctest-v2.4.11/CMakeFiles/doctest_with_main.dir/doctest/parts/doctest.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -I/home/jlind/dev/vio/build-linux/_cmrc/include -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fvisibility=hidden -fvisibility-inlines-hidden -fPIC -o src/CMakeFiles/vio.dir/library.cpp.o -c /home/jlind/dev/vio/src/library.cpp",
+  "file": "/home/jlind/dev/vio/src/library.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/src/CMakeFiles/vio.dir/library.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -I/home/jlind/dev/vio/build-linux/_cmrc/include -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fvisibility=hidden -fvisibility-inlines-hidden -fPIC -o src/CMakeFiles/vio.dir/crypto.cpp.o -c /home/jlind/dev/vio/src/crypto.cpp",
+  "file": "/home/jlind/dev/vio/src/crypto.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/src/CMakeFiles/vio.dir/crypto.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -I/home/jlind/dev/vio/build-linux/_cmrc/include -O3 -DNDEBUG -std=gnu++23 -o src/CMakeFiles/vio_default_certs.dir/__cmrc_vio_default_certs/lib.cpp.o -c /home/jlind/dev/vio/build-linux/src/__cmrc_vio_default_certs/lib.cpp",
+  "file": "/home/jlind/dev/vio/build-linux/src/__cmrc_vio_default_certs/lib.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/src/CMakeFiles/vio_default_certs.dir/__cmrc_vio_default_certs/lib.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -I/home/jlind/dev/vio/build-linux/_cmrc/include -O3 -DNDEBUG -std=gnu++23 -o src/CMakeFiles/vio_default_certs.dir/__cmrc_vio_default_certs/intermediate/default_certs/cert.pem.cpp.o -c /home/jlind/dev/vio/build-linux/src/__cmrc_vio_default_certs/intermediate/default_certs/cert.pem.cpp",
+  "file": "/home/jlind/dev/vio/build-linux/src/__cmrc_vio_default_certs/intermediate/default_certs/cert.pem.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/src/CMakeFiles/vio_default_certs.dir/__cmrc_vio_default_certs/intermediate/default_certs/cert.pem.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_main.cpp.o -c /home/jlind/dev/vio/test/test_main.cpp",
+  "file": "/home/jlind/dev/vio/test/test_main.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_main.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_basic.cpp.o -c /home/jlind/dev/vio/test/test_basic.cpp",
+  "file": "/home/jlind/dev/vio/test/test_basic.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_basic.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_crypto.cpp.o -c /home/jlind/dev/vio/test/test_crypto.cpp",
+  "file": "/home/jlind/dev/vio/test/test_crypto.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_crypto.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ssl_upgrade.cpp.o -c /home/jlind/dev/vio/test/test_ssl_upgrade.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ssl_upgrade.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ssl_upgrade.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_task_and_sleep.cpp.o -c /home/jlind/dev/vio/test/test_task_and_sleep.cpp",
+  "file": "/home/jlind/dev/vio/test/test_task_and_sleep.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_task_and_sleep.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_http_client.cpp.o -c /home/jlind/dev/vio/test/test_http_client.cpp",
+  "file": "/home/jlind/dev/vio/test/test_http_client.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_http_client.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_file.cpp.o -c /home/jlind/dev/vio/test/test_file.cpp",
+  "file": "/home/jlind/dev/vio/test/test_file.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_file.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_file_leak.cpp.o -c /home/jlind/dev/vio/test/test_file_leak.cpp",
+  "file": "/home/jlind/dev/vio/test/test_file_leak.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_file_leak.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_tcp.cpp.o -c /home/jlind/dev/vio/test/test_tcp.cpp",
+  "file": "/home/jlind/dev/vio/test/test_tcp.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_tcp.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_tcp_read_cb.cpp.o -c /home/jlind/dev/vio/test/test_tcp_read_cb.cpp",
+  "file": "/home/jlind/dev/vio/test/test_tcp_read_cb.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_tcp_read_cb.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_tcp_read_into.cpp.o -c /home/jlind/dev/vio/test/test_tcp_read_into.cpp",
+  "file": "/home/jlind/dev/vio/test/test_tcp_read_into.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_tcp_read_into.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_tcp_server_listen.cpp.o -c /home/jlind/dev/vio/test/test_tcp_server_listen.cpp",
+  "file": "/home/jlind/dev/vio/test/test_tcp_server_listen.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_tcp_server_listen.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_tcp_write_guard.cpp.o -c /home/jlind/dev/vio/test/test_tcp_write_guard.cpp",
+  "file": "/home/jlind/dev/vio/test/test_tcp_write_guard.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_tcp_write_guard.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ssl.cpp.o -c /home/jlind/dev/vio/test/test_ssl.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ssl.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ssl.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ssl_alpn.cpp.o -c /home/jlind/dev/vio/test/test_ssl_alpn.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ssl_alpn.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ssl_alpn.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ssl_sni.cpp.o -c /home/jlind/dev/vio/test/test_ssl_sni.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ssl_sni.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ssl_sni.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ssl_deep.cpp.o -c /home/jlind/dev/vio/test/test_ssl_deep.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ssl_deep.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ssl_deep.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ssl_config.cpp.o -c /home/jlind/dev/vio/test/test_ssl_config.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ssl_config.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ssl_config.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ca_certificates.cpp.o -c /home/jlind/dev/vio/test/test_ca_certificates.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ca_certificates.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ca_certificates.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_dns.cpp.o -c /home/jlind/dev/vio/test/test_dns.cpp",
+  "file": "/home/jlind/dev/vio/test/test_dns.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_dns.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_dns_leak.cpp.o -c /home/jlind/dev/vio/test/test_dns_leak.cpp",
+  "file": "/home/jlind/dev/vio/test/test_dns_leak.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_dns_leak.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_elastic_index_storage.cpp.o -c /home/jlind/dev/vio/test/test_elastic_index_storage.cpp",
+  "file": "/home/jlind/dev/vio/test/test_elastic_index_storage.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_elastic_index_storage.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ring_buffer.cpp.o -c /home/jlind/dev/vio/test/test_ring_buffer.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ring_buffer.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ring_buffer.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_tls_server.cpp.o -c /home/jlind/dev/vio/test/test_tls_server.cpp",
+  "file": "/home/jlind/dev/vio/test/test_tls_server.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_tls_server.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_event_pipe.cpp.o -c /home/jlind/dev/vio/test/test_event_pipe.cpp",
+  "file": "/home/jlind/dev/vio/test/test_event_pipe.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_event_pipe.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_event_pipe_drain.cpp.o -c /home/jlind/dev/vio/test/test_event_pipe_drain.cpp",
+  "file": "/home/jlind/dev/vio/test/test_event_pipe_drain.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_event_pipe_drain.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_ref_counted_wrapper.cpp.o -c /home/jlind/dev/vio/test/test_ref_counted_wrapper.cpp",
+  "file": "/home/jlind/dev/vio/test/test_ref_counted_wrapper.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_ref_counted_wrapper.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_handle_closer.cpp.o -c /home/jlind/dev/vio/test/test_handle_closer.cpp",
+  "file": "/home/jlind/dev/vio/test/test_handle_closer.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_handle_closer.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_udp.cpp.o -c /home/jlind/dev/vio/test/test_udp.cpp",
+  "file": "/home/jlind/dev/vio/test/test_udp.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_udp.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_reader_cancel.cpp.o -c /home/jlind/dev/vio/test/test_reader_cancel.cpp",
+  "file": "/home/jlind/dev/vio/test/test_reader_cancel.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_reader_cancel.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_cancellation.cpp.o -c /home/jlind/dev/vio/test/test_cancellation.cpp",
+  "file": "/home/jlind/dev/vio/test/test_cancellation.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_cancellation.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_work.cpp.o -c /home/jlind/dev/vio/test/test_work.cpp",
+  "file": "/home/jlind/dev/vio/test/test_work.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_work.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/3rdparty/doctest-v2.4.11 -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o test/CMakeFiles/vio_tests.dir/test_thread_pool.cpp.o -c /home/jlind/dev/vio/test/test_thread_pool.cpp",
+  "file": "/home/jlind/dev/vio/test/test_thread_pool.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/test/CMakeFiles/vio_tests.dir/test_thread_pool.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/hello_timer.dir/hello_timer.cpp.o -c /home/jlind/dev/vio/examples/hello_timer.cpp",
+  "file": "/home/jlind/dev/vio/examples/hello_timer.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/hello_timer.dir/hello_timer.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/tcp_echo.dir/tcp_echo.cpp.o -c /home/jlind/dev/vio/examples/tcp_echo.cpp",
+  "file": "/home/jlind/dev/vio/examples/tcp_echo.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/tcp_echo.dir/tcp_echo.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/tcp_read_into.dir/tcp_read_into.cpp.o -c /home/jlind/dev/vio/examples/tcp_read_into.cpp",
+  "file": "/home/jlind/dev/vio/examples/tcp_read_into.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/tcp_read_into.dir/tcp_read_into.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/https_get.dir/https_get.cpp.o -c /home/jlind/dev/vio/examples/https_get.cpp",
+  "file": "/home/jlind/dev/vio/examples/https_get.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/https_get.dir/https_get.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/https_fetch.dir/https_fetch.cpp.o -c /home/jlind/dev/vio/examples/https_fetch.cpp",
+  "file": "/home/jlind/dev/vio/examples/https_fetch.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/https_fetch.dir/https_fetch.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/udp_echo.dir/udp_echo.cpp.o -c /home/jlind/dev/vio/examples/udp_echo.cpp",
+  "file": "/home/jlind/dev/vio/examples/udp_echo.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/udp_echo.dir/udp_echo.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/dns_resolve.dir/dns_resolve.cpp.o -c /home/jlind/dev/vio/examples/dns_resolve.cpp",
+  "file": "/home/jlind/dev/vio/examples/dns_resolve.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/dns_resolve.dir/dns_resolve.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/file_copy.dir/file_copy.cpp.o -c /home/jlind/dev/vio/examples/file_copy.cpp",
+  "file": "/home/jlind/dev/vio/examples/file_copy.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/file_copy.dir/file_copy.cpp.o"
+},
+{
+  "directory": "/home/jlind/dev/vio/build-linux",
+  "command": "/usr/bin/c++ -DVIO_SSL_BACKEND_LIBRESSL -DVIO_STATIC_DEFINE -I/home/jlind/dev/vio/src -isystem /home/jlind/dev/vio/build-linux/libressl_4.3.2_install/include -isystem /home/jlind/dev/vio/3rdparty/libuv-v1.51.0/include -isystem /home/jlind/dev/vio/3rdparty/ada-3.2.4/include -O3 -DNDEBUG -std=gnu++23 -fPIC -o examples/CMakeFiles/awaitable_event_pipe.dir/awaitable_event_pipe.cpp.o -c /home/jlind/dev/vio/examples/awaitable_event_pipe.cpp",
+  "file": "/home/jlind/dev/vio/examples/awaitable_event_pipe.cpp",
+  "output": "/home/jlind/dev/vio/build-linux/examples/CMakeFiles/awaitable_event_pipe.dir/awaitable_event_pipe.cpp.o"
+}
+]

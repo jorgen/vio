@@ -1,0 +1,13 @@
+#libcrypto pkg-config source file
+
+prefix=/home/jlind/dev/vio/build-crypto/libressl_4.1.0_install
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: LibreSSL-libcrypto
+Description: LibreSSL cryptography library
+Version: 4.1.0
+Libs: -L${libdir} -lcrypto
+Libs.private:   -lpthread -lrt
+Cflags: -I${includedir}

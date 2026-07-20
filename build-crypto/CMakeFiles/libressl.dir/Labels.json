@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/CMakeFiles/libressl"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/CMakeFiles/libressl.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/CMakeFiles/libressl-complete.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-stamp/libressl-build.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-stamp/libressl-configure.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-stamp/libressl-download.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-stamp/libressl-install.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-stamp/libressl-mkdir.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-stamp/libressl-patch.rule"
+		},
+		{
+			"file" : "/home/jlind/dev/vio/build-crypto/libressl_build_4.1.0/src/libressl-stamp/libressl-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"libressl"
+		],
+		"name" : "libressl"
+	}
+}

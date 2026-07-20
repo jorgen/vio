@@ -1,0 +1,12 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=url
+command=/usr/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/home/jlind/dev/vio/build-linux/CMakeFiles/fc-stamp/libressl/download-libressl.cmake;COMMAND;/usr/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/home/jlind/dev/vio/build-linux/CMakeFiles/fc-stamp/libressl/verify-libressl.cmake;COMMAND;/usr/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/home/jlind/dev/vio/build-linux/CMakeFiles/fc-stamp/libressl/extract-libressl.cmake
+source_dir=/home/jlind/dev/vio/3rdparty/libressl-4.3.2
+work_dir=/home/jlind/dev/vio/3rdparty
+url(s)=https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz
+hash=SHA256=edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5
+      no_extract=
+

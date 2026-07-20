@@ -1,0 +1,15 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/jlind/dev/vio/build-crypto/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/_deps/cmake-dep-build/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/3rdparty/libuv-v1.51.0/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/3rdparty/ada-3.2.4/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/3rdparty/ada-3.2.4/src/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/3rdparty/ada-3.2.4/singleheader/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/3rdparty/doctest-v2.4.11/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/src/cmake_install.cmake",
+		"/home/jlind/dev/vio/build-crypto/test/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
