@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 #include <vio/crypto.h>
+#include <vio/detail/sha2_portable.h>
 
 #include <cstring>
 #include <vector>
@@ -212,6 +213,57 @@ TEST_CASE("base64url decode accepts unpadded url-safe input and round-trips")
   auto decoded = vio::crypto::base64url_decode("-_8");
   REQUIRE(decoded.has_value());
   CHECK(*decoded == hi);
+}
+
+// The self-contained SHA-256 / HMAC-SHA-256 used by the WebAssembly build (no system crypto library).
+// Tested here on the native toolchain against the same published vectors as the OpenSSL-backed API.
+TEST_CASE("portable SHA-256 empty string")
+{
+  auto data = to_bytes("");
+  CHECK(vio::crypto::to_hex(vio::detail::sha256_portable(data)) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+TEST_CASE("portable SHA-256 abc")
+{
+  auto data = to_bytes("abc");
+  CHECK(vio::crypto::to_hex(vio::detail::sha256_portable(data)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+TEST_CASE("portable SHA-256 multi-block 448-bit message")
+{
+  // FIPS 180-2 App. B.2: spans two compression blocks and exercises length padding into a second block.
+  auto data = to_bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+  CHECK(vio::crypto::to_hex(vio::detail::sha256_portable(data)) == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+TEST_CASE("portable SHA-256 agrees with the OpenSSL-backed sha256 on random-ish input")
+{
+  std::vector<uint8_t> data(1000);
+  for (size_t i = 0; i < data.size(); i++)
+    data[i] = uint8_t(i * 31u + 7u);
+  CHECK(vio::detail::sha256_portable(data) == vio::crypto::sha256(data));
+}
+
+TEST_CASE("portable HMAC-SHA-256 RFC 4231 Test Case 1")
+{
+  std::vector<uint8_t> key(20, 0x0b);
+  auto data = to_bytes("Hi There");
+  CHECK(vio::crypto::to_hex(vio::detail::hmac_sha256_portable(key, data)) == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+}
+
+TEST_CASE("portable HMAC-SHA-256 RFC 4231 Test Case 2")
+{
+  auto key = to_bytes("Jefe");
+  auto data = to_bytes("what do ya want for nothing?");
+  CHECK(vio::crypto::to_hex(vio::detail::hmac_sha256_portable(key, data)) == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+}
+
+TEST_CASE("portable HMAC-SHA-256 RFC 4231 Test Case 6 (key longer than the block size)")
+{
+  // 131-byte key exercises the "hash the key first" branch.
+  std::vector<uint8_t> key(131, 0xaa);
+  auto data = to_bytes("Test Using Larger Than Block-Size Key - Hash Key First");
+  CHECK(vio::crypto::to_hex(vio::detail::hmac_sha256_portable(key, data)) == "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
 }
 
 TEST_CASE("random_bytes fills the buffer and succeeds")
