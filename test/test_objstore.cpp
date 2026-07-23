@@ -26,6 +26,40 @@ static std::vector<uint8_t> pattern(size_t n, uint8_t seed)
   return v;
 }
 
+namespace
+{
+// Exposes the protected build_request so a test can inspect the signed + sent headers directly.
+struct exposed_s3_io_manager_t : vio::objstore::s3_io_manager_t
+{
+  using s3_io_manager_t::s3_io_manager_t;
+  vio::http::request_t make_request(const std::string &method, const std::string &name) const
+  {
+    return build_request(method, name, {}, nullptr);
+  }
+};
+
+const std::string *find_header(const vio::http::request_t &req, std::string_view name)
+{
+  for (const auto &h : req.headers)
+    if (vio::http::detail::header_name_equals(h.name, name))
+      return &h.value;
+  return nullptr;
+}
+
+std::string signed_headers_of(const vio::http::request_t &req)
+{
+  const std::string *authz = find_header(req, "Authorization");
+  if (!authz)
+    return {};
+  auto a = authz->find("SignedHeaders=");
+  if (a == std::string::npos)
+    return {};
+  a += std::string_view("SignedHeaders=").size();
+  auto b = authz->find(',', a);
+  return authz->substr(a, b - a);
+}
+} // namespace
+
 TEST_SUITE("objstore")
 {
 
@@ -45,6 +79,63 @@ TEST_CASE("AWS SigV4 matches the official get-vanilla vector")
                                                       "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "us-east-1", "service", "20150830T123600Z", "20150830");
   REQUIRE(authz == "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, "
                    "SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31");
+}
+
+TEST_CASE("AWS SigV4 signs x-amz-security-token as an ordinary header (temp credentials)")
+{
+  // The session token is not special-cased by the signer -- it is lowercased, sorted, and canonicalized
+  // like any other header. Adding it must change SignedHeaders (and hence the signature) vs. the vanilla
+  // request, and it sorts after x-amz-date.
+  std::string empty_sha = vio::crypto::to_hex(vio::crypto::sha256(bytes("")));
+  auto without = vio::objstore::aws_sigv4_authorization("GET", "/", "", {{"host", "example.amazonaws.com"}, {"x-amz-date", "20150830T123600Z"}}, empty_sha, "AKIDEXAMPLE",
+                                                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "us-east-1", "service", "20150830T123600Z", "20150830");
+  auto with = vio::objstore::aws_sigv4_authorization("GET", "/", "", {{"host", "example.amazonaws.com"}, {"x-amz-date", "20150830T123600Z"}, {"x-amz-security-token", "AQoDYXdzT0KEN"}}, empty_sha,
+                                                     "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "us-east-1", "service", "20150830T123600Z", "20150830");
+  REQUIRE(with != without); // the token changed the signature
+  // Known answer cross-checked against an independent SigV4 implementation (validated on the
+  // published get-vanilla vector above): the token is folded into the signing like any other header.
+  REQUIRE(with == "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, "
+                  "SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=978160d7c763b25c77297ea9d237c53b94c828e189d4fbde68b2ddb07c207b83");
+}
+
+TEST_CASE("s3 build_request signs and sends x-amz-security-token only for temporary credentials")
+{
+  vio::event_loop_t loop;
+  vio::objstore::s3_io_manager_t::config_t cfg;
+  cfg.https = false;
+  cfg.host = "127.0.0.1";
+  cfg.port = 9000;
+  cfg.region = "us-east-1";
+  cfg.bucket = "bucket";
+  cfg.access_key = "AKIDEXAMPLE";
+  cfg.secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+  cfg.path_style = true;
+
+  SUBCASE("long-lived credentials: token neither signed nor sent")
+  {
+    exposed_s3_io_manager_t s3(loop, cfg);
+    auto req = s3.make_request("GET", "obj");
+    CHECK(find_header(req, "x-amz-security-token") == nullptr);
+    CHECK(signed_headers_of(req) == "host;x-amz-content-sha256;x-amz-date");
+  }
+
+  SUBCASE("temporary credentials: token sent on the wire and present in SignedHeaders (sorted last)")
+  {
+    cfg.session_token = "FQoGZXIvYXdzEExampleSecurityToken==";
+    exposed_s3_io_manager_t s3(loop, cfg);
+    auto req = s3.make_request("GET", "obj");
+    const std::string *tok = find_header(req, "x-amz-security-token");
+    REQUIRE(tok != nullptr);
+    CHECK(*tok == cfg.session_token);
+    CHECK(signed_headers_of(req) == "host;x-amz-content-sha256;x-amz-date;x-amz-security-token");
+  }
+
+  // event_loop_t needs a run/stop cycle before destruction.
+  loop.run_in_loop([&]() -> vio::task_t<void> {
+    loop.stop();
+    co_return;
+  });
+  loop.run();
 }
 
 TEST_CASE("Azure Shared Key produces a decodable SharedKey header")

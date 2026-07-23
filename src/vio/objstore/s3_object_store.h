@@ -48,6 +48,7 @@ public:
     std::string prefix; // key prefix within the bucket (may be empty; no leading/trailing '/')
     std::string access_key;
     std::string secret_key;
+    std::string session_token; // AWS STS temporary-credential token (empty for long-lived keys)
     bool path_style = false;
   };
 
@@ -85,6 +86,10 @@ protected:
     std::string payload_sha = crypto::to_hex(crypto::sha256(payload));
 
     std::vector<signed_header_t> signed_headers = {{"host", host_value}, {"x-amz-content-sha256", payload_sha}, {"x-amz-date", amz_date}};
+    // STS temporary credentials require x-amz-security-token to be a *signed* header (and sent on the
+    // wire). aws_sigv4_authorization lowercases + sorts the header list, so append order is irrelevant.
+    if (!_cfg.session_token.empty())
+      signed_headers.push_back({"x-amz-security-token", _cfg.session_token});
     std::string authorization = aws_sigv4_authorization(method, canonical_uri, "", signed_headers, payload_sha, _cfg.access_key, _cfg.secret_key, _cfg.region, "s3", amz_date, date_stamp);
 
     http::request_t req;
@@ -95,6 +100,8 @@ protected:
     // Host and Content-Length are added by vio::http::fetch; do not duplicate them here.
     req.headers.push_back({"x-amz-date", amz_date});
     req.headers.push_back({"x-amz-content-sha256", payload_sha});
+    if (!_cfg.session_token.empty())
+      req.headers.push_back({"x-amz-security-token", _cfg.session_token});
     req.headers.push_back({"Authorization", authorization});
     if (range && range->size >= 0 && method == "GET")
       req.headers.push_back({"Range", "bytes=" + std::to_string(range->offset) + "-" + std::to_string(range->offset + range->size - 1)});
