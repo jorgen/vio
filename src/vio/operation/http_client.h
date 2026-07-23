@@ -32,15 +32,21 @@ Copyright (c) 2025 Jørgen Lind
 #include <utility>
 #include <vector>
 
-#include <ada.h>
-
 #include <vio/cancellation.h>
 #include <vio/error.h>
 #include <vio/event_loop.h>
+#include <vio/task.h>
+
+// The native transport is libuv TCP + LibreSSL TLS (with ada for URL parsing). In the browser build
+// these are unavailable and unwanted; the transport is provided by emscripten_fetch instead (see the
+// #ifdef __EMSCRIPTEN__ block at the bottom of this header).
+#ifndef __EMSCRIPTEN__
+#include <ada.h>
+
 #include <vio/operation/dns.h>
 #include <vio/operation/tcp.h>
 #include <vio/operation/tls_client.h>
-#include <vio/task.h>
+#endif
 
 namespace vio::http
 {
@@ -96,6 +102,7 @@ struct response_t
   }
 };
 
+#ifndef __EMSCRIPTEN__
 namespace detail
 {
 inline std::expected<response_t, error_t> parse_response(const std::string &raw)
@@ -332,5 +339,10 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch(event_loop_t &loop,
     }
   }
 }
+#endif // !__EMSCRIPTEN__
 
 } // namespace vio::http
+
+#ifdef __EMSCRIPTEN__
+#include <vio/platform/wasm/http_fetch_impl.h>
+#endif

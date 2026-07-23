@@ -42,6 +42,11 @@ public:
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   explicit thread_pool_t(uint32_t thread_count = std::thread::hardware_concurrency())
   {
+#ifdef __EMSCRIPTEN__
+    // Single-threaded WebAssembly: spawn no workers. enqueue()/enqueue_detached() run their task inline
+    // instead (below). The queue/mutex members are left in place (unused) for ABI parity.
+    (void)thread_count;
+#else
     workers.reserve(thread_count);
     for (uint32_t i = 0; i < thread_count; ++i)
       workers.emplace_back(
@@ -61,6 +66,7 @@ public:
             task();
           }
         });
+#endif
   }
   thread_pool_t(const thread_pool_t &) = delete;
   thread_pool_t(thread_pool_t &&) = delete;
@@ -85,6 +91,9 @@ public:
     auto package = std::make_shared<std::packaged_task<return_type()>>(std::forward<T>(task));
 
     std::future<return_type> res = package->get_future();
+#ifdef __EMSCRIPTEN__
+    (*package)(); // no worker threads on wasm: run inline; the returned future is already ready
+#else
     {
       std::unique_lock<std::mutex> lock(queue_mutex);
 
@@ -96,6 +105,7 @@ public:
       tasks.emplace([package]() { (*package)(); });
     }
     condition.notify_one();
+#endif
     return res;
   }
 
@@ -105,6 +115,9 @@ public:
   template <typename T>
   void enqueue_detached(T &&task)
   {
+#ifdef __EMSCRIPTEN__
+    task(); // no worker threads on wasm: run inline
+#else
     {
       std::unique_lock<std::mutex> lock(queue_mutex);
 
@@ -116,6 +129,7 @@ public:
       tasks.emplace(std::forward<T>(task));
     }
     condition.notify_one();
+#endif
   }
 
 private:

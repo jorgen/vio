@@ -11,6 +11,7 @@
 #include <expected>
 
 #include <emscripten.h>
+#include <emscripten/eventloop.h> // emscripten_set_timeout
 
 namespace vio
 {

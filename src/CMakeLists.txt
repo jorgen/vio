@@ -1,6 +1,8 @@
 if(EMSCRIPTEN)
     add_library(vio STATIC
         library_wasm.cpp
+        crypto_encoding.cpp
+        crypto_sha256.cpp
     )
     target_compile_definitions(vio PUBLIC VIO_STATIC_DEFINE)
     target_include_directories(vio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -9,11 +11,13 @@ else()
         add_library(vio SHARED
             library.cpp
             crypto.cpp
+            crypto_encoding.cpp
         )
     else()
         add_library(vio STATIC
             library.cpp
             crypto.cpp
+            crypto_encoding.cpp
         )
         target_compile_definitions(vio PUBLIC VIO_STATIC_DEFINE)
     endif()

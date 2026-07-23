@@ -21,11 +21,15 @@
 */
 #pragma once
 
-#include <vio/objstore/azure_object_store.h>
-#include <vio/objstore/file_object_store.h>
 #include <vio/objstore/memory_object_store.h>
 #include <vio/objstore/object_store.h>
 #include <vio/objstore/s3_object_store.h>
+#ifndef __EMSCRIPTEN__
+// The directory and Azure backends reach libuv (file I/O); exclude them from the browser build, which
+// has no POSIX filesystem and talks to S3 over emscripten_fetch.
+#include <vio/objstore/azure_object_store.h>
+#include <vio/objstore/file_object_store.h>
+#endif
 
 #include <cstdint>
 #include <cstdlib>
@@ -103,6 +107,7 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std
     return std::unexpected(error_t{.code = -1, .msg = "s3 url missing bucket (expected s3://bucket/prefix)"});
   cfg.access_key = getenv_str("AWS_ACCESS_KEY_ID");
   cfg.secret_key = getenv_str("AWS_SECRET_ACCESS_KEY");
+  cfg.session_token = getenv_str("AWS_SESSION_TOKEN");
   cfg.region = getenv_str("AWS_REGION");
   if (cfg.region.empty())
     cfg.region = getenv_str("AWS_DEFAULT_REGION");
@@ -133,6 +138,7 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std
   return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(cfg)));
 }
 
+#ifndef __EMSCRIPTEN__
 inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_azure(const std::string &path, event_loop_t &loop)
 {
   azure_io_manager_t::config_t cfg;
@@ -165,7 +171,17 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_azure(const 
     return std::unexpected(error_t{.code = -1, .msg = "azure: set AZURE_STORAGE_KEY or AZURE_STORAGE_SAS"});
   return std::unique_ptr<io_manager_t>(std::make_unique<azure_io_manager_t>(loop, std::move(cfg)));
 }
+#endif // __EMSCRIPTEN__
 } // namespace detail
+
+// Build an S3 io_manager from an explicit config, with credentials/endpoint injected by the caller
+// rather than read from the environment. This is the entry point for embedding contexts -- e.g. a
+// browser that obtains temporary STS credentials (access key + secret + session token) from JS -- where
+// getenv is not meaningful. The caller fills config_t (bucket/prefix/region/host/path_style/creds).
+inline std::unique_ptr<io_manager_t> create_s3_with_config(s3_io_manager_t::config_t cfg, event_loop_t &loop)
+{
+  return std::make_unique<s3_io_manager_t>(loop, std::move(cfg));
+}
 
 // Build an io_manager from a URL. Schemes: mem://name, dir:///path, s3://bucket/prefix,
 // az://container/prefix. Cloud credentials/endpoints come from the standard environment variables
@@ -174,14 +190,18 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_azure(const 
 inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_io_manager(const std::string &url, event_loop_t &loop)
 {
   auto [scheme, path] = detail::split_scheme(url);
+#ifndef __EMSCRIPTEN__
   if (scheme == "dir")
     return std::unique_ptr<io_manager_t>(std::make_unique<file_dir_io_manager_t>(path, loop));
+#endif
   if (scheme == "mem")
     return std::unique_ptr<io_manager_t>(std::make_unique<memory_io_manager_t>());
   if (scheme == "s3")
     return detail::create_s3(path, loop);
+#ifndef __EMSCRIPTEN__
   if (scheme == "az" || scheme == "azure")
     return detail::create_azure(path, loop);
+#endif
   return std::unexpected(error_t{.code = -1, .msg = "Unsupported object-store scheme: '" + scheme + "'"});
 }
 
