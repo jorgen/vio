@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -99,12 +100,34 @@ inline void split_bucket_prefix(const std::string &path, std::string &bucket, st
     prefix.pop_back();
 }
 
+// Optional process-global S3 config. When set, create_io_manager uses its credentials / endpoint /
+// region for s3:// URLs instead of reading AWS_* env vars -- the injection point for embedding contexts
+// (a browser holding temporary STS credentials) where getenv is not meaningful. Only bucket/prefix are
+// taken from the URL. NOTE: process-global, so it assumes a single active S3 credential set at a time.
+inline std::optional<s3_io_manager_t::config_t> &s3_config_override()
+{
+  static std::optional<s3_io_manager_t::config_t> cfg;
+  return cfg;
+}
+
 inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std::string &path, event_loop_t &loop)
 {
   s3_io_manager_t::config_t cfg;
   split_bucket_prefix(path, cfg.bucket, cfg.prefix);
   if (cfg.bucket.empty())
     return std::unexpected(error_t{.code = -1, .msg = "s3 url missing bucket (expected s3://bucket/prefix)"});
+
+  // Injected config (browser temp credentials): take creds/endpoint/region from it, bucket/prefix from URL.
+  if (auto &override_cfg = s3_config_override(); override_cfg.has_value())
+  {
+    s3_io_manager_t::config_t merged = *override_cfg;
+    if (merged.bucket.empty())
+      merged.bucket = cfg.bucket;
+    if (merged.prefix.empty())
+      merged.prefix = cfg.prefix;
+    return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(merged)));
+  }
+
   cfg.access_key = getenv_str("AWS_ACCESS_KEY_ID");
   cfg.secret_key = getenv_str("AWS_SECRET_ACCESS_KEY");
   cfg.session_token = getenv_str("AWS_SESSION_TOKEN");
@@ -181,6 +204,19 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_azure(const 
 inline std::unique_ptr<io_manager_t> create_s3_with_config(s3_io_manager_t::config_t cfg, event_loop_t &loop)
 {
   return std::make_unique<s3_io_manager_t>(loop, std::move(cfg));
+}
+
+// Install / clear the process-global S3 config that create_io_manager (below) uses for s3:// URLs in
+// place of AWS_* env vars. Lets a URL-driven pipeline (e.g. the converter storage backend) run against
+// caller-injected temporary credentials. Only bucket/prefix are still taken from each URL.
+inline void set_s3_config_override(s3_io_manager_t::config_t cfg)
+{
+  detail::s3_config_override() = std::move(cfg);
+}
+
+inline void clear_s3_config_override()
+{
+  detail::s3_config_override().reset();
 }
 
 // Build an io_manager from a URL. Schemes: mem://name, dir:///path, s3://bucket/prefix,

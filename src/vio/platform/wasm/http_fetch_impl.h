@@ -172,6 +172,9 @@ struct fetch_awaitable_t
     auto continuation = self->continuation;
     emscripten_fetch_close(fetch); // does not touch *self
     loop->run_in_loop([continuation]() { continuation.resume(); });
+    // Signal the app that async work completed outside a frame, so an on-demand renderer can schedule a
+    // redraw to pump this resume + draw the new data. No-op if no wake hook is registered.
+    vio::wasm::wake();
   }
 };
 
