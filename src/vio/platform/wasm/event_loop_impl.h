@@ -181,6 +181,12 @@ inline std::function<void()> &cooperative_frame_hook()
   return hook;
 }
 
+inline std::function<void()> &wake_hook()
+{
+  static std::function<void()> hook;
+  return hook;
+}
+
 inline void register_loop(event_loop_t *loop)
 {
   cooperative_loops().push_back(loop);
@@ -218,6 +224,21 @@ inline void pump()
 inline void set_frame_hook(std::function<void()> hook)
 {
   cooperative_frame_hook() = std::move(hook);
+}
+
+// Register a callback fired when asynchronous work completes OUTSIDE a frame (e.g. an emscripten_fetch
+// finishing). An on-demand renderer maps this to its "request redraw" (schedule one requestAnimationFrame)
+// so a single frame runs to pump the loops + draw the newly-available data -- instead of rendering
+// continuously. No-op under the continuous install_main_loop model, which pumps every frame anyway.
+inline void set_wake_hook(std::function<void()> hook)
+{
+  wake_hook() = std::move(hook);
+}
+
+inline void wake()
+{
+  if (auto &hook = wake_hook())
+    hook();
 }
 
 inline void cooperative_driver()
