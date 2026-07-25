@@ -138,6 +138,31 @@ TEST_CASE("s3 build_request signs and sends x-amz-security-token only for tempor
   loop.run();
 }
 
+TEST_CASE("s3 build_request sends an UNSIGNED request for anonymous (public-bucket) access")
+{
+  vio::event_loop_t loop;
+  vio::objstore::s3_io_manager_t::config_t cfg;
+  cfg.https = true;
+  cfg.host = "s3.eu-north-1.amazonaws.com";
+  cfg.region = "eu-north-1";
+  cfg.bucket = "limilind-public";
+  cfg.prefix = "points/synthetic";
+  // No access_key / secret_key => anonymous: build_request must omit Authorization / x-amz-* entirely.
+  exposed_s3_io_manager_t s3(loop, cfg);
+  auto req = s3.make_request("GET", "manifest");
+  CHECK(find_header(req, "Authorization") == nullptr);
+  CHECK(find_header(req, "x-amz-content-sha256") == nullptr);
+  CHECK(find_header(req, "x-amz-date") == nullptr);
+  CHECK(find_header(req, "x-amz-security-token") == nullptr);
+  CHECK(req.url == "https://limilind-public.s3.eu-north-1.amazonaws.com/points/synthetic/manifest");
+
+  loop.run_in_loop([&]() -> vio::task_t<void> {
+    loop.stop();
+    co_return;
+  });
+  loop.run();
+}
+
 TEST_CASE("Azure Shared Key produces a decodable SharedKey header")
 {
   std::string key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
@@ -251,6 +276,8 @@ TEST_CASE("create_io_manager dispatches on scheme")
   // not apply to it.
   REQUIRE(vio::objstore::create_io_manager("s3://bucket/p", loop).has_value());
   REQUIRE(!vio::objstore::create_io_manager("s3://bucket/p", "endpoint=http://localhost:9000", loop).has_value());
+  // Anonymous (public bucket): constructs with no credentials.
+  REQUIRE(vio::objstore::create_io_manager("s3://bucket/p", "region=eu-north-1;anonymous=true", loop).has_value());
   // Drain the loop once so it tears down cleanly (its internal handles need a run/stop cycle).
   loop.run_in_loop([&]() -> vio::task_t<void> {
     loop.stop();

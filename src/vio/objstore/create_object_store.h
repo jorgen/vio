@@ -119,6 +119,7 @@ struct resolved_s3_config_t
   s3_io_manager_t::config_t cfg;
   bool has_credentials = false; // explicit access_key + secret_key were supplied (connection string / env)
   bool custom_endpoint = false; // a non-AWS endpoint (minio / localstack / ...) was configured
+  bool anonymous = false;       // anonymous (public-bucket) access requested -> send unsigned requests
 };
 
 // Resolve an S3 config from a connection string and the environment, EXCEPT the credential-presence
@@ -169,6 +170,18 @@ inline std::expected<resolved_s3_config_t, error_t> resolve_s3_config_base(const
   else if (std::string fps = getenv_str("AWS_S3_FORCE_PATH_STYLE"); !fps.empty())
     cfg.path_style = conn_detail::parse_bool(fps, cfg.path_style);
 
+  // Anonymous (public bucket): opt in with anonymous=/public=/no_sign_request=true. The request is sent
+  // unsigned, so any supplied credentials are dropped -- empty credentials are the signal build_request
+  // uses to skip SigV4. Handy for a public dataset read from the browser (no credential chain there).
+  if (auto a = conn.get({"anonymous", "public", "no_sign_request", "nosignrequest"}))
+    out.anonymous = conn_detail::parse_bool(*a, false);
+  if (out.anonymous)
+  {
+    cfg.access_key.clear();
+    cfg.secret_key.clear();
+    cfg.session_token.clear();
+  }
+
   out.has_credentials = !cfg.access_key.empty() && !cfg.secret_key.empty();
   return out;
 }
@@ -180,8 +193,8 @@ inline std::expected<s3_io_manager_t::config_t, error_t> resolve_s3_config(const
   auto r = resolve_s3_config_base(path, conn);
   if (!r)
     return std::unexpected(r.error());
-  if (!r->has_credentials)
-    return std::unexpected(error_t{.code = -1, .msg = "s3: credentials missing (set access_key_id/secret_access_key in the connection string or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"});
+  if (!r->has_credentials && !r->anonymous)
+    return std::unexpected(error_t{.code = -1, .msg = "s3: credentials missing (set access_key_id/secret_access_key in the connection string or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or anonymous=true for a public bucket)"});
   return std::move(r->cfg);
 }
 
@@ -211,6 +224,11 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std
 
   if (!r->has_credentials)
   {
+    if (r->anonymous)
+    {
+      // Explicit anonymous access to a public bucket: construct with no credentials -> unsigned requests.
+      return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(cfg)));
+    }
 #ifndef __EMSCRIPTEN__
     if (r->custom_endpoint)
       return std::unexpected(error_t{.code = -1, .msg = "s3: credentials missing for custom endpoint (set access_key_id/secret_access_key in the connection string or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"});

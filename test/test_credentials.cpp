@@ -424,4 +424,59 @@ TEST_CASE("live AWS: read via the native ~/.aws credential chain" * doctest::ski
   CHECK(bytes_read == 16);
 }
 
+namespace
+{
+vio::task_t<void> live_anonymous_read(vio::event_loop_t &loop, bool &exists, uint64_t &size, uint64_t &bytes_read, std::string &err)
+{
+  // No credentials at all -- the public-bucket path the browser demo uses (anonymous=true => unsigned).
+  auto mgr = vio::objstore::create_io_manager("s3://limilind-public/points/synthetic", "region=eu-north-1;anonymous=true", loop);
+  if (!mgr)
+  {
+    err = mgr.error().msg;
+    loop.stop();
+    co_return;
+  }
+  auto info = co_await (*mgr)->object_info("blob_00000000_0000000000000000");
+  if (!info)
+  {
+    err = info.error().msg;
+    loop.stop();
+    co_return;
+  }
+  exists = info->exists;
+  size = info->size;
+
+  std::vector<uint8_t> head(16, 0);
+  auto r = co_await (*mgr)->read_object("blob_00000000_0000000000000000", head.data(), {0, 16});
+  if (!r)
+    err = r.error().msg;
+  else
+    bytes_read = *r;
+  loop.stop();
+  co_return;
+}
+} // namespace
+
+TEST_CASE("live AWS: anonymous read of a public bucket (no credentials at all)" * doctest::skip())
+{
+  if (!std::getenv("VIO_LIVE_AWS_TEST"))
+    return;
+  ::unsetenv("AWS_ACCESS_KEY_ID");
+  ::unsetenv("AWS_SECRET_ACCESS_KEY");
+  ::unsetenv("AWS_SESSION_TOKEN");
+
+  vio::event_loop_t loop;
+  bool exists = false;
+  uint64_t size = 0, bytes_read = 0;
+  std::string err;
+  loop.run_in_loop([&] { return live_anonymous_read(loop, exists, size, bytes_read, err); });
+  loop.run();
+
+  INFO("error: " << err);
+  CHECK(err.empty());
+  CHECK(exists);
+  CHECK(size == 101069);
+  CHECK(bytes_read == 16);
+}
+
 } // TEST_SUITE
