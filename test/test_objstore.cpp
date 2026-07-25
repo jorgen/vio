@@ -244,8 +244,13 @@ TEST_CASE("create_io_manager dispatches on scheme")
   vio::event_loop_t loop;
   REQUIRE(vio::objstore::create_io_manager("mem://x", loop).has_value());
   REQUIRE(vio::objstore::create_io_manager("dir:///tmp/points_objstore_x", loop).has_value());
-  REQUIRE(!vio::objstore::create_io_manager("ftp://nope", loop).has_value());   // unsupported scheme
-  REQUIRE(!vio::objstore::create_io_manager("s3://bucket/p", loop).has_value()); // no AWS creds in env
+  REQUIRE(!vio::objstore::create_io_manager("ftp://nope", loop).has_value()); // unsupported scheme
+  // A plain AWS s3:// URL with no explicit credentials now succeeds at construction: credential resolution
+  // is deferred to the provider chain (~/.aws / SSO / `aws login` / env / IMDS) and any failure surfaces
+  // at request time. A custom endpoint (minio) with no credentials still fails fast -- the AWS chain does
+  // not apply to it.
+  REQUIRE(vio::objstore::create_io_manager("s3://bucket/p", loop).has_value());
+  REQUIRE(!vio::objstore::create_io_manager("s3://bucket/p", "endpoint=http://localhost:9000", loop).has_value());
   // Drain the loop once so it tears down cleanly (its internal handles need a run/stop cycle).
   loop.run_in_loop([&]() -> vio::task_t<void> {
     loop.stop();

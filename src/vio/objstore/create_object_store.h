@@ -22,12 +22,15 @@
 #pragma once
 
 #include <vio/objstore/connection_string.h>
+#include <vio/objstore/credentials.h>
 #include <vio/objstore/memory_object_store.h>
 #include <vio/objstore/object_store.h>
 #include <vio/objstore/s3_object_store.h>
 #ifndef __EMSCRIPTEN__
 // The directory and Azure backends reach libuv (file I/O); exclude them from the browser build, which
-// has no POSIX filesystem and talks to S3 over emscripten_fetch.
+// has no POSIX filesystem and talks to S3 over emscripten_fetch. aws_config supplies the native ~/.aws
+// credential provider chain (also unavailable in the browser).
+#include <vio/objstore/aws_config.h>
 #include <vio/objstore/azure_object_store.h>
 #include <vio/objstore/file_object_store.h>
 #endif
@@ -111,12 +114,22 @@ inline std::optional<s3_io_manager_t::config_t> &s3_config_override()
   return cfg;
 }
 
-// Resolve an S3 config from a connection string and the environment. Per-field precedence, highest first:
-// connection-string key > AWS_* environment variable > built-in default. Bucket/prefix always come from
-// the URL path. Accepts snake_case canonical keys and common CamelCase/AWS aliases (case-insensitive).
-inline std::expected<s3_io_manager_t::config_t, error_t> resolve_s3_config(const std::string &path, const connection_options_t &conn)
+struct resolved_s3_config_t
 {
   s3_io_manager_t::config_t cfg;
+  bool has_credentials = false; // explicit access_key + secret_key were supplied (connection string / env)
+  bool custom_endpoint = false; // a non-AWS endpoint (minio / localstack / ...) was configured
+};
+
+// Resolve an S3 config from a connection string and the environment, EXCEPT the credential-presence
+// policy. Per-field precedence, highest first: connection-string key > AWS_* environment variable >
+// built-in default. Bucket/prefix always come from the URL path. Accepts snake_case canonical keys and
+// common CamelCase/AWS aliases (case-insensitive). Errors only on structural problems (missing bucket,
+// malformed endpoint) -- NOT on missing credentials, so create_s3 can fall back to the provider chain.
+inline std::expected<resolved_s3_config_t, error_t> resolve_s3_config_base(const std::string &path, const connection_options_t &conn)
+{
+  resolved_s3_config_t out;
+  s3_io_manager_t::config_t &cfg = out.cfg;
   split_bucket_prefix(path, cfg.bucket, cfg.prefix);
   if (cfg.bucket.empty())
     return std::unexpected(error_t{.code = -1, .msg = "s3 url missing bucket (expected s3://bucket/prefix)"});
@@ -142,6 +155,7 @@ inline std::expected<s3_io_manager_t::config_t, error_t> resolve_s3_config(const
     if (!parse_endpoint(endpoint, cfg.https, cfg.host, cfg.port))
       return std::unexpected(error_t{.code = -1, .msg = "invalid s3 endpoint: '" + endpoint + "'"});
     cfg.path_style = true; // custom endpoints (minio) default to path-style
+    out.custom_endpoint = true;
   }
   else
   {
@@ -155,9 +169,20 @@ inline std::expected<s3_io_manager_t::config_t, error_t> resolve_s3_config(const
   else if (std::string fps = getenv_str("AWS_S3_FORCE_PATH_STYLE"); !fps.empty())
     cfg.path_style = conn_detail::parse_bool(fps, cfg.path_style);
 
-  if (cfg.access_key.empty() || cfg.secret_key.empty())
+  out.has_credentials = !cfg.access_key.empty() && !cfg.secret_key.empty();
+  return out;
+}
+
+// Resolve an S3 config, requiring credentials to be explicitly present (connection string / env). Used by
+// the process-global override path (apply_connection_override), which pins a fully-specified config.
+inline std::expected<s3_io_manager_t::config_t, error_t> resolve_s3_config(const std::string &path, const connection_options_t &conn)
+{
+  auto r = resolve_s3_config_base(path, conn);
+  if (!r)
+    return std::unexpected(r.error());
+  if (!r->has_credentials)
     return std::unexpected(error_t{.code = -1, .msg = "s3: credentials missing (set access_key_id/secret_access_key in the connection string or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"});
-  return cfg;
+  return std::move(r->cfg);
 }
 
 inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std::string &path, const connection_options_t &conn, event_loop_t &loop)
@@ -178,10 +203,37 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std
       return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(merged)));
     }
   }
-  auto cfg = resolve_s3_config(path, conn);
-  if (!cfg)
-    return std::unexpected(cfg.error());
-  return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(*cfg)));
+
+  auto r = resolve_s3_config_base(path, conn);
+  if (!r)
+    return std::unexpected(r.error());
+  s3_io_manager_t::config_t cfg = std::move(r->cfg);
+
+  if (!r->has_credentials)
+  {
+#ifndef __EMSCRIPTEN__
+    if (r->custom_endpoint)
+      return std::unexpected(error_t{.code = -1, .msg = "s3: credentials missing for custom endpoint (set access_key_id/secret_access_key in the connection string or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"});
+    // Plain AWS endpoint, no explicit credentials: fall back to the native ~/.aws credential provider
+    // chain (static keys / `aws login` / SSO / assume-role / instance metadata). Temporary credentials
+    // are refreshed per request by s3_io_manager_t. The profile may also supply the region.
+    std::optional<std::string> profile;
+    if (auto p = conn.get({"profile", "aws_profile"}); p && !p->empty())
+      profile = *p;
+    auto chain = resolve_credential_chain(profile);
+    cfg.provider = std::move(chain.provider);
+    const bool region_pinned = conn.get({"region", "aws_region"}).has_value() || !getenv_str("AWS_REGION").empty() || !getenv_str("AWS_DEFAULT_REGION").empty();
+    if (!region_pinned && chain.region && !chain.region->empty())
+    {
+      cfg.region = *chain.region;
+      cfg.host = "s3." + cfg.region + ".amazonaws.com";
+    }
+#else
+    return std::unexpected(error_t{.code = -1, .msg = "s3: credentials missing (set access_key_id/secret_access_key in the connection string or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"});
+#endif
+  }
+
+  return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(cfg)));
 }
 
 #ifndef __EMSCRIPTEN__

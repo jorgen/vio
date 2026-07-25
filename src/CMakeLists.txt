@@ -81,6 +81,57 @@ endif()
 
 add_library(vio::vio ALIAS vio)
 
+# ---------------------------------------------------------------------------
+# vio_objstore: the object-store abstraction (io_manager backends + connection-string
+# parsing + the native AWS credential provider chain) as a SEPARATE target layered on
+# top of vio. Keeping it out of core libvio means base vio carries no AWS/JSON object
+# code and no structify dependency; consumers that need cloud storage link
+# vio::objstore, which brings vio (and its include dirs) transitively.
+#
+# Almost all of objstore is header-only -- its io_manager backends are instantiated in
+# the consumer's translation units. Only the AWS credential parsers are compiled
+# (aws_json.cpp + aws_config.cpp), and those are native-only, so under Emscripten the
+# target is header-only (INTERFACE).
+if(EMSCRIPTEN)
+    add_library(vio_objstore INTERFACE)
+    target_link_libraries(vio_objstore INTERFACE vio)
+else()
+    if(VIO_BUILD_SHARED)
+        add_library(vio_objstore SHARED
+            vio/objstore/aws_json.cpp
+            vio/objstore/aws_config.cpp
+        )
+    else()
+        add_library(vio_objstore STATIC
+            vio/objstore/aws_json.cpp
+            vio/objstore/aws_config.cpp
+        )
+    endif()
+
+    set_target_properties(vio_objstore PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        C_VISIBILITY_PRESET hidden
+    )
+
+    # PUBLIC: objstore's public headers use vio's public API (task_t, event_loop_t,
+    # crypto, http::fetch), so consumers of vio_objstore need vio + its include dirs.
+    # This also propagates VIO_STATIC_DEFINE in the static build, so the VIO_EXPORT
+    # macros in the objstore sources resolve consistently with core vio.
+    target_link_libraries(vio_objstore PUBLIC vio)
+
+    # structify (header-only) is used only by aws_json.cpp. PRIVATE + SYSTEM: it must
+    # not leak into objstore's public headers (which expose plain structs instead) and
+    # its headers must not trip the -Wall -Werror build.
+    target_include_directories(vio_objstore SYSTEM PRIVATE ${structify_SOURCE_DIR}/include)
+
+    if(VIO_BUILD_SHARED AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(vio_objstore PRIVATE "-Wl,--exclude-libs,ALL")
+    endif()
+endif()
+
+add_library(vio::objstore ALIAS vio_objstore)
+
 if(VIO_INSTALL AND NOT EMSCRIPTEN)
     include(CMakePackageConfigHelpers)
 
@@ -89,7 +140,7 @@ if(VIO_INSTALL AND NOT EMSCRIPTEN)
         FILES_MATCHING PATTERN "*.h")
 
     if(VIO_USE_SYSTEM_LIBUV AND VIO_USE_SYSTEM_LIBRESSL AND VIO_USE_SYSTEM_ADA)
-        set(_vio_export_targets vio vio_default_certs)
+        set(_vio_export_targets vio vio_objstore vio_default_certs)
         set(VIO_CONFIG_DEPS "")
         string(APPEND VIO_CONFIG_DEPS "find_dependency(libuv CONFIG)\n")
         string(APPEND VIO_CONFIG_DEPS "find_dependency(LibreSSL)\n")
@@ -123,7 +174,7 @@ if(VIO_INSTALL AND NOT EMSCRIPTEN)
             ${CMAKE_CURRENT_BINARY_DIR}/vioConfigVersion.cmake
             DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vio)
     else()
-        install(TARGETS vio vio_default_certs
+        install(TARGETS vio vio_objstore vio_default_certs
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

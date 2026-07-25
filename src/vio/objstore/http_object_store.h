@@ -50,6 +50,8 @@ public:
 
   task_t<std::expected<uint64_t, error_t>> read_object(std::string name, uint8_t *dst, io_range_t range) override
   {
+    if (auto creds = co_await ensure_credentials(); !creds)
+      co_return std::unexpected(creds.error());
     auto req = build_request("GET", name, std::span<const uint8_t>{}, &range);
     auto resp = co_await http::fetch(_loop, req);
     if (!resp.has_value())
@@ -65,6 +67,8 @@ public:
 
   task_t<std::expected<void, error_t>> write_object(std::string name, std::shared_ptr<uint8_t[]> data, uint64_t size) override
   {
+    if (auto creds = co_await ensure_credentials(); !creds)
+      co_return std::unexpected(creds.error());
     std::span<const uint8_t> payload(data.get(), size);
     auto req = build_request("PUT", name, payload, nullptr);
     req.body.assign(reinterpret_cast<const char *>(data.get()), size);
@@ -78,6 +82,8 @@ public:
 
   task_t<std::expected<object_info_t, error_t>> object_info(std::string name) override
   {
+    if (auto creds = co_await ensure_credentials(); !creds)
+      co_return std::unexpected(creds.error());
     auto req = build_request("HEAD", name, std::span<const uint8_t>{}, nullptr);
     auto resp = co_await http::fetch(_loop, req);
     if (!resp.has_value())
@@ -99,6 +105,8 @@ public:
 
   task_t<std::expected<void, error_t>> remove_object(std::string name) override
   {
+    if (auto creds = co_await ensure_credentials(); !creds)
+      co_return std::unexpected(creds.error());
     auto req = build_request("DELETE", name, std::span<const uint8_t>{}, nullptr);
     auto resp = co_await http::fetch(_loop, req);
     if (!resp.has_value())
@@ -114,6 +122,15 @@ protected:
   // `range` is non-null only for a ranged GET. Sets url/method/headers/body and, from the members below,
   // allow_plaintext and ca_mem.
   virtual http::request_t build_request(const std::string &method, const std::string &name, std::span<const uint8_t> payload, const io_range_t *range) const = 0;
+
+  // Refresh the credentials build_request will sign with, if they are temporary and near expiry. Called
+  // once before build_request in each of the four operations above. The default does nothing (static
+  // credentials, and Azure, which does not use this path); the S3 backend overrides it to consult its
+  // credentials provider. Returning an error fails the operation (e.g. an expired `aws login` session).
+  virtual task_t<std::expected<void, error_t>> ensure_credentials()
+  {
+    co_return std::expected<void, error_t>{};
+  }
 
   // The Host header value vio::http::fetch will send for (scheme, host, port): host, plus ":port" only
   // when the port is non-default. Providers must sign this exact value.

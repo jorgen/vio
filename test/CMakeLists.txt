@@ -3,6 +3,7 @@ add_executable(vio_tests
     test_basic.cpp
     test_crypto.cpp
     test_objstore.cpp
+    test_credentials.cpp
     test_ssl_upgrade.cpp
     test_task_and_sleep.cpp
     test_http_client.cpp
@@ -35,7 +36,7 @@ add_executable(vio_tests
     test_thread_pool.cpp
 )
 
-CmDepTargetLinkLibrary(vio_tests PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_tests PRIVATE vio vio_objstore LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
 
 if(VIO_USE_SYSTEM_DOCTEST)
     target_link_libraries(vio_tests PRIVATE doctest::doctest)

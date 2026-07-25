@@ -22,10 +22,13 @@
 #pragma once
 
 #include <vio/crypto.h>
+#include <vio/objstore/credentials.h>
 #include <vio/objstore/http_object_store.h>
 #include <vio/objstore/signing.h>
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -50,16 +53,36 @@ public:
     std::string secret_key;
     std::string session_token; // AWS STS temporary-credential token (empty for long-lived keys)
     bool path_style = false;
+    // Optional async credentials source. When set, it supplies (and refreshes) the access_key / secret_key
+    // / session_token used to sign each request, overriding the static values above; when null, the static
+    // values are signed with as-is. Built by resolve_credential_chain (create_object_store.h) for a plain
+    // AWS URL with no explicit credentials.
+    std::shared_ptr<credentials_provider_t> provider;
   };
 
   s3_io_manager_t(event_loop_t &loop, config_t cfg)
     : http_io_manager_t(loop)
     , _cfg(std::move(cfg))
+    , _provider(_cfg.provider)
+    , _current{_cfg.access_key, _cfg.secret_key, _cfg.session_token, std::nullopt}
   {
     _allow_plaintext = !_cfg.https;
   }
 
 protected:
+  // Refresh _current from the credentials provider before each signed request. A no-op when there is no
+  // provider (static credentials), so the injected-config / connection-string paths are unchanged.
+  task_t<std::expected<void, error_t>> ensure_credentials() override
+  {
+    if (!_provider)
+      co_return std::expected<void, error_t>{};
+    auto creds = co_await _provider->credentials(_loop);
+    if (!creds)
+      co_return std::unexpected(creds.error());
+    _current = std::move(*creds);
+    co_return std::expected<void, error_t>{};
+  }
+
   http::request_t build_request(const std::string &method, const std::string &name, std::span<const uint8_t> payload, const io_range_t *range) const override
   {
     std::string amz_date, date_stamp, rfc1123;
@@ -88,9 +111,11 @@ protected:
     std::vector<signed_header_t> signed_headers = {{"host", host_value}, {"x-amz-content-sha256", payload_sha}, {"x-amz-date", amz_date}};
     // STS temporary credentials require x-amz-security-token to be a *signed* header (and sent on the
     // wire). aws_sigv4_authorization lowercases + sorts the header list, so append order is irrelevant.
-    if (!_cfg.session_token.empty())
-      signed_headers.push_back({"x-amz-security-token", _cfg.session_token});
-    std::string authorization = aws_sigv4_authorization(method, canonical_uri, "", signed_headers, payload_sha, _cfg.access_key, _cfg.secret_key, _cfg.region, "s3", amz_date, date_stamp);
+    // The credential material comes from _current (kept fresh by ensure_credentials); the endpoint /
+    // region / addressing come from _cfg.
+    if (!_current.session_token.empty())
+      signed_headers.push_back({"x-amz-security-token", _current.session_token});
+    std::string authorization = aws_sigv4_authorization(method, canonical_uri, "", signed_headers, payload_sha, _current.access_key, _current.secret_key, _cfg.region, "s3", amz_date, date_stamp);
 
     http::request_t req;
     req.method = method;
@@ -100,8 +125,8 @@ protected:
     // Host and Content-Length are added by vio::http::fetch; do not duplicate them here.
     req.headers.push_back({"x-amz-date", amz_date});
     req.headers.push_back({"x-amz-content-sha256", payload_sha});
-    if (!_cfg.session_token.empty())
-      req.headers.push_back({"x-amz-security-token", _cfg.session_token});
+    if (!_current.session_token.empty())
+      req.headers.push_back({"x-amz-security-token", _current.session_token});
     req.headers.push_back({"Authorization", authorization});
     if (range && range->size >= 0 && method == "GET")
       req.headers.push_back({"Range", "bytes=" + std::to_string(range->offset) + "-" + std::to_string(range->offset + range->size - 1)});
@@ -110,6 +135,8 @@ protected:
 
 private:
   config_t _cfg;
+  std::shared_ptr<credentials_provider_t> _provider; // null => sign with the static _current credentials
+  credentials_t _current;                            // the credentials build_request signs with
 };
 
 } // namespace vio::objstore
