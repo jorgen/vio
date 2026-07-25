@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <vio/objstore/connection_string.h>
 #include <vio/objstore/memory_object_store.h>
 #include <vio/objstore/object_store.h>
 #include <vio/objstore/s3_object_store.h>
@@ -110,40 +111,36 @@ inline std::optional<s3_io_manager_t::config_t> &s3_config_override()
   return cfg;
 }
 
-inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std::string &path, event_loop_t &loop)
+// Resolve an S3 config from a connection string and the environment. Per-field precedence, highest first:
+// connection-string key > AWS_* environment variable > built-in default. Bucket/prefix always come from
+// the URL path. Accepts snake_case canonical keys and common CamelCase/AWS aliases (case-insensitive).
+inline std::expected<s3_io_manager_t::config_t, error_t> resolve_s3_config(const std::string &path, const connection_options_t &conn)
 {
   s3_io_manager_t::config_t cfg;
   split_bucket_prefix(path, cfg.bucket, cfg.prefix);
   if (cfg.bucket.empty())
     return std::unexpected(error_t{.code = -1, .msg = "s3 url missing bucket (expected s3://bucket/prefix)"});
 
-  // Injected config (browser temp credentials): take creds/endpoint/region from it, bucket/prefix from URL.
-  if (auto &override_cfg = s3_config_override(); override_cfg.has_value())
-  {
-    s3_io_manager_t::config_t merged = *override_cfg;
-    if (merged.bucket.empty())
-      merged.bucket = cfg.bucket;
-    if (merged.prefix.empty())
-      merged.prefix = cfg.prefix;
-    return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(merged)));
-  }
+  cfg.access_key = conn.get({"access_key_id", "accesskeyid", "aws_access_key_id"}).value_or(getenv_str("AWS_ACCESS_KEY_ID"));
+  cfg.secret_key = conn.get({"secret_access_key", "secretaccesskey", "secretkey", "aws_secret_access_key", "aws_secret_key"}).value_or(getenv_str("AWS_SECRET_ACCESS_KEY"));
+  cfg.session_token = conn.get({"session_token", "sessiontoken", "aws_session_token"}).value_or(getenv_str("AWS_SESSION_TOKEN"));
 
-  cfg.access_key = getenv_str("AWS_ACCESS_KEY_ID");
-  cfg.secret_key = getenv_str("AWS_SECRET_ACCESS_KEY");
-  cfg.session_token = getenv_str("AWS_SESSION_TOKEN");
-  cfg.region = getenv_str("AWS_REGION");
+  cfg.region = conn.get({"region", "aws_region"}).value_or(getenv_str("AWS_REGION"));
   if (cfg.region.empty())
     cfg.region = getenv_str("AWS_DEFAULT_REGION");
   if (cfg.region.empty())
     cfg.region = "us-east-1";
 
-  std::string endpoint = getenv_str("AWS_ENDPOINT_URL");
-  if (endpoint.empty())
+  std::string endpoint;
+  if (auto e = conn.get({"endpoint", "endpoint_url", "endpointoverride", "aws_endpoint_url"}))
+    endpoint = *e;
+  else if (endpoint = getenv_str("AWS_ENDPOINT_URL"); endpoint.empty())
     endpoint = getenv_str("AWS_S3_ENDPOINT");
+
   if (!endpoint.empty())
   {
     if (!parse_endpoint(endpoint, cfg.https, cfg.host, cfg.port))
-      return std::unexpected(error_t{.code = -1, .msg = "invalid AWS_ENDPOINT_URL"});
+      return std::unexpected(error_t{.code = -1, .msg = "invalid s3 endpoint: '" + endpoint + "'"});
     cfg.path_style = true; // custom endpoints (minio) default to path-style
   }
   else
@@ -152,35 +149,73 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std
     cfg.host = "s3." + cfg.region + ".amazonaws.com";
     cfg.path_style = false;
   }
-  std::string fps = getenv_str("AWS_S3_FORCE_PATH_STYLE");
-  if (fps == "1" || fps == "true" || fps == "TRUE")
-    cfg.path_style = true;
+
+  if (auto ps = conn.get({"path_style", "pathstyle", "force_path_style"}))
+    cfg.path_style = conn_detail::parse_bool(*ps, cfg.path_style);
+  else if (std::string fps = getenv_str("AWS_S3_FORCE_PATH_STYLE"); !fps.empty())
+    cfg.path_style = conn_detail::parse_bool(fps, cfg.path_style);
 
   if (cfg.access_key.empty() || cfg.secret_key.empty())
-    return std::unexpected(error_t{.code = -1, .msg = "s3: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"});
-  return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(cfg)));
+    return std::unexpected(error_t{.code = -1, .msg = "s3: credentials missing (set access_key_id/secret_access_key in the connection string or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"});
+  return cfg;
+}
+
+inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_s3(const std::string &path, const connection_options_t &conn, event_loop_t &loop)
+{
+  // With no connection string, an injected process-global config (e.g. browser temp credentials) still
+  // wins over the environment. A supplied connection string takes precedence over the override.
+  if (conn.empty())
+  {
+    if (auto &override_cfg = s3_config_override(); override_cfg.has_value())
+    {
+      s3_io_manager_t::config_t merged = *override_cfg;
+      std::string bucket, prefix;
+      split_bucket_prefix(path, bucket, prefix);
+      if (merged.bucket.empty())
+        merged.bucket = std::move(bucket);
+      if (merged.prefix.empty())
+        merged.prefix = std::move(prefix);
+      return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(merged)));
+    }
+  }
+  auto cfg = resolve_s3_config(path, conn);
+  if (!cfg)
+    return std::unexpected(cfg.error());
+  return std::unique_ptr<io_manager_t>(std::make_unique<s3_io_manager_t>(loop, std::move(*cfg)));
 }
 
 #ifndef __EMSCRIPTEN__
-inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_azure(const std::string &path, event_loop_t &loop)
+inline std::optional<azure_io_manager_t::config_t> &azure_config_override()
+{
+  static std::optional<azure_io_manager_t::config_t> cfg;
+  return cfg;
+}
+
+// Resolve an Azure config from a connection string and the environment (connection key > AZURE_* env >
+// default). Container/prefix always come from the URL path.
+inline std::expected<azure_io_manager_t::config_t, error_t> resolve_azure_config(const std::string &path, const connection_options_t &conn)
 {
   azure_io_manager_t::config_t cfg;
   split_bucket_prefix(path, cfg.container, cfg.prefix);
   if (cfg.container.empty())
     return std::unexpected(error_t{.code = -1, .msg = "azure url missing container (expected az://container/prefix)"});
-  cfg.account = getenv_str("AZURE_STORAGE_ACCOUNT");
-  cfg.account_key_base64 = getenv_str("AZURE_STORAGE_KEY");
-  cfg.sas = getenv_str("AZURE_STORAGE_SAS");
-  if (cfg.account.empty())
-    return std::unexpected(error_t{.code = -1, .msg = "azure: set AZURE_STORAGE_ACCOUNT"});
 
-  std::string endpoint = getenv_str("AZURE_BLOB_ENDPOINT");
-  if (endpoint.empty())
+  cfg.account = conn.get({"account", "account_name", "accountname"}).value_or(getenv_str("AZURE_STORAGE_ACCOUNT"));
+  cfg.account_key_base64 = conn.get({"account_key", "accountkey", "account_key_base64"}).value_or(getenv_str("AZURE_STORAGE_KEY"));
+  cfg.sas = conn.get({"sas", "shared_access_signature", "sharedaccesssignature"}).value_or(getenv_str("AZURE_STORAGE_SAS"));
+  if (cfg.account.empty())
+    return std::unexpected(error_t{.code = -1, .msg = "azure: account missing (set account in the connection string or AZURE_STORAGE_ACCOUNT)"});
+
+  std::string endpoint;
+  if (auto e = conn.get({"endpoint", "blob_endpoint", "blobendpoint"}))
+    endpoint = *e;
+  else if (endpoint = getenv_str("AZURE_BLOB_ENDPOINT"); endpoint.empty())
     endpoint = getenv_str("AZURE_STORAGE_ENDPOINT");
+
   if (!endpoint.empty())
   {
     if (!parse_endpoint(endpoint, cfg.https, cfg.host, cfg.port))
-      return std::unexpected(error_t{.code = -1, .msg = "invalid AZURE_BLOB_ENDPOINT"});
+      return std::unexpected(error_t{.code = -1, .msg = "invalid azure endpoint: '" + endpoint + "'"});
     cfg.account_in_path = true; // azurite / custom endpoints carry the account in the path
   }
   else
@@ -191,8 +226,30 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_azure(const 
   }
 
   if (cfg.sas.empty() && cfg.account_key_base64.empty())
-    return std::unexpected(error_t{.code = -1, .msg = "azure: set AZURE_STORAGE_KEY or AZURE_STORAGE_SAS"});
-  return std::unique_ptr<io_manager_t>(std::make_unique<azure_io_manager_t>(loop, std::move(cfg)));
+    return std::unexpected(error_t{.code = -1, .msg = "azure: set account_key or sas (or AZURE_STORAGE_KEY / AZURE_STORAGE_SAS)"});
+  return cfg;
+}
+
+inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_azure(const std::string &path, const connection_options_t &conn, event_loop_t &loop)
+{
+  if (conn.empty())
+  {
+    if (auto &override_cfg = azure_config_override(); override_cfg.has_value())
+    {
+      azure_io_manager_t::config_t merged = *override_cfg;
+      std::string container, prefix;
+      split_bucket_prefix(path, container, prefix);
+      if (merged.container.empty())
+        merged.container = std::move(container);
+      if (merged.prefix.empty())
+        merged.prefix = std::move(prefix);
+      return std::unique_ptr<io_manager_t>(std::make_unique<azure_io_manager_t>(loop, std::move(merged)));
+    }
+  }
+  auto cfg = resolve_azure_config(path, conn);
+  if (!cfg)
+    return std::unexpected(cfg.error());
+  return std::unique_ptr<io_manager_t>(std::make_unique<azure_io_manager_t>(loop, std::move(*cfg)));
 }
 #endif // __EMSCRIPTEN__
 } // namespace detail
@@ -219,11 +276,54 @@ inline void clear_s3_config_override()
   detail::s3_config_override().reset();
 }
 
-// Build an io_manager from a URL. Schemes: mem://name, dir:///path, s3://bucket/prefix,
-// az://container/prefix. Cloud credentials/endpoints come from the standard environment variables
-// (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION / AWS_ENDPOINT_URL / AWS_S3_FORCE_PATH_STYLE;
-// AZURE_STORAGE_ACCOUNT / AZURE_STORAGE_KEY / AZURE_STORAGE_SAS / AZURE_BLOB_ENDPOINT).
-inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_io_manager(const std::string &url, event_loop_t &loop)
+#ifndef __EMSCRIPTEN__
+// Azure counterparts of the S3 config override (used for az:// URLs when no connection string is given).
+inline void set_azure_config_override(azure_io_manager_t::config_t cfg)
+{
+  detail::azure_config_override() = std::move(cfg);
+}
+
+inline void clear_azure_config_override()
+{
+  detail::azure_config_override().reset();
+}
+#endif
+
+// Parse `connection_string` and install it as the process-global config override for the URL's provider
+// (s3 / azure), so a later create_io_manager(url) [environment overload] uses it. A no-op for file / dir /
+// mem URLs. Convenience for single-output tools (the converter); a multi-endpoint tool (e.g. a copy tool
+// with two different stores) should instead pass the connection to create_io_manager(url, connection, ...)
+// per side rather than rely on the single global override.
+inline std::expected<void, error_t> apply_connection_override(const std::string &url, std::string_view connection_string)
+{
+  auto conn = parse_connection_string(connection_string);
+  if (!conn)
+    return std::unexpected(conn.error());
+  auto [scheme, path] = detail::split_scheme(url);
+  if (scheme == "s3")
+  {
+    auto cfg = detail::resolve_s3_config(path, *conn);
+    if (!cfg)
+      return std::unexpected(cfg.error());
+    set_s3_config_override(std::move(*cfg));
+  }
+#ifndef __EMSCRIPTEN__
+  else if (scheme == "az" || scheme == "azure")
+  {
+    auto cfg = detail::resolve_azure_config(path, *conn);
+    if (!cfg)
+      return std::unexpected(cfg.error());
+    set_azure_config_override(std::move(*cfg));
+  }
+#endif
+  return {};
+}
+
+// Build an io_manager from a URL + an (already-parsed) connection string. Schemes: mem://name,
+// dir:///path, s3://bucket/prefix, az://container/prefix. For cloud stores, credentials/endpoint/region
+// come from `conn` first, then the standard AWS_* / AZURE_* environment variables, then built-in defaults
+// (see resolve_s3_config / resolve_azure_config). dir/mem ignore `conn`.
+inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_io_manager(const std::string &url, const connection_options_t &conn, event_loop_t &loop)
 {
   auto [scheme, path] = detail::split_scheme(url);
 #ifndef __EMSCRIPTEN__
@@ -233,12 +333,27 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_io_manager(c
   if (scheme == "mem")
     return std::unique_ptr<io_manager_t>(std::make_unique<memory_io_manager_t>());
   if (scheme == "s3")
-    return detail::create_s3(path, loop);
+    return detail::create_s3(path, conn, loop);
 #ifndef __EMSCRIPTEN__
   if (scheme == "az" || scheme == "azure")
-    return detail::create_azure(path, loop);
+    return detail::create_azure(path, conn, loop);
 #endif
   return std::unexpected(error_t{.code = -1, .msg = "Unsupported object-store scheme: '" + scheme + "'"});
+}
+
+// As above, taking a raw connection string (parsed here). An empty string means "environment + defaults".
+inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_io_manager(const std::string &url, std::string_view connection_string, event_loop_t &loop)
+{
+  auto conn = parse_connection_string(connection_string);
+  if (!conn)
+    return std::unexpected(conn.error());
+  return create_io_manager(url, *conn, loop);
+}
+
+// Environment-only overload (credentials from AWS_* / AZURE_* env vars, or the process-global override).
+inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_io_manager(const std::string &url, event_loop_t &loop)
+{
+  return create_io_manager(url, connection_options_t{}, loop);
 }
 
 } // namespace vio::objstore
