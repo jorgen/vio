@@ -2,3 +2,6 @@
 cmake-build-*
 3rdparty
 
+build*/
+cmake-build-*/
+test_write_then_read_*
