@@ -72,15 +72,27 @@ public:
   thread_pool_t(thread_pool_t &&) = delete;
   thread_pool_t &operator=(const thread_pool_t &) = delete;
   thread_pool_t &operator=(thread_pool_t &&) = delete;
-  ~thread_pool_t()
+  // Drain the queue and join every worker. Idempotent, so it may be called early -- e.g. to quiesce the pool
+  // while the state its parked tasks reference (event loops, backends) is still alive -- and then again by
+  // the destructor as a no-op. Workers run every already-queued task before exiting (see the worker loop);
+  // callers must guarantee no enqueue() races this (enqueue after stop aborts).
+  void join()
   {
     {
       std::unique_lock<std::mutex> lock(queue_mutex);
+      if (joined)
+        return;
       stop = true;
+      joined = true;
     }
     condition.notify_all();
     for (std::thread &worker : workers)
-      worker.join();
+      if (worker.joinable())
+        worker.join();
+  }
+  ~thread_pool_t()
+  {
+    join();
   }
 
   template <typename T>
@@ -139,5 +151,6 @@ private:
   std::mutex queue_mutex;
   std::condition_variable condition;
   std::atomic<bool> stop{false};
+  bool joined = false; // guarded by queue_mutex; makes join() idempotent (early drain + destructor)
 };
 } // namespace vio
