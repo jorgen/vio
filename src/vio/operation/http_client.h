@@ -29,6 +29,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -80,6 +81,8 @@ struct request_t
   std::string body;
   int max_redirects = 0;        // 0 = do not follow redirects (the default single-shot behaviour)
   bool allow_plaintext = false; // opt-in: permit http:// (plain HTTP is refused by default)
+  bool cache_immutable = false; // hint to an http_cache_t: treat this resource as content-immutable (never
+                                // revalidate). For content-addressed objects the caller knows can't change.
   // Verify the https peer against this PEM CA bundle instead of the system trust
   // store (e.g. a private/test ACME CA like Pebble). Unset => the default bundle.
   std::optional<std::vector<uint8_t>> ca_mem;
@@ -171,12 +174,229 @@ inline std::expected<response_t, error_t> parse_response(const std::string &raw)
 
   return response;
 }
+// Minimal HTTP/1.1 response framing + a keep-alive connection pool. Reusing a connection requires stopping
+// the read at the message boundary (Content-Length / chunked / empty-body status) instead of at the peer's
+// close, so these helpers frame the response and decide whether the connection is safe to keep.
+struct frame_info_t
+{
+  int status = 0;
+  bool http_1_1 = false;
+  bool chunked = false;
+  bool conn_close = false;       // response asked to close the connection
+  long long content_length = -1; // -1 => header absent
+};
+
+inline frame_info_t parse_frame_info(std::string_view header_block)
+{
+  frame_info_t fi;
+  auto eol = header_block.find("\r\n");
+  std::string_view status_line = header_block.substr(0, eol == std::string_view::npos ? header_block.size() : eol);
+  fi.http_1_1 = status_line.substr(0, 9) == "HTTP/1.1 ";
+  if (auto sp = status_line.find(' '); sp != std::string_view::npos)
+    fi.status = std::atoi(std::string(status_line.substr(sp + 1)).c_str());
+  std::string_view rest = (eol == std::string_view::npos) ? std::string_view{} : header_block.substr(eol + 2);
+  while (!rest.empty())
+  {
+    auto le = rest.find("\r\n");
+    std::string_view line = rest.substr(0, le == std::string_view::npos ? rest.size() : le);
+    if (auto c = line.find(':'); c != std::string_view::npos)
+    {
+      std::string_view k = line.substr(0, c);
+      std::string_view v = line.substr(c + 1);
+      while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+        v.remove_prefix(1);
+      while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+        v.remove_suffix(1);
+      if (header_name_equals(k, "Content-Length"))
+        fi.content_length = std::atoll(std::string(v).c_str());
+      else if (header_name_equals(k, "Transfer-Encoding") && header_name_equals(v, "chunked"))
+        fi.chunked = true;
+      else if (header_name_equals(k, "Connection") && header_name_equals(v, "close"))
+        fi.conn_close = true;
+    }
+    if (le == std::string_view::npos)
+      break;
+    rest = rest.substr(le + 2);
+  }
+  return fi;
+}
+
+// Has the chunked body that starts at `body` reached its terminating 0-length chunk?
+inline bool chunked_complete(std::string_view body)
+{
+  std::string_view s = body;
+  while (!s.empty())
+  {
+    auto nl = s.find("\r\n");
+    if (nl == std::string_view::npos)
+      return false;
+    unsigned long sz = std::strtoul(std::string(s.substr(0, nl)).c_str(), nullptr, 16);
+    s = s.substr(nl + 2);
+    if (sz == 0)
+      return true; // last chunk seen (trailers ignored)
+    if (s.size() < sz + 2)
+      return false;
+    s = s.substr(sz + 2);
+  }
+  return false;
+}
+
+inline bool is_stream_end(const error_t &e)
+{
+  return e.code == UV_EOF || e.code == vio_tls_clean_shutdown || e.code == vio_tls_truncated;
+}
+
+struct framed_response_t
+{
+  std::string raw;       // headers + body, trimmed to exactly the framed message when length-delimited
+  bool complete = false; // a full response was read
+  bool reusable = false; // the connection is safe to keep alive (self-delimited, no trailing bytes, keep-alive)
+};
+
+// Read one HTTP/1.1 response with correct message framing. Returns as soon as the body boundary is reached
+// (Content-Length / chunked / empty-body status / HEAD) rather than waiting for the peer to close, so the
+// connection can be pooled. Falls back to close-delimited (read-to-end) when no length is advertised.
+template <typename Reader>
+inline vio::task_t<std::expected<framed_response_t, error_t>> read_framed(Reader &reader, bool is_head)
+{
+  framed_response_t out;
+  std::string &raw = out.raw;
+  bool have_headers = false;
+  std::size_t body_start = 0;
+  frame_info_t fi;
+
+  for (;;)
+  {
+    if (!have_headers)
+    {
+      if (auto he = raw.find("\r\n\r\n"); he != std::string::npos)
+      {
+        have_headers = true;
+        body_start = he + 4;
+        fi = parse_frame_info(std::string_view(raw).substr(0, he));
+        if (is_head || fi.status == 204 || fi.status == 304)
+          fi.content_length = 0;
+      }
+    }
+    if (have_headers)
+    {
+      if (fi.chunked)
+      {
+        if (chunked_complete(std::string_view(raw).substr(body_start)))
+        {
+          out.complete = true;
+          out.reusable = false; // conservative: never pool chunked responses
+          co_return out;
+        }
+      }
+      else if (fi.content_length >= 0)
+      {
+        const std::size_t want = body_start + static_cast<std::size_t>(fi.content_length);
+        if (raw.size() >= want)
+        {
+          const bool overshoot = raw.size() > want;
+          raw.resize(want); // hand parse_response exactly the framed message
+          out.complete = true;
+          out.reusable = fi.http_1_1 && !fi.conn_close && !overshoot;
+          co_return out;
+        }
+      }
+      // else: no length advertised -> close-delimited; fall through and read until the stream ends.
+    }
+
+    auto chunk = co_await reader;
+    if (!chunk)
+    {
+      if (is_stream_end(chunk.error()) && have_headers && !fi.chunked && fi.content_length < 0)
+      {
+        out.complete = true; // close-delimited body ends here (legacy read-to-EOF)
+        out.reusable = false;
+        co_return out;
+      }
+      co_return std::unexpected(chunk.error()); // truncated or a transport error
+    }
+    raw.append(chunk.value().buf.base, chunk.value().buf.len);
+  }
+}
 } // namespace detail
 
-// One request over a fresh verified TLS connection (SSL_VERIFY_PEER + hostname check), sent with
-// Connection: close; reads the whole response (Content-Length or chunked). No keep-alive, no
-// redirect following (see fetch below), no transparent decompression (Accept-Encoding: identity).
-inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &loop, const request_t &request, cancellation_t *cancel = nullptr)
+// A pooled, already-connected transport, kept alive between requests to the same origin. https uses `tls`,
+// plaintext http uses `tcp`; exactly one is set.
+struct pooled_connection_t
+{
+  std::string key;
+  std::optional<ssl_client_t> tls;
+  std::optional<tcp_t> tcp;
+  uint64_t idle_since_ms = 0;
+};
+
+// Keep-alive connection pool for vio::http::fetch. Single event-loop / single-thread: every method runs
+// inside a fetch coroutine on that loop's thread, so no locking is needed. It must outlive every fetch that
+// uses it and every connection it hands out. Pass `&pool` as the last argument to fetch()/fetch_once() to
+// enable keep-alive; omit it (or pass nullptr) for the legacy fresh-connection-per-request behaviour.
+struct connection_pool_t
+{
+  connection_pool_t() = default;
+  connection_pool_t(const connection_pool_t &) = delete;
+  connection_pool_t &operator=(const connection_pool_t &) = delete;
+
+  // Declared first => destroyed last, after any idle ssl_client_t whose SSL_CTX ex_data references it.
+  ssl_session_cache_t session_cache;
+  std::unordered_map<std::string, std::vector<pooled_connection_t>> idle;
+
+  std::size_t max_idle_per_host = 8;
+  uint64_t idle_timeout_ms = 30'000;
+
+  // telemetry
+  uint64_t reuses = 0;
+  uint64_t creations = 0;
+  uint64_t discards_stale = 0;
+
+  static std::string make_key(std::string_view scheme, std::string_view host, std::uint16_t port)
+  {
+    std::string k;
+    k.reserve(scheme.size() + host.size() + 8);
+    k.append(scheme).append("://").append(host).append(":").append(std::to_string(port));
+    return k;
+  }
+
+  // Pop a warm connection (LIFO) for `key`, discarding entries idle past the timeout. Fully synchronous
+  // (no co_await between pick and remove) so two coroutines can never be handed the same connection.
+  std::optional<pooled_connection_t> acquire(event_loop_t &loop, const std::string &key)
+  {
+    auto it = idle.find(key);
+    if (it == idle.end())
+      return std::nullopt;
+    const uint64_t now = uv_now(loop.loop());
+    auto &vec = it->second;
+    while (!vec.empty())
+    {
+      pooled_connection_t c = std::move(vec.back());
+      vec.pop_back();
+      if (now - c.idle_since_ms > idle_timeout_ms)
+        continue; // too old: let it drop (closes), try the next
+      return c;
+    }
+    return std::nullopt;
+  }
+
+  void release(event_loop_t &loop, pooled_connection_t &&c)
+  {
+    auto &vec = idle[c.key];
+    if (vec.size() >= max_idle_per_host)
+      return; // over cap: drop -> connection closes on destruction
+    c.idle_since_ms = uv_now(loop.loop());
+    vec.push_back(std::move(c));
+  }
+};
+
+// One request over a verified TLS (or opt-in plaintext) connection. With `pool == nullptr` this opens a
+// fresh connection, sends Connection: close, and reads the whole response (legacy behaviour). With a pool
+// it sends Connection: keep-alive, reuses a warm connection when available (retrying once on a fresh one if
+// the pooled connection was stale), frames the response by Content-Length/chunked, and returns the
+// connection to the pool when it is safe to reuse. No redirect following (see fetch below), no transparent
+// decompression (Accept-Encoding: identity).
+inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &loop, const request_t &request, cancellation_t *cancel = nullptr, connection_pool_t *pool = nullptr)
 {
   auto parsed = ada::parse<ada::url_aggregator>(request.url);
   if (!parsed)
@@ -207,7 +427,7 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
   wire.append("\r\n");
   wire.append("User-Agent: vio-http/0.1\r\n");
   wire.append("Accept-Encoding: identity\r\n");
-  wire.append("Connection: close\r\n");
+  wire.append(pool ? "Connection: keep-alive\r\n" : "Connection: close\r\n");
   for (const auto &h : request.headers)
     wire.append(h.name).append(": ").append(h.value).append("\r\n");
   if (!request.body.empty())
@@ -215,101 +435,161 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
   wire.append("\r\n");
   wire.append(request.body);
 
-  std::string raw;
+  const std::string key = connection_pool_t::make_key(is_https ? "https" : "http", host, port);
+  const bool is_head = request.method == "HEAD";
 
-  if (is_https)
+  std::optional<pooled_connection_t> pc;
+  bool from_pool = false;
+  if (pool)
   {
-    ssl_config_t tls_config;
-    if (request.ca_mem)
-      tls_config.ca_mem = request.ca_mem;
-    auto client = ssl_client_create(loop, tls_config);
-    if (!client)
-      co_return std::unexpected(client.error());
-
-    auto connected = co_await ssl_client_connect(client.value(), host, port, cancel);
-    if (!connected)
-      co_return std::unexpected(connected.error());
-
-    uv_buf_t buf;
-    buf.base = wire.data();
-    buf.len = static_cast<decltype(buf.len)>(wire.size());
-    auto written = co_await ssl_client_write(client.value(), buf, cancel);
-    if (!written)
-      co_return std::unexpected(written.error());
-
-    auto reader_result = ssl_client_create_reader(client.value());
-    if (!reader_result)
-      co_return std::unexpected(reader_result.error());
-    auto reader = std::move(reader_result.value());
-
-    while (true)
-    {
-      auto chunk = co_await reader;
-      if (!chunk)
-        break;
-      raw.append(chunk.value().buf.base, chunk.value().buf.len);
-    }
-  }
-  else
-  {
-    // Plaintext HTTP (opt-in): resolve the host, stamp the port onto the address, and drive a plain
-    // TCP connection with the same request wire. Used for same-host reverse proxying to an internal
-    // backend; unreachable unless request.allow_plaintext was set.
-    address_info_t hints;
-    hints.socktype = SOCK_STREAM;
-    auto resolved = co_await get_addrinfo(loop, host, hints, cancel);
-    if (!resolved)
-      co_return std::unexpected(resolved.error());
-    if (resolved->empty())
-      co_return std::unexpected(error_t{.code = -1, .msg = "http: host did not resolve"});
-
-    sockaddr *sa = resolved->front().get_sockaddr();
-    if (sa == nullptr)
-      co_return std::unexpected(error_t{.code = -1, .msg = "http: no address for host"});
-    if (sa->sa_family == AF_INET)
-      reinterpret_cast<sockaddr_in *>(sa)->sin_port = htons(port);
-    else if (sa->sa_family == AF_INET6)
-      reinterpret_cast<sockaddr_in6 *>(sa)->sin6_port = htons(port);
-
-    auto tcp = tcp_create(loop);
-    if (!tcp)
-      co_return std::unexpected(tcp.error());
-
-    auto connected = co_await tcp_connect(tcp.value(), sa, cancel);
-    if (!connected)
-      co_return std::unexpected(connected.error());
-
-    auto written = co_await write_tcp(tcp.value(), reinterpret_cast<const uint8_t *>(wire.data()), wire.size(), cancel);
-    if (!written)
-      co_return std::unexpected(written.error());
-
-    auto reader_result = tcp_create_reader(tcp.value());
-    if (!reader_result)
-      co_return std::unexpected(reader_result.error());
-    auto reader = std::move(reader_result.value());
-
-    while (true)
-    {
-      auto chunk = co_await reader;
-      if (!chunk)
-        break;
-      raw.append(chunk.value().buf.base, chunk.value().buf.len);
-    }
+    pc = pool->acquire(loop, key);
+    from_pool = pc.has_value();
   }
 
-  co_return detail::parse_response(raw);
+  for (int attempt = 0;; ++attempt)
+  {
+    // Establish a fresh connection unless we are reusing a warm one from the pool.
+    if (!pc)
+    {
+      pooled_connection_t fresh;
+      fresh.key = key;
+      if (is_https)
+      {
+        ssl_config_t tls_config;
+        if (request.ca_mem)
+          tls_config.ca_mem = request.ca_mem;
+        if (pool)
+        {
+          // Cross-connection TLS session resumption shortens even the fresh-connection handshake.
+          tls_config.session_cache = &pool->session_cache;
+          tls_config.enable_session_cache = true;
+        }
+        auto client = ssl_client_create(loop, tls_config);
+        if (!client)
+          co_return std::unexpected(client.error());
+        auto connected = co_await ssl_client_connect(client.value(), host, port, cancel);
+        if (!connected)
+          co_return std::unexpected(connected.error());
+        fresh.tls = std::move(client.value());
+      }
+      else
+      {
+        // Plaintext HTTP (opt-in): resolve the host, stamp the port onto the address, and drive a plain
+        // TCP connection with the same request wire. Unreachable unless request.allow_plaintext was set.
+        address_info_t hints;
+        hints.socktype = SOCK_STREAM;
+        auto resolved = co_await get_addrinfo(loop, host, hints, cancel);
+        if (!resolved)
+          co_return std::unexpected(resolved.error());
+        if (resolved->empty())
+          co_return std::unexpected(error_t{.code = -1, .msg = "http: host did not resolve"});
+        sockaddr *sa = resolved->front().get_sockaddr();
+        if (sa == nullptr)
+          co_return std::unexpected(error_t{.code = -1, .msg = "http: no address for host"});
+        if (sa->sa_family == AF_INET)
+          reinterpret_cast<sockaddr_in *>(sa)->sin_port = htons(port);
+        else if (sa->sa_family == AF_INET6)
+          reinterpret_cast<sockaddr_in6 *>(sa)->sin6_port = htons(port);
+        auto tcp = tcp_create(loop);
+        if (!tcp)
+          co_return std::unexpected(tcp.error());
+        auto connected = co_await tcp_connect(tcp.value(), sa, cancel);
+        if (!connected)
+          co_return std::unexpected(connected.error());
+        fresh.tcp = std::move(tcp.value());
+      }
+      pc = std::move(fresh);
+      from_pool = false;
+      if (pool)
+        pool->creations++;
+    }
+
+    // Send the request and read exactly one framed response. The reader lives only inside this block, so
+    // it is destroyed (reads disarmed) before the connection may be returned to the pool.
+    std::optional<error_t> req_err;
+    detail::framed_response_t framed;
+    {
+      uv_buf_t buf;
+      buf.base = wire.data();
+      buf.len = static_cast<decltype(buf.len)>(wire.size());
+      if (pc->tls)
+      {
+        auto written = co_await ssl_client_write(pc->tls.value(), buf, cancel);
+        if (!written)
+          req_err = written.error();
+        else if (auto rr = ssl_client_create_reader(pc->tls.value()); !rr)
+          req_err = rr.error();
+        else
+        {
+          auto reader = std::move(rr.value());
+          auto fr = co_await detail::read_framed(reader, is_head);
+          if (!fr)
+            req_err = fr.error();
+          else
+            framed = std::move(fr.value());
+        }
+      }
+      else
+      {
+        auto written = co_await write_tcp(pc->tcp.value(), reinterpret_cast<const uint8_t *>(wire.data()), wire.size(), cancel);
+        if (!written)
+          req_err = written.error();
+        else if (auto rr = tcp_create_reader(pc->tcp.value()); !rr)
+          req_err = rr.error();
+        else
+        {
+          auto reader = std::move(rr.value());
+          auto fr = co_await detail::read_framed(reader, is_head);
+          if (!fr)
+            req_err = fr.error();
+          else
+            framed = std::move(fr.value());
+        }
+      }
+    }
+
+    if (req_err)
+    {
+      // A pooled connection the server had already half-closed fails here; retry ONCE on a fresh one.
+      if (from_pool && attempt == 0 && !is_cancelled(*req_err))
+      {
+        if (pool)
+          pool->discards_stale++;
+        pc.reset(); // drop -> close
+        from_pool = false;
+        continue;
+      }
+      co_return std::unexpected(*req_err);
+    }
+
+    if (pool && from_pool)
+      pool->reuses++;
+
+    auto response = detail::parse_response(framed.raw);
+    if (!response)
+    {
+      pc.reset();
+      co_return std::unexpected(response.error());
+    }
+
+    if (pool && framed.complete && framed.reusable)
+      pool->release(loop, std::move(*pc)); // keep alive for the next request
+    else
+      pc.reset(); // legacy fresh-connection path, or a connection the peer is closing
+    co_return std::move(*response);
+  }
 }
 
 // HTTPS/1.1 GET/POST that follows up to request.max_redirects hops (3xx with a Location). Only
 // same-scheme https redirects are followed; a redirect to a non-https target is refused. On
 // 303 (and 301/302 for a POST) the method is downgraded to GET and the body dropped, per the
 // browser fetch model. With max_redirects == 0 this behaves exactly like fetch_once.
-inline vio::task_t<std::expected<response_t, error_t>> fetch(event_loop_t &loop, const request_t &request, cancellation_t *cancel = nullptr)
+inline vio::task_t<std::expected<response_t, error_t>> fetch(event_loop_t &loop, const request_t &request, cancellation_t *cancel = nullptr, connection_pool_t *pool = nullptr)
 {
   request_t current = request;
   for (int hops = 0;; ++hops)
   {
-    auto response = co_await fetch_once(loop, current, cancel);
+    auto response = co_await fetch_once(loop, current, cancel, pool);
     if (!response.has_value())
       co_return response;
 

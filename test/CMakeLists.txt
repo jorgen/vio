@@ -7,6 +7,7 @@ add_executable(vio_tests
     test_ssl_upgrade.cpp
     test_task_and_sleep.cpp
     test_http_client.cpp
+    test_http_cache.cpp
     test_file.cpp
     test_file_leak.cpp
     test_tcp.cpp

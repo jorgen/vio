@@ -199,6 +199,98 @@ TEST_SUITE("http_client plaintext")
   }
 }
 
+namespace
+{
+// Serve `count` keep-alive responses (Content-Length framed) back-to-back on a SINGLE accepted connection.
+// Proves the client frames each response at its Content-Length (so the next request can be read on the same
+// socket) and returns the connection to the pool between requests.
+vio::task_t<void> keepalive_reuse_scenario(vio::event_loop_t &event_loop, int count, vio::http::connection_pool_t &pool, std::vector<vio::http::response_t> &out, bool &ok)
+{
+  auto server_and_port = bound_http_server(event_loop);
+  REQUIRE_EXPECTED(server_and_port);
+  const int port = server_and_port->second;
+
+  auto server_task = [](vio::tcp_server_t s, int n) -> vio::task_t<void>
+  {
+    auto server = std::move(s);
+    auto listen_result = co_await vio::tcp_listen(server, 10);
+    REQUIRE_EXPECTED(listen_result);
+    auto accepted = vio::tcp_accept(server); // exactly one connection for all n requests
+    REQUIRE_EXPECTED(accepted);
+    auto conn = std::move(accepted.value());
+    auto reader_or = vio::tcp_create_reader(conn);
+    REQUIRE_EXPECTED(reader_or);
+    auto reader = std::move(reader_or.value());
+    std::string buf;
+    for (int i = 0; i < n; ++i)
+    {
+      while (buf.find("\r\n\r\n") == std::string::npos)
+      {
+        auto chunk = co_await reader;
+        if (!chunk)
+          co_return;
+        buf.append(chunk.value().buf.base, chunk.value().buf.len);
+      }
+      buf.erase(0, buf.find("\r\n\r\n") + 4); // consume the (body-less) request
+      std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+      auto w = co_await vio::write_tcp(conn, reinterpret_cast<const uint8_t *>(response.data()), response.size());
+      REQUIRE_EXPECTED(w);
+    }
+  }(std::move(server_and_port->first), count);
+
+  co_await [](vio::event_loop_t &el, int p, int n, vio::http::connection_pool_t &pl, std::vector<vio::http::response_t> &results, bool &success) -> vio::task_t<void>
+  {
+    for (int i = 0; i < n; ++i)
+    {
+      vio::http::request_t req;
+      req.method = "GET";
+      req.url = "http://127.0.0.1:" + std::to_string(p) + "/a";
+      req.allow_plaintext = true;
+      auto resp = co_await vio::http::fetch_once(el, req, nullptr, &pl);
+      REQUIRE_EXPECTED(resp);
+      results.push_back(std::move(resp.value()));
+    }
+    pl.idle.clear(); // close pooled connections while the loop is still alive (asan-clean teardown)
+    success = true;
+  }(event_loop, port, count, pool, out, ok);
+
+  co_await std::move(server_task);
+}
+} // namespace
+
+TEST_SUITE("http_client keep-alive")
+{
+  // Two requests share one connection: the pool creates exactly one connection and reuses it once.
+  TEST_CASE("pool reuses a single connection across requests")
+  {
+    vio::event_loop_t event_loop;
+    vio::http::connection_pool_t pool;
+    std::vector<vio::http::response_t> resps;
+    bool ok = false;
+
+    event_loop.run_in_loop(
+      [&]
+      {
+        return [](vio::event_loop_t &el, vio::http::connection_pool_t &pl, std::vector<vio::http::response_t> &out, bool &success) -> vio::task_t<void>
+        {
+          co_await keepalive_reuse_scenario(el, 2, pl, out, success);
+          el.stop();
+        }(event_loop, pool, resps, ok);
+      });
+    event_loop.run();
+
+    REQUIRE(ok);
+    REQUIRE(resps.size() == 2);
+    CHECK(resps[0].status == 200);
+    CHECK(resps[0].body == "hello");
+    CHECK(resps[1].status == 200);
+    CHECK(resps[1].body == "hello");
+    CHECK(pool.creations == 1); // only the first request opened a socket
+    CHECK(pool.reuses == 1);    // the second request rode the pooled connection
+    CHECK(pool.discards_stale == 0);
+  }
+}
+
 // The ca_mem end-to-end cases connect fetch_once to a literal 127.0.0.1 (a single
 // address, so no IPv4/IPv6 candidate failover) against a loopback TLS server whose
 // leaf carries an IP SAN for 127.0.0.1 (verified by IP, so no DNS name is needed).

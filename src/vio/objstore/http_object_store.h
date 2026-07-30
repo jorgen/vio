@@ -23,6 +23,9 @@
 
 #include <vio/objstore/object_store.h>
 #include <vio/operation/http_client.h>
+#ifndef __EMSCRIPTEN__
+#include <vio/objstore/http_cache.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +40,21 @@
 namespace vio::objstore
 {
 
+#ifndef __EMSCRIPTEN__
+// Process-global default HTTP cache. When installed, every http_io_manager created afterwards uses it for
+// GET responses unless it is given a different one via set_cache(). The application owns the http_cache_t
+// (it must outlive the io_managers); vio never writes to disk unless the app opts in by installing one.
+inline http_cache_t *&default_http_cache()
+{
+  static http_cache_t *cache = nullptr;
+  return cache;
+}
+inline void set_default_http_cache(http_cache_t *cache)
+{
+  default_http_cache() = cache;
+}
+#endif
+
 // Common HTTP object-store machinery for the S3 and Azure backends: the four io_manager operations as
 // GET / PUT / HEAD / DELETE over vio::http::fetch, plus response/status handling. Providers supply a
 // fully-signed request via build_request().
@@ -46,14 +64,25 @@ public:
   explicit http_io_manager_t(event_loop_t &loop)
     : _loop(loop)
   {
+#ifndef __EMSCRIPTEN__
+    _cache = default_http_cache();
+#endif
   }
+
+#ifndef __EMSCRIPTEN__
+  // Override the HTTP cache for this store (nullptr disables caching). Defaults to the process-global cache.
+  void set_cache(http_cache_t *cache)
+  {
+    _cache = cache;
+  }
+#endif
 
   task_t<std::expected<uint64_t, error_t>> read_object(std::string name, uint8_t *dst, io_range_t range) override
   {
     if (auto creds = co_await ensure_credentials(); !creds)
       co_return std::unexpected(creds.error());
     auto req = build_request("GET", name, std::span<const uint8_t>{}, &range);
-    auto resp = co_await http::fetch(_loop, req);
+    auto resp = co_await do_fetch(req);
     if (!resp.has_value())
       co_return std::unexpected(resp.error());
     if (resp->status != 200 && resp->status != 206)
@@ -72,7 +101,7 @@ public:
     std::span<const uint8_t> payload(data.get(), size);
     auto req = build_request("PUT", name, payload, nullptr);
     req.body.assign(reinterpret_cast<const char *>(data.get()), size);
-    auto resp = co_await http::fetch(_loop, req);
+    auto resp = co_await do_fetch(req);
     if (!resp.has_value())
       co_return std::unexpected(resp.error());
     if (resp->status != 200 && resp->status != 201)
@@ -85,7 +114,7 @@ public:
     if (auto creds = co_await ensure_credentials(); !creds)
       co_return std::unexpected(creds.error());
     auto req = build_request("HEAD", name, std::span<const uint8_t>{}, nullptr);
-    auto resp = co_await http::fetch(_loop, req);
+    auto resp = co_await do_fetch(req);
     if (!resp.has_value())
       co_return std::unexpected(resp.error());
     object_info_t out;
@@ -108,7 +137,7 @@ public:
     if (auto creds = co_await ensure_credentials(); !creds)
       co_return std::unexpected(creds.error());
     auto req = build_request("DELETE", name, std::span<const uint8_t>{}, nullptr);
-    auto resp = co_await http::fetch(_loop, req);
+    auto resp = co_await do_fetch(req);
     if (!resp.has_value())
       co_return std::unexpected(resp.error());
     // Idempotent: a missing object (404/410) is success, as are 200/202/204.
@@ -118,6 +147,55 @@ public:
   }
 
 protected:
+  // Single choke point for all four ops. On native it reuses a per-store keep-alive connection pool; on
+  // wasm the browser owns connection reuse, so it forwards to the emscripten_fetch path unchanged.
+  task_t<std::expected<http::response_t, error_t>> do_fetch(const http::request_t &req)
+  {
+#ifndef __EMSCRIPTEN__
+    // GET responses go through the on-disk HTTP cache (browser semantics): a fresh entry is served without
+    // touching the network; a stale one is revalidated with a conditional GET (a 304 refreshes it for free).
+    // Non-GET ops and the no-cache configuration fall straight through to the keep-alive fetch.
+    if (_cache && req.method == "GET")
+    {
+      std::string range;
+      for (const auto &h : req.headers)
+        if (http::detail::header_name_equals(h.name, "Range"))
+          range = h.value;
+
+      auto hit = _cache->lookup(req.url, range);
+      if (hit.state == http_cache_t::state_t::fresh)
+        co_return std::move(hit.response);
+
+      http::request_t r = req;
+      if (hit.state == http_cache_t::state_t::stale)
+      {
+        if (!hit.etag.empty())
+          r.headers.push_back(http::header_t{"If-None-Match", hit.etag});
+        if (!hit.last_modified.empty())
+          r.headers.push_back(http::header_t{"If-Modified-Since", hit.last_modified});
+      }
+
+      auto resp = co_await http::fetch(_loop, r, nullptr, &_pool);
+      if (resp.has_value())
+      {
+        if (resp->status == 304)
+        {
+          if (auto served = _cache->note_not_modified(req.url, range, *resp))
+            co_return std::move(*served); // revalidated: serve the stored body as 200
+        }
+        else
+        {
+          _cache->store(req.url, range, *resp, req.cache_immutable);
+        }
+      }
+      co_return resp;
+    }
+    co_return co_await http::fetch(_loop, req, nullptr, &_pool);
+#else
+    co_return co_await http::fetch(_loop, req, nullptr);
+#endif
+  }
+
   // Build and sign the request for the given op. `payload` is the exact body (empty for GET/HEAD/DELETE);
   // `range` is non-null only for a ranged GET. Sets url/method/headers/body and, from the members below,
   // allow_plaintext and ca_mem.
@@ -167,6 +245,12 @@ protected:
   event_loop_t &_loop;
   bool _allow_plaintext = false;              // permit http:// (e.g. a local minio/azurite over plain HTTP)
   std::optional<std::vector<uint8_t>> _ca_mem; // optional custom CA bundle for a private endpoint
+#ifndef __EMSCRIPTEN__
+  // Per-store, per-loop keep-alive pool reused across all four ops (native transport only; the browser
+  // build lets emscripten_fetch handle connection reuse). Declared last so it is torn down first.
+  http::connection_pool_t _pool;
+  http_cache_t *_cache = nullptr; // shared, app-owned HTTP cache (nullptr => no caching)
+#endif
 
 private:
   static error_t http_error(int status, const std::string &op, const std::string &body)
