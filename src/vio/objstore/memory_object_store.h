@@ -38,6 +38,20 @@ class memory_io_manager_t : public io_manager_t
 public:
   memory_io_manager_t() = default;
 
+  task_t<std::expected<uint64_t, error_t>> read_object_all(std::string name, uint8_t *dst, uint64_t capacity) override
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    auto it = _objects.find(name);
+    if (it == _objects.end())
+      co_return std::unexpected(error_t{.code = 1, .msg = "Object not found: " + name});
+    const auto &bytes = it->second;
+    if (bytes.size() > capacity)
+      co_return std::unexpected(error_t{.code = 1, .msg = "Object larger than caller buffer: " + name});
+    if (!bytes.empty())
+      memcpy(dst, bytes.data(), bytes.size());
+    co_return uint64_t(bytes.size());
+  }
+
   task_t<std::expected<uint64_t, error_t>> read_object(std::string name, uint8_t *dst, io_range_t range) override
   {
     std::unique_lock<std::mutex> lock(_mutex);

@@ -60,6 +60,21 @@ public:
   // number of bytes read. A missing object is an error.
   virtual task_t<std::expected<uint64_t, error_t>> read_object(std::string name, uint8_t *dst, io_range_t range = {}) = 0;
 
+  // Whole-object read that never sends a Range header and never overruns the caller's buffer:
+  // fails when the object is larger than `capacity`, otherwise returns the object's byte count.
+  // The default is HEAD-then-GET; concrete stores override with a single capacity-checked read.
+  virtual task_t<std::expected<uint64_t, error_t>> read_object_all(std::string name, uint8_t *dst, uint64_t capacity)
+  {
+    auto info = co_await object_info(name);
+    if (!info.has_value())
+      co_return std::unexpected(info.error());
+    if (!info->exists)
+      co_return std::unexpected(error_t{.code = 1, .msg = "Object not found: " + name});
+    if (info->size > capacity)
+      co_return std::unexpected(error_t{.code = 1, .msg = "Object larger than caller buffer: " + name});
+    co_return co_await read_object(std::move(name), dst, io_range_t{});
+  }
+
   // Write a whole object (create or atomically replace) from `size` bytes of `data`.
   virtual task_t<std::expected<void, error_t>> write_object(std::string name, std::shared_ptr<uint8_t[]> data, uint64_t size) = 0;
 

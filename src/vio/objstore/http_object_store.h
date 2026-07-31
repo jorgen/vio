@@ -94,6 +94,23 @@ public:
     co_return n;
   }
 
+  task_t<std::expected<uint64_t, error_t>> read_object_all(std::string name, uint8_t *dst, uint64_t capacity) override
+  {
+    if (auto creds = co_await ensure_credentials(); !creds)
+      co_return std::unexpected(creds.error());
+    auto req = build_request("GET", name, std::span<const uint8_t>{}, nullptr); // never a Range header
+    auto resp = co_await do_fetch(req);
+    if (!resp.has_value())
+      co_return std::unexpected(resp.error());
+    if (resp->status != 200 && resp->status != 206)
+      co_return std::unexpected(http_error(resp->status, "read_object_all " + name, resp->body));
+    if (resp->body.size() > capacity)
+      co_return std::unexpected(error_t{.code = 1, .msg = "Object larger than caller buffer: " + name});
+    if (!resp->body.empty())
+      memcpy(dst, resp->body.data(), resp->body.size());
+    co_return uint64_t(resp->body.size());
+  }
+
   task_t<std::expected<void, error_t>> write_object(std::string name, std::shared_ptr<uint8_t[]> data, uint64_t size) override
   {
     if (auto creds = co_await ensure_credentials(); !creds)

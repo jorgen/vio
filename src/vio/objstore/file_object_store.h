@@ -48,6 +48,18 @@ public:
   {
   }
 
+  task_t<std::expected<uint64_t, error_t>> read_object_all(std::string name, uint8_t *dst, uint64_t capacity) override
+  {
+    std::string path = _dir + "/" + name;
+    auto st = stat_file(_loop, path);
+    if (!st.has_value())
+      co_return std::unexpected(error_t{.code = 1, .msg = "Object not found: " + name});
+    uint64_t fsize = uint64_t(st.value().st_size);
+    if (fsize > capacity)
+      co_return std::unexpected(error_t{.code = 1, .msg = "Object larger than caller buffer: " + name});
+    co_return co_await read_object(std::move(name), dst, io_range_t{0, int64_t(fsize)});
+  }
+
   task_t<std::expected<uint64_t, error_t>> read_object(std::string name, uint8_t *dst, io_range_t range) override
   {
     std::string path = _dir + "/" + name;
