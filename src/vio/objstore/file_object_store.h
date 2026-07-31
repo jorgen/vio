@@ -89,6 +89,11 @@ public:
     int dir_mode = S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH;
 #endif
     (void)mkdir_path(_loop, _dir, dir_mode);
+    // Object names may contain '/' (S3-style keys, e.g. "data/00000001"): ensure the target's
+    // parent directory exists too, mirroring flat-keyed cloud stores where this is a non-issue.
+    auto last_slash = name.find_last_of('/');
+    if (last_slash != std::string::npos)
+      (void)mkdir_path(_loop, _dir + "/" + name.substr(0, last_slash), dir_mode);
 
     std::string tmpl = _dir + "/.tmp_XXXXXX";
     auto tmp = mkstemp_file(_loop, tmpl);
