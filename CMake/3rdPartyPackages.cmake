@@ -32,6 +32,6 @@ CmDepFetchPackage(ada 3.2.4
 # structify: header-only JSON<->struct reflection, used by the native AWS credential provider chain to
 # parse the ~/.aws login/SSO caches and the SSO/STS/IMDS responses. Consumed as includes only (no
 # add_subdirectory, so structify's own catch2 / yaml-test-suite fetches never run) -- see src/CMakeLists.txt.
-CmDepFetchPackage(structify 7ff77e
-    https://github.com/jorgen/structify/archive/7ff77ebeb8da5c28d24d88a55abde350e0f0e0e4.tar.gz
-    SHA256=2aa00a0741e8ee13befd2afb35f2659d67f41485206ec28d331f4ceae02d8296)
+CmDepFetchPackage(structify 5e9de3b
+    https://github.com/jorgen/structify/archive/5e9de3b209822b3db97cb8d1fbc8368080ffffec.tar.gz
+    SHA256=fe92459294c47debad57481dbfb779a8b3846bb1e9972ac9dd1189389e3f7cc6)
