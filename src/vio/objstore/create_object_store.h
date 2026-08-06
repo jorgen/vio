@@ -401,7 +401,14 @@ inline std::expected<std::unique_ptr<io_manager_t>, error_t> create_io_manager(c
     return std::unique_ptr<io_manager_t>(std::make_unique<file_dir_io_manager_t>(path, loop));
 #endif
   if (scheme == "mem")
-    return std::unique_ptr<io_manager_t>(std::make_unique<memory_io_manager_t>());
+  {
+    // mem://name shares one process-wide store, so a writer and a reader on the same url see the same
+    // objects -- which is what makes mem:// usable for handing a dataset between components at all.
+    // A bare mem:// (no name) keeps the old private-store behaviour.
+    if (path.empty())
+      return std::unique_ptr<io_manager_t>(std::make_unique<memory_io_manager_t>());
+    return std::unique_ptr<io_manager_t>(std::make_unique<memory_io_manager_t>(path));
+  }
   if (scheme == "s3")
     return detail::create_s3(path, conn, loop);
 #ifndef __EMSCRIPTEN__

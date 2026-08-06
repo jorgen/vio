@@ -222,6 +222,98 @@ TEST_CASE("memory io_manager round trip")
   loop.run();
 }
 
+// A NAMED store is shared process-wide, which is the whole reason mem:// is usable for handing a
+// dataset from a writer to a reader: without it each manager on the same url got its own empty store
+// and the reader always saw nothing.
+static vio::task_t<void> memory_named_sharing(vio::event_loop_t &loop)
+{
+  vio::objstore::memory_io_manager_t::reset_named_store("shared-bucket");
+
+  auto data = pattern(64, 7);
+  auto p = std::make_shared<uint8_t[]>(data.size());
+  memcpy(p.get(), data.data(), data.size());
+
+  // The writer goes away entirely before the reader is built -- the store has to outlive it.
+  {
+    vio::objstore::memory_io_manager_t writer("shared-bucket");
+    auto w = co_await writer.write_object("blob", p, data.size());
+    REQUIRE_EXPECTED(w);
+  }
+
+  vio::objstore::memory_io_manager_t reader("shared-bucket");
+  auto info = co_await reader.object_info("blob");
+  REQUIRE_EXPECTED(info);
+  REQUIRE(info->exists);
+  REQUIRE(info->size == data.size());
+
+  std::vector<uint8_t> whole(data.size());
+  auto r = co_await reader.read_object_all("blob", whole.data(), whole.size());
+  REQUIRE_EXPECTED(r);
+  REQUIRE(memcmp(whole.data(), data.data(), data.size()) == 0);
+
+  // A DIFFERENT name is a different store, or naming would be worse than useless.
+  vio::objstore::memory_io_manager_t other("other-bucket");
+  auto missing = co_await other.object_info("blob");
+  REQUIRE_EXPECTED(missing);
+  REQUIRE(!missing->exists);
+
+  // And an unnamed manager stays private, which is the pre-existing behaviour.
+  vio::objstore::memory_io_manager_t anonymous;
+  auto anon = co_await anonymous.object_info("blob");
+  REQUIRE_EXPECTED(anon);
+  REQUIRE(!anon->exists);
+
+  // reset forgets it, so a test that reuses the name does not inherit these bytes.
+  REQUIRE(vio::objstore::memory_io_manager_t::reset_named_store("shared-bucket"));
+  vio::objstore::memory_io_manager_t after_reset("shared-bucket");
+  auto gone = co_await after_reset.object_info("blob");
+  REQUIRE_EXPECTED(gone);
+  REQUIRE(!gone->exists);
+
+  loop.stop();
+}
+
+TEST_CASE("memory io_manager: a named store is shared and an unnamed one is private")
+{
+  vio::event_loop_t loop;
+  loop.run_in_loop([&] { return memory_named_sharing(loop); });
+  loop.run();
+}
+
+TEST_CASE("create_io_manager: mem://name resolves to the shared store")
+{
+  // The url is what a caller actually uses, so the wiring in create_io_manager needs its own check --
+  // a correct registry reached through a manager that ignores the name would still be broken.
+  vio::objstore::memory_io_manager_t::reset_named_store("url-bucket");
+  vio::event_loop_t loop;
+  loop.run_in_loop([&loop]() -> vio::task_t<void> {
+    auto writer = vio::objstore::create_io_manager("mem://url-bucket", loop);
+    REQUIRE(writer.has_value());
+    auto data = pattern(32, 11);
+    auto p = std::make_shared<uint8_t[]>(data.size());
+    memcpy(p.get(), data.data(), data.size());
+    auto w = co_await writer.value()->write_object("obj", p, data.size());
+    REQUIRE_EXPECTED(w);
+
+    auto reader = vio::objstore::create_io_manager("mem://url-bucket", loop);
+    REQUIRE(reader.has_value());
+    auto info = co_await reader.value()->object_info("obj");
+    REQUIRE_EXPECTED(info);
+    REQUIRE(info->exists);
+
+    // A bare mem:// is still ephemeral.
+    auto ephemeral = vio::objstore::create_io_manager("mem://", loop);
+    REQUIRE(ephemeral.has_value());
+    auto absent = co_await ephemeral.value()->object_info("obj");
+    REQUIRE_EXPECTED(absent);
+    REQUIRE(!absent->exists);
+    loop.stop();
+    co_return;
+  });
+  loop.run();
+  vio::objstore::memory_io_manager_t::reset_named_store("url-bucket");
+}
+
 static vio::task_t<void> file_round_trip(vio::event_loop_t &loop)
 {
   vio::objstore::file_dir_io_manager_t io("vio_objstore_test_dir", loop);
