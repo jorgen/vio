@@ -26,7 +26,7 @@ if(VIO_BUILD_SHARED)
 endif()
 
 if(NOT EMSCRIPTEN)
-    set(CMDEP_TAG 71abe2b188d28f433bf6436bcf5e5b0edc49b6ce)
+    set(CMDEP_TAG 503df5bd6fd8094fffa415d1bd59bec9a5fa11de)
     include(FetchContent)
     FetchContent_Declare(cmake-dep
         GIT_REPOSITORY https://github.com/jorgen/cmake-dep.git
