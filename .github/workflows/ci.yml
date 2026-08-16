@@ -86,7 +86,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: 3rdparty
-          key: 3rdparty-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          restore-keys: 3rdparty-${{ runner.os }}-
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -119,3 +120,38 @@ jobs:
 
       - name: Test
         run: ./build/test/vio_tests
+
+  windows-msvc:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug-msvc, msvc-asan]
+    name: ${{ matrix.preset }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache 3rdparty dependencies
+        uses: actions/cache@v4
+        with:
+          path: 3rdparty
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          restore-keys: 3rdparty-${{ runner.os }}-
+
+      # vcvars64.bat only affects the process it runs in, so configure, build
+      # and test share one step. vswhere lives at a fixed path independent of
+      # the installed VS version; %ProgramFiles(x86)% is read into a variable
+      # first because its parentheses confuse cmd inside a for /f block.
+      - name: Configure, build and test
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" (echo vswhere.exe not found at "%VSWHERE%" & exit /b 1)
+          "%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%RUNNER_TEMP%\vspath.txt"
+          set /p VSPATH=<"%RUNNER_TEMP%\vspath.txt"
+          if not defined VSPATH (echo no Visual Studio with the C++ toolchain & exit /b 1)
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake --preset ${{ matrix.preset }} || exit /b 1
+          cmake --build --preset ${{ matrix.preset }} || exit /b 1
+          ctest --preset ${{ matrix.preset }} --output-on-failure || exit /b 1
