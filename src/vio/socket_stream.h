@@ -1092,7 +1092,7 @@ stream_read_awaitable_t<REF_PTR_T, STREAM> stream_reader_t<REF_PTR_T, STREAM>::r
     }
     auto &queued = stream->buffer_queue.front().value();
     using to_copy_t = decltype(buf.len);
-    auto to_copy = std::min(queued.buf.len, buf.len - to_copy_t(stream->bytes_read));
+    auto to_copy = (std::min)(queued.buf.len, buf.len - to_copy_t(stream->bytes_read));
     std::memcpy(buf.base + stream->bytes_read, queued.buf.base, to_copy);
     stream->bytes_read += to_copy;
 

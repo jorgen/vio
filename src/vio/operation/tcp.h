@@ -716,7 +716,9 @@ public:
       uv_buf_t &src = front.value().buf;
       const std::size_t offset = state->read.front_consumed;
       const std::size_t avail = src.len - offset;
-      const std::size_t n = std::min(avail, dst.size());
+      // Parenthesised to defeat the windows.h min() macro: vio's headers are
+      // public and a consumer may not have defined NOMINMAX.
+      const std::size_t n = (std::min)(avail, dst.size());
       std::memcpy(dst.data(), src.base + offset, n);
       state->read.front_consumed += n;
       if (state->read.front_consumed >= src.len)
