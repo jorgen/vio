@@ -1,3 +1,4 @@
+#include "env_helpers.h"
 #include "require_expected.h"
 
 #include <doctest/doctest.h>
@@ -225,11 +226,11 @@ TEST_CASE("resolve_credential_chain: builds a non-null provider for SSO and assu
              "[sso-session corp]\nsso_start_url = https://corp.awsapps.com/start\nsso_region = us-east-1\n"
              "[profile deploy]\nrole_arn = arn:aws:iam::444455556666:role/Deploy\nsource_profile = work\n");
 
-  const char *home_env = std::getenv("HOME");
+  const char *home_env = std::getenv(vio::test::home_env_name());
   std::optional<std::string> saved_home = home_env ? std::optional<std::string>(home_env) : std::nullopt;
-  ::setenv("HOME", home.string().c_str(), 1);
-  ::unsetenv("AWS_CONFIG_FILE");
-  ::unsetenv("AWS_SHARED_CREDENTIALS_FILE");
+  vio::test::set_env(vio::test::home_env_name(), home.string().c_str());
+  vio::test::unset_env("AWS_CONFIG_FILE");
+  vio::test::unset_env("AWS_SHARED_CREDENTIALS_FILE");
 
   auto sso = resolve_credential_chain(std::string("work"));
   CHECK(sso.provider != nullptr);
@@ -240,7 +241,7 @@ TEST_CASE("resolve_credential_chain: builds a non-null provider for SSO and assu
   CHECK(ar.provider != nullptr);
 
   if (saved_home)
-    ::setenv("HOME", saved_home->c_str(), 1);
+    vio::test::set_env(vio::test::home_env_name(), saved_home->c_str());
   fs::remove_all(home);
 }
 
@@ -296,9 +297,9 @@ TEST_CASE("environment provider + chain: env preferred, falls through when unset
   auto ak0 = saved("AWS_ACCESS_KEY_ID");
   auto sk0 = saved("AWS_SECRET_ACCESS_KEY");
   auto tk0 = saved("AWS_SESSION_TOKEN");
-  ::unsetenv("AWS_ACCESS_KEY_ID");
-  ::unsetenv("AWS_SECRET_ACCESS_KEY");
-  ::unsetenv("AWS_SESSION_TOKEN");
+  vio::test::unset_env("AWS_ACCESS_KEY_ID");
+  vio::test::unset_env("AWS_SECRET_ACCESS_KEY");
+  vio::test::unset_env("AWS_SESSION_TOKEN");
 
   auto chain = std::make_shared<chain_credentials_provider_t>(std::vector<std::shared_ptr<credentials_provider_t>>{
     std::make_shared<environment_credentials_provider_t>(), std::make_shared<login_cache_credentials_provider_t>(session, dir.string())});
@@ -312,23 +313,23 @@ TEST_CASE("environment provider + chain: env preferred, falls through when unset
 
   SUBCASE("env set -> wins over the login cache")
   {
-    ::setenv("AWS_ACCESS_KEY_ID", "AKIAENV", 1);
-    ::setenv("AWS_SECRET_ACCESS_KEY", "envsecret", 1);
+    vio::test::set_env("AWS_ACCESS_KEY_ID", "AKIAENV");
+    vio::test::set_env("AWS_SECRET_ACCESS_KEY", "envsecret");
     auto c = get_creds(*chain);
     REQUIRE_EXPECTED(c);
     CHECK(c->access_key == "AKIAENV");
     CHECK(c->secret_key == "envsecret");
-    ::unsetenv("AWS_ACCESS_KEY_ID");
-    ::unsetenv("AWS_SECRET_ACCESS_KEY");
+    vio::test::unset_env("AWS_ACCESS_KEY_ID");
+    vio::test::unset_env("AWS_SECRET_ACCESS_KEY");
   }
 
   // Restore ambient env.
   if (ak0)
-    ::setenv("AWS_ACCESS_KEY_ID", ak0->c_str(), 1);
+    vio::test::set_env("AWS_ACCESS_KEY_ID", ak0->c_str());
   if (sk0)
-    ::setenv("AWS_SECRET_ACCESS_KEY", sk0->c_str(), 1);
+    vio::test::set_env("AWS_SECRET_ACCESS_KEY", sk0->c_str());
   if (tk0)
-    ::setenv("AWS_SESSION_TOKEN", tk0->c_str(), 1);
+    vio::test::set_env("AWS_SESSION_TOKEN", tk0->c_str());
   fs::remove_all(fs::temp_directory_path() / "vio_cred_test_env");
 }
 
@@ -340,15 +341,15 @@ TEST_CASE("resolve_credential_chain: end-to-end from a fixture ~/.aws (login_ses
   write_file(home / ".aws" / "config", "[default]\nlogin_session = " + session + "\nregion = eu-north-1\n");
   write_file(home / ".aws" / "login" / "cache" / login_cache_filename(session), R"({"accessToken":{"accessKeyId":"ASIAE2E","secretAccessKey":"e2ekey","sessionToken":"e2etok","expiresAt":"2099-01-01T00:00:00Z"}})");
 
-  const char *home_env = std::getenv("HOME");
+  const char *home_env = std::getenv(vio::test::home_env_name());
   std::optional<std::string> saved_home = home_env ? std::optional<std::string>(home_env) : std::nullopt;
-  ::setenv("HOME", home.string().c_str(), 1);
+  vio::test::set_env(vio::test::home_env_name(), home.string().c_str());
   // Ensure no ambient env/profile overrides interfere.
-  ::unsetenv("AWS_PROFILE");
-  ::unsetenv("AWS_CONFIG_FILE");
-  ::unsetenv("AWS_SHARED_CREDENTIALS_FILE");
+  vio::test::unset_env("AWS_PROFILE");
+  vio::test::unset_env("AWS_CONFIG_FILE");
+  vio::test::unset_env("AWS_SHARED_CREDENTIALS_FILE");
   auto ak0 = std::getenv("AWS_ACCESS_KEY_ID") ? std::optional<std::string>(std::getenv("AWS_ACCESS_KEY_ID")) : std::nullopt;
-  ::unsetenv("AWS_ACCESS_KEY_ID");
+  vio::test::unset_env("AWS_ACCESS_KEY_ID");
 
   auto chain = resolve_credential_chain(std::nullopt);
   REQUIRE(chain.provider != nullptr);
@@ -360,9 +361,9 @@ TEST_CASE("resolve_credential_chain: end-to-end from a fixture ~/.aws (login_ses
   CHECK(c->session_token == "e2etok");
 
   if (saved_home)
-    ::setenv("HOME", saved_home->c_str(), 1);
+    vio::test::set_env(vio::test::home_env_name(), saved_home->c_str());
   if (ak0)
-    ::setenv("AWS_ACCESS_KEY_ID", ak0->c_str(), 1);
+    vio::test::set_env("AWS_ACCESS_KEY_ID", ak0->c_str());
   fs::remove_all(home);
 }
 
@@ -406,9 +407,9 @@ TEST_CASE("live AWS: read via the native ~/.aws credential chain" * doctest::ski
   if (!std::getenv("VIO_LIVE_AWS_TEST"))
     return;
   // Force the native chain: no ambient AWS_* credentials.
-  ::unsetenv("AWS_ACCESS_KEY_ID");
-  ::unsetenv("AWS_SECRET_ACCESS_KEY");
-  ::unsetenv("AWS_SESSION_TOKEN");
+  vio::test::unset_env("AWS_ACCESS_KEY_ID");
+  vio::test::unset_env("AWS_SECRET_ACCESS_KEY");
+  vio::test::unset_env("AWS_SESSION_TOKEN");
 
   vio::event_loop_t loop;
   bool exists = false;
@@ -461,9 +462,9 @@ TEST_CASE("live AWS: anonymous read of a public bucket (no credentials at all)" 
 {
   if (!std::getenv("VIO_LIVE_AWS_TEST"))
     return;
-  ::unsetenv("AWS_ACCESS_KEY_ID");
-  ::unsetenv("AWS_SECRET_ACCESS_KEY");
-  ::unsetenv("AWS_SESSION_TOKEN");
+  vio::test::unset_env("AWS_ACCESS_KEY_ID");
+  vio::test::unset_env("AWS_SECRET_ACCESS_KEY");
+  vio::test::unset_env("AWS_SESSION_TOKEN");
 
   vio::event_loop_t loop;
   bool exists = false;
