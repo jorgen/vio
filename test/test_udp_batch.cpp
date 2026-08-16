@@ -1,6 +1,7 @@
 #include "require_expected.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -9,6 +10,7 @@
 #include <vector>
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
+#include <vio/operation/sleep.h>
 #include <vio/operation/tcp.h>
 #include <vio/operation/udp.h>
 #include <vio/task.h>
@@ -346,6 +348,117 @@ TEST_CASE("udp_set_allocator routes reader allocations through the hook")
 
   event_loop.run();
   CHECK(counters.allocs > 0);
+}
+
+TEST_CASE("the receive queue is bounded and drops are counted")
+{
+  constexpr std::size_t limit = 4;
+  constexpr int sent_count = 32;
+  vio::event_loop_t event_loop;
+  vio::udp_recv_stats_t stats = {};
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &loop, vio::udp_recv_stats_t &stats) -> vio::task_t<void>
+      {
+        {
+        auto receiver_pair = bound_socket(loop);
+        REQUIRE_EXPECTED(receiver_pair);
+        const int port = receiver_pair->second;
+        vio::udp_set_recv_queue_limit(receiver_pair->first, limit);
+
+        auto reader_or_err = vio::udp_create_reader(receiver_pair->first);
+        REQUIRE_EXPECTED(reader_or_err);
+        auto reader = std::move(reader_or_err.value());
+
+        co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
+        {
+          auto sender_pair = bound_socket(el);
+          REQUIRE_EXPECTED(sender_pair);
+          auto dest = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(dest);
+          for (int i = 0; i < sent_count; ++i)
+          {
+            REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, as_bytes("flood"), reinterpret_cast<const sockaddr *>(&dest.value())));
+          }
+          co_return;
+        }(loop, port);
+
+        // Idle so the loop delivers everything the socket buffered while
+        // nobody drains the reader; the limit is then what stops the queue
+        // growing. Awaiting the reader instead would resume on the first
+        // datagram, before the rest have been delivered at all.
+        auto sleeper = vio::sleep(loop, std::chrono::milliseconds(100));
+        auto idle = co_await sleeper;
+        REQUIRE_EXPECTED(idle);
+
+        stats = vio::udp_recv_stats(receiver_pair->first);
+        }
+        loop.stop();
+      }(event_loop, stats);
+    });
+
+  event_loop.run();
+  CHECK(stats.queued <= limit);
+  CHECK(stats.recv_errors == 0);
+  MESSAGE("queued=" << stats.queued << " dropped=" << stats.dropped_datagrams);
+}
+
+TEST_CASE("udp_reader_take_batch drains without suspending")
+{
+  constexpr int sent_count = 5;
+  vio::event_loop_t event_loop;
+  std::size_t taken = 0;
+  std::size_t taken_when_empty = 1;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &loop, std::size_t &taken, std::size_t &taken_when_empty) -> vio::task_t<void>
+      {
+        {
+        auto receiver_pair = bound_socket(loop);
+        REQUIRE_EXPECTED(receiver_pair);
+        const int port = receiver_pair->second;
+
+        auto reader_or_err = vio::udp_create_reader(receiver_pair->first);
+        REQUIRE_EXPECTED(reader_or_err);
+        auto reader = std::move(reader_or_err.value());
+
+        co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
+        {
+          auto sender_pair = bound_socket(el);
+          REQUIRE_EXPECTED(sender_pair);
+          auto dest = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(dest);
+          for (int i = 0; i < sent_count; ++i)
+          {
+            REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, as_bytes("drain"), reinterpret_cast<const sockaddr *>(&dest.value())));
+          }
+          co_return;
+        }(loop, port);
+
+        auto sleeper = vio::sleep(loop, std::chrono::milliseconds(100));
+        auto idle = co_await sleeper;
+        REQUIRE_EXPECTED(idle);
+
+        std::array<std::expected<vio::udp_datagram_t, vio::error_t>, 16> out;
+        taken = vio::udp_reader_take_batch(reader, out);
+        for (std::size_t i = 0; i < taken; ++i)
+        {
+          REQUIRE_EXPECTED(out[i]);
+        }
+
+        taken_when_empty = vio::udp_reader_take_batch(reader, out);
+        }
+        loop.stop();
+      }(event_loop, taken, taken_when_empty);
+    });
+
+  event_loop.run();
+  CHECK(taken > 0);
+  CHECK(taken_when_empty == 0);
 }
 
 TEST_CASE("udp_fileno returns the underlying socket")

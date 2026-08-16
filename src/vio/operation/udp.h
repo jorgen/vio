@@ -31,6 +31,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <coroutine>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <expected>
 #include <span>
 #include <string>
@@ -73,13 +74,23 @@ struct udp_send_state_t
   bool done = false;
 };
 
+// Datagrams a reader has taken off the socket but the consumer has not yet
+// collected. Bounded: a peer that sends faster than the consumer drains must
+// cost bounded memory, so arrivals past the limit are dropped and counted
+// rather than queued. Tail drop, like the kernel's own receive buffer, so the
+// datagrams that are kept stay in arrival order.
+inline constexpr std::size_t udp_default_recv_queue_limit = 1024;
+
 struct udp_recv_state_t
 {
   bool active = false;
   bool started = false;
   bool is_cancelled = false;
   bool cancelled = false;
-  std::vector<std::expected<udp_datagram_t, error_t>> buffer_queue;
+  std::deque<std::expected<udp_datagram_t, error_t>> buffer_queue;
+  std::size_t recv_queue_limit = udp_default_recv_queue_limit;
+  std::uint64_t dropped_datagrams = 0;
+  std::uint64_t recv_errors = 0;
   std::coroutine_handle<> continuation;
   alloc_cb_t alloc_buffer_cb = default_alloc;
   dealloc_cb_t dealloc_buffer_cb = default_dealloc;
@@ -419,6 +430,25 @@ inline void udp_set_allocator(udp_t &udp, alloc_cb_t alloc, dealloc_cb_t dealloc
   udp.handle->recv.alloc_cb_data = user_data;
 }
 
+inline void udp_set_recv_queue_limit(udp_t &udp, std::size_t datagrams)
+{
+  udp.handle->recv.recv_queue_limit = datagrams == 0 ? 1 : datagrams;
+}
+
+struct udp_recv_stats_t
+{
+  std::size_t queued = 0;
+  std::uint64_t dropped_datagrams = 0;
+  std::uint64_t recv_errors = 0;
+};
+
+// Drops and errors are silent by design -- neither should tear a socket down --
+// so this is the only way to notice them.
+inline udp_recv_stats_t udp_recv_stats(udp_t &udp)
+{
+  return udp_recv_stats_t{.queued = udp.handle->recv.buffer_queue.size(), .dropped_datagrams = udp.handle->recv.dropped_datagrams, .recv_errors = udp.handle->recv.recv_errors};
+}
+
 class udp_reader_t
 {
 public:
@@ -513,7 +543,7 @@ public:
     std::expected<udp_datagram_t, error_t> await_resume()
     {
       auto result = std::move(state->recv.buffer_queue.front());
-      state->recv.buffer_queue.erase(state->recv.buffer_queue.begin());
+      state->recv.buffer_queue.pop_front();
       return result;
     }
   };
@@ -538,6 +568,13 @@ public:
     ref_ptr_t<udp_state_t> &handle;
   };
 
+  static void alloc_cb(uv_handle_t *h, size_t size, uv_buf_t *buf)
+  {
+    auto udp_state = ref_ptr_t<udp_state_t>::from_raw(h->data);
+    udp_state->recv.alloc_buffer_cb(udp_state->recv.alloc_cb_data, size, buf);
+    udp_state.release_to_raw();
+  }
+
   static void recv_cb(uv_udp_t *udp_handle, ssize_t nread, const uv_buf_t *buf, const sockaddr *addr, unsigned int /*flags*/)
   {
     auto udp_state = ref_ptr_t<udp_state_t>::from_raw(udp_handle->data);
@@ -554,6 +591,16 @@ public:
 
     if (nread > 0)
     {
+      if (udp_state->recv.buffer_queue.size() >= udp_state->recv.recv_queue_limit)
+      {
+        ++udp_state->recv.dropped_datagrams;
+        if (buf != nullptr && buf->base != nullptr)
+        {
+          udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
+        }
+        return;
+      }
+
       uv_buf_t sized_buf = *buf;
       sized_buf.len = static_cast<decltype(sized_buf.len)>(nread);
 
@@ -567,13 +614,28 @@ public:
     }
     else
     {
-      auto error = std::unexpected(error_t{.code = static_cast<int>(nread), .msg = uv_strerror(static_cast<int>(nread))});
-      udp_state->recv.buffer_queue.emplace_back(std::move(error));
-
+      // One peer must not be able to kill the socket. libuv stops the read
+      // before reporting a real error, so recovery means restarting it; the
+      // error is counted, not delivered. Only a failed restart is terminal,
+      // and that leaves recv.started alone so the destructor still reclaims
+      // the reference parked in the handle.
+      ++udp_state->recv.recv_errors;
       if (buf != nullptr && buf->base != nullptr)
       {
         udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
       }
+
+      if (udp_state->recv.is_cancelled || !udp_state->recv.started)
+      {
+        return;
+      }
+
+      const int restarted = uv_udp_recv_start(udp_handle, udp_reader_t::alloc_cb, &udp_reader_t::recv_cb);
+      if (restarted >= 0 || restarted == UV_EALREADY)
+      {
+        return;
+      }
+      udp_state->recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = restarted, .msg = uv_strerror(restarted)}));
     }
 
     if (udp_state->recv.continuation)
@@ -596,6 +658,23 @@ private:
   bool _is_valid = false;
 };
 
+// Drains what has already arrived without suspending, so a read loop can take
+// a whole batch per wake-up instead of one datagram per resume. Returns how
+// many entries were written; zero means nothing is queued and the caller
+// should co_await the reader.
+inline std::size_t udp_reader_take_batch(udp_reader_t &reader, std::span<std::expected<udp_datagram_t, error_t>> out)
+{
+  auto &queue = reader.handle->recv.buffer_queue;
+  std::size_t taken = 0;
+  while (taken < out.size() && !queue.empty())
+  {
+    out[taken] = std::move(queue.front());
+    queue.pop_front();
+    ++taken;
+  }
+  return taken;
+}
+
 inline std::expected<udp_reader_t, error_t> udp_create_reader(udp_t &udp)
 {
   if (udp.handle.ref_counted() == nullptr)
@@ -607,15 +686,9 @@ inline std::expected<udp_reader_t, error_t> udp_create_reader(udp_t &udp)
     return std::unexpected(error_t{.code = 1, .msg = "Can not create multiple active readers for a udp socket. Destroy other reader, before making a new one."});
   }
 
-  auto alloc_cb = [](uv_handle_t *h, size_t size, uv_buf_t *buf)
-  {
-    auto udp_state = ref_ptr_t<udp_state_t>::from_raw(h->data);
-    udp_state->recv.alloc_buffer_cb(udp_state->recv.alloc_cb_data, size, buf);
-    udp_state.release_to_raw();
-  };
   auto copy = udp.handle;
   udp.get_udp()->data = copy.release_to_raw();
-  if (const auto r = uv_udp_recv_start(udp.get_udp(), alloc_cb, &udp_reader_t::recv_cb); r >= 0)
+  if (const auto r = uv_udp_recv_start(udp.get_udp(), &udp_reader_t::alloc_cb, &udp_reader_t::recv_cb); r >= 0)
   {
     udp.handle->recv.active = true;
     udp.handle->recv.started = true;
