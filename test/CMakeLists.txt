@@ -6,6 +6,7 @@ add_executable(vio_tests
     test_credentials.cpp
     test_ssl_upgrade.cpp
     test_task_and_sleep.cpp
+    test_timer.cpp
     test_http_client.cpp
     test_http_cache.cpp
     test_file.cpp

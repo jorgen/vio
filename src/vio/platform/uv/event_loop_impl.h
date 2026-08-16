@@ -4,6 +4,9 @@
 #include "vio/event_pipe.h"
 #include "vio/task.h"
 #include "vio/thread_pool.h"
+#include "vio/tick.h"
+
+#include <chrono>
 
 #include <memory>
 #include <mutex>
@@ -246,5 +249,17 @@ private:
   event_loop_t _event_loop;
   std::unique_ptr<std::thread> _thread;
 };
+
+// The single producer of tick_t in a process.
+//
+// uv_hrtime() rather than uv_now(): uv_now() is the loop's cached time in
+// milliseconds, too coarse for an RTT estimate. The event loop is taken by
+// parameter although uv_hrtime() is global, so that a caller cannot read the
+// clock without having a loop in hand.
+inline tick_t loop_now(event_loop_t &event_loop)
+{
+  (void)event_loop;
+  return tick_t::from_nanoseconds(std::chrono::nanoseconds(uv_hrtime()));
+}
 
 } // namespace vio
