@@ -27,9 +27,12 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/unique_buf.h"
 #include "vio/uv_coro.h"
 
+#include <array>
 #include <coroutine>
+#include <cstdint>
 #include <cstring>
 #include <expected>
+#include <span>
 #include <string>
 #include <utility>
 #include <uv.h>
@@ -309,6 +312,111 @@ inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t l
 inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t length)
 {
   return send_udp(udp, data, length, nullptr);
+}
+
+// Synchronous send. Unlike send_udp there is no request object, no completion
+// callback and no reference parked for the duration, so any number of these
+// may be issued back to back -- which is what a server talking to many peers
+// from one socket needs, and what send_udp explicitly refuses.
+//
+// A full socket buffer surfaces as an error with code UV_EAGAIN; that is the
+// caller's signal to stop draining and retry later, not a failure.
+inline std::expected<std::size_t, error_t> udp_try_send(udp_t &udp, std::span<const uint8_t> bytes, const sockaddr *addr)
+{
+  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(bytes.data())), static_cast<unsigned int>(bytes.size()));
+  const int r = uv_udp_try_send(udp.get_udp(), &buf, 1, addr);
+  if (r < 0)
+  {
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+  }
+  return static_cast<std::size_t>(r);
+}
+
+struct udp_out_datagram_t
+{
+  std::span<const uint8_t> bytes;
+  const sockaddr *addr = nullptr;
+};
+
+inline constexpr std::size_t udp_max_batch_size = 64;
+
+// Sends up to udp_max_batch_size datagrams in one call, mapping to sendmmsg
+// where the platform has it. Returns how many were accepted, which may be
+// fewer than requested; the caller resumes from that offset.
+inline std::expected<unsigned int, error_t> udp_try_send_batch(udp_t &udp, std::span<const udp_out_datagram_t> datagrams)
+{
+  if (datagrams.empty())
+  {
+    return 0u;
+  }
+  const unsigned int count = static_cast<unsigned int>(datagrams.size() < udp_max_batch_size ? datagrams.size() : udp_max_batch_size);
+
+  std::array<uv_buf_t, udp_max_batch_size> storage = {};
+  std::array<uv_buf_t *, udp_max_batch_size> bufs = {};
+  std::array<unsigned int, udp_max_batch_size> nbufs = {};
+  std::array<struct sockaddr *, udp_max_batch_size> addrs = {};
+
+  for (unsigned int i = 0; i < count; ++i)
+  {
+    storage[i] = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(datagrams[i].bytes.data())), static_cast<unsigned int>(datagrams[i].bytes.size()));
+    bufs[i] = &storage[i];
+    nbufs[i] = 1;
+    addrs[i] = const_cast<struct sockaddr *>(datagrams[i].addr);
+  }
+
+  const int r = uv_udp_try_send2(udp.get_udp(), count, bufs.data(), nbufs.data(), addrs.data(), 0);
+  if (r < 0)
+  {
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+  }
+  return static_cast<unsigned int>(r);
+}
+
+inline std::expected<uv_os_fd_t, error_t> udp_fileno(udp_t &udp)
+{
+  uv_os_fd_t fd = {};
+  const int r = uv_fileno(udp.get_handle(), &fd);
+  if (r < 0)
+  {
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+  }
+  return fd;
+}
+
+// Binds one socket that accepts both IPv6 and IPv4-mapped peers. libuv clears
+// IPV6_V6ONLY when UV_UDP_IPV6ONLY is absent, so binding [::] is enough; hosts
+// without IPv6 fall back to 0.0.0.0.
+inline std::expected<void, error_t> udp_bind_dual_stack(udp_t &udp, std::uint16_t port)
+{
+  sockaddr_in6 addr6 = {};
+  if (const int r = uv_ip6_addr("::", static_cast<int>(port), &addr6); r == 0)
+  {
+    if (const int bound = uv_udp_bind(udp.get_udp(), reinterpret_cast<const sockaddr *>(&addr6), 0); bound == 0)
+    {
+      return {};
+    }
+  }
+
+  sockaddr_in addr4 = {};
+  if (const int r = uv_ip4_addr("0.0.0.0", static_cast<int>(port), &addr4); r < 0)
+  {
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+  }
+  if (const int r = uv_udp_bind(udp.get_udp(), reinterpret_cast<const sockaddr *>(&addr4), 0); r < 0)
+  {
+    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+  }
+  return {};
+}
+
+// Must be called before udp_create_reader: the reader allocates through these
+// on every datagram, and the default allocator takes a fresh 64 KiB block for
+// what is usually a ~1200 byte packet.
+inline void udp_set_allocator(udp_t &udp, alloc_cb_t alloc, dealloc_cb_t dealloc, void *user_data)
+{
+  udp.handle->recv.alloc_buffer_cb = alloc;
+  udp.handle->recv.dealloc_buffer_cb = dealloc;
+  udp.handle->recv.alloc_cb_data = user_data;
 }
 
 class udp_reader_t
