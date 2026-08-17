@@ -11,6 +11,7 @@ add_executable(vio_tests
     test_udp_batch.cpp
     test_buffer_pool.cpp
     test_udp_send_async.cpp
+    test_quic_vectors.cpp
     test_http_client.cpp
     test_http_cache.cpp
     test_file.cpp
