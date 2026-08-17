@@ -91,6 +91,7 @@ struct udp_recv_state_t
   std::deque<std::expected<udp_datagram_t, error_t>> buffer_queue;
   std::size_t recv_queue_limit = udp_default_recv_queue_limit;
   std::uint64_t dropped_datagrams = 0;
+  std::uint64_t truncated_datagrams = 0;
   std::uint64_t recv_errors = 0;
   std::coroutine_handle<> continuation;
   alloc_cb_t alloc_buffer_cb = default_alloc;
@@ -171,16 +172,37 @@ struct udp_t
   }
 };
 
-inline std::expected<udp_t, error_t> udp_create(event_loop_t &loop)
+// recvmmsg reads several datagrams per syscall. It is a Linux/BSD facility;
+// libuv ignores the request elsewhere, so asking for it unconditionally is
+// safe and uv_udp_using_recvmmsg reports what was actually obtained.
+enum class udp_recvmmsg_t : std::uint8_t
+{
+  off,
+  on,
+};
+
+inline std::expected<udp_t, error_t> udp_create(event_loop_t &loop, udp_recvmmsg_t recvmmsg = udp_recvmmsg_t::off)
 {
   udp_t udp{ref_ptr_t<udp_state_t>(loop)};
-  if (auto r = uv_udp_init(loop.loop(), udp.get_udp()); r < 0)
+  const int r = recvmmsg == udp_recvmmsg_t::on ? uv_udp_init_ex(loop.loop(), udp.get_udp(), AF_UNSPEC | UV_UDP_RECVMMSG) : uv_udp_init(loop.loop(), udp.get_udp());
+  if (r < 0)
   {
     return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
   udp.handle.register_handle(udp.get_udp());
   return udp;
 }
+
+inline bool udp_using_recvmmsg(udp_t &udp)
+{
+  return uv_udp_using_recvmmsg(udp.get_udp()) != 0;
+}
+
+// libuv slices a recvmmsg buffer into fixed 64 KiB chunks and reads
+// buf.len / 64 KiB datagrams at a time (src/unix/udp.c, UV__UDP_DGRAM_MAXSIZE).
+// An allocator handing back less than one chunk yields zero slots, so the
+// socket reads nothing at all -- silently, and forever.
+inline constexpr std::size_t udp_recvmmsg_chunk_size = 64 * 1024;
 
 inline std::expected<void, error_t> udp_bind(udp_t &udp, const sockaddr *addr, unsigned int flags = 0)
 {
@@ -447,6 +469,7 @@ struct udp_recv_stats_t
 {
   std::size_t queued = 0;
   std::uint64_t dropped_datagrams = 0;
+  std::uint64_t truncated_datagrams = 0;
   std::uint64_t recv_errors = 0;
 };
 
@@ -454,7 +477,10 @@ struct udp_recv_stats_t
 // so this is the only way to notice them.
 inline udp_recv_stats_t udp_recv_stats(udp_t &udp)
 {
-  return udp_recv_stats_t{.queued = udp.handle->recv.buffer_queue.size(), .dropped_datagrams = udp.handle->recv.dropped_datagrams, .recv_errors = udp.handle->recv.recv_errors};
+  return udp_recv_stats_t{.queued = udp.handle->recv.buffer_queue.size(),
+                          .dropped_datagrams = udp.handle->recv.dropped_datagrams,
+                          .truncated_datagrams = udp.handle->recv.truncated_datagrams,
+                          .recv_errors = udp.handle->recv.recv_errors};
 }
 
 class udp_reader_t
@@ -583,12 +609,29 @@ public:
     udp_state.release_to_raw();
   }
 
-  static void recv_cb(uv_udp_t *udp_handle, ssize_t nread, const uv_buf_t *buf, const sockaddr *addr, unsigned int /*flags*/)
+  // Under recvmmsg libuv fills one allocation with several datagrams and hands
+  // each out as a slice tagged UV_UDP_MMSG_CHUNK, then asks for the whole
+  // allocation back once with UV_UDP_MMSG_FREE. A slice must therefore never
+  // be adopted by a unique_buf_t -- N datagrams would each free the same
+  // block. Slices are copied into a buffer of their own; the copy comes from
+  // the same allocator, so a pooled socket still does not reach the heap.
+  static void recv_cb(uv_udp_t *udp_handle, ssize_t nread, const uv_buf_t *buf, const sockaddr *addr, unsigned int flags)
   {
     auto udp_state = ref_ptr_t<udp_state_t>::from_raw(udp_handle->data);
     ref_ptr_releaser_t releaser(udp_state);
 
-    if (nread == 0 && addr == nullptr)
+    const bool is_chunk = (flags & UV_UDP_MMSG_CHUNK) != 0;
+    const bool owns_buffer = !is_chunk;
+
+    auto release_buffer = [&]()
+    {
+      if (owns_buffer && buf != nullptr && buf->base != nullptr)
+      {
+        udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
+      }
+    };
+
+    if ((flags & UV_UDP_MMSG_FREE) != 0)
     {
       if (buf != nullptr && buf->base != nullptr)
       {
@@ -597,23 +640,55 @@ public:
       return;
     }
 
+    if (nread == 0 && addr == nullptr)
+    {
+      release_buffer();
+      return;
+    }
+
     if (nread > 0)
     {
-      if (udp_state->recv.buffer_queue.size() >= udp_state->recv.recv_queue_limit)
+      // A truncated datagram is not a short datagram; the remainder is gone.
+      // Handing back a prefix would have the caller parse garbage.
+      if ((flags & UV_UDP_PARTIAL) != 0)
       {
-        ++udp_state->recv.dropped_datagrams;
-        if (buf != nullptr && buf->base != nullptr)
-        {
-          udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
-        }
+        ++udp_state->recv.truncated_datagrams;
+        release_buffer();
         return;
       }
 
-      uv_buf_t sized_buf = *buf;
-      sized_buf.len = static_cast<decltype(sized_buf.len)>(nread);
+      if (udp_state->recv.buffer_queue.size() >= udp_state->recv.recv_queue_limit)
+      {
+        ++udp_state->recv.dropped_datagrams;
+        release_buffer();
+        return;
+      }
 
       udp_datagram_t datagram;
-      datagram.data = unique_buf_t(sized_buf, udp_state->recv.dealloc_buffer_cb, udp_state->recv.alloc_cb_data);
+      if (is_chunk)
+      {
+        uv_buf_t copy = {};
+        udp_state->recv.alloc_buffer_cb(udp_state->recv.alloc_cb_data, static_cast<size_t>(nread), &copy);
+        if (copy.base == nullptr || copy.len < static_cast<decltype(copy.len)>(nread))
+        {
+          ++udp_state->recv.dropped_datagrams;
+          if (copy.base != nullptr)
+          {
+            udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, &copy);
+          }
+          return;
+        }
+        std::memcpy(copy.base, buf->base, static_cast<size_t>(nread));
+        copy.len = static_cast<decltype(copy.len)>(nread);
+        datagram.data = unique_buf_t(copy, udp_state->recv.dealloc_buffer_cb, udp_state->recv.alloc_cb_data);
+      }
+      else
+      {
+        uv_buf_t sized_buf = *buf;
+        sized_buf.len = static_cast<decltype(sized_buf.len)>(nread);
+        datagram.data = unique_buf_t(sized_buf, udp_state->recv.dealloc_buffer_cb, udp_state->recv.alloc_cb_data);
+      }
+
       if (addr != nullptr)
       {
         std::memcpy(&datagram.sender_addr, addr, addr->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in));
@@ -692,6 +767,25 @@ inline std::expected<udp_reader_t, error_t> udp_create_reader(udp_t &udp)
   if (udp.handle->recv.active)
   {
     return std::unexpected(error_t{.code = 1, .msg = "Can not create multiple active readers for a udp socket. Destroy other reader, before making a new one."});
+  }
+
+  // Fail here rather than let the socket go quiet: ask the allocator for what
+  // libuv is about to ask for, and refuse if it cannot cover a single chunk.
+  if (uv_udp_using_recvmmsg(udp.get_udp()) != 0)
+  {
+    uv_buf_t probe = {};
+    udp.handle->recv.alloc_buffer_cb(udp.handle->recv.alloc_cb_data, udp_recvmmsg_chunk_size, &probe);
+    const std::size_t offered = probe.base == nullptr ? 0 : static_cast<std::size_t>(probe.len);
+    if (probe.base != nullptr)
+    {
+      udp.handle->recv.dealloc_buffer_cb(udp.handle->recv.alloc_cb_data, &probe);
+    }
+    if (offered < udp_recvmmsg_chunk_size)
+    {
+      return std::unexpected(error_t{.code = UV_ENOBUFS,
+                                     .msg = "recvmmsg needs an allocator that yields at least " + std::to_string(udp_recvmmsg_chunk_size) + " bytes per buffer, but it offered " + std::to_string(offered) +
+                                            "; size the buffer pool to a multiple of the chunk size or create the socket without recvmmsg"});
+    }
   }
 
   auto copy = udp.handle;
