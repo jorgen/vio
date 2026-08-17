@@ -22,6 +22,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include "vio/buffer_pool.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/unique_buf.h"
@@ -428,6 +429,13 @@ inline void udp_set_allocator(udp_t &udp, alloc_cb_t alloc, dealloc_cb_t dealloc
   udp.handle->recv.alloc_buffer_cb = alloc;
   udp.handle->recv.dealloc_buffer_cb = dealloc;
   udp.handle->recv.alloc_cb_data = user_data;
+}
+
+// The pool must outlive the socket: every datagram still in the receive queue
+// holds a pointer to it as its deallocator's user handle.
+inline void udp_use_buffer_pool(udp_t &udp, buffer_pool_t &pool)
+{
+  udp_set_allocator(udp, &buffer_pool_t::alloc_cb, &buffer_pool_t::dealloc_cb, &pool);
 }
 
 inline void udp_set_recv_queue_limit(udp_t &udp, std::size_t datagrams)
