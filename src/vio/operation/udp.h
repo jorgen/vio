@@ -22,6 +22,8 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include "vio/cancellation.h"
+#include "vio/owned_payload.h"
 #include "vio/buffer_pool.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
@@ -34,6 +36,9 @@ Copyright (c) 2025 Jørgen Lind
 #include <cstring>
 #include <deque>
 #include <expected>
+#include <memory>
+#include <ranges>
+#include <type_traits>
 #include <span>
 #include <string>
 #include <utility>
@@ -348,7 +353,160 @@ inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t l
   return send_udp(udp, data, length, nullptr);
 }
 
-// Synchronous send. Unlike send_udp there is no request object, no completion
+// An owning, awaitable send. Unlike send_udp above there is one of these per
+// call rather than one per socket, so any number may be in flight at once.
+//
+// The payload is moved in and held until libuv's completion callback fires,
+// which is what makes early resumption safe: a cancelled send hands its
+// awaiter an answer immediately while uv is still reading the bytes, and the
+// operation stays alive underneath until uv is done with them.
+struct udp_send_op_t
+{
+  uv_udp_send_t req = {};
+  ref_ptr_t<udp_state_t> socket = ref_ptr_t<udp_state_t>::null();
+  std::unique_ptr<owned_payload_t> payload;
+  std::coroutine_handle<> continuation;
+  std::expected<void, error_t> result;
+  registration_t cancel_registration;
+  bool completed = false;
+  bool detached = false;
+};
+
+namespace detail
+{
+// The op outlives whichever of the two finishes first. Whoever is last to let
+// go frees it: the callback when the awaiter has already been answered or
+// abandoned, the awaiter when the callback has already fired.
+inline void udp_send_release(udp_send_op_t *op)
+{
+  if (op->completed)
+  {
+    delete op;
+    return;
+  }
+  op->detached = true;
+}
+
+inline void udp_send_cb(uv_udp_send_t *req, int status)
+{
+  auto *op = static_cast<udp_send_op_t *>(req->data);
+  op->completed = true;
+  op->cancel_registration.reset();
+  if (op->detached)
+  {
+    delete op;
+    return;
+  }
+  if (status < 0)
+  {
+    op->result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
+  }
+  if (op->continuation)
+  {
+    auto continuation = op->continuation;
+    op->continuation = {};
+    continuation.resume();
+  }
+}
+} // namespace detail
+
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
+struct udp_send_awaitable_t
+{
+  udp_send_op_t *op = nullptr;
+
+  explicit udp_send_awaitable_t(udp_send_op_t *operation)
+    : op(operation)
+  {
+  }
+
+  udp_send_awaitable_t(const udp_send_awaitable_t &) = delete;
+  udp_send_awaitable_t &operator=(const udp_send_awaitable_t &) = delete;
+
+  udp_send_awaitable_t(udp_send_awaitable_t &&other) noexcept
+    : op(std::exchange(other.op, nullptr))
+  {
+  }
+
+  ~udp_send_awaitable_t()
+  {
+    if (op != nullptr)
+    {
+      detail::udp_send_release(op);
+    }
+  }
+
+  [[nodiscard]] bool await_ready() const noexcept
+  {
+    return op->completed || op->detached;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    op->continuation = continuation;
+  }
+
+  std::expected<void, error_t> await_resume() noexcept
+  {
+    auto result = std::move(op->result);
+    detail::udp_send_release(op);
+    op = nullptr;
+    return result;
+  }
+};
+
+// Cancelling does not stop the datagram; it stops the caller waiting for it.
+template <typename Bytes>
+  requires owned_byte_range<Bytes>
+udp_send_awaitable_t send_udp(udp_t &udp, Bytes &&bytes, const sockaddr *addr, cancellation_t *cancel = nullptr)
+{
+  using payload_t = std::remove_cvref_t<Bytes>;
+  auto *op = new udp_send_op_t();
+  op->socket = udp.handle;
+
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    op->completed = true;
+    op->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return udp_send_awaitable_t(op);
+  }
+
+  auto owned = std::make_unique<owned_payload_impl_t<payload_t>>(std::forward<Bytes>(bytes));
+  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<char *>(reinterpret_cast<const char *>(std::ranges::data(owned->value)))), static_cast<unsigned int>(std::ranges::size(owned->value)));
+  op->payload = std::move(owned);
+  op->req.data = op;
+
+  if (const int r = uv_udp_send(&op->req, udp.get_udp(), &buf, 1, addr, &detail::udp_send_cb); r < 0)
+  {
+    op->completed = true;
+    op->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return udp_send_awaitable_t(op);
+  }
+
+  if (cancel != nullptr)
+  {
+    op->cancel_registration = cancel->register_callback(
+      [op]()
+      {
+        if (op->completed || op->detached)
+        {
+          return;
+        }
+        op->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+        op->detached = true;
+        if (op->continuation)
+        {
+          auto continuation = op->continuation;
+          op->continuation = {};
+          continuation.resume();
+        }
+      });
+  }
+
+  return udp_send_awaitable_t(op);
+}
+
+// Synchronous send. Unlike send_udp above there is no request object, no completion
 // callback and no reference parked for the duration, so any number of these
 // may be issued back to back -- which is what a server talking to many peers
 // from one socket needs, and what send_udp explicitly refuses.

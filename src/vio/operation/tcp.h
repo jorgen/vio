@@ -25,6 +25,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/cancellation.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/owned_payload.h"
 #include "vio/unique_buf.h"
 #include "vio/uv_coro.h"
 
@@ -88,29 +89,8 @@ struct tcp_connect_state_t
   bool done = false;
 };
 
-// A cancellable write resumes its awaiter early while the in-flight uv_write is
-// still reading the buffer, so vio must keep the bytes alive until the real
-// write callback fires. owned_payload_t type-erases the lifetime of an arbitrary
-// moved-in buffer (std::string, std::vector, or any owning contiguous byte
-// range); the write reads a uv_buf_t computed from it at submit time.
-struct owned_payload_t
-{
-  virtual ~owned_payload_t() = default;
-};
-
-template <typename T>
-struct owned_payload_impl_t : owned_payload_t
-{
-  T value;
-  explicit owned_payload_impl_t(T &&v)
-    : value(std::move(v))
-  {
-  }
-};
-
-template <typename T>
-concept owned_byte_range = std::ranges::contiguous_range<T> && std::ranges::sized_range<T> && std::move_constructible<T> && sizeof(std::ranges::range_value_t<T>) == 1 &&
-                           std::is_trivially_copyable_v<std::ranges::range_value_t<T>> && !std::ranges::view<std::remove_cvref_t<T>>;
+// owned_payload_t, owned_payload_impl_t and owned_byte_range live in
+// vio/owned_payload.h -- the udp sends need them too.
 
 struct tcp_write_state_t
 {
