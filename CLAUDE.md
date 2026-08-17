@@ -197,6 +197,42 @@ The event loop has always-active internal handles (async, prepare, event pipes).
 be called, which sends an async signal that closes all internal handles. Tests that don't use
 coroutines still need `event_loop.stop()` before `event_loop.run()` for cleanup.
 
+### Handle lifetime vs loop teardown
+
+**A vio handle must be released while the loop can still run.** Dropping the last reference to a
+`udp_t`, `timer_t`, `tcp_server_t` … only *requests* `uv_close`; the close callback runs on a later
+loop iteration, and the ref-counted storage is freed only once it has. So a handle still alive when
+`run()` returns leaves its `uv_close` unfinished, `uv_loop_close()` fails with `EBUSY`, and
+`~event_loop_t` reports every handle still open and then aborts on its `assert` (in a debug build —
+under `NDEBUG` it used to be silent, which is why the destructor prints regardless of build type).
+
+The symptom has two faces, and the second one does not look like a lifetime problem at all:
+
+- `Assertion failed: close_result == 0` at the end of a test, *after* every assertion passed.
+- **`run()` never returns.** `stop()` closes vio's internal handles, but `uv_run` keeps going while a
+  user handle is open. A test that calls `loop.stop()` while still holding a socket hangs rather
+  than aborting.
+
+The fix is always to shorten the handle's life, not to lengthen the loop's:
+
+```cpp
+// Owned by a coroutine that completes before stop() -- the pattern in test_udp.cpp.
+auto receiver_task = [](vio::udp_t receiver) -> vio::task_t<void> { … }(std::move(socket));
+co_await std::move(receiver_task);
+loop.stop();
+
+// Or a plain scope, when a sub-coroutine would be contrived.
+{
+  auto socket = …;
+  auto reader = …;
+}                 // uv_close requested here
+loop.stop();      // and drained by the run() that is still in progress
+```
+
+Handles are deliberately **not** force-closed in `~event_loop_t`: they live in reference-counted
+storage their owner still holds, and that owner will `uv_close` them when it is destroyed. Closing
+them twice is worse than leaking them.
+
 ### Socket reads: queue, read_into (zero-copy), pause/resume
 
 `tcp_reader_t` (`operation/tcp.h`) supports three modes over one persistent

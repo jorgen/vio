@@ -17,6 +17,7 @@
 
 #include <barrier>
 #include <cassert>
+#include <cstdio>
 #ifndef _WIN32
 #include <csignal>
 #endif
@@ -67,9 +68,38 @@ public:
 
   event_loop_t &operator=(event_loop_t &&other) = delete;
 
+  // uv_loop_close fails while any handle is still open, which happens when a
+  // vio handle outlives the loop: its uv_close is requested after the loop
+  // stopped running, so the close callback never fires. The failure is a
+  // programming error, but assert() alone reports it as a bare abort with no
+  // context in debug and vanishes entirely under NDEBUG, leaking the loop and
+  // every handle on it. Naming the open handles costs nothing and turns it
+  // into a one-line diagnosis.
+  //
+  // The handles are deliberately not force-closed here. They live inside
+  // reference-counted storage their owner still holds, and that owner will
+  // uv_close them when it is destroyed; closing them twice is worse than
+  // leaking them.
   ~event_loop_t()
   {
     auto close_result = uv_loop_close(_loop);
+    if (close_result != 0)
+    {
+      int open_handles = 0;
+      uv_walk(
+        _loop,
+        [](uv_handle_t *handle, void *arg)
+        {
+          ++*static_cast<int *>(arg);
+          std::fprintf(stderr, "vio: ~event_loop_t: %s handle still open\n", uv_handle_type_name(handle->type));
+        },
+        &open_handles);
+      std::fprintf(stderr,
+                   "vio: ~event_loop_t: %d handle(s) still open (%s). A vio handle outlived its event loop; "
+                   "release it before the loop stops running -- owning it inside a coroutine that completes, "
+                   "or in a scope that ends, before stop() is the usual fix.\n",
+                   open_handles, uv_strerror(close_result));
+    }
     assert(close_result == 0);
     delete _loop;
     _loop = nullptr;
