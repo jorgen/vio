@@ -30,6 +30,12 @@
 // for the traffic and takes it back afterwards, so a steady-state read loop
 // stops allocating entirely.
 //
+// A recycled block still holds the previous datagram's bytes. Nothing reads
+// past a datagram's length, so this is not a leak -- but QUIC decrypts in
+// place, which means those bytes can be plaintext. Zeroing every block costs
+// a memset per datagram on the receive path, so it is off by default and
+// available to deployments that would rather pay it.
+//
 // Single-threaded, like the loop it serves. The pool must outlive every buffer
 // handed out from it -- a unique_buf_t holds a pointer to it as its
 // deallocator's user handle.
@@ -40,6 +46,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <vector>
 
@@ -53,9 +60,10 @@ inline constexpr std::size_t default_pool_max_retained = 256;
 class buffer_pool_t
 {
 public:
-  explicit buffer_pool_t(std::size_t block_size = default_pool_block_size, std::size_t max_retained = default_pool_max_retained)
+  explicit buffer_pool_t(std::size_t block_size = default_pool_block_size, std::size_t max_retained = default_pool_max_retained, bool zero_on_release = false)
     : _block_size(block_size == 0 ? default_pool_block_size : block_size)
     , _max_retained(max_retained)
+    , _zero_on_release(zero_on_release)
   {
   }
 
@@ -99,6 +107,12 @@ public:
     if (buf == nullptr || buf->base == nullptr)
     {
       return;
+    }
+    if (_zero_on_release)
+    {
+      // memset, not a secure-zero intrinsic: the block goes back on the free
+      // list and is read again through it, so the store cannot be eliminated.
+      std::memset(buf->base, 0, _block_size);
     }
     if (_free.size() < _max_retained)
     {
@@ -146,6 +160,7 @@ private:
   std::vector<char *> _free;
   std::size_t _block_size;
   std::size_t _max_retained;
+  bool _zero_on_release = false;
   std::uint64_t _allocations = 0;
   std::uint64_t _reuses = 0;
 };

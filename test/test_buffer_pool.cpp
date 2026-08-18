@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -92,6 +93,40 @@ TEST_CASE("the free list is capped")
     pool.release(&buffer);
   }
   CHECK(pool.retained() == retain);
+}
+
+TEST_CASE("zero_on_release wipes a block before it is reused")
+{
+  vio::buffer_pool_t plain(32, 4);
+  vio::buffer_pool_t wiping(32, 4, true);
+
+  auto fill_and_release = [](vio::buffer_pool_t &pool)
+  {
+    uv_buf_t buf = {};
+    pool.acquire(&buf);
+    REQUIRE(buf.base != nullptr);
+    std::memset(buf.base, 0x5a, 32);
+    char *address = buf.base;
+    pool.release(&buf);
+    return address;
+  };
+
+  char *plain_block = fill_and_release(plain);
+  char *wiped_block = fill_and_release(wiping);
+
+  // The same block comes back out, so this reads what release() left behind.
+  uv_buf_t reused = {};
+  plain.acquire(&reused);
+  CHECK(reused.base == plain_block);
+  CHECK(reused.base[0] == static_cast<char>(0x5a));
+  plain.release(&reused);
+
+  uv_buf_t clean = {};
+  wiping.acquire(&clean);
+  CHECK(clean.base == wiped_block);
+  CHECK(clean.base[0] == 0);
+  CHECK(clean.base[31] == 0);
+  wiping.release(&clean);
 }
 
 TEST_CASE("a zero block size falls back to the default")
