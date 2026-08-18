@@ -131,7 +131,10 @@ public:
     return _impl != nullptr;
   }
 
-  [[nodiscard]] std::expected<header_protection_mask_t, error_t> mask(std::span<const std::uint8_t, header_protection_sample_size> sample) const;
+  // Not const and not reentrant: the ChaCha20 variant reuses one cipher
+  // context so that masking a packet costs no allocation. One key per
+  // connection direction, used from the connection's own thread.
+  [[nodiscard]] std::expected<header_protection_mask_t, error_t> mask(std::span<const std::uint8_t, header_protection_sample_size> sample);
 
 private:
   void *_impl = nullptr;

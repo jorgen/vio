@@ -18,8 +18,8 @@ struct reference_counted_t
   bool in_destroy_sequence{false};
   std::function<void()> destroyer;
 
-  explicit reference_counted_t(std::function<void()> destroyer)
-    : destroyer(std::move(destroyer))
+  explicit reference_counted_t(std::function<void()> on_destroy)
+    : destroyer(std::move(on_destroy))
   {
   }
 

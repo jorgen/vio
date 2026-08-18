@@ -165,6 +165,35 @@ TEST_CASE("RFC 9000 A.3: packet number decoding")
     }
   }
 
+  SUBCASE("a bit count the wire cannot produce is refused, not shifted")
+  {
+    // The length comes from an unauthenticated header. A shift of 64 or more
+    // is undefined behaviour rather than a big number, so the guard has to be
+    // in the function and not in the caller's good intentions.
+    CHECK(vio::quic::packet_number_decode(0xa82f30ea, 0x9b32, 0) == 0x9b32);
+    CHECK(vio::quic::packet_number_decode(0xa82f30ea, 0x9b32, 33) == 0x9b32);
+    CHECK(vio::quic::packet_number_decode(0xa82f30ea, 0x9b32, 64) == 0x9b32);
+    CHECK(vio::quic::packet_number_decode(0xa82f30ea, 0x9b32, 4096) == 0x9b32);
+  }
+
+  SUBCASE("all four wire lengths round trip")
+  {
+    for (std::size_t bytes = 1; bytes <= 4; ++bytes)
+    {
+      CAPTURE(bytes);
+      const std::uint64_t largest = 1000;
+      const std::uint64_t full = largest + 1;
+      std::array<std::uint8_t, 4> out = {};
+      REQUIRE(vio::quic::packet_number_encode(out, full, bytes) == bytes);
+      std::uint64_t truncated = 0;
+      for (std::size_t i = 0; i < bytes; ++i)
+      {
+        truncated = (truncated << 8) | out[i];
+      }
+      CHECK(vio::quic::packet_number_decode(largest, truncated, bytes * 8) == full);
+    }
+  }
+
   SUBCASE("a wrapped candidate is pulled into the window")
   {
     // Expected is just past a 16-bit boundary, so a small truncated value

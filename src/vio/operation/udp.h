@@ -106,6 +106,14 @@ struct udp_recv_state_t
 
 struct udp_state_t
 {
+  // A constructor rather than aggregate initialisation: naming only the loop
+  // leaves the rest to -Wmissing-field-initializers, which prism compiles as
+  // an error.
+  explicit udp_state_t(event_loop_t &loop)
+    : event_loop(loop)
+  {
+  }
+
   event_loop_t &event_loop;
   uv_udp_t uv_handle = {};
 
@@ -128,9 +136,9 @@ struct udp_future_t
 {
   ref_ptr_t<udp_state_t> handle;
   State *state;
-  udp_future_t(ref_ptr_t<udp_state_t> handle, State &state)
-    : handle(std::move(handle))
-    , state(&state)
+  udp_future_t(ref_ptr_t<udp_state_t> socket, State &operation_state)
+    : handle(std::move(socket))
+    , state(&operation_state)
   {
   }
   bool await_ready() noexcept
@@ -601,21 +609,28 @@ inline std::expected<void, error_t> udp_bind_dual_stack(udp_t &udp, std::uint16_
   return {};
 }
 
-// Must be called before udp_create_reader: the reader allocates through these
-// on every datagram, and the default allocator takes a fresh 64 KiB block for
-// what is usually a ~1200 byte packet.
-inline void udp_set_allocator(udp_t &udp, alloc_cb_t alloc, dealloc_cb_t dealloc, void *user_data)
+// Refused once a reader is running, and that refusal is the point: buffers
+// already handed out were taken from the old allocator but would be returned
+// to the new one. A pool would take a foreign block onto its free list and
+// later hand it back as though it were pool-sized, which is a heap overflow
+// several datagrams after the mistake.
+inline std::expected<void, error_t> udp_set_allocator(udp_t &udp, alloc_cb_t alloc, dealloc_cb_t dealloc, void *user_data)
 {
+  if (udp.handle->recv.started || udp.handle->recv.active)
+  {
+    return std::unexpected(error_t{.code = UV_EBUSY, .msg = "the allocator cannot change while a reader is active; set it before udp_create_reader"});
+  }
   udp.handle->recv.alloc_buffer_cb = alloc;
   udp.handle->recv.dealloc_buffer_cb = dealloc;
   udp.handle->recv.alloc_cb_data = user_data;
+  return {};
 }
 
 // The pool must outlive the socket: every datagram still in the receive queue
 // holds a pointer to it as its deallocator's user handle.
-inline void udp_use_buffer_pool(udp_t &udp, buffer_pool_t &pool)
+inline std::expected<void, error_t> udp_use_buffer_pool(udp_t &udp, buffer_pool_t &pool)
 {
-  udp_set_allocator(udp, &buffer_pool_t::alloc_cb, &buffer_pool_t::dealloc_cb, &pool);
+  return udp_set_allocator(udp, &buffer_pool_t::alloc_cb, &buffer_pool_t::dealloc_cb, &pool);
 }
 
 inline void udp_set_recv_queue_limit(udp_t &udp, std::size_t datagrams)
@@ -748,8 +763,8 @@ public:
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
   struct ref_ptr_releaser_t
   {
-    explicit ref_ptr_releaser_t(ref_ptr_t<udp_state_t> &handle)
-      : handle(handle)
+    explicit ref_ptr_releaser_t(ref_ptr_t<udp_state_t> &socket)
+      : handle(socket)
     {
     }
 

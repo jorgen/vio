@@ -304,7 +304,7 @@ TEST_CASE("udp_set_allocator routes reader allocations through the hook")
         REQUIRE_EXPECTED(receiver_pair);
         const int port = receiver_pair->second;
 
-        vio::udp_set_allocator(
+        REQUIRE_EXPECTED(vio::udp_set_allocator(
           receiver_pair->first,
           [](void *user, size_t suggested, uv_buf_t *buf)
           {
@@ -318,7 +318,7 @@ TEST_CASE("udp_set_allocator routes reader allocations through the hook")
             delete[] buf->base;
             buf->base = nullptr;
           },
-          &counters);
+          &counters));
 
         auto receiver_task = [](vio::udp_t receiver) -> vio::task_t<void>
         {
@@ -481,7 +481,7 @@ TEST_CASE("recvmmsg delivers every datagram exactly once")
         auto receiver = vio::udp_create(loop, vio::udp_recvmmsg_t::on);
         REQUIRE_EXPECTED(receiver);
         using_recvmmsg = vio::udp_using_recvmmsg(receiver.value());
-        vio::udp_use_buffer_pool(receiver.value(), pool);
+        REQUIRE_EXPECTED(vio::udp_use_buffer_pool(receiver.value(), pool));
 
         auto addr = vio::ip4_addr("127.0.0.1", 0);
         REQUIRE_EXPECTED(addr);
@@ -532,6 +532,44 @@ TEST_CASE("recvmmsg delivers every datagram exactly once")
   CHECK(received == datagram_count);
   CHECK(stats.truncated_datagrams == 0);
   MESSAGE("using_recvmmsg=" << using_recvmmsg << " received=" << received << " pool_allocations=" << pool.allocations());
+}
+
+TEST_CASE("the allocator cannot be swapped under a running reader")
+{
+  vio::event_loop_t event_loop;
+  bool refused = false;
+  bool accepted_before = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &loop, bool &refused, bool &accepted_before) -> vio::task_t<void>
+      {
+        {
+          auto socket = bound_socket(loop);
+          REQUIRE_EXPECTED(socket);
+          vio::buffer_pool_t pool(2048, 8);
+
+          accepted_before = vio::udp_use_buffer_pool(socket->first, pool).has_value();
+
+          auto reader_or_err = vio::udp_create_reader(socket->first);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+
+          // Buffers already handed out came from the pool; pointing the
+          // socket at a different allocator now would have them freed by the
+          // wrong one.
+          vio::buffer_pool_t other(64, 8);
+          refused = !vio::udp_use_buffer_pool(socket->first, other).has_value();
+        }
+        loop.stop();
+        co_return;
+      }(event_loop, refused, accepted_before);
+    });
+
+  event_loop.run();
+  CHECK(accepted_before);
+  CHECK(refused);
 }
 
 TEST_CASE("udp_fileno returns the underlying socket")

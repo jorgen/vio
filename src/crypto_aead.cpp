@@ -27,6 +27,8 @@
 #include <utility>
 
 #include <openssl/aes.h>
+#include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 
@@ -53,9 +55,21 @@ const EVP_AEAD *aead_for(aead_t algorithm)
   return nullptr;
 }
 
+// Drains the thread-local OpenSSL error queue into the message. Leaving it
+// populated is not harmless: the next caller to check it sees a failure that
+// belongs to us.
 error_t crypto_error(const char *what)
 {
-  return error_t{.code = -1, .msg = what};
+  std::string message = what;
+  if (const unsigned long code = ERR_get_error(); code != 0)
+  {
+    char buffer[256] = {};
+    ERR_error_string_n(code, buffer, sizeof(buffer));
+    message += ": ";
+    message += buffer;
+  }
+  ERR_clear_error();
+  return error_t{.code = -1, .msg = std::move(message)};
 }
 
 struct header_protection_impl_t
@@ -63,6 +77,25 @@ struct header_protection_impl_t
   aead_t algorithm = aead_t::aes_128_gcm;
   AES_KEY aes = {};
   std::array<std::uint8_t, 32> chacha_key = {};
+  // Reused across packets. Creating a context per mask() would be a heap
+  // allocation and a key schedule for every packet on the connection; the
+  // cost is that mask() is not reentrant, which is why it is not const.
+  EVP_CIPHER_CTX *chacha_ctx = nullptr;
+
+  ~header_protection_impl_t()
+  {
+    if (chacha_ctx != nullptr)
+    {
+      EVP_CIPHER_CTX_free(chacha_ctx);
+    }
+    // Key material must not survive in freed heap.
+    OPENSSL_cleanse(&aes, sizeof(aes));
+    OPENSSL_cleanse(chacha_key.data(), chacha_key.size());
+  }
+
+  header_protection_impl_t() = default;
+  header_protection_impl_t(const header_protection_impl_t &) = delete;
+  header_protection_impl_t &operator=(const header_protection_impl_t &) = delete;
 };
 } // namespace
 
@@ -254,6 +287,12 @@ std::expected<void, error_t> header_protection_key_t::init(aead_t algorithm, std
   if (algorithm == aead_t::chacha20_poly1305)
   {
     std::memcpy(impl->chacha_key.data(), key.data(), key.size());
+    impl->chacha_ctx = EVP_CIPHER_CTX_new();
+    if (impl->chacha_ctx == nullptr || EVP_EncryptInit_ex(impl->chacha_ctx, EVP_chacha20(), nullptr, impl->chacha_key.data(), nullptr) != 1)
+    {
+      delete impl;
+      return std::unexpected(crypto_error("EVP_EncryptInit_ex failed"));
+    }
   }
   else if (AES_set_encrypt_key(key.data(), static_cast<int>(key.size() * 8), &impl->aes) != 0)
   {
@@ -266,9 +305,9 @@ std::expected<void, error_t> header_protection_key_t::init(aead_t algorithm, std
   return {};
 }
 
-std::expected<header_protection_mask_t, error_t> header_protection_key_t::mask(std::span<const std::uint8_t, header_protection_sample_size> sample) const
+std::expected<header_protection_mask_t, error_t> header_protection_key_t::mask(std::span<const std::uint8_t, header_protection_sample_size> sample)
 {
-  const auto *impl = static_cast<const header_protection_impl_t *>(_impl);
+  auto *impl = static_cast<header_protection_impl_t *>(_impl);
   if (impl == nullptr)
   {
     return std::unexpected(crypto_error("header protection key not initialized"));
@@ -286,25 +325,18 @@ std::expected<header_protection_mask_t, error_t> header_protection_key_t::mask(s
 
   // RFC 9001 section 5.4.4: the sample is the 4-byte little-endian counter
   // followed by the 12-byte nonce, which is exactly EVP_chacha20's 16-byte IV
-  // layout, and the mask is the keystream.
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (ctx == nullptr)
-  {
-    return std::unexpected(crypto_error("EVP_CIPHER_CTX_new failed"));
-  }
-  if (EVP_EncryptInit_ex(ctx, EVP_chacha20(), nullptr, impl->chacha_key.data(), sample.data()) != 1)
-  {
-    EVP_CIPHER_CTX_free(ctx);
-    return std::unexpected(crypto_error("EVP_EncryptInit_ex failed"));
-  }
+  // layout, and the mask is the keystream. Re-initialising with only the IV
+  // keeps the key schedule from the init above.
   const std::array<std::uint8_t, header_protection_mask_size> zeros = {};
   int written = 0;
-  if (EVP_EncryptUpdate(ctx, out.data(), &written, zeros.data(), static_cast<int>(zeros.size())) != 1 || written != static_cast<int>(out.size()))
+  if (EVP_EncryptInit_ex(impl->chacha_ctx, nullptr, nullptr, nullptr, sample.data()) != 1)
   {
-    EVP_CIPHER_CTX_free(ctx);
+    return std::unexpected(crypto_error("EVP_EncryptInit_ex failed"));
+  }
+  if (EVP_EncryptUpdate(impl->chacha_ctx, out.data(), &written, zeros.data(), static_cast<int>(zeros.size())) != 1 || written != static_cast<int>(out.size()))
+  {
     return std::unexpected(crypto_error("EVP_EncryptUpdate failed"));
   }
-  EVP_CIPHER_CTX_free(ctx);
   return out;
 }
 } // namespace vio::crypto

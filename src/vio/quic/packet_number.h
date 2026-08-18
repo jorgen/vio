@@ -73,6 +73,14 @@ inline constexpr std::size_t max_packet_number_size = 4;
 // processed number in this space; pass it as it stands, the +1 is here.
 [[nodiscard]] inline std::uint64_t packet_number_decode(std::uint64_t largest_packet_number, std::uint64_t truncated, std::size_t bits)
 {
+  // The wire only ever yields 8, 16, 24 or 32 here, but this reads a length
+  // field from an unauthenticated header: a shift of 64 or more is undefined
+  // behaviour, not a large number.
+  if (bits == 0 || bits > 32)
+  {
+    return truncated;
+  }
+
   const std::uint64_t expected = largest_packet_number + 1;
   const std::uint64_t window = std::uint64_t{1} << bits;
   const std::uint64_t half_window = window / 2;

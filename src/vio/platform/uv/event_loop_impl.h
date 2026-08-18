@@ -152,7 +152,7 @@ public:
       std::function<uv_handle_t *(uv_loop_t *)> func = [&event_pipe, &barrier](uv_loop_t *loop)
       {
         auto to_ret = event_pipe.initialize_in_loop(loop);
-        std::unique_lock<std::mutex> lock(barrier.mutex);
+        std::unique_lock<std::mutex> notify_lock(barrier.mutex);
         barrier.wait.notify_one();
         return to_ret;
       };
@@ -233,7 +233,7 @@ public:
     auto run = [&barrier, this]
     {
       {
-        std::unique_lock<std::mutex> lock(barrier.mutex);
+        std::unique_lock<std::mutex> notify_lock(barrier.mutex);
         barrier.wait.notify_one();
       }
       _event_loop.run();

@@ -165,6 +165,61 @@ TEST_CASE("RFC 9001 A.5: ChaCha20 keys, header protection and AEAD")
   }
 }
 
+TEST_CASE("a header protection key is reusable across packets")
+{
+  // The ChaCha20 variant keeps one cipher context and re-initialises it with
+  // each sample, so the keystream counter has to restart every call. If it
+  // did not, the first mask would match the RFC and every later one would
+  // silently differ -- and a wrong mask is indistinguishable from a corrupt
+  // packet at the peer.
+  const auto hp_bytes = unhex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4");
+  const auto sample_bytes = unhex("5e5cd55c41f69080575d7999c25a5bfb");
+  const auto other_sample = unhex("d1b1c98dd7689fb8ec11d242b123dc9b");
+
+  vio::crypto::header_protection_key_t key;
+  REQUIRE(key.init(vio::crypto::aead_t::chacha20_poly1305, hp_bytes).has_value());
+
+  std::span<const std::uint8_t, vio::crypto::header_protection_sample_size> sample(sample_bytes.data(), vio::crypto::header_protection_sample_size);
+  std::span<const std::uint8_t, vio::crypto::header_protection_sample_size> other(other_sample.data(), vio::crypto::header_protection_sample_size);
+
+  for (int i = 0; i < 8; ++i)
+  {
+    auto mask = key.mask(sample);
+    REQUIRE(mask.has_value());
+    CHECK(hex_of(*mask) == "aefefe7d03");
+
+    // Interleave a different sample: the context must carry nothing between
+    // calls.
+    auto elsewhere = key.mask(other);
+    REQUIRE(elsewhere.has_value());
+    CHECK(hex_of(*elsewhere) != "aefefe7d03");
+  }
+
+  SUBCASE("the aes variant is equally repeatable")
+  {
+    vio::crypto::header_protection_key_t aes_key;
+    REQUIRE(aes_key.init(vio::crypto::aead_t::aes_128_gcm, unhex("9f50449e04a0e810283a1e9933adedd2")).has_value());
+    for (int i = 0; i < 4; ++i)
+    {
+      auto mask = aes_key.mask(other);
+      REQUIRE(mask.has_value());
+      CHECK(hex_of(*mask) == "437b9aec36");
+    }
+  }
+}
+
+TEST_CASE("a failure carries the OpenSSL reason and leaves the error queue clean")
+{
+  vio::crypto::aead_key_t aead;
+  auto failed = aead.init(vio::crypto::aead_t::aes_128_gcm, std::vector<std::uint8_t>(3, 0));
+  REQUIRE_FALSE(failed.has_value());
+  CHECK_FALSE(failed.error().msg.empty());
+
+  // A later, valid operation must not inherit anything from the failure.
+  vio::crypto::aead_key_t good;
+  CHECK(good.init(vio::crypto::aead_t::aes_128_gcm, std::vector<std::uint8_t>(16, 0x11)).has_value());
+}
+
 TEST_CASE("aes-gcm round trip and key length validation")
 {
   const std::vector<std::uint8_t> key_128(16, 0xab);

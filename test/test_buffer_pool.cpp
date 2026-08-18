@@ -115,7 +115,7 @@ TEST_CASE("a pooled socket stops allocating once it is warm")
         auto receiver_pair = bound_socket(loop);
         REQUIRE_EXPECTED(receiver_pair);
         const int port = receiver_pair->second;
-        vio::udp_use_buffer_pool(receiver_pair->first, pool);
+        REQUIRE_EXPECTED(vio::udp_use_buffer_pool(receiver_pair->first, pool));
 
         auto receiver_task = [](vio::udp_t receiver, int &received) -> vio::task_t<void>
         {

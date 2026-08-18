@@ -51,6 +51,11 @@ namespace vio
 {
 struct timer_state_t
 {
+  explicit timer_state_t(event_loop_t &loop)
+    : event_loop(loop)
+  {
+  }
+
   event_loop_t &event_loop;
   uv_timer_t uv_handle = {};
   std::function<void()> on_fire;
