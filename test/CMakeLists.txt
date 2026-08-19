@@ -13,6 +13,7 @@ add_executable(vio_tests
     test_udp_send_async.cpp
     test_quic_vectors.cpp
     test_quic_frame_table.cpp
+    test_quic_frame_codec.cpp
     test_http_client.cpp
     test_http_cache.cpp
     test_file.cpp
