@@ -471,7 +471,11 @@ TEST_CASE("recvmmsg delivers every datagram exactly once")
   int received = 0;
   bool using_recvmmsg = false;
   vio::udp_recv_stats_t stats = {};
-  vio::buffer_pool_t pool(2048, 128);
+  // libuv hands recvmmsg a single 64 KiB chunk and slices the datagrams out of
+  // it, so a pool of smaller blocks yields no read slots at all and the socket
+  // goes silent. udp_create_reader refuses that combination outright; the pool
+  // has to be sized to the chunk.
+  vio::buffer_pool_t pool(vio::udp_recvmmsg_chunk_size, 8);
 
   event_loop.run_in_loop(
     [&]
@@ -532,6 +536,151 @@ TEST_CASE("recvmmsg delivers every datagram exactly once")
   CHECK(received == datagram_count);
   CHECK(stats.truncated_datagrams == 0);
   MESSAGE("using_recvmmsg=" << using_recvmmsg << " received=" << received << " pool_allocations=" << pool.allocations());
+}
+
+TEST_CASE("a reader destroyed mid batch hands the recvmmsg buffer back")
+{
+  // libuv only returns a recvmmsg buffer through a final UV_UDP_MMSG_FREE
+  // callback, and it skips that callback entirely once the read has been
+  // stopped. Taking a single datagram and letting the reader go destroys it
+  // from inside the batch libuv is still iterating, which is exactly the case
+  // that used to strand the whole chunk.
+  constexpr int datagram_count = 16;
+  vio::event_loop_t event_loop;
+  int received = 0;
+  bool using_recvmmsg = false;
+  vio::buffer_pool_t pool(vio::udp_recvmmsg_chunk_size * 4, 8);
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &loop, vio::buffer_pool_t &pool, int &received, bool &using_recvmmsg) -> vio::task_t<void>
+      {
+        auto receiver = vio::udp_create(loop, vio::udp_recvmmsg_t::on);
+        REQUIRE_EXPECTED(receiver);
+        using_recvmmsg = vio::udp_using_recvmmsg(receiver.value());
+        REQUIRE_EXPECTED(vio::udp_use_buffer_pool(receiver.value(), pool));
+
+        auto addr = vio::ip4_addr("127.0.0.1", 0);
+        REQUIRE_EXPECTED(addr);
+        REQUIRE_EXPECTED(vio::udp_bind(receiver.value(), reinterpret_cast<const sockaddr *>(&addr.value())));
+        auto name = vio::udp_sockname(receiver.value());
+        REQUIRE_EXPECTED(name);
+        const int port = ntohs(reinterpret_cast<const sockaddr_in *>(&name.value())->sin_port);
+
+        auto receiver_task = [](vio::udp_t socket, int &received) -> vio::task_t<void>
+        {
+          auto reader_or_err = vio::udp_create_reader(socket);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto datagram = co_await reader;
+          REQUIRE_EXPECTED(datagram);
+          ++received;
+        }(std::move(receiver.value()), received);
+
+        co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
+        {
+          auto sender_pair = bound_socket(el);
+          REQUIRE_EXPECTED(sender_pair);
+          auto dest = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(dest);
+          for (int i = 0; i < datagram_count; ++i)
+          {
+            REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, as_bytes("batch"), reinterpret_cast<const sockaddr *>(&dest.value())));
+          }
+          co_return;
+        }(loop, port);
+
+        co_await std::move(receiver_task);
+        {
+          auto tmp = std::move(receiver_task);
+        }
+        loop.stop();
+      }(event_loop, pool, received, using_recvmmsg);
+    });
+
+  event_loop.run();
+
+  CHECK(received == 1);
+  // Every block the pool ever handed out is back on its free list. Before the
+  // reader reclaimed the buffer libuv was holding, the chunk stayed out.
+  CHECK(pool.retained() == pool.allocations());
+  MESSAGE("using_recvmmsg=" << using_recvmmsg << " allocations=" << pool.allocations() << " retained=" << pool.retained());
+}
+
+TEST_CASE("a second reader on the same socket does not strand the first buffer")
+{
+  // Stopping a read and starting another one is the case the socket teardown
+  // cannot rescue: the next allocation overwrites the record of the buffer
+  // libuv is holding, so a buffer not reclaimed at the stop is gone for as
+  // long as the socket lives. The accounting is therefore read while the
+  // socket is still open.
+  constexpr int datagram_count = 16;
+  vio::event_loop_t event_loop;
+  int received = 0;
+  bool using_recvmmsg = false;
+  std::uint64_t allocations = 0;
+  std::size_t retained = 0;
+  vio::buffer_pool_t pool(vio::udp_recvmmsg_chunk_size * 4, 8);
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &loop, vio::buffer_pool_t &pool, int &received, bool &using_recvmmsg, std::uint64_t &allocations, std::size_t &retained) -> vio::task_t<void>
+      {
+        auto receiver = vio::udp_create(loop, vio::udp_recvmmsg_t::on);
+        REQUIRE_EXPECTED(receiver);
+        using_recvmmsg = vio::udp_using_recvmmsg(receiver.value());
+        REQUIRE_EXPECTED(vio::udp_use_buffer_pool(receiver.value(), pool));
+
+        auto addr = vio::ip4_addr("127.0.0.1", 0);
+        REQUIRE_EXPECTED(addr);
+        REQUIRE_EXPECTED(vio::udp_bind(receiver.value(), reinterpret_cast<const sockaddr *>(&addr.value())));
+        auto name = vio::udp_sockname(receiver.value());
+        REQUIRE_EXPECTED(name);
+        const int port = ntohs(reinterpret_cast<const sockaddr_in *>(&name.value())->sin_port);
+
+        auto receiver_task = [](vio::udp_t socket, int &received, vio::buffer_pool_t &pool, std::uint64_t &allocations, std::size_t &retained) -> vio::task_t<void>
+        {
+          for (int round = 0; round < 2; ++round)
+          {
+            auto reader_or_err = vio::udp_create_reader(socket);
+            REQUIRE_EXPECTED(reader_or_err);
+            auto reader = std::move(reader_or_err.value());
+            auto datagram = co_await reader;
+            REQUIRE_EXPECTED(datagram);
+            ++received;
+          }
+          allocations = pool.allocations();
+          retained = pool.retained();
+        }(std::move(receiver.value()), received, pool, allocations, retained);
+
+        co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
+        {
+          auto sender_pair = bound_socket(el);
+          REQUIRE_EXPECTED(sender_pair);
+          auto dest = vio::ip4_addr("127.0.0.1", p);
+          REQUIRE_EXPECTED(dest);
+          for (int i = 0; i < datagram_count; ++i)
+          {
+            REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, as_bytes("again"), reinterpret_cast<const sockaddr *>(&dest.value())));
+          }
+          co_return;
+        }(loop, port);
+
+        co_await std::move(receiver_task);
+        {
+          auto tmp = std::move(receiver_task);
+        }
+        loop.stop();
+      }(event_loop, pool, received, using_recvmmsg, allocations, retained);
+    });
+
+  event_loop.run();
+
+  CHECK(received == 2);
+  CHECK(retained == allocations);
+  MESSAGE("using_recvmmsg=" << using_recvmmsg << " allocations=" << allocations << " retained=" << retained);
 }
 
 TEST_CASE("the allocator cannot be swapped under a running reader")

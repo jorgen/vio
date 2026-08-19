@@ -102,7 +102,27 @@ struct udp_recv_state_t
   alloc_cb_t alloc_buffer_cb = default_alloc;
   dealloc_cb_t dealloc_buffer_cb = default_dealloc;
   void *alloc_cb_data = nullptr;
+
+  // The buffer libuv is currently holding. Under recvmmsg libuv fills one
+  // allocation with a batch of datagrams and only hands it back through a
+  // final UV_UDP_MMSG_FREE callback that it skips outright when the read has
+  // been stopped mid-batch (libuv src/unix/udp.c guards that last callback on
+  // recv_cb still being set). A reader destroyed or cancelled from inside a
+  // datagram callback would therefore strand the whole chunk, so ownership is
+  // tracked here and reclaimed wherever the read stops.
+  uv_buf_t inflight_recv_buffer = {};
 };
+
+inline void udp_reclaim_inflight_recv_buffer(udp_recv_state_t &recv)
+{
+  if (recv.inflight_recv_buffer.base == nullptr)
+  {
+    return;
+  }
+  uv_buf_t buffer = recv.inflight_recv_buffer;
+  recv.inflight_recv_buffer = {};
+  recv.dealloc_buffer_cb(recv.alloc_cb_data, &buffer);
+}
 
 struct udp_state_t
 {
@@ -125,6 +145,11 @@ struct udp_state_t
   uv_handle_t *get_handle()
   {
     return reinterpret_cast<uv_handle_t *>(&uv_handle);
+  }
+
+  ~udp_state_t()
+  {
+    udp_reclaim_inflight_recv_buffer(recv);
   }
 
   udp_send_state_t send;
@@ -214,7 +239,10 @@ inline bool udp_using_recvmmsg(udp_t &udp)
 // libuv slices a recvmmsg buffer into fixed 64 KiB chunks and reads
 // buf.len / 64 KiB datagrams at a time (src/unix/udp.c, UV__UDP_DGRAM_MAXSIZE).
 // An allocator handing back less than one chunk yields zero slots, so the
-// socket reads nothing at all -- silently, and forever.
+// socket reads nothing at all -- silently, and forever. This is the minimum,
+// not the useful size: a buffer of exactly one chunk batches a single datagram
+// per syscall, which is all of the cost of recvmmsg and none of the benefit.
+// Size a pool to a multiple of it, up to the 20 slots libuv reads at once.
 inline constexpr std::size_t udp_recvmmsg_chunk_size = 64 * 1024;
 
 inline std::expected<void, error_t> udp_bind(udp_t &udp, const sockaddr *addr, unsigned int flags = 0)
@@ -677,6 +705,7 @@ public:
       {
         auto state = ref_ptr_t<udp_state_t>::from_raw(handle->get_udp()->data);
         uv_udp_recv_stop(handle->get_udp());
+        udp_reclaim_inflight_recv_buffer(state->recv);
         state->recv.started = false;
         state->recv.active = false;
       }
@@ -693,6 +722,7 @@ public:
     {
       auto state = ref_ptr_t<udp_state_t>::from_raw(handle->get_udp()->data);
       uv_udp_recv_stop(handle->get_udp());
+      udp_reclaim_inflight_recv_buffer(state->recv);
       state->recv.started = false;
       state->recv.active = false;
     }
@@ -714,6 +744,7 @@ public:
     {
       auto state = ref_ptr_t<udp_state_t>::from_raw(handle->get_udp()->data);
       uv_udp_recv_stop(handle->get_udp());
+      udp_reclaim_inflight_recv_buffer(state->recv);
       state->recv.started = false;
       state->recv.active = false;
     }
@@ -779,6 +810,7 @@ public:
   {
     auto udp_state = ref_ptr_t<udp_state_t>::from_raw(h->data);
     udp_state->recv.alloc_buffer_cb(udp_state->recv.alloc_cb_data, size, buf);
+    udp_state->recv.inflight_recv_buffer = *buf;
     udp_state.release_to_raw();
   }
 
@@ -800,6 +832,7 @@ public:
     {
       if (owns_buffer && buf != nullptr && buf->base != nullptr)
       {
+        udp_state->recv.inflight_recv_buffer = {};
         udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
       }
     };
@@ -808,6 +841,7 @@ public:
     {
       if (buf != nullptr && buf->base != nullptr)
       {
+        udp_state->recv.inflight_recv_buffer = {};
         udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
       }
       return;
@@ -859,6 +893,7 @@ public:
       {
         uv_buf_t sized_buf = *buf;
         sized_buf.len = static_cast<decltype(sized_buf.len)>(nread);
+        udp_state->recv.inflight_recv_buffer = {};
         datagram.data = unique_buf_t(sized_buf, udp_state->recv.dealloc_buffer_cb, udp_state->recv.alloc_cb_data);
       }
 
@@ -878,6 +913,7 @@ public:
       ++udp_state->recv.recv_errors;
       if (buf != nullptr && buf->base != nullptr)
       {
+        udp_state->recv.inflight_recv_buffer = {};
         udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
       }
 
