@@ -115,7 +115,14 @@ Configuration is in `.clang-tidy` at the project root.
   of RFC 9001 Appendix A by script -- no hex is transcribed by hand -- and
   `test_quic_protection.cpp` reproduces the A.2/A.3/A.5 packets byte for byte.
   That is the only external check on the stack: everything below `protection.h`
-  is tested only against itself.
+  is tested only against itself. `tls.h` + `src/quic_tls.cpp` is the seam onto
+  LibreSSL's QUIC API (`SSL_CTX_set_quic_method`): CRYPTO bytes in and out,
+  traffic secrets out per level, ALPN and transport parameters across. It
+  buffers incoming CRYPTO data per level, because LibreSSL accepts it only at
+  the level it is currently reading while a peer may legitimately have the next
+  level already in flight. 0-RTT is refused there explicitly rather than
+  silently. `test_quic_tls.cpp` runs a full handshake with no socket under it
+  and then protects and opens a packet with the secrets it produced.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 

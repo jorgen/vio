@@ -13,6 +13,7 @@ else()
             crypto.cpp
             crypto_aead.cpp
             crypto_encoding.cpp
+            quic_tls.cpp
         )
     else()
         add_library(vio STATIC
@@ -20,6 +21,7 @@ else()
             crypto.cpp
             crypto_aead.cpp
             crypto_encoding.cpp
+            quic_tls.cpp
         )
         target_compile_definitions(vio PUBLIC VIO_STATIC_DEFINE)
     endif()
