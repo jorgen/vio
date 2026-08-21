@@ -109,7 +109,13 @@ Configuration is in `.clang-tidy` at the project root.
   `packet_number.h`, `connection_id.h`, `frame.h` (the RFC 9000 section 12.4 frame
   table plus the per-frame loss policy), `frame_codec.h` (section 19 encode/decode),
   `packet.h` (section 17 headers; stops at the packet number, since the rest is
-  header-protected, and reports the offsets protection needs)
+  header-protected, and reports the offsets protection needs), `protection.h`
+  (RFC 9001: the key schedule, the AEAD, and header protection, over
+  `crypto_aead`). `test/quic_rfc9001_vectors.h` is generated from the raw text
+  of RFC 9001 Appendix A by script -- no hex is transcribed by hand -- and
+  `test_quic_protection.cpp` reproduces the A.2/A.3/A.5 packets byte for byte.
+  That is the only external check on the stack: everything below `protection.h`
+  is tested only against itself.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 
