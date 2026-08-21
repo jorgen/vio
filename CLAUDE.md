@@ -107,7 +107,9 @@ Configuration is in `.clang-tidy` at the project root.
 - `src/vio/operation/` - Async operation implementations (tcp, tls, dns, file, sleep, udp, timer)
 - `src/vio/quic/` - QUIC wire primitives, sans-I/O and dependency-free: `varint.h`,
   `packet_number.h`, `connection_id.h`, `frame.h` (the RFC 9000 section 12.4 frame
-  table plus the per-frame loss policy), `frame_codec.h` (section 19 encode/decode)
+  table plus the per-frame loss policy), `frame_codec.h` (section 19 encode/decode),
+  `packet.h` (section 17 headers; stops at the packet number, since the rest is
+  header-protected, and reports the offsets protection needs)
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 
