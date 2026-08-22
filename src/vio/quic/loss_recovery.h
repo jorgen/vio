@@ -244,6 +244,12 @@ struct timeout_outcome_t
 class loss_recovery_t
 {
 public:
+  struct ack_span_t
+  {
+    std::uint64_t smallest = 0;
+    std::uint64_t largest = 0;
+  };
+
   void on_packet_sent(pn_space_t space, sent_packet_t packet)
   {
     auto &state = _spaces[pn_space_to_index(space)];
@@ -261,6 +267,7 @@ public:
     {
       state.time_of_last_ack_eliciting = packet.time_sent;
       state.has_ack_eliciting_sent = true;
+      ++_ack_eliciting_in_flight;
     }
     const auto number = packet.packet_number;
     state.sent.insert_or_assign(number, std::move(packet));
@@ -286,7 +293,8 @@ public:
     // Decoded before anything is believed: a frame whose ranges do not add up
     // must not be allowed to move largest_acked.
     bool well_formed = true;
-    const auto spans = decode_ack_spans(ack, well_formed);
+    decode_ack_spans(ack, _ack_spans, well_formed);
+    const auto &spans = _ack_spans;
     if (!well_formed)
     {
       outcome.malformed = true;
@@ -316,7 +324,11 @@ public:
       {
         _bytes_in_flight -= std::min(_bytes_in_flight, it->second.size);
       }
-      acked_ack_eliciting = acked_ack_eliciting || it->second.ack_eliciting;
+      if (it->second.ack_eliciting)
+      {
+        acked_ack_eliciting = true;
+        --_ack_eliciting_in_flight;
+      }
       outcome.acknowledged.push_back(std::move(it->second));
       it = state.sent.erase(it);
     }
@@ -386,6 +398,10 @@ public:
         {
           _bytes_in_flight -= std::min(_bytes_in_flight, it->second.size);
         }
+        if (it->second.ack_eliciting)
+        {
+          --_ack_eliciting_in_flight;
+        }
         lost.push_back(std::move(it->second));
         it = state.sent.erase(it);
         continue;
@@ -454,6 +470,10 @@ public:
       {
         _bytes_in_flight -= std::min(_bytes_in_flight, entry.second.size);
       }
+      if (entry.second.ack_eliciting)
+      {
+        --_ack_eliciting_in_flight;
+      }
     }
     state = space_state_t{};
     state.discarded = true;
@@ -483,19 +503,12 @@ public:
     return _first_rtt_sample;
   }
 
+  // Kept as a count rather than discovered by walking. This sits on the
+  // poll_send path via the PTO calculation, so scanning every packet in flight
+  // made sending cost a pass over the congestion window each time.
   [[nodiscard]] bool ack_eliciting_in_flight() const
   {
-    for (const auto &state : _spaces)
-    {
-      for (const auto &entry : state.sent)
-      {
-        if (entry.second.ack_eliciting)
-        {
-          return true;
-        }
-      }
-    }
-    return false;
+    return _ack_eliciting_in_flight > 0;
   }
 
   [[nodiscard]] std::size_t unacknowledged(pn_space_t space) const
@@ -531,23 +544,19 @@ private:
     bool discarded = false;
   };
 
-  struct ack_span_t
-  {
-    std::uint64_t smallest = 0;
-    std::uint64_t largest = 0;
-  };
-
   // The ranges an ACK frame names, as intervals rather than as the numbers
   // inside them. There are at most as many as the frame had room to encode,
   // which the frame codec already bounded against the packet.
-  [[nodiscard]] static std::vector<ack_span_t> decode_ack_spans(const frame_t &ack, bool &well_formed)
+  // Fills a caller-owned buffer rather than returning one: this is on the
+  // receive path of every ACK, and the buffer is the same shape every time.
+  static void decode_ack_spans(const frame_t &ack, std::vector<ack_span_t> &spans, bool &well_formed)
   {
     well_formed = true;
-    std::vector<ack_span_t> spans;
+    spans.clear();
     if (ack.first_ack_range > ack.largest_acknowledged)
     {
       well_formed = false;
-      return spans;
+      return;
     }
     std::uint64_t largest = ack.largest_acknowledged;
     std::uint64_t smallest = largest - ack.first_ack_range;
@@ -575,7 +584,6 @@ private:
     }
     // Descending on the wire; ascending is easier to search.
     std::reverse(spans.begin(), spans.end());
-    return spans;
   }
 
   [[nodiscard]] static bool covered(const std::vector<ack_span_t> &spans, std::uint64_t number)
@@ -682,7 +690,10 @@ private:
 
   std::array<space_state_t, pn_space_count> _spaces;
   rtt_estimator_t _rtt;
+  // Reused across acknowledgements so the receive path does not allocate.
+  std::vector<ack_span_t> _ack_spans;
   std::size_t _bytes_in_flight = 0;
+  std::size_t _ack_eliciting_in_flight = 0;
   std::uint64_t _pto_count = 0;
   std::optional<tick_t> _first_rtt_sample;
 };

@@ -46,6 +46,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <optional>
 #include <span>
@@ -873,9 +874,13 @@ private:
     {
       return false;
     }
-    for (std::size_t i = 0; i < data.size(); ++i)
+    // A STREAM or CRYPTO payload is most of a packet, so this is the copy that
+    // matters; a byte-at-a-time loop leaves most of the machine idle. Guarded
+    // because an empty frame is legal and memcpy from a null pointer is
+    // undefined even for zero bytes.
+    if (!data.empty())
     {
-      _out[_position + i] = data[i];
+      std::memcpy(_out.data() + _position, data.data(), data.size());
     }
     _position += data.size();
     return true;

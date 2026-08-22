@@ -153,7 +153,18 @@ Configuration is in `.clang-tidy` at the project root.
   encrypted per key, and forgery attempts across the connection. The idle
   timeout of section 10.1 closes a connection silently, floored at three PTOs.
   MAX_STREAMS returns credit as the application finishes with peer-initiated
-  streams -- without it a peer that reaches the limit stays there forever. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+  streams -- without it a peer that reaches the limit stays there forever.
+
+`test/bench_quic.cpp` (target `vio_bench`, excluded from the default build) is
+the QUIC hot-path benchmark. It replaces global `operator new` to count
+allocations, so it must never share a binary with the tests. Being sans-I/O it
+measures exactly the per-packet cost with no kernel in the way, which makes it
+a fair measure of protocol overhead and an unfair one of link throughput.
+Two things dominated when it was first written, both since fixed: TLS was
+driven on every received packet long after the handshake, and
+`ack_eliciting_in_flight` scanned every packet in flight from the PTO
+calculation on every `poll_send`. With those gone the profile is 80%+ AES-GCM,
+which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
   transcribed from the appendix A pseudocode. A sent packet records *what it
   meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes

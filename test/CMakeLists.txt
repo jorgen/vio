@@ -67,3 +67,9 @@ target_include_directories(vio_tests PRIVATE
 )
 
 add_test(NAME vio_tests COMMAND vio_tests)
+# A benchmark, not a test: it replaces global operator new to count
+# allocations, so it must not share a binary with anything else. Excluded from
+# the default build; configure and then "cmake --build . --target vio_bench".
+add_executable(vio_bench EXCLUDE_FROM_ALL bench_quic.cpp)
+CmDepTargetLinkLibrary(vio_bench PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+target_include_directories(vio_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)

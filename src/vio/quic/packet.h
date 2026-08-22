@@ -46,6 +46,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <optional>
 #include <span>
@@ -539,9 +540,9 @@ public:
     if (kind == packet_kind_t::initial)
     {
       position += varint_encode(_out.subspan(position), token.size());
-      for (std::size_t i = 0; i < token.size(); ++i)
+      if (!token.empty())
       {
-        _out[position + i] = token[i];
+        std::memcpy(_out.data() + position, token.data(), token.size());
       }
       position += token.size();
     }
@@ -641,9 +642,10 @@ private:
   {
     _out[position] = static_cast<std::uint8_t>(id.size());
     const auto bytes = id.bytes();
-    for (std::size_t i = 0; i < bytes.size(); ++i)
+    // A zero-length connection ID is legal, so this cannot assume a pointer.
+    if (!bytes.empty())
     {
-      _out[position + 1 + i] = bytes[i];
+      std::memcpy(_out.data() + position + 1, bytes.data(), bytes.size());
     }
     return 1 + bytes.size();
   }

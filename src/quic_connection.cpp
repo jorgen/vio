@@ -484,6 +484,7 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     return {};
   }
 
+  bool provided = false;
   for (auto level : ordered_levels)
   {
     auto &space = impl.spaces[space_index(level)];
@@ -498,6 +499,15 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
       return {};
     }
     space.crypto.consume(readable.size());
+    provided = true;
+  }
+
+  // Once the handshake is done, TLS has nothing to say unless CRYPTO data
+  // arrives -- a session ticket, say. Asking it anyway put an SSL call on the
+  // path of every packet for the life of the connection.
+  if (impl.handshake_complete && !provided)
+  {
+    return {};
   }
 
   auto advanced = impl.tls.advance();
