@@ -101,8 +101,8 @@ transport_parameters_t generous()
   parameters.initial_max_stream_data_bidi_local = 1ull << 32;
   parameters.initial_max_stream_data_bidi_remote = 1ull << 32;
   parameters.initial_max_stream_data_uni = 1ull << 32;
-  parameters.initial_max_streams_bidi = 1000;
-  parameters.initial_max_streams_uni = 1000;
+  parameters.initial_max_streams_bidi = 100000;
+  parameters.initial_max_streams_uni = 100000;
   return parameters;
 }
 
