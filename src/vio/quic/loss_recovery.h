@@ -156,6 +156,13 @@ public:
     _smoothed = (_smoothed * 7) / 8 + adjusted / 8;
   }
 
+  // Section 9.4 of RFC 9000: a new path is a different network, and an
+  // estimate built from the old one describes nothing about it.
+  void reset()
+  {
+    *this = rtt_estimator_t{};
+  }
+
   // Section 6.2.1, without the max_ack_delay term: that is added only for the
   // application space, and only once the handshake is confirmed.
   [[nodiscard]] std::chrono::nanoseconds pto_base() const
@@ -481,6 +488,11 @@ public:
     state = space_state_t{};
     state.discarded = true;
     _pto_count = 0;
+  }
+
+  void reset_rtt()
+  {
+    _rtt.reset();
   }
 
   [[nodiscard]] const rtt_estimator_t &rtt() const

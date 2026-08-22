@@ -71,6 +71,16 @@ inline constexpr std::int64_t persistent_congestion_threshold = 3;
 class congestion_control_t
 {
 public:
+  // Section 9.4 of RFC 9000: on confirming a peer's new address the controller
+  // returns to initial values, because the capacity it learned belongs to the
+  // path that is no longer in use. Sending at the old rate on a path that
+  // cannot carry it is how a migration turns into a burst of loss.
+  void reset()
+  {
+    const auto datagram_size = _max_datagram_size;
+    *this = congestion_control_t(datagram_size);
+  }
+
   explicit congestion_control_t(std::size_t max_datagram_size = 1200)
     : _max_datagram_size(max_datagram_size == 0 ? 1200 : max_datagram_size)
     , _window(initial_congestion_window(max_datagram_size == 0 ? 1200 : max_datagram_size))

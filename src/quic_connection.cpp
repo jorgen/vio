@@ -267,6 +267,14 @@ struct connection_impl_t
   // Set when a read may have finished a stream, cleared by the sweep that
   // returns the credit.
   bool reap_wanted = false;
+  // Section 9. Where packets are being sent, and the highest-numbered
+  // non-probing packet that put them there -- reordering must not drag the
+  // connection back to an address the peer has already left.
+  std::vector<std::uint8_t> peer_address;
+  bool peer_address_known = false;
+  std::uint64_t highest_non_probing = 0;
+  bool have_non_probing = false;
+  std::uint64_t migrations = 0;
   // Section 5.1. Two pools: what this endpoint issued and must keep accepting,
   // and what the peer issued and this endpoint may spend.
   local_connection_ids_t local_ids;
@@ -373,6 +381,21 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   impl.recovery.discard_space(to_pn_space(level));
 }
 
+// Section 9.3: a non-probing packet from an address this connection is not
+// already talking to means the peer has moved. The response is fixed by the
+// spec and every part of it matters:
+//
+//   Send to the new address, but treat it as unproven. Until path validation
+//   succeeds the anti-amplification limit of section 8 applies again, because
+//   a spoofed source address would otherwise turn this endpoint into a
+//   reflector aimed at the address in the packet (section 9.3.1).
+//
+//   Reset congestion control and the RTT estimate (section 9.4). What was
+//   learned describes the old path, and using it on a new one is how a
+//   migration becomes a burst of loss.
+//
+//   Move to a connection ID the old path never carried (section 9.5), or an
+//   observer of both paths can trivially link them.
 // Section 8.2.4: three times the larger of the current PTO and a PTO computed
 // from the initial RTT, because a new path may be slower than the one in use
 // and the estimate in hand describes the old one.
@@ -381,6 +404,40 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   const auto current = impl.recovery.rtt().pto_base() + impl.config.max_ack_delay;
   const auto fresh = initial_rtt + std::max(initial_rtt / 2 * 4, loss_granularity) + impl.config.max_ack_delay;
   return std::max(current, fresh) * 3;
+}
+
+void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, std::uint64_t packet_number, std::size_t datagram_size, tick_t now)
+{
+  impl.peer_address.assign(address.begin(), address.end());
+  impl.highest_non_probing = packet_number;
+  impl.have_non_probing = true;
+  ++impl.migrations;
+
+  // Section 8: the limit is per path, so what the old one earned does not
+  // carry over. Only this datagram has arrived here so far.
+  impl.address_validated = false;
+  impl.bytes_received = datagram_size;
+  impl.bytes_sent = 0;
+
+  // Section 9.4.
+  impl.congestion.reset();
+  impl.recovery.reset_rtt();
+
+  // Section 9.5. If the peer has supplied no spare, the connection keeps the
+  // one it has: a linkable connection is better than an unusable one, and the
+  // peer is the one that failed to supply the id.
+  if (impl.remote_ids.has_unused() && impl.remote_ids.switch_to_unused())
+  {
+    if (const auto *chosen = impl.remote_ids.current(); chosen != nullptr)
+    {
+      impl.peer_connection_id = *chosen;
+    }
+  }
+
+  // Section 9.3: validation of the new address starts now, and any attempt
+  // against the old one is abandoned.
+  impl.path.reset();
+  impl.path.begin(now, path_abandon_timeout(impl));
 }
 
 // Section 10.1: floored at three times the current PTO, so a peer advertising
@@ -710,7 +767,7 @@ std::expected<void, error_t> replenish_connection_ids(connection_impl_t &impl)
 }
 
 // Everything a received packet's frames can do to the connection.
-std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<const std::uint8_t> payload, packet_kind_t kind, tick_t now, const connection_id_t &destination)
+std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<const std::uint8_t> payload, packet_kind_t kind, tick_t now, const connection_id_t &destination, bool &non_probing)
 {
   const auto packet_type = frame_packet_type(kind);
   if (!packet_type.has_value())
@@ -732,6 +789,14 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
     if (properties.has_value() && properties->ack_eliciting)
     {
       ack_eliciting = true;
+    }
+    // Section 9.1: PATH_CHALLENGE, PATH_RESPONSE, NEW_CONNECTION_ID and
+    // PADDING are probing frames, and a packet of nothing else says nothing
+    // about where the peer has moved to -- it is exactly what an attacker
+    // replaying a captured packet from another address would produce.
+    if (properties.has_value() && !properties->probing)
+    {
+      non_probing = true;
     }
 
     switch (frame.kind)
@@ -1012,7 +1077,15 @@ std::expected<void, error_t> receive_retry(connection_impl_t &impl, const packet
   return {};
 }
 
-std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packet_header_t &header, std::span<std::uint8_t> packet, tick_t now)
+// What a datagram turned out to say about where the peer is, gathered across
+// its coalesced packets and acted on once the whole datagram has been read.
+struct migration_signal_t
+{
+  bool saw_non_probing = false;
+  std::uint64_t highest_non_probing = 0;
+};
+
+std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packet_header_t &header, std::span<std::uint8_t> packet, tick_t now, migration_signal_t &signal)
 {
   if (header.kind == packet_kind_t::retry)
   {
@@ -1214,10 +1287,21 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     }
   }
 
-  auto ack_eliciting = process_frames(impl, opened->payload, header.kind, now, header.destination_id);
+  bool non_probing = false;
+  auto ack_eliciting = process_frames(impl, opened->payload, header.kind, now, header.destination_id, non_probing);
   if (!ack_eliciting.has_value())
   {
     return std::unexpected(ack_eliciting.error());
+  }
+  // Only 1-RTT packets. Section 9 describes migration for an established
+  // connection, and the "highest-numbered" comparison of section 9.3 is only
+  // meaningful within one packet number space -- each space numbers from zero,
+  // so a Handshake packet number and a 1-RTT packet number are not on the same
+  // scale and comparing them decides nothing.
+  if (non_probing && header.kind == packet_kind_t::one_rtt && (!signal.saw_non_probing || opened->packet_number > signal.highest_non_probing))
+  {
+    signal.saw_non_probing = true;
+    signal.highest_non_probing = opened->packet_number;
   }
   space.acks.on_packet_received(opened->packet_number, *ack_eliciting, now);
   ++impl.packets_processed;
@@ -1902,6 +1986,11 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
 
 std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datagram, tick_t now)
 {
+  return receive(datagram, now, {});
+}
+
+std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address)
+{
   auto &impl = *_impl;
   if (impl.state == connection_state_t::closed || datagram.empty())
   {
@@ -1912,6 +2001,8 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
   // datagram has not been authenticated yet, so this is refined below to only
   // count when something in it actually opened.
   const std::uint64_t processed_before = impl.packets_processed;
+  const std::size_t datagram_size = datagram.size();
+  migration_signal_t signal;
 
   // A server has to know the client's connection ID before it can answer, and
   // it only learns it from the first Initial. Setting the transport parameters
@@ -1927,7 +2018,7 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
       {
         impl.peer_connection_id = *source;
         impl.peer_connection_id_confirmed = true;
-        // Section 5.1.1: the client'"'"'s handshake connection ID is its sequence 0.
+        // Section 5.1.1: the client's handshake connection ID is its sequence 0.
         // Section 7.3 authenticates it later through the transport parameter.
         impl.remote_ids.install_initial(*source);
         auto parameters = impl.config.transport_parameters;
@@ -1952,7 +2043,7 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
     }
     const auto header = next->value();
     const auto offset = static_cast<std::size_t>(header.packet.data() - datagram.data());
-    if (auto r = receive_packet(impl, header, datagram.subspan(offset, header.packet.size()), now); !r.has_value())
+    if (auto r = receive_packet(impl, header, datagram.subspan(offset, header.packet.size()), now, signal); !r.has_value())
     {
       return r;
     }
@@ -1967,6 +2058,35 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
     impl.last_activity = now;
     impl.activity_seen = true;
     impl.idle_since_last_receive = false;
+  }
+
+  // Section 9.3. Only now, with the whole datagram read and its packets
+  // authenticated, is there anything worth believing about where the peer is.
+  if (!peer_address.empty() && signal.saw_non_probing && impl.packets_processed != processed_before)
+  {
+    const bool same = impl.peer_address_known && impl.peer_address.size() == peer_address.size() && std::equal(impl.peer_address.begin(), impl.peer_address.end(), peer_address.begin());
+    if (!impl.peer_address_known)
+    {
+      impl.peer_address.assign(peer_address.begin(), peer_address.end());
+      impl.peer_address_known = true;
+      impl.have_non_probing = true;
+      impl.highest_non_probing = signal.highest_non_probing;
+    }
+    else if (same)
+    {
+      if (!impl.have_non_probing || signal.highest_non_probing > impl.highest_non_probing)
+      {
+        impl.have_non_probing = true;
+        impl.highest_non_probing = signal.highest_non_probing;
+      }
+    }
+    else if (!impl.have_non_probing || signal.highest_non_probing > impl.highest_non_probing)
+    {
+      // Section 9.3: only the highest-numbered non-probing packet moves the
+      // connection, so a packet that took the long way round cannot pull it
+      // back to an address the peer has already left.
+      migrate_to(impl, peer_address, signal.highest_non_probing, datagram_size, now);
+    }
   }
   return {};
 }
@@ -2207,6 +2327,11 @@ bool connection_t::handshake_confirmed() const
 bool connection_t::address_validated_by_retry() const
 {
   return _impl->validated_by_retry;
+}
+
+std::uint64_t connection_t::migration_count() const
+{
+  return _impl->migrations;
 }
 
 std::size_t connection_t::peer_connection_id_count() const

@@ -1820,4 +1820,140 @@ TEST_CASE("connection ids are exchanged up to the advertised limit")
   CHECK_FALSE(client->close_reason().has_value());
   CHECK_FALSE(server->close_reason().has_value());
 }
+TEST_CASE("a peer that moves is followed, cautiously")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.active_connection_id_limit = 4;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.transport_parameters.active_connection_id_limit = 4;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  const std::vector<std::uint8_t> home = {10, 0, 0, 1, 0xc0, 0x00};
+  const std::vector<std::uint8_t> away = {10, 0, 0, 2, 0xc0, 0x01};
+
+  // The handshake, with every client datagram arriving from the same address.
+  auto deliver_to_server = [&](vio::tick_t now, const std::vector<std::uint8_t> &from)
+  {
+    std::size_t count = 0;
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      REQUIRE(server->receive(datagram, now, from).has_value());
+      ++count;
+    }
+    return count;
+  };
+  auto deliver_to_client = [&](vio::tick_t now)
+  {
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = server->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      REQUIRE(client->receive(datagram, now).has_value());
+    }
+  };
+
+  for (int round = 0; round < 8; ++round)
+  {
+    const auto moved = deliver_to_server(at(0ns), home);
+    deliver_to_client(at(0ns));
+    if (moved == 0 && client->handshake_complete())
+    {
+      break;
+    }
+  }
+  REQUIRE(client->handshake_complete());
+  REQUIRE(server->handshake_complete());
+  CHECK(server->migration_count() == 0);
+
+  // Something non-probing to carry the news: section 9.1 says a packet of
+  // probing frames alone proves nothing about where the peer is.
+  auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+  const std::string message = "moved house";
+  const std::vector<std::uint8_t> payload(message.begin(), message.end());
+  REQUIRE(client->write_stream(*stream, payload, false) == payload.size());
+
+  SUBCASE("staying put is not a migration")
+  {
+    REQUIRE(deliver_to_server(at(1ms), home) > 0);
+    CHECK(server->migration_count() == 0);
+  }
+
+  SUBCASE("arriving from somewhere else moves the connection")
+  {
+    const auto available_before = server->peer_connection_id_count();
+    REQUIRE(available_before > 1);
+    REQUIRE(deliver_to_server(at(1ms), away) > 0);
+    CHECK(server->migration_count() == 1);
+
+    // Section 9.3: the new address is unproven until it answers a challenge.
+    CHECK(server->path_state() == path_state_t::validating);
+
+    // Section 9.5: the connection moves to an id the old path never carried,
+    // or an observer of both paths links them on sight. The one left behind is
+    // retired, so the pool shrinks.
+    CHECK(server->peer_connection_id_count() == available_before - 1);
+  }
+
+  SUBCASE("the new address earns its allowance from scratch")
+  {
+    // Section 8 and 9.3.1: a spoofed source address would otherwise make this
+    // server into an amplifier aimed at whoever the attacker named. The limit
+    // is three times what has arrived *on this path*, not on the old one.
+    REQUIRE(deliver_to_server(at(1ms), away) > 0);
+    REQUIRE(server->migration_count() == 1);
+
+    std::size_t sent = 0;
+    for (int i = 0; i < 20; ++i)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = server->poll_send(datagram, at(1ms));
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      sent += *size;
+    }
+    CHECK(sent <= 3 * 1500);
+  }
+
+  SUBCASE("the peer that moved is answered at the new address")
+  {
+    REQUIRE(deliver_to_server(at(1ms), away) > 0);
+    // The challenge the server now owes reaches the client, which echoes it.
+    for (int round = 0; round < 4; ++round)
+    {
+      deliver_to_client(at(1ms));
+      (void)deliver_to_server(at(1ms), away);
+    }
+    CHECK(server->path_state() == path_state_t::validated);
+    CHECK_FALSE(server->close_reason().has_value());
+  }
+}
 }

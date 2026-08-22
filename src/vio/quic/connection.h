@@ -149,6 +149,21 @@ public:
   // connection itself has to end.
   [[nodiscard]] std::expected<void, error_t> receive(std::span<std::uint8_t> datagram, tick_t now);
 
+  // The same, told where the datagram came from. peer_address is opaque here:
+  // the connection only ever compares it for equality, so any stable encoding
+  // of the peer's address and port will do.
+  //
+  // Supplying it turns on connection migration (section 9). A non-probing
+  // packet from an address the connection is not already using moves it there,
+  // subject to path validation. Leaving it empty pins the connection to
+  // wherever the caller is sending, which is what a client behind a fixed
+  // socket wants.
+  [[nodiscard]] std::expected<void, error_t> receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address);
+
+  // How many times the peer has been observed to move. Mostly of interest to
+  // a test or a log.
+  [[nodiscard]] std::uint64_t migration_count() const;
+
   // Fills out with the next datagram to send, returning its size. Zero means
   // there is nothing to send right now, which is the normal idle answer.
   [[nodiscard]] std::expected<std::size_t, error_t> poll_send(std::span<std::uint8_t> out, tick_t now);
