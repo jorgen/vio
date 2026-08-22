@@ -427,23 +427,26 @@ private:
       return nullptr;
     }
 
+    // Section 3.2 opens every lower-numbered stream of the same type as well,
+    // and all of them count against the limit -- but only the high-water mark
+    // is recorded. Materialising state for streams that have never carried a
+    // frame would let a peer that advertised nothing but a single frame for a
+    // high index force an allocation per implied stream, which with a
+    // generous advertised limit is millions of objects from one packet.
     auto &opened = direction == stream_direction_t::bidirectional ? _remote_bidi_opened : _remote_uni_opened;
     const std::uint64_t index = stream_index(id);
-    for (std::uint64_t i = opened; i <= index; ++i)
-    {
-      const auto lower = make_stream_id(initiator, direction, i);
-      auto &stream = _streams[lower];
-      stream.id = lower;
-      stream.has_receive = true;
-      stream.receive = receive_stream_t(local_initial_stream_limit(lower));
-      if (direction == stream_direction_t::bidirectional)
-      {
-        stream.has_send = true;
-        stream.send = send_stream_t(peer_initial_stream_limit(lower));
-      }
-    }
     opened = std::max(opened, index + 1);
-    return &_streams[id];
+
+    auto &stream = _streams[id];
+    stream.id = id;
+    stream.has_receive = true;
+    stream.receive = receive_stream_t(local_initial_stream_limit(id));
+    if (direction == stream_direction_t::bidirectional)
+    {
+      stream.has_send = true;
+      stream.send = send_stream_t(peer_initial_stream_limit(id));
+    }
+    return &stream;
   }
 
   streams_config_t _config;

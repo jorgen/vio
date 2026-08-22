@@ -506,6 +506,18 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
     {
       const auto space = to_pn_space(*level_for(kind));
       auto outcome = impl.recovery.on_ack_received(space, frame, now, recovery_context(impl));
+      if (outcome.malformed)
+      {
+        begin_close(impl, static_cast<std::uint64_t>(transport_error_code_t::frame_encoding_error), "malformed ACK ranges", false, false);
+        return ack_eliciting;
+      }
+      if (outcome.acknowledged_unsent)
+      {
+        // Section 13.1: a peer claiming to have received something that was
+        // never sent is not confused, it is lying.
+        begin_close(impl, transport_error_protocol_violation, "acknowledgement for a packet that was never sent", false, false);
+        return ack_eliciting;
+      }
       if (kind == packet_kind_t::handshake)
       {
         impl.received_handshake_ack = true;
@@ -513,6 +525,17 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       for (const auto &acked : outcome.acknowledged)
       {
         impl.congestion.on_packet_acked(acked);
+        for (const auto &sent : acked.frames)
+        {
+          if (sent.kind != frame_kind_t::stream)
+          {
+            continue;
+          }
+          if (auto *stream = impl.streams.find(sent.stream_id); stream != nullptr && stream->has_send)
+          {
+            stream->send.on_range_acknowledged(sent.offset, sent.length);
+          }
+        }
       }
       impl.congestion.on_packets_lost(outcome.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
       repair_lost(impl, space, outcome.lost);

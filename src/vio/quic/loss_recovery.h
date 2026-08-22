@@ -220,6 +220,15 @@ struct ack_outcome_t
   std::vector<sent_packet_t> acknowledged;
   std::vector<sent_packet_t> lost;
   bool rtt_updated = false;
+  // Section 13.1 of RFC 9000: acknowledging a packet that was never sent is a
+  // PROTOCOL_VIOLATION. It is also the shape a confused or hostile peer takes,
+  // so the caller is told rather than left to notice the numbers drifting.
+  bool acknowledged_unsent = false;
+  // Section 19.3.1: a range that computes a packet number below zero is a
+  // FRAME_ENCODING_ERROR. Absorbing it silently would let a peer move this
+  // endpoint's largest-acknowledged forward with a frame that acknowledges
+  // nothing, which drives loss detection off a number the peer invented.
+  bool malformed = false;
 };
 
 // What the loss detection timer expiring turned out to mean. Exactly one of
@@ -242,6 +251,8 @@ public:
     {
       return;
     }
+    state.largest_sent = state.has_sent ? std::max(state.largest_sent, packet.packet_number) : packet.packet_number;
+    state.has_sent = true;
     if (packet.in_flight)
     {
       _bytes_in_flight += packet.size;
@@ -266,6 +277,22 @@ public:
       return outcome;
     }
 
+    if (!state.has_sent || ack.largest_acknowledged > state.largest_sent)
+    {
+      outcome.acknowledged_unsent = true;
+      return outcome;
+    }
+
+    // Decoded before anything is believed: a frame whose ranges do not add up
+    // must not be allowed to move largest_acked.
+    bool well_formed = true;
+    const auto spans = decode_ack_spans(ack, well_formed);
+    if (!well_formed)
+    {
+      outcome.malformed = true;
+      return outcome;
+    }
+
     const bool largest_was_unacked = state.sent.contains(ack.largest_acknowledged);
     if (!state.has_largest_acked || ack.largest_acknowledged > state.largest_acked)
     {
@@ -273,13 +300,17 @@ public:
       state.has_largest_acked = true;
     }
 
+    // Walk what was actually sent, not the numbers the frame names. A single
+    // ACK frame may legitimately describe up to 2^62 packet numbers in twenty
+    // bytes, so iterating the number space is a hang the peer chooses; the
+    // packets in flight are bounded by the congestion window.
     bool acked_ack_eliciting = false;
-    for_each_acked(ack, [&](std::uint64_t number)
+    for (auto it = state.sent.begin(); it != state.sent.end();)
     {
-      auto it = state.sent.find(number);
-      if (it == state.sent.end())
+      if (!covered(spans, it->first))
       {
-        return;
+        ++it;
+        continue;
       }
       if (it->second.in_flight)
       {
@@ -287,8 +318,8 @@ public:
       }
       acked_ack_eliciting = acked_ack_eliciting || it->second.ack_eliciting;
       outcome.acknowledged.push_back(std::move(it->second));
-      state.sent.erase(it);
-    });
+      it = state.sent.erase(it);
+    }
 
     // Only the largest gives an RTT sample, and only when it is newly
     // acknowledged: a repeated ACK of an old packet would otherwise report a
@@ -494,44 +525,67 @@ private:
     bool has_largest_acked = false;
     std::optional<tick_t> loss_time;
     tick_t time_of_last_ack_eliciting;
+    std::uint64_t largest_sent = 0;
+    bool has_sent = false;
     bool has_ack_eliciting_sent = false;
     bool discarded = false;
   };
 
-  // Walks the packet numbers an ACK frame covers, newest range first.
-  template <typename Fn>
-  static void for_each_acked(const frame_t &ack, Fn &&callback)
+  struct ack_span_t
   {
+    std::uint64_t smallest = 0;
+    std::uint64_t largest = 0;
+  };
+
+  // The ranges an ACK frame names, as intervals rather than as the numbers
+  // inside them. There are at most as many as the frame had room to encode,
+  // which the frame codec already bounded against the packet.
+  [[nodiscard]] static std::vector<ack_span_t> decode_ack_spans(const frame_t &ack, bool &well_formed)
+  {
+    well_formed = true;
+    std::vector<ack_span_t> spans;
+    if (ack.first_ack_range > ack.largest_acknowledged)
+    {
+      well_formed = false;
+      return spans;
+    }
     std::uint64_t largest = ack.largest_acknowledged;
-    if (ack.first_ack_range > largest)
-    {
-      return;
-    }
     std::uint64_t smallest = largest - ack.first_ack_range;
-    for (std::uint64_t number = smallest; number <= largest; ++number)
-    {
-      callback(number);
-    }
+    spans.push_back(ack_span_t{.smallest = smallest, .largest = largest});
 
     ack_range_reader_t reader(ack.ack_ranges);
     while (auto range = reader.next())
     {
-      // Section 19.3.1: largest = previous_smallest - gap - 2.
+      // Section 19.3.1: largest = previous_smallest - gap - 2. A computed
+      // number below zero is malformed, and the walk stops rather than
+      // wrapping around into a range that acknowledges everything.
       if (smallest < range->gap + 2)
       {
-        return;
+        well_formed = false;
+        break;
       }
       largest = smallest - range->gap - 2;
       if (range->length > largest)
       {
-        return;
+        well_formed = false;
+        break;
       }
       smallest = largest - range->length;
-      for (std::uint64_t number = smallest; number <= largest; ++number)
-      {
-        callback(number);
-      }
+      spans.push_back(ack_span_t{.smallest = smallest, .largest = largest});
     }
+    // Descending on the wire; ascending is easier to search.
+    std::reverse(spans.begin(), spans.end());
+    return spans;
+  }
+
+  [[nodiscard]] static bool covered(const std::vector<ack_span_t> &spans, std::uint64_t number)
+  {
+    auto after = std::upper_bound(spans.begin(), spans.end(), number, [](std::uint64_t value, const ack_span_t &span) { return value < span.smallest; });
+    if (after == spans.begin())
+    {
+      return false;
+    }
+    return number <= std::prev(after)->largest;
   }
 
   [[nodiscard]] std::optional<tick_t> earliest_loss_time() const

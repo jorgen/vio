@@ -381,18 +381,42 @@ TEST_CASE("a peer-initiated stream opens on first use, along with every lower on
 
   // Server-initiated bidirectional stream index 2 is id 9.
   CHECK(streams.receive_stream_frame(9, 0, as_bytes("hi"), false) == streams_error_t::none);
-  // Section 3.2: 1 and 5 are open too, and all three count against the limit.
-  CHECK(streams.find(1) != nullptr);
-  CHECK(streams.find(5) != nullptr);
   CHECK(streams.find(9) != nullptr);
+
+  // Section 3.2: 1 and 5 are open too and all three count against the limit,
+  // but no state is held for streams that have carried nothing. Materialising
+  // them would let one frame naming a high index cost an allocation per
+  // implied stream.
   CHECK(streams.remote_streams_opened(stream_direction_t::bidirectional) == 3);
+  CHECK(streams.find(1) == nullptr);
+  CHECK(streams.find(5) == nullptr);
 
   SUBCASE("and the data landed on the right one")
   {
     auto *stream = streams.find(9);
     REQUIRE(stream != nullptr);
     CHECK(as_text(stream->receive.readable()) == "hi");
-    CHECK(streams.find(1)->receive.readable().empty());
+  }
+
+  SUBCASE("a later frame for a lower one is still accepted")
+  {
+    CHECK(streams.receive_stream_frame(1, 0, as_bytes("late"), false) == streams_error_t::none);
+    auto *stream = streams.find(1);
+    REQUIRE(stream != nullptr);
+    CHECK(as_text(stream->receive.readable()) == "late");
+    // And it did not re-count against the limit.
+    CHECK(streams.remote_streams_opened(stream_direction_t::bidirectional) == 3);
+  }
+
+  SUBCASE("a single frame naming a huge index costs one stream, not that many")
+  {
+    streams_t wide(client_config(1000, 500, 1000000));
+    wide.apply_peer_parameters(peer_parameters());
+    const std::uint64_t high = make_stream_id(stream_initiator_t::server, stream_direction_t::bidirectional, 999999);
+    CHECK(wide.receive_stream_frame(high, 0, as_bytes("x"), false) == streams_error_t::none);
+    CHECK(wide.remote_streams_opened(stream_direction_t::bidirectional) == 1000000);
+    CHECK(wide.find(high) != nullptr);
+    CHECK(wide.all().size() == 1);
   }
 }
 

@@ -551,6 +551,7 @@ TEST_CASE("a malformed ACK cannot drive the walk off the end")
   {
     ack_builder_t builder(3, 100);
     auto outcome = recovery.on_ack_received(pn_space_t::initial, builder.build(), at(10ms), context);
+    CHECK(outcome.malformed);
     CHECK(outcome.acknowledged.empty());
   }
 
@@ -559,7 +560,8 @@ TEST_CASE("a malformed ACK cannot drive the walk off the end")
     ack_builder_t builder(5, 0);
     builder.add(1000, 0);
     auto outcome = recovery.on_ack_received(pn_space_t::initial, builder.build(), at(10ms), context);
-    CHECK(numbers(outcome.acknowledged) == std::vector<std::uint64_t>{5});
+    CHECK(outcome.malformed);
+    CHECK(outcome.acknowledged.empty());
   }
 
   SUBCASE("a range length that would run below zero")
@@ -567,7 +569,8 @@ TEST_CASE("a malformed ACK cannot drive the walk off the end")
     ack_builder_t builder(5, 0);
     builder.add(0, 1000);
     auto outcome = recovery.on_ack_received(pn_space_t::initial, builder.build(), at(10ms), context);
-    CHECK(numbers(outcome.acknowledged) == std::vector<std::uint64_t>{5});
+    CHECK(outcome.malformed);
+    CHECK(outcome.acknowledged.empty());
   }
 
   SUBCASE("a frame that is not an ACK at all")
@@ -577,6 +580,86 @@ TEST_CASE("a malformed ACK cannot drive the walk off the end")
     auto outcome = recovery.on_ack_received(pn_space_t::initial, ping, at(10ms), context);
     CHECK(outcome.acknowledged.empty());
     CHECK(recovery.unacknowledged(pn_space_t::initial) == 8);
+  }
+}
+
+TEST_CASE("an ACK naming an enormous range costs nothing to process")
+{
+  loss_recovery_t recovery;
+  const recovery_context_t context;
+  for (std::uint64_t n = 0; n < 8; ++n)
+  {
+    recovery.on_packet_sent(pn_space_t::initial, packet(n, at(0ns)));
+  }
+
+  // Twenty bytes on the wire naming 2^62 packet numbers. Walking the numbers
+  // rather than the packets in flight would never return.
+  ack_builder_t builder(7, varint_max);
+  auto outcome = recovery.on_ack_received(pn_space_t::initial, builder.build(), at(10ms), context);
+  CHECK_FALSE(outcome.acknowledged_unsent);
+  // Section 19.3.1: the first range computes a packet number below zero, so
+  // the frame is malformed and must not move anything -- not the
+  // acknowledgements, and not the largest acknowledged that loss detection
+  // runs off.
+  CHECK(outcome.malformed);
+  CHECK(outcome.acknowledged.empty());
+  CHECK(outcome.lost.empty());
+  CHECK(recovery.unacknowledged(pn_space_t::initial) == 8);
+
+  SUBCASE("and a range that does cover everything acknowledges only what was sent")
+  {
+    ack_builder_t wide(7, 7);
+    auto covered = recovery.on_ack_received(pn_space_t::initial, wide.build(), at(10ms), context);
+    CHECK(covered.acknowledged.size() == 8);
+    CHECK(recovery.unacknowledged(pn_space_t::initial) == 0);
+  }
+
+  SUBCASE("many gap ranges are bounded by what the frame could encode")
+  {
+    loss_recovery_t other;
+    for (std::uint64_t n = 0; n < 8; ++n)
+    {
+      other.on_packet_sent(pn_space_t::initial, packet(n, at(0ns)));
+    }
+    ack_builder_t gappy(7, 0);
+    for (int i = 0; i < 20; ++i)
+    {
+      gappy.add(varint_max / 4, varint_max / 4);
+    }
+    auto result = other.on_ack_received(pn_space_t::initial, gappy.build(), at(10ms), context);
+    // The first gap already runs below zero, so the frame is refused rather
+    // than half believed.
+    CHECK(result.malformed);
+    CHECK(result.acknowledged.empty());
+  }
+}
+
+TEST_CASE("acknowledging a packet that was never sent is reported")
+{
+  loss_recovery_t recovery;
+  const recovery_context_t context;
+  recovery.on_packet_sent(pn_space_t::initial, packet(0, at(0ns)));
+
+  // Section 13.1 of RFC 9000: a PROTOCOL_VIOLATION, not something to absorb.
+  ack_builder_t builder(5, 0);
+  auto outcome = recovery.on_ack_received(pn_space_t::initial, builder.build(), at(10ms), context);
+  CHECK(outcome.acknowledged_unsent);
+  CHECK(outcome.acknowledged.empty());
+  CHECK(recovery.unacknowledged(pn_space_t::initial) == 1);
+
+  SUBCASE("but acknowledging what was sent is not")
+  {
+    ack_builder_t fine(0, 0);
+    auto ok = recovery.on_ack_received(pn_space_t::initial, fine.build(), at(10ms), context);
+    CHECK_FALSE(ok.acknowledged_unsent);
+    CHECK(ok.acknowledged.size() == 1);
+  }
+
+  SUBCASE("and an ACK in a space nothing was sent in is refused")
+  {
+    ack_builder_t empty_space(0, 0);
+    auto result = recovery.on_ack_received(pn_space_t::handshake, empty_space.build(), at(10ms), context);
+    CHECK(result.acknowledged_unsent);
   }
 }
 

@@ -557,6 +557,13 @@ public:
     {
       return;
     }
+    // A range the peer has already acknowledged is not lost, however late the
+    // loss declaration arrives; resending it would be pure waste and the
+    // bytes may no longer be held.
+    if (offset + length <= acknowledged_prefix_end())
+    {
+      return;
+    }
     for (const auto &pending : _retransmit)
     {
       if (pending.offset == offset && pending.length == length)
@@ -567,14 +574,39 @@ public:
     _retransmit.push_back(range_t{.offset = offset, .length = length});
   }
 
+  // Acknowledgements arrive out of order and repeat, so counting bytes is not
+  // enough: a duplicate would make the stream look complete before it was.
+  // They are merged into ranges, and the contiguous prefix is what decides
+  // both completion and how much of the buffer can go.
   void on_range_acknowledged(std::uint64_t offset, std::uint64_t length)
   {
-    _acknowledged += length;
-    (void)offset;
-    if (_state == send_state_t::data_sent && _acknowledged >= queued())
+    if (length == 0)
+    {
+      return;
+    }
+    insert_acknowledged(offset, offset + length);
+
+    // Anything acknowledged can never be asked for again. Without this a
+    // stream holds every byte it ever sent for the life of the connection,
+    // which on a long-lived stream is unbounded growth rather than a leak
+    // only in the sense that it is reachable.
+    const std::uint64_t prefix = acknowledged_prefix_end();
+    if (prefix > _base)
+    {
+      const std::size_t drop = static_cast<std::size_t>(std::min<std::uint64_t>(prefix - _base, _data.size()));
+      _data.erase(_data.begin(), _data.begin() + static_cast<std::ptrdiff_t>(drop));
+      _base += drop;
+    }
+
+    if (_state == send_state_t::data_sent && prefix >= queued())
     {
       _state = send_state_t::data_received;
     }
+  }
+
+  [[nodiscard]] std::uint64_t acknowledged_prefix() const
+  {
+    return acknowledged_prefix_end();
   }
 
   // Section 3.1: a reset abandons everything not yet delivered.
@@ -621,13 +653,43 @@ private:
     return std::span<const std::uint8_t>(_data).subspan(index, std::min(amount, _data.size() - index));
   }
 
+  void insert_acknowledged(std::uint64_t start, std::uint64_t end)
+  {
+    auto first = _acknowledged.upper_bound(start);
+    if (first != _acknowledged.begin())
+    {
+      auto previous = std::prev(first);
+      if (previous->second >= start)
+      {
+        first = previous;
+      }
+    }
+    auto last = first;
+    std::uint64_t merged_start = start;
+    std::uint64_t merged_end = end;
+    for (; last != _acknowledged.end() && last->first <= end; ++last)
+    {
+      merged_start = std::min(merged_start, last->first);
+      merged_end = std::max(merged_end, last->second);
+    }
+    _acknowledged.erase(first, last);
+    _acknowledged.emplace(merged_start, merged_end);
+  }
+
+  [[nodiscard]] std::uint64_t acknowledged_prefix_end() const
+  {
+    auto it = _acknowledged.begin();
+    return it != _acknowledged.end() && it->first == 0 ? it->second : 0;
+  }
+
   std::vector<std::uint8_t> _data;
   std::vector<range_t> _retransmit;
+  // Offset to end, merged and disjoint.
+  std::map<std::uint64_t, std::uint64_t> _acknowledged;
   send_state_t _state = send_state_t::ready;
   std::uint64_t _base = 0;
   std::uint64_t _sent_offset = 0;
   std::uint64_t _max_data = 0;
-  std::uint64_t _acknowledged = 0;
   std::optional<std::uint64_t> _reset_error;
   bool _fin = false;
 };
