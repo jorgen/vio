@@ -1650,4 +1650,116 @@ TEST_CASE("a configuration that cannot work is refused up front")
     CHECK(connection->local_connection_id().empty());
   }
 }
+TEST_CASE("path validation runs between two connections")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  // Everything either side has to say, until both go quiet. Returns what the
+  // client put on the wire so a test can look at the datagrams themselves.
+  auto pump = [&](vio::tick_t now)
+  {
+    std::vector<std::vector<std::uint8_t>> from_client;
+    for (int round = 0; round < 8; ++round)
+    {
+      bool moved = false;
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = client->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        from_client.push_back(datagram);
+        REQUIRE(server->receive(datagram, now).has_value());
+        moved = true;
+      }
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = server->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        REQUIRE(client->receive(datagram, now).has_value());
+        moved = true;
+      }
+      if (!moved)
+      {
+        break;
+      }
+    }
+    return from_client;
+  };
+
+  SUBCASE("a challenge is answered and the path becomes validated")
+  {
+    CHECK(client->path_state() == path_state_t::unknown);
+    client->validate_path(at(1ms));
+    CHECK(client->path_state() == path_state_t::validating);
+
+    const auto sent = pump(at(1ms));
+    REQUIRE_FALSE(sent.empty());
+    CHECK(client->path_state() == path_state_t::validated);
+  }
+
+  SUBCASE("the datagram carrying a challenge is expanded to 1200 bytes")
+  {
+    // Sections 8.2.1 and 8.2.2: a path proven reachable is also proven to
+    // carry a full-size datagram, so a validation that fit in 40 bytes would
+    // certify an MTU it never tested.
+    client->validate_path(at(1ms));
+    const auto sent = pump(at(1ms));
+    REQUIRE_FALSE(sent.empty());
+    CHECK(sent.front().size() == 1200);
+  }
+
+  SUBCASE("an attempt whose responses never arrive is abandoned")
+  {
+    client->validate_path(at(1ms));
+    // Send only into the void: the server never sees a challenge, so nothing
+    // is ever echoed.
+    for (int round = 0; round < 4; ++round)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, at(1ms));
+      REQUIRE(size.has_value());
+    }
+    CHECK(client->path_state() == path_state_t::validating);
+
+    // The deadline is three times a PTO built from the initial RTT, which is
+    // comfortably under ten seconds.
+    std::vector<std::uint8_t> datagram(1500);
+    REQUIRE(client->poll_send(datagram, at(10s)).has_value());
+    CHECK(client->path_state() == path_state_t::failed);
+  }
+
+  SUBCASE("the deadline is reported so a caller knows when to come back")
+  {
+    client->validate_path(at(1ms));
+    const auto deadline = client->next_timeout(at(1ms));
+    REQUIRE(deadline.has_value());
+    CHECK(*deadline > at(1ms));
+  }
+}
 }

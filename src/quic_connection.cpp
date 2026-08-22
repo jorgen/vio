@@ -29,6 +29,7 @@
 #include "vio/quic/frame_codec.h"
 #include "vio/quic/loss_recovery.h"
 #include "vio/quic/packet.h"
+#include "vio/quic/path.h"
 #include "vio/quic/protection.h"
 #include "vio/quic/retry_token.h"
 #include "vio/quic/streams.h"
@@ -265,6 +266,10 @@ struct connection_impl_t
   // Set when a read may have finished a stream, cleared by the sweep that
   // returns the credit.
   bool reap_wanted = false;
+  // Section 8.2. The validator drives probes this endpoint sends; the queue
+  // holds echoes it owes.
+  path_validator_t path;
+  path_response_queue_t path_responses;
   // Section 10.1. Zero disables it.
   std::chrono::nanoseconds idle_timeout{};
   tick_t last_activity;
@@ -357,6 +362,16 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   space.probe_pending = false;
   space.crypto_send = crypto_sender_t{};
   impl.recovery.discard_space(to_pn_space(level));
+}
+
+// Section 8.2.4: three times the larger of the current PTO and a PTO computed
+// from the initial RTT, because a new path may be slower than the one in use
+// and the estimate in hand describes the old one.
+[[nodiscard]] std::chrono::nanoseconds path_abandon_timeout(const connection_impl_t &impl)
+{
+  const auto current = impl.recovery.rtt().pto_base() + impl.config.max_ack_delay;
+  const auto fresh = initial_rtt + std::max(initial_rtt / 2 * 4, loss_granularity) + impl.config.max_ack_delay;
+  return std::max(current, fresh) * 3;
 }
 
 // Section 10.1: floored at three times the current PTO, so a peer advertising
@@ -777,10 +792,22 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       // reply beyond what the window update policy already does.
       break;
 
+    case frame_kind_t::path_challenge:
+      // Section 8.2.2: the echo is owed unconditionally, and is the only
+      // evidence the peer will get that this endpoint holds this address.
+      impl.path_responses.push(frame.path_data);
+      break;
+
+    case frame_kind_t::path_response:
+      // Section 8.2.3. An echo that matches nothing outstanding is ignored
+      // rather than treated as an error -- a stale response and a forged one
+      // are indistinguishable, and neither is worth ending a connection over.
+      (void)impl.path.on_response(frame.path_data);
+      break;
+
     default:
-      // NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, PATH_CHALLENGE,
-      // PATH_RESPONSE and NEW_TOKEN are parsed and acknowledged but not acted
-      // on: migration, connection ID rotation and Retry are not built.
+      // NEW_CONNECTION_ID, RETIRE_CONNECTION_ID and NEW_TOKEN are parsed and
+      // acknowledged but not acted on: connection ID rotation is not built.
       break;
     }
   }
@@ -1139,7 +1166,12 @@ void reap_and_grant(connection_impl_t &impl)
 
 // Writes the frames for one space into a packet, returning its size or zero
 // when there was nothing worth sending.
-std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack)
+// expand_to is how large this packet must be for the datagram to reach the
+// 1200 bytes section 14.1 requires, or zero when the datagram is already there.
+// force_expand says the datagram owes that size for a reason decided before
+// this packet -- an Initial ahead of it -- as opposed to one this packet
+// discovers for itself by writing a PATH_CHALLENGE or PATH_RESPONSE.
+std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack, std::size_t expand_to = 0, bool force_expand = false)
 {
   auto &space = impl.spaces[space_index(level)];
   if (space.discarded || !space.have_write)
@@ -1171,6 +1203,14 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   const bool want_close = impl.close_frame_pending && space.have_write;
   const bool want_probe = space.probe_pending;
 
+  bool want_path = false;
+  if (level == encryption_level_t::application && !want_close)
+  {
+    // Section 8.2.2 forbids delaying a PATH_RESPONSE, so an owed echo is by
+    // itself a reason to send.
+    want_path = !impl.path_responses.empty() || impl.path.challenge_due(now, impl.recovery.rtt().pto_base() + impl.config.max_ack_delay);
+  }
+
   bool want_streams = false;
   if (level == encryption_level_t::application && !want_close)
   {
@@ -1178,7 +1218,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1] || impl.streams.has_sendable();
   }
 
-  if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe && !want_streams)
+  if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
   {
     return std::size_t{0};
   }
@@ -1306,6 +1346,48 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     if (wrote_handshake_done)
     {
       record.push_back(sent_frame_t{.kind = frame_kind_t::handshake_done});
+    }
+  }
+
+  bool wrote_path_frame = false;
+  if (want_path)
+  {
+    // Section 8.2.2: one echo per challenge, sent once. The loss policy for
+    // PATH_RESPONSE is discard, so an entry leaves the queue when it reaches
+    // the wire and is not repaired if that packet is lost -- the peer asks
+    // again instead.
+    while (!impl.path_responses.empty())
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::path_response;
+      frame.path_data = impl.path_responses.front();
+      if (!frames.write(frame))
+      {
+        break;
+      }
+      impl.path_responses.pop();
+      record.push_back(sent_frame_t{.kind = frame_kind_t::path_response});
+      wrote_path_frame = true;
+    }
+
+    // Section 8.2.1: at most one challenge per packet, and fresh data every
+    // time, so that a response can only have come from something this
+    // endpoint actually sent.
+    if (impl.path.challenge_due(now, impl.recovery.rtt().pto_base() + impl.config.max_ack_delay))
+    {
+      auto data = impl.path.issue(now, path_abandon_timeout(impl));
+      if (!data.has_value())
+      {
+        return std::unexpected(data.error());
+      }
+      frame_t frame;
+      frame.kind = frame_kind_t::path_challenge;
+      frame.path_data = *data;
+      if (frames.write(frame))
+      {
+        record.push_back(sent_frame_t{.kind = frame_kind_t::path_challenge});
+        wrote_path_frame = true;
+      }
     }
   }
 
@@ -1477,6 +1559,29 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     if (!frames.write(padding))
     {
       return std::size_t{0};
+    }
+  }
+
+  // Sections 8.2.1, 8.2.2 and 14.1 all want a datagram of at least 1200 bytes,
+  // and the padding that gets it there has to go *inside* the packet whenever
+  // this one is a 1-RTT packet. A short header carries no length field, so its
+  // payload is defined to run to the end of the datagram: bytes appended after
+  // the AEAD sealed it are read back as ciphertext, and the peer discards the
+  // packet instead of unpadding it. Only a long header, whose Length bounds the
+  // packet, can be followed by filler.
+  if (expand_to > 0 && (force_expand || wrote_path_frame))
+  {
+    const std::size_t overhead = builder.header_length() + default_aead_expansion;
+    if (expand_to > overhead)
+    {
+      const std::size_t target = std::min(expand_to - overhead, capacity);
+      if (target > frames.written())
+      {
+        frame_t padding;
+        padding.kind = frame_kind_t::padding;
+        padding.padding_count = target - frames.written();
+        (void)frames.write(padding);
+      }
     }
   }
 
@@ -1698,6 +1803,9 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
 std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8_t> out, tick_t now)
 {
   auto &impl = *_impl;
+  // Section 8.2.4: an attempt that has run out of time is abandoned before
+  // anything else decides what to send.
+  impl.path.on_timeout(now);
   if (auto deadline = idle_deadline(impl); deadline.has_value() && now >= *deadline)
   {
     // Section 10.1: silently closed and the state discarded. No
@@ -1797,6 +1905,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   std::size_t written = 0;
   bool carries_initial = false;
   bool carries_anything = false;
+  bool last_packet_short_header = false;
 
   for (auto level : ordered_levels)
   {
@@ -1804,9 +1913,13 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     {
       break;
     }
+    // How big this packet would have to be for the datagram to reach 1200.
+    // The levels run in order, so by the time the 1-RTT packet is built,
+    // carries_initial already says whether the datagram owes that size.
+    const std::size_t expand_to = written < minimum_initial_datagram ? minimum_initial_datagram - written : 0;
     // An ACK on its own is worth a datagram only if nothing else is going out
     // in it; otherwise it rides along.
-    auto size = build_packet(impl, level, out.subspan(written, budget - written), now, true);
+    auto size = build_packet(impl, level, out.subspan(written, budget - written), now, true, expand_to, carries_initial);
     if (!size.has_value())
     {
       return std::unexpected(size.error());
@@ -1815,6 +1928,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     {
       written += *size;
       carries_anything = true;
+      last_packet_short_header = level == encryption_level_t::application;
       if (level == encryption_level_t::initial)
       {
         carries_initial = true;
@@ -1831,7 +1945,16 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   // Section 12.2 permits padding it with what looks like an invalid packet,
   // which is what trailing zeroes are, and a receiver discards the remainder
   // of a datagram once a packet fails to parse.
-  if (carries_initial && written < minimum_initial_datagram && budget >= minimum_initial_datagram)
+  //
+  // This only works behind a long header. When the datagram ends in a 1-RTT
+  // packet the filler had to go inside it, which build_packet has already
+  // done -- appending here would land inside the AEAD's idea of the payload
+  // and cost the peer the whole packet.
+  //
+  // Expansion yields to the anti-amplification limit either way, which the
+  // budget already carries: padding past what a server may send would make
+  // section 14.1 into the amplifier section 8.1 exists to prevent.
+  if (carries_initial && !last_packet_short_header && written < minimum_initial_datagram && budget >= minimum_initial_datagram)
   {
     std::fill(out.begin() + static_cast<std::ptrdiff_t>(written), out.begin() + static_cast<std::ptrdiff_t>(minimum_initial_datagram), std::uint8_t{0});
     written = minimum_initial_datagram;
@@ -1887,6 +2010,7 @@ std::optional<tick_t> connection_t::next_timeout(tick_t now) const
   // detection timer telling it something of its own has gone missing.
   consider(_impl->recovery.loss_detection_timer(now, recovery_context(*_impl)));
   consider(idle_deadline(*_impl));
+  consider(_impl->path.deadline());
   return earliest;
 }
 
@@ -1908,6 +2032,16 @@ bool connection_t::handshake_confirmed() const
 bool connection_t::address_validated_by_retry() const
 {
   return _impl->validated_by_retry;
+}
+
+void connection_t::validate_path(tick_t now)
+{
+  _impl->path.begin(now, path_abandon_timeout(*_impl));
+}
+
+path_state_t connection_t::path_state() const
+{
+  return _impl->path.state();
 }
 
 bool connection_t::initiate_key_update()

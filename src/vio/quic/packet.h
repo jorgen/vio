@@ -590,6 +590,11 @@ public:
     return _out.subspan(_header_length);
   }
 
+  [[nodiscard]] std::size_t header_length() const
+  {
+    return _header_length;
+  }
+
   // The most frames that will fit once the AEAD has taken its expansion.
   [[nodiscard]] std::size_t maximum_frame_bytes(std::size_t expansion = default_aead_expansion) const
   {

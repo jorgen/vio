@@ -48,6 +48,7 @@
 
 #include "vio/error.h"
 #include "vio/quic/connection_id.h"
+#include "vio/quic/path.h"
 #include "vio/quic/retry_token.h"
 #include "vio/quic/stream.h"
 #include "vio/quic/tls.h"
@@ -171,6 +172,13 @@ public:
   // Whether this connection went through a Retry, and so whether the peer
   // address was validated before any handshake work was done.
   [[nodiscard]] bool address_validated_by_retry() const;
+
+  // Section 8.2: asks the peer to prove it can receive at the address it is
+  // sending from, by echoing unpredictable data. Costs one round trip and
+  // succeeds or is abandoned on a timer; the result is readable below rather
+  // than reported, because the caller decides what an unusable path means.
+  void validate_path(tick_t now);
+  [[nodiscard]] path_state_t path_state() const;
 
   // Moves to the next set of 1-RTT keys. False when it is not permitted yet:
   // section 6.1 forbids it before the handshake is confirmed, and forbids a
