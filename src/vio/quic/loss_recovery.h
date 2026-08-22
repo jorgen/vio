@@ -222,6 +222,16 @@ struct ack_outcome_t
   bool rtt_updated = false;
 };
 
+// What the loss detection timer expiring turned out to mean. Exactly one of
+// the two spaces is set: either packets have been declared lost and want
+// repairing, or a probe is owed in a space that has gone quiet.
+struct timeout_outcome_t
+{
+  std::optional<pn_space_t> loss_space;
+  std::optional<pn_space_t> probe_space;
+  std::vector<sent_packet_t> lost;
+};
+
 class loss_recovery_t
 {
 public:
@@ -383,17 +393,19 @@ public:
     return pto_time(now, context).second;
   }
 
-  // Appendix A.9. Returns the space to send a probe in, if the expiry was a
-  // PTO rather than time-threshold loss detection.
-  [[nodiscard]] std::optional<pn_space_t> on_loss_detection_timeout(tick_t now, const recovery_context_t &context, std::vector<sent_packet_t> &lost)
+  // Appendix A.9.
+  [[nodiscard]] timeout_outcome_t on_loss_detection_timeout(tick_t now, const recovery_context_t &context)
   {
+    timeout_outcome_t outcome;
     if (auto space = earliest_loss_space(); space.has_value())
     {
-      lost = detect_lost_packets(*space, now);
-      return std::nullopt;
+      outcome.loss_space = space;
+      outcome.lost = detect_lost_packets(*space, now);
+      return outcome;
     }
     ++_pto_count;
-    return loss_detection_space(now, context);
+    outcome.probe_space = loss_detection_space(now, context);
+    return outcome;
   }
 
   // Appendix A.11: the packets go, the RTT estimate stays. It described the
@@ -446,6 +458,20 @@ public:
   [[nodiscard]] std::size_t unacknowledged(pn_space_t space) const
   {
     return _spaces[pn_space_to_index(space)].sent.size();
+  }
+
+  // What is still outstanding in a space, oldest first. Section 6.2.4 says a
+  // probe should carry data rather than a bare PING when there is any, and
+  // for a handshake that is the difference between recovering and deadlocking:
+  // a PING tells the peer nothing it needs.
+  [[nodiscard]] std::vector<sent_frame_t> unacknowledged_frames(pn_space_t space) const
+  {
+    std::vector<sent_frame_t> out;
+    for (const auto &entry : _spaces[pn_space_to_index(space)].sent)
+    {
+      out.insert(out.end(), entry.second.frames.begin(), entry.second.frames.end());
+    }
+    return out;
   }
 
 private:

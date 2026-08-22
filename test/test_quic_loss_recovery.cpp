@@ -320,10 +320,10 @@ TEST_CASE("a packet not yet lost sets a deadline for when it will be")
 
   SUBCASE("and the timeout reports them as lost without a probe")
   {
-    std::vector<sent_packet_t> lost;
-    auto probe = recovery.on_loss_detection_timeout(at(213ms), context, lost);
-    CHECK_FALSE(probe.has_value());
-    CHECK(numbers(lost) == std::vector<std::uint64_t>{0, 1});
+    auto outcome = recovery.on_loss_detection_timeout(at(213ms), context);
+    CHECK_FALSE(outcome.probe_space.has_value());
+    CHECK(outcome.loss_space == pn_space_t::initial);
+    CHECK(numbers(outcome.lost) == std::vector<std::uint64_t>{0, 1});
   }
 }
 
@@ -401,12 +401,11 @@ TEST_CASE("the PTO backs off and resets")
   REQUIRE(timer.has_value());
   CHECK(*timer == at(base));
 
-  std::vector<sent_packet_t> lost;
-  auto probe = recovery.on_loss_detection_timeout(at(base), context, lost);
-  REQUIRE(probe.has_value());
-  CHECK(*probe == pn_space_t::initial);
+  auto outcome = recovery.on_loss_detection_timeout(at(base), context);
+  REQUIRE(outcome.probe_space.has_value());
+  CHECK(*outcome.probe_space == pn_space_t::initial);
   CHECK(recovery.pto_count() == 1);
-  CHECK(lost.empty());
+  CHECK(outcome.lost.empty());
 
   auto doubled = recovery.loss_detection_timer(at(base), context);
   REQUIRE(doubled.has_value());

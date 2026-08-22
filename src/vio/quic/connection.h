@@ -37,13 +37,14 @@
 // first yields the keys for the second, so TLS is driven after every packet
 // rather than once per datagram.
 //
-// What is here is the handshake and the rules that protect it: the key
-// progression, address validation limits, and connection close. What is not
-// here yet, and is required before this is a usable transport: loss detection
-// and retransmission, congestion control, streams and flow control, connection
-// migration, Retry, and key update. Handshake data consumed from TLS is
-// therefore gone once packetized -- on a lossy path this connection stalls
-// rather than recovering.
+// Loss is expected rather than fatal. Everything TLS produces is kept in a
+// per-level send buffer until it is acknowledged, so a lost CRYPTO frame can be
+// resent byte for byte; a PTO with no data to send emits a PING to draw one out.
+// What each lost frame costs to repair is decided by the loss policy frozen in
+// frame.h, not by replaying the bytes that went out.
+//
+// Still missing before this is a usable transport: congestion control, streams
+// and flow control, connection migration, Retry, and key update.
 
 #include "vio/error.h"
 #include "vio/quic/connection_id.h"
@@ -136,9 +137,10 @@ public:
   // there is nothing to send right now, which is the normal idle answer.
   [[nodiscard]] std::expected<std::size_t, error_t> poll_send(std::span<std::uint8_t> out, tick_t now);
 
-  // When poll_send should next be called even if nothing else happens, because
-  // an ACK is owed. Nothing pending means no deadline.
-  [[nodiscard]] std::optional<tick_t> next_timeout() const;
+  // When poll_send should next be called even if nothing else happens: an ACK
+  // is owed, or loss detection has something to report. Nothing pending means
+  // no deadline.
+  [[nodiscard]] std::optional<tick_t> next_timeout(tick_t now) const;
 
   [[nodiscard]] connection_state_t state() const;
   [[nodiscard]] bool handshake_complete() const;

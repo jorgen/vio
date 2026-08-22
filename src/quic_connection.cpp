@@ -26,6 +26,7 @@
 #include "vio/quic/ack_tracker.h"
 #include "vio/quic/crypto_stream.h"
 #include "vio/quic/frame_codec.h"
+#include "vio/quic/loss_recovery.h"
 #include "vio/quic/packet.h"
 #include "vio/quic/protection.h"
 
@@ -77,6 +78,21 @@ constexpr std::size_t space_count = 3;
 
 constexpr encryption_level_t ordered_levels[space_count] = {encryption_level_t::initial, encryption_level_t::handshake, encryption_level_t::application};
 
+[[nodiscard]] pn_space_t to_pn_space(encryption_level_t level)
+{
+  switch (level)
+  {
+  case encryption_level_t::initial:
+    return pn_space_t::initial;
+  case encryption_level_t::handshake:
+    return pn_space_t::handshake;
+  case encryption_level_t::application:
+  case encryption_level_t::early_data:
+    break;
+  }
+  return pn_space_t::application;
+}
+
 // Section 14.1.
 constexpr std::size_t minimum_initial_datagram = 1200;
 
@@ -84,12 +100,39 @@ constexpr std::size_t minimum_initial_datagram = 1200;
 // and the tracker holds a bounded number of them.
 constexpr std::size_t ack_range_scratch = 1024;
 
+struct crypto_range_t
+{
+  std::uint64_t offset = 0;
+  std::uint64_t length = 0;
+};
+
+// The send side of one level's CRYPTO stream. Everything TLS has produced is
+// kept until the handshake is over, because a lost CRYPTO frame is repaired by
+// sending the same bytes again (section 13.3) and TLS will not produce them a
+// second time. The buffer is bounded by the size of a handshake.
+struct crypto_sender_t
+{
+  std::vector<std::uint8_t> data;
+  // How far into the stream has been packetized at least once.
+  std::uint64_t sent_offset = 0;
+  // Ranges that went out and were then declared lost.
+  std::vector<crypto_range_t> retransmit;
+
+  [[nodiscard]] bool has_pending() const
+  {
+    return !retransmit.empty() || sent_offset < data.size();
+  }
+};
+
 struct packet_space_t
 {
   crypto_stream_t crypto;
   ack_tracker_t acks;
+  crypto_sender_t crypto_send;
   std::uint64_t next_packet_number = 0;
-  std::uint64_t crypto_send_offset = 0;
+  // Set when a PTO expires here: the next packet must be ack-eliciting even if
+  // there is nothing to say.
+  bool probe_pending = false;
   packet_protection_t read;
   packet_protection_t write;
   header_protection_t read_header;
@@ -141,6 +184,11 @@ struct connection_impl_t
   bool close_frame_pending = false;
 
   std::optional<transport_parameters_t> peer_parameters;
+
+  loss_recovery_t recovery;
+  // Appendix A.8 of RFC 9002: a client considers the server's address
+  // validated once it has seen an acknowledgement at the Handshake level.
+  bool received_handshake_ack = false;
 };
 } // namespace detail
 
@@ -190,11 +238,75 @@ std::expected<void, error_t> install_initial_keys(connection_impl_t &impl, const
   return install_keys(space, read, true);
 }
 
-void discard_space(packet_space_t &space)
+void discard_space(connection_impl_t &impl, encryption_level_t level)
 {
+  auto &space = impl.spaces[space_index(level)];
   space.discarded = true;
   space.have_read = false;
   space.have_write = false;
+  space.probe_pending = false;
+  space.crypto_send = crypto_sender_t{};
+  impl.recovery.discard_space(to_pn_space(level));
+}
+
+[[nodiscard]] recovery_context_t recovery_context(const connection_impl_t &impl)
+{
+  recovery_context_t context;
+  context.handshake_confirmed = impl.handshake_confirmed;
+  context.has_handshake_keys = impl.spaces[space_index(encryption_level_t::handshake)].have_write;
+  // A server validates the client implicitly by answering it; a client is
+  // waiting on the server until something at the Handshake level comes back.
+  context.peer_completed_address_validation = impl.config.role == tls_role_t::server || impl.handshake_confirmed || impl.received_handshake_ack;
+  context.max_ack_delay = impl.config.max_ack_delay;
+  // The peer's exponent, not this endpoint's: it is the peer that encoded the
+  // delay being decoded. Section 18.2 says assume 3 until told otherwise.
+  context.ack_delay_exponent = impl.peer_parameters.has_value() ? static_cast<std::uint32_t>(impl.peer_parameters->ack_delay_exponent) : static_cast<std::uint32_t>(default_ack_delay_exponent_parameter);
+  return context;
+}
+
+void queue_crypto_retransmit(packet_space_t &space, std::uint64_t offset, std::uint64_t length)
+{
+  if (length == 0)
+  {
+    return;
+  }
+  for (const auto &pending : space.crypto_send.retransmit)
+  {
+    if (pending.offset == offset && pending.length == length)
+    {
+      // A repeated PTO must not enqueue the same bytes again and again.
+      return;
+    }
+  }
+  space.crypto_send.retransmit.push_back(crypto_range_t{.offset = offset, .length = length});
+}
+
+// Section 13.3: a lost packet is repaired frame by frame, according to what
+// each frame meant. The loss policy that decides which repair applies was
+// settled in frame.h.
+void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<sent_packet_t> &lost)
+{
+  for (const auto &packet : lost)
+  {
+    for (const auto &frame : packet.frames)
+    {
+      switch (frame.kind)
+      {
+      case frame_kind_t::crypto:
+        // Retransmit: the same bytes, at the same offset.
+        queue_crypto_retransmit(impl.spaces[static_cast<std::size_t>(space)], frame.offset, frame.length);
+        break;
+      case frame_kind_t::handshake_done:
+        // Also retransmit, and section 13.3 says until acknowledged.
+        impl.handshake_done_sent = false;
+        break;
+      default:
+        // PING and PADDING carry no information to repair; a stale ACK would
+        // do more harm than good. Both are discard.
+        break;
+      }
+    }
+  }
 }
 
 void begin_close(connection_impl_t &impl, std::uint64_t error_code, std::string_view reason, bool application, bool from_peer)
@@ -344,10 +456,16 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       break;
 
     case frame_kind_t::ack:
-      // Nothing consumes acknowledgements yet: loss detection and congestion
-      // control are not built. The frame is still parsed and validated so a
-      // malformed one is caught.
+    {
+      const auto space = to_pn_space(*level_for(kind));
+      auto outcome = impl.recovery.on_ack_received(space, frame, now, recovery_context(impl));
+      if (kind == packet_kind_t::handshake)
+      {
+        impl.received_handshake_ack = true;
+      }
+      repair_lost(impl, space, outcome.lost);
       break;
+    }
 
     case frame_kind_t::crypto:
     {
@@ -387,7 +505,6 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       break;
     }
   }
-  (void)now;
   return ack_eliciting;
 }
 
@@ -455,7 +572,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     impl.address_validated = true;
     if (impl.config.role == tls_role_t::server && !impl.spaces[0].discarded)
     {
-      discard_space(impl.spaces[0]);
+      discard_space(impl, encryption_level_t::initial);
     }
   }
 
@@ -491,12 +608,21 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     return std::size_t{0};
   }
 
-  const auto crypto_pending = impl.tls.pending_handshake_data(level);
+  // Whatever TLS has produced becomes ours to keep: it will not produce it
+  // again, and a lost CRYPTO frame is repaired by resending the same bytes.
+  if (const auto produced = impl.tls.pending_handshake_data(level); !produced.empty())
+  {
+    space.crypto_send.data.insert(space.crypto_send.data.end(), produced.begin(), produced.end());
+    impl.tls.consume_handshake_data(level, produced.size());
+  }
+
+  const bool want_crypto = space.crypto_send.has_pending();
   const bool want_ack = space.acks.has_received() && (space.acks.should_send_ack(now, impl.config.max_ack_delay) || (allow_empty_ack && space.acks.ack_pending()));
   const bool want_handshake_done = level == encryption_level_t::application && impl.config.role == tls_role_t::server && impl.handshake_complete && !impl.handshake_done_sent;
   const bool want_close = impl.close_frame_pending && space.have_write;
+  const bool want_probe = space.probe_pending;
 
-  if (crypto_pending.empty() && !want_ack && !want_handshake_done && !want_close)
+  if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe)
   {
     return std::size_t{0};
   }
@@ -572,14 +698,29 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     }
   }
 
+  std::vector<sent_frame_t> record;
   std::size_t crypto_written = 0;
-  if (!crypto_pending.empty() && !want_close)
+  std::uint64_t crypto_offset = 0;
+  bool crypto_from_retransmit = false;
+  if (want_crypto && !want_close)
   {
-    const std::size_t available = frames.remaining();
-    const std::size_t header_cost = 1 + varint_size(space.crypto_send_offset);
-    if (available > header_cost + 1)
+    // Section 13.3: retransmissions go before new data.
+    if (!space.crypto_send.retransmit.empty())
     {
-      std::size_t amount = std::min(crypto_pending.size(), available);
+      crypto_offset = space.crypto_send.retransmit.front().offset;
+      crypto_from_retransmit = true;
+    }
+    else
+    {
+      crypto_offset = space.crypto_send.sent_offset;
+    }
+    const std::uint64_t span_end = crypto_from_retransmit ? crypto_offset + space.crypto_send.retransmit.front().length : space.crypto_send.data.size();
+
+    const std::size_t available = frames.remaining();
+    const std::size_t header_cost = 1 + varint_size(crypto_offset);
+    if (available > header_cost + 1 && span_end > crypto_offset)
+    {
+      std::size_t amount = static_cast<std::size_t>(std::min<std::uint64_t>(span_end - crypto_offset, available));
       while (amount > 0 && header_cost + varint_size(amount) + amount > available)
       {
         --amount;
@@ -588,11 +729,12 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       {
         frame_t frame;
         frame.kind = frame_kind_t::crypto;
-        frame.offset = space.crypto_send_offset;
-        frame.data = crypto_pending.first(amount);
+        frame.offset = crypto_offset;
+        frame.data = std::span<const std::uint8_t>(space.crypto_send.data).subspan(static_cast<std::size_t>(crypto_offset), amount);
         if (frames.write(frame))
         {
           crypto_written = amount;
+          record.push_back(sent_frame_t{.kind = frame_kind_t::crypto, .offset = crypto_offset, .length = amount});
         }
       }
     }
@@ -604,6 +746,24 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     frame_t frame;
     frame.kind = frame_kind_t::handshake_done;
     wrote_handshake_done = frames.write(frame);
+    if (wrote_handshake_done)
+    {
+      record.push_back(sent_frame_t{.kind = frame_kind_t::handshake_done});
+    }
+  }
+
+  // A probe has to elicit an acknowledgement; if nothing else in this packet
+  // will, a PING is the cheapest thing that does.
+  bool wrote_ping = false;
+  if (want_probe && !want_close && crypto_written == 0 && !wrote_handshake_done)
+  {
+    frame_t frame;
+    frame.kind = frame_kind_t::ping;
+    wrote_ping = frames.write(frame);
+    if (wrote_ping)
+    {
+      record.push_back(sent_frame_t{.kind = frame_kind_t::ping});
+    }
   }
 
   if (frames.written() == 0)
@@ -636,10 +796,22 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   }
 
   space.next_packet_number = packet_number + 1;
-  space.crypto_send_offset += crypto_written;
   if (crypto_written > 0)
   {
-    impl.tls.consume_handshake_data(level, crypto_written);
+    if (crypto_from_retransmit)
+    {
+      auto &front = space.crypto_send.retransmit.front();
+      front.offset += crypto_written;
+      front.length -= crypto_written;
+      if (front.length == 0)
+      {
+        space.crypto_send.retransmit.erase(space.crypto_send.retransmit.begin());
+      }
+    }
+    else
+    {
+      space.crypto_send.sent_offset += crypto_written;
+    }
   }
   if (wrote_ack)
   {
@@ -649,6 +821,19 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   {
     impl.handshake_done_sent = true;
   }
+  space.probe_pending = false;
+
+  // Section 2 of RFC 9002: ACK, PADDING and CONNECTION_CLOSE neither elicit an
+  // acknowledgement nor count against the congestion window, so a packet
+  // carrying only those is not tracked for loss.
+  sent_packet_t sent;
+  sent.packet_number = packet_number;
+  sent.time_sent = now;
+  sent.ack_eliciting = crypto_written > 0 || wrote_handshake_done || wrote_ping;
+  sent.in_flight = sent.ack_eliciting;
+  sent.size = *length;
+  sent.frames = std::move(record);
+  impl.recovery.on_packet_sent(to_pn_space(level), std::move(sent));
   return *length;
 }
 } // namespace
@@ -800,6 +985,40 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     return std::size_t{0};
   }
 
+  // A timer that has come due is handled before anything new is built, so a
+  // probe or a repair goes out in this datagram rather than the next one.
+  const auto context = recovery_context(impl);
+  if (auto deadline = impl.recovery.loss_detection_timer(now, context); deadline.has_value() && now >= *deadline)
+  {
+    auto expiry = impl.recovery.on_loss_detection_timeout(now, context);
+    if (expiry.loss_space.has_value())
+    {
+      repair_lost(impl, *expiry.loss_space, expiry.lost);
+    }
+    if (expiry.probe_space.has_value())
+    {
+      for (auto level : ordered_levels)
+      {
+        if (to_pn_space(level) != *expiry.probe_space)
+        {
+          continue;
+        }
+        auto &space = impl.spaces[space_index(level)];
+        space.probe_pending = true;
+        // Section 6.2.4: a probe should carry data. During a handshake a bare
+        // PING would elicit an acknowledgement while telling the peer nothing
+        // it is waiting for, so anything still outstanding goes again.
+        for (const auto &frame : impl.recovery.unacknowledged_frames(*expiry.probe_space))
+        {
+          if (frame.kind == frame_kind_t::crypto)
+          {
+            queue_crypto_retransmit(space, frame.offset, frame.length);
+          }
+        }
+      }
+    }
+  }
+
   std::size_t budget = std::min(out.size(), impl.config.max_datagram_size);
   if (impl.config.role == tls_role_t::server && !impl.address_validated)
   {
@@ -870,19 +1089,27 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   // at the Handshake level.
   if (impl.config.role == tls_role_t::client && impl.spaces[1].have_write && !impl.spaces[0].discarded)
   {
-    discard_space(impl.spaces[0]);
+    discard_space(impl, encryption_level_t::initial);
   }
   if (impl.handshake_confirmed && !impl.spaces[1].discarded)
   {
     // Section 4.9.2.
-    discard_space(impl.spaces[1]);
+    discard_space(impl, encryption_level_t::handshake);
   }
   return written;
 }
 
-std::optional<tick_t> connection_t::next_timeout() const
+std::optional<tick_t> connection_t::next_timeout(tick_t now) const
 {
   std::optional<tick_t> earliest;
+  const auto consider = [&earliest](std::optional<tick_t> candidate)
+  {
+    if (candidate.has_value() && (!earliest.has_value() || *candidate < *earliest))
+    {
+      earliest = candidate;
+    }
+  };
+
   for (auto level : ordered_levels)
   {
     const auto &space = _impl->spaces[space_index(level)];
@@ -890,12 +1117,11 @@ std::optional<tick_t> connection_t::next_timeout() const
     {
       continue;
     }
-    auto deadline = space.acks.ack_deadline(_impl->config.max_ack_delay);
-    if (deadline.has_value() && (!earliest.has_value() || *deadline < *earliest))
-    {
-      earliest = deadline;
-    }
+    consider(space.acks.ack_deadline(_impl->config.max_ack_delay));
   }
+  // Whichever comes first: an acknowledgement this endpoint owes, or the loss
+  // detection timer telling it something of its own has gone missing.
+  consider(_impl->recovery.loss_detection_timer(now, recovery_context(*_impl)));
   return earliest;
 }
 

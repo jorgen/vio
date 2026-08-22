@@ -135,15 +135,18 @@ Configuration is in `.clang-tidy` at the project root.
   progression, anti-amplification (section 8.1) and connection close. It is
   sans-I/O -- datagrams in, datagrams out, `tick_t` in -- so
   `test_quic_connection.cpp` completes a real handshake between two of them
-  with no socket. Loss recovery, congestion control, streams, flow control,
-  migration, Retry and key update are **not** built yet: handshake data is
-  dropped once packetized, so a lossy path stalls rather than recovering.
-  `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+  with no socket, and completes it again over a link that drops datagrams.
+  Everything TLS produces is kept per level until acknowledged so a lost CRYPTO
+  frame can be resent byte for byte, and a PTO probe carries outstanding data
+  rather than a bare PING (section 6.2.4) -- during a handshake a PING would
+  elicit an ACK while telling the peer nothing it is waiting for. Congestion
+  control, streams, flow control, migration, Retry and key update are **not**
+  built yet. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
   transcribed from the appendix A pseudocode. A sent packet records *what it
   meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes
-  the `resend_current` loss policy in `frame.h` implementable. Not yet wired
-  into `connection_t`; congestion control (section 7) is still to come.
+  the `resend_current` loss policy in `frame.h` implementable. Congestion
+  control (section 7) is still to come.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 

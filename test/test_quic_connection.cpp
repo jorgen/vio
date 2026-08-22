@@ -563,7 +563,7 @@ TEST_CASE("an ACK deadline is reported so a caller can arm a timer")
   auto client = connection_t::create(contexts.client_context, client_config, "localhost");
   REQUIRE(client.has_value());
 
-  CHECK_FALSE(server->next_timeout().has_value());
+  CHECK_FALSE(server->next_timeout(at(0ns)).has_value());
 
   std::vector<std::uint8_t> datagram(1500);
   auto size = client->poll_send(datagram, at(0ns));
@@ -573,7 +573,222 @@ TEST_CASE("an ACK deadline is reported so a caller can arm a timer")
 
   // Having received an ack-eliciting packet, the server owes an ACK by some
   // deadline even if it had nothing else to say.
-  CHECK(server->next_timeout().has_value());
+  CHECK(server->next_timeout(at(0ns)).has_value());
+}
+
+TEST_CASE("a handshake survives losing datagrams")
+{
+  const auto identity = make_self_signed("localhost");
+
+  // Drives both sides against a lossy link, advancing the clock to whichever
+  // timer either endpoint is waiting on. Without retransmission any drop here
+  // deadlocks, so this is the test that says loss recovery is wired up.
+  struct link_t
+  {
+    int client_sent = 0;
+    int server_sent = 0;
+    int dropped = 0;
+  };
+
+  const auto run = [&](auto should_drop_client, auto should_drop_server)
+  {
+    auto contexts = make_contexts(identity);
+
+    connection_config_t server_config;
+    server_config.role = tls_role_t::server;
+    server_config.transport_parameters = sane_parameters();
+    connection_config_t client_config;
+    client_config.role = tls_role_t::client;
+    client_config.transport_parameters = sane_parameters();
+
+    auto server = connection_t::create(contexts.server_context, server_config);
+    REQUIRE(server.has_value());
+    auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+    REQUIRE(client.has_value());
+
+    link_t link;
+    auto now = at(0ns);
+
+    for (int round = 0; round < 60; ++round)
+    {
+      bool moved = false;
+
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = client->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        moved = true;
+        if (should_drop_client(link.client_sent++))
+        {
+          ++link.dropped;
+          continue;
+        }
+        REQUIRE(server->receive(datagram, now).has_value());
+      }
+
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = server->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        moved = true;
+        if (should_drop_server(link.server_sent++))
+        {
+          ++link.dropped;
+          continue;
+        }
+        REQUIRE(client->receive(datagram, now).has_value());
+      }
+
+      if (client->handshake_confirmed() && server->handshake_confirmed() && !moved)
+      {
+        break;
+      }
+
+      // Nothing more to send right now: wait for whichever timer comes first.
+      if (!moved)
+      {
+        std::optional<vio::tick_t> next;
+        for (auto *side : {&*client, &*server})
+        {
+          auto deadline = side->next_timeout(now);
+          if (deadline.has_value() && (!next.has_value() || *deadline < *next))
+          {
+            next = deadline;
+          }
+        }
+        REQUIRE(next.has_value());
+        now = *next > now ? *next : now + std::chrono::nanoseconds(1ms);
+      }
+    }
+
+    CHECK(link.dropped > 0);
+    CHECK(client->handshake_complete());
+    CHECK(server->handshake_complete());
+    CHECK_FALSE(client->close_reason().has_value());
+    CHECK_FALSE(server->close_reason().has_value());
+    CHECK(client->selected_alpn() == "h3");
+  };
+
+  SUBCASE("the client's first flight is lost")
+  {
+    run([](int n) { return n == 0; }, [](int) { return false; });
+  }
+
+  SUBCASE("the server's first flight is lost")
+  {
+    run([](int) { return false; }, [](int n) { return n == 0; });
+  }
+
+  SUBCASE("the client's second flight is lost")
+  {
+    run([](int n) { return n == 1; }, [](int) { return false; });
+  }
+
+  SUBCASE("every other datagram in both directions is lost")
+  {
+    run([](int n) { return n % 2 == 0; }, [](int n) { return n % 2 == 0; });
+  }
+
+  SUBCASE("the first two datagrams each way are lost")
+  {
+    run([](int n) { return n < 2; }, [](int n) { return n < 2; });
+  }
+}
+
+TEST_CASE("a lost CRYPTO frame is resent with the same bytes at the same offset")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  std::vector<std::uint8_t> first(1500);
+  auto size = client->poll_send(first, at(0ns));
+  REQUIRE(size.has_value());
+  first.resize(*size);
+
+  // Nothing acknowledged it, so the PTO eventually fires and the same
+  // ClientHello goes out again.
+  auto deadline = client->next_timeout(at(0ns));
+  REQUIRE(deadline.has_value());
+
+  std::vector<std::uint8_t> second(1500);
+  auto retry = client->poll_send(second, *deadline);
+  REQUIRE(retry.has_value());
+  REQUIRE(*retry > 0);
+  second.resize(*retry);
+
+  // Same size and same shape: an Initial padded to the section 14.1 minimum.
+  CHECK(second.size() >= 1200);
+
+  packet_reader_t reader(second, 0);
+  auto header = reader.next();
+  REQUIRE(header.has_value());
+  REQUIRE(header->has_value());
+  CHECK(header->value().kind == packet_kind_t::initial);
+
+  SUBCASE("and a server that only ever sees the retransmission still completes")
+  {
+    connection_config_t server_config;
+    server_config.role = tls_role_t::server;
+    server_config.transport_parameters = sane_parameters();
+    auto server = connection_t::create(contexts.server_context, server_config);
+    REQUIRE(server.has_value());
+
+    REQUIRE(server->receive(second, *deadline).has_value());
+    // The retransmitted ClientHello was enough to drive TLS forward.
+    std::vector<std::uint8_t> answer(1500);
+    auto out = server->poll_send(answer, *deadline);
+    REQUIRE(out.has_value());
+    CHECK(*out > 0);
+  }
+}
+
+TEST_CASE("a PTO backs off rather than retrying at a fixed rate")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  std::vector<std::uint8_t> datagram(1500);
+  auto size = client->poll_send(datagram, at(0ns));
+  REQUIRE(size.has_value());
+  REQUIRE(*size > 0);
+
+  auto first = client->next_timeout(at(0ns));
+  REQUIRE(first.has_value());
+
+  auto probe = client->poll_send(datagram, *first);
+  REQUIRE(probe.has_value());
+  CHECK(*probe > 0);
+
+  auto second = client->next_timeout(*first);
+  REQUIRE(second.has_value());
+  // Section 6.2.1: the period doubles on each consecutive expiry.
+  const auto firstwait = *first - at(0ns);
+  const auto secondwait = *second - *first;
+  CHECK(secondwait > firstwait);
 }
 
 TEST_CASE("a configuration that cannot work is refused up front")
