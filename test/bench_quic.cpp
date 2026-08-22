@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -150,8 +151,9 @@ void operator delete(void *p, std::size_t) noexcept
   std::free(p);
 }
 
-int main()
+int main(int argc, char **argv)
 {
+  const std::size_t stream_count = argc > 1 ? static_cast<std::size_t>(std::atoi(argv[1])) : 512;
   const auto identity = make_self_signed("localhost");
 
   tls_config_t server_tls;
@@ -287,5 +289,77 @@ int main()
 
   print("bulk stream transfer", report);
   std::printf("%-34s %zu bytes delivered\n", "", report.bytes);
+  // A second shape entirely: many streams open at once with a little traffic
+  // on each. The bulk case above touches the stream container barely once per
+  // packet, so it cannot see what holding a thousand streams costs. Here every
+  // poll_send asks whether any stream has something to send, and every frame
+  // that arrives is a lookup by stream id.
+  std::vector<std::uint64_t> ids;
+  ids.reserve(stream_count);
+  for (std::size_t i = 0; i < stream_count; ++i)
+  {
+    auto opened = client->open_stream(stream_direction_t::bidirectional);
+    if (!opened.has_value())
+    {
+      std::printf("could not open stream %zu\n", i);
+      return 1;
+    }
+    ids.push_back(*opened);
+  }
+
+  const std::vector<std::uint8_t> small(256, 0x33);
+  report_t many;
+  g_allocations = 0;
+  g_bytes_allocated = 0;
+  g_counting = true;
+  const auto many_started = std::chrono::steady_clock::now();
+
+  for (int round = 0; round < 32; ++round)
+  {
+    for (auto stream : ids)
+    {
+      (void)client->write_stream(stream, small, false);
+    }
+    for (;;)
+    {
+      auto size = client->poll_send(scratch, now);
+      if (!size.has_value() || *size == 0)
+      {
+        break;
+      }
+      ++many.datagrams;
+      (void)server->receive(std::span<std::uint8_t>(scratch).first(*size), now);
+      for (;;)
+      {
+        auto reply = server->poll_send(scratch, now);
+        if (!reply.has_value() || *reply == 0)
+        {
+          break;
+        }
+        (void)client->receive(std::span<std::uint8_t>(scratch).first(*reply), now);
+      }
+    }
+    for (auto stream : ids)
+    {
+      auto readable = server->readable_stream(stream);
+      if (!readable.empty())
+      {
+        many.bytes += readable.size();
+        server->consume_stream(stream, readable.size());
+      }
+    }
+    now = now + std::chrono::nanoseconds(1ms);
+  }
+
+  const auto many_finished = std::chrono::steady_clock::now();
+  g_counting = false;
+  many.seconds = std::chrono::duration<double>(many_finished - many_started).count();
+  many.allocations = g_allocations;
+  many.allocated_bytes = g_bytes_allocated;
+
+  char label[64];
+  std::snprintf(label, sizeof(label), "%zu concurrent streams", stream_count);
+  print(label, many);
+
   return 0;
 }
