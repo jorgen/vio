@@ -20,6 +20,7 @@ add_executable(vio_tests
     test_quic_reassembly.cpp
     test_quic_transport_parameters.cpp
     test_quic_connection.cpp
+    test_quic_loss_recovery.cpp
     test_http_client.cpp
     test_http_cache.cpp
     test_file.cpp

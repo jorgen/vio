@@ -138,6 +138,12 @@ Configuration is in `.clang-tidy` at the project root.
   with no socket. Loss recovery, congestion control, streams, flow control,
   migration, Retry and key update are **not** built yet: handshake data is
   dropped once packetized, so a lossy path stalls rather than recovering.
+  `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+  time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
+  transcribed from the appendix A pseudocode. A sent packet records *what it
+  meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes
+  the `resend_current` loss policy in `frame.h` implementable. Not yet wired
+  into `connection_t`; congestion control (section 7) is still to come.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 
