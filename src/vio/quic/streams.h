@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -114,7 +115,17 @@ struct stream_t
   std::uint64_t consumed_since_update = 0;
   // A STOP_SENDING this endpoint owes the peer.
   std::optional<std::uint64_t> stop_sending_pending;
+  // Whether this stream is currently on the sendable list. A hint in one
+  // direction only: the list may still name a stream that has gone quiet,
+  // which the next sweep drops, but a stream with work must always be on it.
+  bool in_sendable = false;
 };
+
+// Everything that would put a frame for this stream into a packet.
+[[nodiscard]] inline bool stream_has_sendable_work(const stream_t &stream)
+{
+  return stream.reset_pending || (stream.has_send && stream.send.has_pending()) || stream.pending_max_stream_data || stream.stop_sending_pending.has_value();
+}
 
 struct streams_config_t
 {
@@ -213,6 +224,71 @@ public:
     return it == _streams.end() ? nullptr : &it->second;
   }
 
+  // Streams that may have something to send. Building a packet walks this
+  // rather than every stream the connection holds open, which is the
+  // difference between paying for the streams that are busy and paying for a
+  // cache miss on each of the thousand that are not.
+  //
+  // Every place that gives a stream work marks it here. A stale entry costs
+  // one check and is dropped; a missing one would be a stream that never
+  // sends, so the debug build re-derives the list the slow way and complains
+  // if the two disagree.
+  void mark_sendable(stream_t &stream)
+  {
+    if (stream.in_sendable)
+    {
+      return;
+    }
+    stream.in_sendable = true;
+    _sendable.push_back(stream.id);
+  }
+
+  [[nodiscard]] bool has_sendable()
+  {
+    // Answering the question only requires reaching the first stream that
+    // still has work. Entries ahead of it have gone quiet or been reaped and
+    // are dropped on the way past, which is what keeps the list from growing
+    // without bound; the rest are left alone, because on a connection with a
+    // thousand busy streams the rest is nearly all of them.
+    std::size_t dead = 0;
+    while (dead < _sendable.size())
+    {
+      auto *stream = find(_sendable[dead]);
+      if (stream != nullptr)
+      {
+        if (stream_has_sendable_work(*stream))
+        {
+          break;
+        }
+        stream->in_sendable = false;
+      }
+      ++dead;
+    }
+    _sendable.erase(_sendable.begin(), _sendable.begin() + static_cast<std::ptrdiff_t>(dead));
+#ifndef NDEBUG
+    for (const auto &entry : _streams)
+    {
+      assert(!stream_has_sendable_work(entry.second) || entry.second.in_sendable);
+    }
+#endif
+    return !_sendable.empty();
+  }
+
+  [[nodiscard]] const std::vector<std::uint64_t> &sendable() const
+  {
+    return _sendable;
+  }
+
+  // Moves the streams a packet has already served to the back, so the next one
+  // starts where it left off. Without this the head of the list would hold the
+  // connection for as long as it had anything to send, and a stream further
+  // down would wait however long that took.
+  void rotate_sendable(std::size_t served)
+  {
+    served = std::min(served, _sendable.size());
+    std::rotate(_sendable.begin(), _sendable.begin() + static_cast<std::ptrdiff_t>(served), _sendable.end());
+  }
+
   [[nodiscard]] std::map<std::uint64_t, stream_t> &all()
   {
     return _streams;
@@ -305,6 +381,7 @@ public:
     {
       stream->send.reset(error_code);
       stream->reset_pending = true;
+      mark_sendable(*stream);
     }
     return streams_error_t::none;
   }
@@ -378,15 +455,24 @@ public:
     limit += additional;
   }
 
-  // Peer-initiated streams that have been fully dealt with and can be
-  // forgotten, which is what makes room for the credit above.
-  [[nodiscard]] std::uint64_t reap_finished(stream_direction_t direction, stream_initiator_t remote_initiator)
+  struct reaped_t
   {
-    std::uint64_t reaped = 0;
+    std::uint64_t bidirectional = 0;
+    std::uint64_t unidirectional = 0;
+  };
+
+  // Peer-initiated streams that have been fully dealt with and can be
+  // forgotten, which is what makes room for the credit above. Both directions
+  // are settled in a single pass: this walks every open stream, and asking
+  // twice made a connection holding many of them cost twice as much for
+  // nothing.
+  [[nodiscard]] reaped_t reap_finished(stream_initiator_t remote_initiator)
+  {
+    reaped_t reaped;
     for (auto it = _streams.begin(); it != _streams.end();)
     {
       const auto id = it->first;
-      if (stream_direction(id) != direction || stream_initiator(id) != remote_initiator)
+      if (stream_initiator(id) != remote_initiator)
       {
         ++it;
         continue;
@@ -396,8 +482,8 @@ public:
       const bool send_done = !stream.has_send || stream.send.state() == send_state_t::data_received || stream.send.state() == send_state_t::reset_sent;
       if (receive_done && send_done)
       {
+        (stream_direction(id) == stream_direction_t::bidirectional ? reaped.bidirectional : reaped.unidirectional) += 1;
         it = _streams.erase(it);
-        ++reaped;
         continue;
       }
       ++it;
@@ -491,6 +577,7 @@ private:
 
   streams_config_t _config;
   std::map<std::uint64_t, stream_t> _streams;
+  std::vector<std::uint64_t> _sendable;
 
   std::uint64_t _local_max_data = 0;
   std::uint64_t _peer_max_data = 0;

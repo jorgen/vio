@@ -262,6 +262,9 @@ struct connection_impl_t
   // Section 17.2.5.2: once an Initial has been processed from the server, a
   // Retry is too late to be genuine.
   bool received_server_initial = false;
+  // Set when a read may have finished a stream, cleared by the sweep that
+  // returns the credit.
+  bool reap_wanted = false;
   // Section 10.1. Zero disables it.
   std::chrono::nanoseconds idle_timeout{};
   tick_t last_activity;
@@ -429,6 +432,7 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         if (auto *stream = impl.streams.find(frame.stream_id); stream != nullptr && stream->has_send)
         {
           stream->send.on_range_lost(frame.offset, frame.length);
+          impl.streams.mark_sendable(*stream);
         }
         break;
       }
@@ -436,6 +440,7 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         if (auto *stream = impl.streams.find(frame.stream_id); stream != nullptr)
         {
           stream->reset_pending = true;
+          impl.streams.mark_sendable(*stream);
         }
         break;
       case frame_kind_t::max_data:
@@ -1106,6 +1111,32 @@ std::expected<std::size_t, error_t> build_retry(connection_impl_t &impl, std::sp
   return head + retry_integrity_tag_size;
 }
 
+// Returning stream credit means walking every open stream, so it happens once
+// before a packet is built rather than once per read. The credit is only ever
+// spent by the MAX_STREAMS frame below, so nothing observes it any sooner, and
+// an application draining a thousand streams no longer pays for a thousand
+// passes over all of them.
+void reap_and_grant(connection_impl_t &impl)
+{
+  if (!impl.reap_wanted)
+  {
+    return;
+  }
+  impl.reap_wanted = false;
+  const auto remote_initiator = impl.config.role == tls_role_t::client ? stream_initiator_t::server : stream_initiator_t::client;
+  const auto reaped = impl.streams.reap_finished(remote_initiator);
+  if (reaped.bidirectional > 0)
+  {
+    impl.streams.grant_streams(stream_direction_t::bidirectional, reaped.bidirectional);
+    impl.max_streams_pending[0] = true;
+  }
+  if (reaped.unidirectional > 0)
+  {
+    impl.streams.grant_streams(stream_direction_t::unidirectional, reaped.unidirectional);
+    impl.max_streams_pending[1] = true;
+  }
+}
+
 // Writes the frames for one space into a packet, returning its size or zero
 // when there was nothing worth sending.
 std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack)
@@ -1143,16 +1174,8 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   bool want_streams = false;
   if (level == encryption_level_t::application && !want_close)
   {
-    want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1];
-    for (auto &entry : impl.streams.all())
-    {
-      auto &stream = entry.second;
-      if (stream.reset_pending || (stream.has_send && stream.send.has_pending()) || stream.pending_max_stream_data || stream.stop_sending_pending.has_value())
-      {
-        want_streams = true;
-        break;
-      }
-    }
+    reap_and_grant(impl);
+    want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1] || impl.streams.has_sendable();
   }
 
   if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe && !want_streams)
@@ -1322,9 +1345,26 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       }
     }
 
-    for (auto &entry : impl.streams.all())
+    // The smallest of the frames below: a type byte, a stream id, and one
+    // more field. Below this the rest of the list can only be walked for
+    // nothing, and with many busy streams that is nearly all of it. Anything
+    // skipped this way is still pending, so it goes in the next packet.
+    constexpr std::size_t minimum_stream_frame_bytes = 5;
+
+    std::size_t served = 0;
+    const auto &sendable = impl.streams.sendable();
+    for (; served < sendable.size(); ++served)
     {
-      auto &stream = entry.second;
+      if (frames.remaining() < minimum_stream_frame_bytes)
+      {
+        break;
+      }
+      auto *found = impl.streams.find(sendable[served]);
+      if (found == nullptr)
+      {
+        continue;
+      }
+      auto &stream = *found;
 
       if (stream.pending_max_stream_data && stream.has_receive)
       {
@@ -1405,6 +1445,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
         stream_bytes_written += chunk->data.size();
       }
     }
+    impl.streams.rotate_sendable(served);
   }
 
   // A probe has to elicit an acknowledgement; if nothing else in this packet
@@ -1930,6 +1971,7 @@ std::size_t connection_t::write_stream(std::uint64_t id, std::span<const std::ui
   {
     return 0;
   }
+  _impl->streams.mark_sendable(*stream);
   return data.size();
 }
 
@@ -1975,6 +2017,7 @@ void connection_t::consume_stream(std::uint64_t id, std::size_t bytes)
       stream->receive.set_max_data(stream->receive.read_offset() + increment);
       stream->consumed_since_update = 0;
       stream->pending_max_stream_data = true;
+      _impl->streams.mark_sendable(*stream);
     }
 
     _impl->consumed_since_max_data += taken;
@@ -1987,24 +2030,13 @@ void connection_t::consume_stream(std::uint64_t id, std::size_t bytes)
     }
   }
 
-  // Returning stream credit is the same idea as returning data credit, and
-  // belongs at the same moment: once the application is done with a stream the
-  // peer may open another in its place. It runs whether or not bytes moved,
-  // because what finishes a stream is often the read that took its last byte
-  // earlier, or a reset with nothing left to take.
-  //
-  // Reaping erases from the stream map, so `stream` must not be touched after
-  // this point.
-  const auto remote_initiator = _impl->config.role == tls_role_t::client ? stream_initiator_t::server : stream_initiator_t::client;
-  for (auto direction : {stream_direction_t::bidirectional, stream_direction_t::unidirectional})
-  {
-    const auto reaped = _impl->streams.reap_finished(direction, remote_initiator);
-    if (reaped > 0)
-    {
-      _impl->streams.grant_streams(direction, reaped);
-      _impl->max_streams_pending[direction == stream_direction_t::bidirectional ? 0 : 1] = true;
-    }
-  }
+  // Returning stream credit is the same idea as returning data credit: once
+  // the application is done with a stream the peer may open another in its
+  // place. It is noted whether or not bytes moved, because what finishes a
+  // stream is often the read that took its last byte earlier, or a reset with
+  // nothing left to take. The scan itself waits until the next packet is
+  // built.
+  _impl->reap_wanted = true;
 }
 
 std::vector<std::uint64_t> connection_t::readable_streams()
@@ -2051,6 +2083,7 @@ void connection_t::reset_stream(std::uint64_t id, std::uint64_t error_code)
   }
   stream->send.reset(error_code);
   stream->reset_pending = true;
+  _impl->streams.mark_sendable(*stream);
 }
 
 void connection_t::stop_sending(std::uint64_t id, std::uint64_t error_code)
@@ -2061,5 +2094,6 @@ void connection_t::stop_sending(std::uint64_t id, std::uint64_t error_code)
     return;
   }
   stream->stop_sending_pending = error_code;
+  _impl->streams.mark_sendable(*stream);
 }
 } // namespace vio::quic
