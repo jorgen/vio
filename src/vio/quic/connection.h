@@ -48,6 +48,7 @@
 
 #include "vio/error.h"
 #include "vio/quic/connection_id.h"
+#include "vio/quic/stream.h"
 #include "vio/quic/tls.h"
 #include "vio/quic/transport_parameters.h"
 #include "vio/tick.h"
@@ -61,6 +62,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace vio::quic
 {
@@ -155,6 +157,35 @@ public:
 
   // Queues a CONNECTION_CLOSE. The frame goes out on the next poll_send.
   void close(std::uint64_t error_code, std::string_view reason, bool application = false);
+
+  // Opens the next stream this endpoint may initiate, or nothing when the
+  // peer's limit is reached. Section 4.6 forbids exceeding it, so a caller is
+  // told to wait rather than allowed to break the rule.
+  [[nodiscard]] std::optional<std::uint64_t> open_stream(stream_direction_t direction);
+
+  // Queues data. Returns how much was accepted, which is everything unless the
+  // stream has already been finished or reset -- flow control bounds what goes
+  // on the wire, not what may be queued.
+  [[nodiscard]] std::size_t write_stream(std::uint64_t id, std::span<const std::uint8_t> data, bool fin = false);
+
+  // Contiguous bytes ready to be read. The span is invalidated by
+  // consume_stream and by receive.
+  [[nodiscard]] std::span<const std::uint8_t> readable_stream(std::uint64_t id);
+  void consume_stream(std::uint64_t id, std::size_t bytes);
+
+  [[nodiscard]] std::vector<std::uint64_t> readable_streams();
+
+  // The two halves finish independently -- that is the whole point of
+  // modelling them separately -- so a caller that wants to know whether it can
+  // stop reading asks a different question from one that wants to know whether
+  // everything it sent arrived.
+  [[nodiscard]] bool stream_receive_finished(std::uint64_t id);
+  [[nodiscard]] bool stream_send_finished(std::uint64_t id);
+
+  // Abandons the sending half; the peer is told with RESET_STREAM.
+  void reset_stream(std::uint64_t id, std::uint64_t error_code);
+  // Asks the peer to stop sending on the receiving half.
+  void stop_sending(std::uint64_t id, std::uint64_t error_code);
 
 private:
   connection_t() = default;

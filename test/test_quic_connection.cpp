@@ -791,6 +791,365 @@ TEST_CASE("a PTO backs off rather than retrying at a fixed rate")
   CHECK(secondwait > firstwait);
 }
 
+TEST_CASE("streams carry data end to end over a real connection")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+  REQUIRE(server->handshake_complete());
+
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+  // The first client-initiated bidirectional stream.
+  CHECK(*id == 0);
+
+  const std::string message = "the quick brown fox jumps over the lazy dog";
+  const std::vector<std::uint8_t> payload(message.begin(), message.end());
+  CHECK(client->write_stream(*id, payload, true) == payload.size());
+
+  run_handshake(*client, *server, at(0ns));
+
+  auto readable = server->readable_streams();
+  REQUIRE(readable.size() == 1);
+  CHECK(readable[0] == *id);
+  auto data = server->readable_stream(*id);
+  CHECK(std::string(reinterpret_cast<const char *>(data.data()), data.size()) == message);
+
+  SUBCASE("and the FIN arrived with it")
+  {
+    server->consume_stream(*id, data.size());
+    CHECK(server->stream_receive_finished(*id));
+  }
+
+  SUBCASE("the server can answer on the same stream")
+  {
+    server->consume_stream(*id, data.size());
+    const std::string reply = "and the dog did not care";
+    const std::vector<std::uint8_t> reply_bytes(reply.begin(), reply.end());
+    CHECK(server->write_stream(*id, reply_bytes, true) == reply_bytes.size());
+
+    run_handshake(*client, *server, at(0ns));
+
+    auto back = client->readable_stream(*id);
+    CHECK(std::string(reinterpret_cast<const char *>(back.data()), back.size()) == reply);
+  }
+}
+
+TEST_CASE("a stream larger than one packet is reassembled")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+
+  // Well over a datagram, so it must be split across several STREAM frames
+  // and put back together on the far side.
+  std::vector<std::uint8_t> payload(20000);
+  for (std::size_t i = 0; i < payload.size(); ++i)
+  {
+    payload[i] = static_cast<std::uint8_t>(i * 31 + 7);
+  }
+  CHECK(client->write_stream(*id, payload, true) == payload.size());
+
+  // Drain repeatedly, consuming as it arrives so the window keeps moving.
+  std::vector<std::uint8_t> received;
+  auto now = at(0ns);
+  for (int round = 0; round < 200; ++round)
+  {
+    bool moved = false;
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      REQUIRE(server->receive(datagram, now).has_value());
+      moved = true;
+    }
+
+    auto chunk = server->readable_stream(*id);
+    if (!chunk.empty())
+    {
+      received.insert(received.end(), chunk.begin(), chunk.end());
+      server->consume_stream(*id, chunk.size());
+      moved = true;
+    }
+
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = server->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      REQUIRE(client->receive(datagram, now).has_value());
+      moved = true;
+    }
+
+    if (!moved)
+    {
+      if (received.size() >= payload.size())
+      {
+        break;
+      }
+      auto deadline = client->next_timeout(now);
+      auto other = server->next_timeout(now);
+      if (other.has_value() && (!deadline.has_value() || *other < *deadline))
+      {
+        deadline = other;
+      }
+      REQUIRE(deadline.has_value());
+      now = *deadline > now ? *deadline : now + std::chrono::nanoseconds(1ms);
+    }
+  }
+
+  REQUIRE(received.size() == payload.size());
+  CHECK(received == payload);
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+}
+
+TEST_CASE("a peer that ignores the connection flow control limit is closed on")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  // The server advertises a tiny connection-level limit.
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.initial_max_data = 16;
+  server_config.transport_parameters.initial_max_stream_data_bidi_remote = 1000;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+
+  // A well-behaved client will not exceed the limit, so this asserts the
+  // other half of the contract: it stops rather than overrunning.
+  std::vector<std::uint8_t> payload(100, 0xab);
+  CHECK(client->write_stream(*id, payload, false) == payload.size());
+  run_handshake(*client, *server, at(0ns));
+
+  CHECK_FALSE(server->close_reason().has_value());
+  auto data = server->readable_stream(*id);
+  // Section 4.1: no more than the advertised sixteen bytes may arrive.
+  CHECK(data.size() <= 16);
+}
+
+TEST_CASE("a reset stream tells the peer how much credit it consumed")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+
+  std::vector<std::uint8_t> payload(50, 0x5a);
+  CHECK(client->write_stream(*id, payload, false) == payload.size());
+  client->reset_stream(*id, 42);
+
+  run_handshake(*client, *server, at(0ns));
+
+  // Section 4.5: the final size arrives whichever way the stream ended, so
+  // both endpoints agree what it cost.
+  CHECK(server->stream_receive_finished(*id));
+  CHECK_FALSE(server->close_reason().has_value());
+  CHECK_FALSE(client->close_reason().has_value());
+}
+
+TEST_CASE("STOP_SENDING reaches the peer and stops it")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+  std::vector<std::uint8_t> payload(20, 0x11);
+  CHECK(client->write_stream(*id, payload, false) == payload.size());
+  run_handshake(*client, *server, at(0ns));
+
+  server->stop_sending(*id, 13);
+  run_handshake(*client, *server, at(0ns));
+
+  // Section 3.5: the client answers a STOP_SENDING with a RESET_STREAM
+  // rather than continuing to send into a void.
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+  CHECK(client->stream_send_finished(*id));
+}
+
+TEST_CASE("streams survive a lossy link")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+
+  std::vector<std::uint8_t> payload(5000);
+  for (std::size_t i = 0; i < payload.size(); ++i)
+  {
+    payload[i] = static_cast<std::uint8_t>(i * 17 + 3);
+  }
+  CHECK(client->write_stream(*id, payload, true) == payload.size());
+
+  std::vector<std::uint8_t> received;
+  auto now = at(0ns);
+  int sent = 0;
+  int dropped = 0;
+
+  for (int round = 0; round < 400 && received.size() < payload.size(); ++round)
+  {
+    bool moved = false;
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      moved = true;
+      // Every third datagram never arrives.
+      if (sent++ % 3 == 1)
+      {
+        ++dropped;
+        continue;
+      }
+      REQUIRE(server->receive(datagram, now).has_value());
+    }
+
+    auto chunk = server->readable_stream(*id);
+    if (!chunk.empty())
+    {
+      received.insert(received.end(), chunk.begin(), chunk.end());
+      server->consume_stream(*id, chunk.size());
+      moved = true;
+    }
+
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = server->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      REQUIRE(client->receive(datagram, now).has_value());
+      moved = true;
+    }
+
+    if (!moved)
+    {
+      auto deadline = client->next_timeout(now);
+      auto other = server->next_timeout(now);
+      if (other.has_value() && (!deadline.has_value() || *other < *deadline))
+      {
+        deadline = other;
+      }
+      if (!deadline.has_value())
+      {
+        break;
+      }
+      now = *deadline > now ? *deadline : now + std::chrono::nanoseconds(1ms);
+    }
+  }
+
+  CHECK(dropped > 0);
+  REQUIRE(received.size() == payload.size());
+  CHECK(received == payload);
+}
+
 TEST_CASE("a configuration that cannot work is refused up front")
 {
   const auto identity = make_self_signed("localhost");

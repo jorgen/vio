@@ -30,6 +30,7 @@
 #include "vio/quic/loss_recovery.h"
 #include "vio/quic/packet.h"
 #include "vio/quic/protection.h"
+#include "vio/quic/streams.h"
 
 #include <algorithm>
 #include <array>
@@ -125,6 +126,19 @@ struct crypto_sender_t
   }
 };
 
+[[nodiscard]] streams_config_t make_streams_config(const connection_config_t &config)
+{
+  streams_config_t out;
+  out.local_initiator = config.role == tls_role_t::client ? stream_initiator_t::client : stream_initiator_t::server;
+  out.initial_max_data = config.transport_parameters.initial_max_data;
+  out.initial_max_stream_data_bidi_local = config.transport_parameters.initial_max_stream_data_bidi_local;
+  out.initial_max_stream_data_bidi_remote = config.transport_parameters.initial_max_stream_data_bidi_remote;
+  out.initial_max_stream_data_uni = config.transport_parameters.initial_max_stream_data_uni;
+  out.initial_max_streams_bidi = config.transport_parameters.initial_max_streams_bidi;
+  out.initial_max_streams_uni = config.transport_parameters.initial_max_streams_uni;
+  return out;
+}
+
 struct packet_space_t
 {
   crypto_stream_t crypto;
@@ -152,6 +166,7 @@ struct connection_impl_t
     : tls(std::move(session))
     , config(configuration)
     , congestion(configuration.max_datagram_size)
+    , streams(make_streams_config(configuration))
   {
   }
 
@@ -189,6 +204,12 @@ struct connection_impl_t
 
   loss_recovery_t recovery;
   congestion_control_t congestion;
+  streams_t streams;
+  // A window is only extended when the application has actually taken the
+  // data; sending MAX_DATA for bytes still sitting in a reassembly buffer
+  // would advertise capacity that does not exist.
+  bool max_data_pending = false;
+  std::uint64_t consumed_since_max_data = 0;
   // Appendix A.8 of RFC 9002: a client considers the server's address
   // validated once it has seen an acknowledgement at the Handshake level.
   bool received_handshake_ack = false;
@@ -303,6 +324,28 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         // Also retransmit, and section 13.3 says until acknowledged.
         impl.handshake_done_sent = false;
         break;
+      case frame_kind_t::stream:
+      {
+        // Retransmit: the same bytes at the same offset, exactly as for
+        // CRYPTO. The stream may have been reset since, in which case its
+        // send half refuses the range.
+        if (auto *stream = impl.streams.find(frame.stream_id); stream != nullptr && stream->has_send)
+        {
+          stream->send.on_range_lost(frame.offset, frame.length);
+        }
+        break;
+      }
+      case frame_kind_t::reset_stream:
+        if (auto *stream = impl.streams.find(frame.stream_id); stream != nullptr)
+        {
+          stream->reset_pending = true;
+        }
+        break;
+      case frame_kind_t::max_data:
+        // Resend current, not retransmit: the limit that applies now, which
+        // is why nothing here replays the bytes that went out.
+        impl.max_data_pending = true;
+        break;
       default:
         // PING and PADDING carry no information to repair; a stale ACK would
         // do more harm than good. Both are discard.
@@ -412,6 +455,7 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     }
 
     impl.peer_parameters = *parameters;
+    impl.streams.apply_peer_parameters(*parameters);
 
     // Section 4.9.2: a server confirms the handshake by completing it. A
     // client waits for HANDSHAKE_DONE.
@@ -506,10 +550,69 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       impl.handshake_confirmed = true;
       break;
 
+    case frame_kind_t::stream:
+    {
+      const auto error = impl.streams.receive_stream_frame(frame.stream_id, frame.offset, frame.data, frame.fin);
+      if (error != streams_error_t::none)
+      {
+        begin_close(impl, streams_error_code(error), "stream error", false, false);
+        return ack_eliciting;
+      }
+      break;
+    }
+
+    case frame_kind_t::reset_stream:
+    {
+      const auto error = impl.streams.receive_reset_stream(frame.stream_id, frame.error_code, frame.final_size);
+      if (error != streams_error_t::none)
+      {
+        begin_close(impl, streams_error_code(error), "stream reset error", false, false);
+        return ack_eliciting;
+      }
+      break;
+    }
+
+    case frame_kind_t::stop_sending:
+    {
+      const auto error = impl.streams.receive_stop_sending(frame.stream_id, frame.error_code);
+      if (error != streams_error_t::none)
+      {
+        begin_close(impl, streams_error_code(error), "stop sending error", false, false);
+        return ack_eliciting;
+      }
+      break;
+    }
+
+    case frame_kind_t::max_data:
+      impl.streams.set_peer_max_data(frame.maximum);
+      break;
+
+    case frame_kind_t::max_stream_data:
+    {
+      const auto error = impl.streams.receive_max_stream_data(frame.stream_id, frame.maximum);
+      if (error != streams_error_t::none)
+      {
+        begin_close(impl, streams_error_code(error), "max stream data error", false, false);
+        return ack_eliciting;
+      }
+      break;
+    }
+
+    case frame_kind_t::max_streams:
+      impl.streams.set_peer_max_streams(frame.bidirectional ? stream_direction_t::bidirectional : stream_direction_t::unidirectional, frame.maximum);
+      break;
+
+    case frame_kind_t::data_blocked:
+    case frame_kind_t::stream_data_blocked:
+    case frame_kind_t::streams_blocked:
+      // The peer is telling us it wants a bigger limit. Nothing is owed in
+      // reply beyond what the window update policy already does.
+      break;
+
     default:
-      // Streams, flow control and connection ID management are not
-      // implemented. Their frames are well formed and are accepted so the
-      // packet is still acknowledged, but nothing acts on them.
+      // NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, PATH_CHALLENGE,
+      // PATH_RESPONSE and NEW_TOKEN are parsed and acknowledged but not acted
+      // on: migration, connection ID rotation and Retry are not built.
       break;
     }
   }
@@ -630,7 +733,22 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   const bool want_close = impl.close_frame_pending && space.have_write;
   const bool want_probe = space.probe_pending;
 
-  if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe)
+  bool want_streams = false;
+  if (level == encryption_level_t::application && !want_close)
+  {
+    want_streams = impl.max_data_pending;
+    for (auto &entry : impl.streams.all())
+    {
+      auto &stream = entry.second;
+      if (stream.reset_pending || (stream.has_send && stream.send.has_pending()) || stream.pending_max_stream_data || stream.stop_sending_pending.has_value())
+      {
+        want_streams = true;
+        break;
+      }
+    }
+  }
+
+  if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe && !want_streams)
   {
     return std::size_t{0};
   }
@@ -760,10 +878,113 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     }
   }
 
+  std::size_t stream_bytes_written = 0;
+  if (want_streams)
+  {
+    // Section 4.1: a window update says what this endpoint is now willing to
+    // receive in total, so it is recomputed at send time rather than queued
+    // with a stale number.
+    if (impl.max_data_pending)
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::max_data;
+      frame.maximum = impl.streams.local_max_data();
+      if (frames.write(frame))
+      {
+        impl.max_data_pending = false;
+        record.push_back(sent_frame_t{.kind = frame_kind_t::max_data});
+      }
+    }
+
+    for (auto &entry : impl.streams.all())
+    {
+      auto &stream = entry.second;
+
+      if (stream.pending_max_stream_data && stream.has_receive)
+      {
+        frame_t frame;
+        frame.kind = frame_kind_t::max_stream_data;
+        frame.stream_id = stream.id;
+        frame.maximum = stream.receive.max_data();
+        if (frames.write(frame))
+        {
+          stream.pending_max_stream_data = false;
+          record.push_back(sent_frame_t{.kind = frame_kind_t::max_stream_data, .stream_id = stream.id});
+        }
+      }
+
+      if (stream.stop_sending_pending.has_value() && stream.has_receive)
+      {
+        frame_t frame;
+        frame.kind = frame_kind_t::stop_sending;
+        frame.stream_id = stream.id;
+        frame.error_code = *stream.stop_sending_pending;
+        if (frames.write(frame))
+        {
+          stream.stop_sending_pending.reset();
+          record.push_back(sent_frame_t{.kind = frame_kind_t::stop_sending, .stream_id = stream.id});
+        }
+      }
+
+      if (stream.reset_pending && stream.has_send)
+      {
+        frame_t frame;
+        frame.kind = frame_kind_t::reset_stream;
+        frame.stream_id = stream.id;
+        frame.error_code = stream.send.reset_error().value_or(0);
+        frame.final_size = stream.send.final_size();
+        if (frames.write(frame))
+        {
+          stream.reset_pending = false;
+          record.push_back(sent_frame_t{.kind = frame_kind_t::reset_stream, .stream_id = stream.id});
+        }
+        continue;
+      }
+
+      if (!stream.has_send || !stream.send.has_pending())
+      {
+        continue;
+      }
+
+      // A STREAM frame costs its type byte, the id, the offset and the
+      // length; leave room for all four before deciding how much data fits.
+      const std::size_t available = frames.remaining();
+      const std::size_t overhead = 1 + varint_size(stream.id) + varint_size(stream.send.sent_offset()) + 2;
+      if (available <= overhead)
+      {
+        continue;
+      }
+      auto chunk = stream.send.next_chunk(available - overhead, impl.streams.connection_send_window());
+      if (!chunk.has_value())
+      {
+        continue;
+      }
+
+      frame_t frame;
+      frame.kind = frame_kind_t::stream;
+      frame.stream_id = stream.id;
+      frame.offset = chunk->offset;
+      frame.data = chunk->data;
+      frame.fin = chunk->fin;
+      if (!frames.write(frame))
+      {
+        continue;
+      }
+      record.push_back(sent_frame_t{.kind = frame_kind_t::stream, .offset = chunk->offset, .length = chunk->data.size(), .stream_id = stream.id});
+      stream.send.on_chunk_sent(*chunk);
+      if (!chunk->retransmit)
+      {
+        // Only new data consumes connection-level credit; a retransmission
+        // was charged when it first went out.
+        stream_bytes_written += chunk->data.size();
+      }
+    }
+  }
+
   // A probe has to elicit an acknowledgement; if nothing else in this packet
   // will, a PING is the cheapest thing that does.
   bool wrote_ping = false;
-  if (want_probe && !want_close && crypto_written == 0 && !wrote_handshake_done)
+  if (want_probe && !want_close && crypto_written == 0 && !wrote_handshake_done && stream_bytes_written == 0)
   {
     frame_t frame;
     frame.kind = frame_kind_t::ping;
@@ -830,6 +1051,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     impl.handshake_done_sent = true;
   }
   space.probe_pending = false;
+  impl.streams.on_data_sent(stream_bytes_written);
 
   // Section 2 of RFC 9002: ACK, PADDING and CONNECTION_CLOSE neither elicit an
   // acknowledgement nor count against the congestion window, so a packet
@@ -837,7 +1059,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   sent_packet_t sent;
   sent.packet_number = packet_number;
   sent.time_sent = now;
-  sent.ack_eliciting = crypto_written > 0 || wrote_handshake_done || wrote_ping;
+  sent.ack_eliciting = crypto_written > 0 || wrote_handshake_done || wrote_ping || !record.empty();
   sent.in_flight = sent.ack_eliciting;
   sent.size = *length;
   sent.frames = std::move(record);
@@ -1190,5 +1412,128 @@ std::optional<connection_close_t> connection_t::close_reason() const
 void connection_t::close(std::uint64_t error_code, std::string_view reason, bool application)
 {
   begin_close(*_impl, error_code, reason, application, false);
+}
+
+std::optional<std::uint64_t> connection_t::open_stream(stream_direction_t direction)
+{
+  return _impl->streams.open(direction);
+}
+
+std::size_t connection_t::write_stream(std::uint64_t id, std::span<const std::uint8_t> data, bool fin)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_send)
+  {
+    return 0;
+  }
+  if (!stream->send.write(data, fin))
+  {
+    return 0;
+  }
+  return data.size();
+}
+
+std::span<const std::uint8_t> connection_t::readable_stream(std::uint64_t id)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_receive)
+  {
+    return {};
+  }
+  return stream->receive.readable();
+}
+
+void connection_t::consume_stream(std::uint64_t id, std::size_t bytes)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_receive)
+  {
+    return;
+  }
+  const auto before = stream->receive.read_offset();
+  stream->receive.consume(bytes);
+  const auto taken = stream->receive.read_offset() - before;
+  if (taken == 0)
+  {
+    return;
+  }
+
+  // Section 4.1: the peer may send more once this endpoint has actually taken
+  // the data. Updating on every byte would spend a frame per read, so the
+  // window is extended once it has been half consumed -- early enough that the
+  // peer never stalls waiting for credit.
+  stream->consumed_since_update += taken;
+  const auto stream_window = stream->receive.max_data() - stream->receive.read_offset();
+  if (stream->consumed_since_update * 2 >= stream_window + stream->consumed_since_update)
+  {
+    stream->receive.set_max_data(stream->receive.read_offset() + _impl->config.transport_parameters.initial_max_stream_data_bidi_local);
+    stream->consumed_since_update = 0;
+    stream->pending_max_stream_data = true;
+  }
+
+  _impl->consumed_since_max_data += taken;
+  const auto connection_window = _impl->streams.local_max_data() - _impl->streams.data_received();
+  if (_impl->consumed_since_max_data * 2 >= connection_window + _impl->consumed_since_max_data)
+  {
+    _impl->streams.set_local_max_data(_impl->streams.local_max_data() + _impl->consumed_since_max_data);
+    _impl->consumed_since_max_data = 0;
+    _impl->max_data_pending = true;
+  }
+}
+
+std::vector<std::uint64_t> connection_t::readable_streams()
+{
+  std::vector<std::uint64_t> out;
+  for (auto &entry : _impl->streams.all())
+  {
+    if (entry.second.has_receive && !entry.second.receive.readable().empty())
+    {
+      out.push_back(entry.first);
+    }
+  }
+  return out;
+}
+
+bool connection_t::stream_receive_finished(std::uint64_t id)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_receive)
+  {
+    return false;
+  }
+  const auto state = stream->receive.state();
+  return state == receive_state_t::data_received || state == receive_state_t::data_read || state == receive_state_t::reset_received || state == receive_state_t::reset_read;
+}
+
+bool connection_t::stream_send_finished(std::uint64_t id)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_send)
+  {
+    return false;
+  }
+  const auto state = stream->send.state();
+  return state == send_state_t::data_received || state == send_state_t::reset_sent || state == send_state_t::reset_received;
+}
+
+void connection_t::reset_stream(std::uint64_t id, std::uint64_t error_code)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_send)
+  {
+    return;
+  }
+  stream->send.reset(error_code);
+  stream->reset_pending = true;
+}
+
+void connection_t::stop_sending(std::uint64_t id, std::uint64_t error_code)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_receive)
+  {
+    return;
+  }
+  stream->stop_sending_pending = error_code;
 }
 } // namespace vio::quic

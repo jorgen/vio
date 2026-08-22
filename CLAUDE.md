@@ -139,8 +139,8 @@ Configuration is in `.clang-tidy` at the project root.
   Everything TLS produces is kept per level until acknowledged so a lost CRYPTO
   frame can be resent byte for byte, and a PTO probe carries outstanding data
   rather than a bare PING (section 6.2.4) -- during a handshake a PING would
-  elicit an ACK while telling the peer nothing it is waiting for. Streams, flow
-  control, migration, Retry and key update are **not** built yet. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+  elicit an ACK while telling the peer nothing it is waiting for. Migration,
+  Retry and key update are **not** built yet. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
   transcribed from the appendix A pseudocode. A sent packet records *what it
   meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes
@@ -150,6 +150,14 @@ Configuration is in `.clang-tidy` at the project root.
   packet), congestion avoidance with the integer remainder carried, and
   persistent congestion. `poll_send` will not exceed the window, except for a
   PTO probe or a CONNECTION_CLOSE, which section 7.5 exempts.
+  `stream.h` and `streams.h` are sections 2 to 4: a stream is two independent
+  halves that share an identifier, each with its own state machine and its own
+  flow control limit, which is why `connection_t` asks
+  `stream_receive_finished` and `stream_send_finished` separately. Final size
+  is the idea that ties them to connection-level accounting -- a sender always
+  communicates it, by FIN or by RESET_STREAM, so both endpoints agree exactly
+  how much credit the stream consumed, and a later frame implying a different
+  one is a FINAL_SIZE_ERROR.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 
