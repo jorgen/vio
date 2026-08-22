@@ -17,6 +17,7 @@ add_executable(vio_tests
     test_quic_packet.cpp
     test_quic_protection.cpp
     test_quic_tls.cpp
+    test_quic_reassembly.cpp
     test_http_client.cpp
     test_http_cache.cpp
     test_file.cpp

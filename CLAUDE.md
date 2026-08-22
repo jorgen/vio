@@ -123,6 +123,10 @@ Configuration is in `.clang-tidy` at the project root.
   level already in flight. 0-RTT is refused there explicitly rather than
   silently. `test_quic_tls.cpp` runs a full handshake with no socket under it
   and then protects and opens a packet with the secrets it produced.
+  `crypto_stream.h` reassembles CRYPTO frames into the ordered byte stream
+  `tls.h` requires (merging overlaps, bounded per section 7.5), and
+  `ack_tracker.h` holds what has been received in one packet number space and
+  turns it into the descending ACK encoding of section 19.3.1.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 
