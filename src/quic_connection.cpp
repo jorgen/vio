@@ -24,6 +24,7 @@
 
 #include "vio/crypto.h"
 #include "vio/quic/ack_tracker.h"
+#include "vio/quic/congestion_control.h"
 #include "vio/quic/crypto_stream.h"
 #include "vio/quic/frame_codec.h"
 #include "vio/quic/loss_recovery.h"
@@ -150,6 +151,7 @@ struct connection_impl_t
   connection_impl_t(tls_session_t &&session, const connection_config_t &configuration)
     : tls(std::move(session))
     , config(configuration)
+    , congestion(configuration.max_datagram_size)
   {
   }
 
@@ -186,6 +188,7 @@ struct connection_impl_t
   std::optional<transport_parameters_t> peer_parameters;
 
   loss_recovery_t recovery;
+  congestion_control_t congestion;
   // Appendix A.8 of RFC 9002: a client considers the server's address
   // validated once it has seen an acknowledgement at the Handshake level.
   bool received_handshake_ack = false;
@@ -463,6 +466,11 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       {
         impl.received_handshake_ack = true;
       }
+      for (const auto &acked : outcome.acknowledged)
+      {
+        impl.congestion.on_packet_acked(acked);
+      }
+      impl.congestion.on_packets_lost(outcome.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
       repair_lost(impl, space, outcome.lost);
       break;
     }
@@ -993,6 +1001,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     auto expiry = impl.recovery.on_loss_detection_timeout(now, context);
     if (expiry.loss_space.has_value())
     {
+      impl.congestion.on_packets_lost(expiry.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
       repair_lost(impl, *expiry.loss_space, expiry.lost);
     }
     if (expiry.probe_space.has_value())
@@ -1017,6 +1026,19 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
         }
       }
     }
+  }
+
+  // Section 7.5: a probe is never blocked by the controller, and neither is a
+  // CONNECTION_CLOSE -- both have to get out for the connection to make any
+  // progress at all. Everything else waits for the window.
+  bool probing = impl.close_frame_pending;
+  for (auto level : ordered_levels)
+  {
+    probing = probing || impl.spaces[space_index(level)].probe_pending;
+  }
+  if (!probing && impl.recovery.bytes_in_flight() >= impl.congestion.window())
+  {
+    return std::size_t{0};
   }
 
   std::size_t budget = std::min(out.size(), impl.config.max_datagram_size);

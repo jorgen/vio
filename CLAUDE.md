@@ -139,14 +139,17 @@ Configuration is in `.clang-tidy` at the project root.
   Everything TLS produces is kept per level until acknowledged so a lost CRYPTO
   frame can be resent byte for byte, and a PTO probe carries outstanding data
   rather than a bare PING (section 6.2.4) -- during a handshake a PING would
-  elicit an ACK while telling the peer nothing it is waiting for. Congestion
-  control, streams, flow control, migration, Retry and key update are **not**
-  built yet. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+  elicit an ACK while telling the peer nothing it is waiting for. Streams, flow
+  control, migration, Retry and key update are **not** built yet. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
   transcribed from the appendix A pseudocode. A sent packet records *what it
   meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes
-  the `resend_current` loss policy in `frame.h` implementable. Congestion
-  control (section 7) is still to come.
+  the `resend_current` loss policy in `frame.h` implementable.
+  `congestion_control.h` is section 7 NewReno on top of it: slow start,
+  recovery periods (a lost round trip is one congestion event, not one per
+  packet), congestion avoidance with the integer remainder carried, and
+  persistent congestion. `poll_send` will not exceed the window, except for a
+  PTO probe or a CONNECTION_CLOSE, which section 7.5 exempts.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 

@@ -306,6 +306,10 @@ public:
         // Section 5.3: the application space is the only one whose ACK delay
         // is bounded by max_ack_delay, and only after confirmation.
         _rtt.on_rtt_sample(now - packet.time_sent, delay, context.handshake_confirmed && space == pn_space_t::application, context.max_ack_delay);
+        if (!_first_rtt_sample.has_value())
+        {
+          _first_rtt_sample = now;
+        }
         outcome.rtt_updated = true;
         break;
       }
@@ -438,6 +442,14 @@ public:
   [[nodiscard]] std::uint64_t pto_count() const
   {
     return _pto_count;
+  }
+
+  // When the first round trip measurement arrived. Section 7.6.2 forbids
+  // declaring persistent congestion before there is one, because until then
+  // the PTO is armed from a guess.
+  [[nodiscard]] std::optional<tick_t> first_rtt_sample() const
+  {
+    return _first_rtt_sample;
   }
 
   [[nodiscard]] bool ack_eliciting_in_flight() const
@@ -618,5 +630,6 @@ private:
   rtt_estimator_t _rtt;
   std::size_t _bytes_in_flight = 0;
   std::uint64_t _pto_count = 0;
+  std::optional<tick_t> _first_rtt_sample;
 };
 } // namespace vio::quic
