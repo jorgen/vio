@@ -83,6 +83,7 @@ inline constexpr std::uint64_t transport_error_no_error = 0x00;
 inline constexpr std::uint64_t transport_error_internal = 0x01;
 inline constexpr std::uint64_t transport_error_protocol_violation = 0x0a;
 inline constexpr std::uint64_t transport_error_crypto_buffer_exceeded = 0x0d;
+inline constexpr std::uint64_t transport_error_aead_limit_reached = 0x0f;
 
 struct connection_close_t
 {

@@ -165,6 +165,8 @@ struct packet_space_t
   // previous generation immediately would drop perfectly good data.
   packet_protection_t read_previous;
   bool have_previous = false;
+  // Section 6.6: how many packets have been protected under the current key.
+  std::uint64_t packets_encrypted = 0;
   // The phase this endpoint is sending in, and expecting to receive in.
   bool key_phase = false;
   // Section 6.1: another update may not begin until a packet from this phase
@@ -245,9 +247,29 @@ struct connection_impl_t
   // would advertise capacity that does not exist.
   bool max_data_pending = false;
   std::uint64_t consumed_since_max_data = 0;
+  // Section 4.6: credit to return to the peer for streams it opened and this
+  // endpoint has finished with.
+  std::array<bool, 2> max_streams_pending = {};
   // Appendix A.8 of RFC 9002: a client considers the server's address
   // validated once it has seen an acknowledgement at the Handshake level.
   bool received_handshake_ack = false;
+  // Section 6.6: forgery attempts, counted across every key for the life of
+  // the connection.
+  std::uint64_t packets_failed_authentication = 0;
+  // How many packets have been authenticated and acted on, which is what
+  // section 10.1 means by a packet received and processed.
+  std::uint64_t packets_processed = 0;
+  // Section 17.2.5.2: once an Initial has been processed from the server, a
+  // Retry is too late to be genuine.
+  bool received_server_initial = false;
+  // Section 10.1. Zero disables it.
+  std::chrono::nanoseconds idle_timeout{};
+  tick_t last_activity;
+  bool activity_seen = false;
+  // Section 10.1 also restarts the timer on sending an ack-eliciting packet,
+  // but only the first since the last one received -- otherwise an endpoint
+  // that keeps talking to a peer that has vanished would never time out.
+  bool idle_since_last_receive = false;
 };
 } // namespace detail
 
@@ -334,6 +356,20 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   impl.recovery.discard_space(to_pn_space(level));
 }
 
+// Section 10.1: floored at three times the current PTO, so a peer advertising
+// a very small value cannot make the connection unusable before loss recovery
+// has had a chance to work.
+[[nodiscard]] std::optional<tick_t> idle_deadline(const connection_impl_t &impl)
+{
+  if (impl.idle_timeout == std::chrono::nanoseconds::zero() || !impl.activity_seen)
+  {
+    return std::nullopt;
+  }
+  const auto pto = impl.recovery.rtt().pto_base() + impl.config.max_ack_delay;
+  const auto period = std::max(impl.idle_timeout, pto * 3);
+  return impl.last_activity + period;
+}
+
 [[nodiscard]] recovery_context_t recovery_context(const connection_impl_t &impl)
 {
   recovery_context_t context;
@@ -406,6 +442,10 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         // Resend current, not retransmit: the limit that applies now, which
         // is why nothing here replays the bytes that went out.
         impl.max_data_pending = true;
+        break;
+      case frame_kind_t::max_streams:
+        impl.max_streams_pending[0] = true;
+        impl.max_streams_pending[1] = true;
         break;
       default:
         // PING and PADDING carry no information to repair; a stale ACK would
@@ -525,6 +565,22 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
 
     impl.peer_parameters = *parameters;
     impl.streams.apply_peer_parameters(*parameters);
+
+    // Section 10.1: the effective timeout is the smaller of the two advertised
+    // values, or the sole one when only a single endpoint asks for a limit.
+    // Zero on both sides means the connection never expires on its own.
+    const auto local = impl.config.transport_parameters.max_idle_timeout;
+    const auto remote = parameters->max_idle_timeout;
+    std::uint64_t effective = 0;
+    if (local != 0 && remote != 0)
+    {
+      effective = std::min(local, remote);
+    }
+    else
+    {
+      effective = local != 0 ? local : remote;
+    }
+    impl.idle_timeout = std::chrono::milliseconds(static_cast<std::int64_t>(effective));
 
     // Section 4.9.2: a server confirms the handshake by completing it. A
     // client waits for HANDSHAKE_DONE.
@@ -735,6 +791,8 @@ std::expected<void, error_t> advance_key_phase(packet_space_t &space, bool move_
   space.key_phase = !space.key_phase;
   space.first_packet_in_phase = space.next_packet_number;
   space.phase_acknowledged = false;
+  // Section 6.6: the count is per key, so it starts again with the new one.
+  space.packets_encrypted = 0;
   return derive_next_generation(space);
 }
 
@@ -747,10 +805,12 @@ std::expected<void, error_t> receive_retry(connection_impl_t &impl, const packet
   {
     return {};
   }
-  if (impl.retry_handled || impl.handshake_complete)
+  if (impl.retry_handled || impl.handshake_complete || impl.received_server_initial)
   {
-    // At most one per connection attempt, and none once the handshake has
-    // moved on.
+    // Section 17.2.5.2: at most one per connection attempt, and none once an
+    // Initial has been processed from the server -- by then the handshake has
+    // started and a Retry could only be an injected attempt to restart it
+    // against a different server.
     return {};
   }
   if (header.retry_token.empty())
@@ -939,6 +999,15 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     if (is_connection_error(opened.error()))
     {
       begin_close(impl, transport_error_protocol_violation, "reserved bits set", false, false);
+      return {};
+    }
+    // Section 6.6: every packet that fails to authenticate is a forgery
+    // attempt, and enough of them across the connection means the key can no
+    // longer be trusted to reject the next one.
+    ++impl.packets_failed_authentication;
+    if (impl.packets_failed_authentication > aead_integrity_limit(space.read.suite().aead))
+    {
+      begin_close(impl, transport_error_aead_limit_reached, "AEAD integrity limit reached", false, false);
     }
     return {};
   }
@@ -958,6 +1027,11 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   if (space.acks.is_duplicate(opened->packet_number))
   {
     return {};
+  }
+
+  if (header.kind == packet_kind_t::initial && impl.config.role == tls_role_t::client)
+  {
+    impl.received_server_initial = true;
   }
 
   if (is_long_header(header.kind) && !impl.peer_connection_id_confirmed)
@@ -986,6 +1060,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     return std::unexpected(ack_eliciting.error());
   }
   space.acks.on_packet_received(opened->packet_number, *ack_eliciting, now);
+  ++impl.packets_processed;
 
   // Keys for the next packet in this same datagram may depend on this one:
   // that is exactly why senders coalesce Initial before Handshake.
@@ -1058,7 +1133,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   bool want_streams = false;
   if (level == encryption_level_t::application && !want_close)
   {
-    want_streams = impl.max_data_pending;
+    want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1];
     for (auto &entry : impl.streams.all())
     {
       auto &stream = entry.second;
@@ -1219,6 +1294,24 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       }
     }
 
+    for (std::size_t i = 0; i < impl.max_streams_pending.size(); ++i)
+    {
+      if (!impl.max_streams_pending[i])
+      {
+        continue;
+      }
+      const auto direction = i == 0 ? stream_direction_t::bidirectional : stream_direction_t::unidirectional;
+      frame_t frame;
+      frame.kind = frame_kind_t::max_streams;
+      frame.bidirectional = direction == stream_direction_t::bidirectional;
+      frame.maximum = impl.streams.local_max_streams(direction);
+      if (frames.write(frame))
+      {
+        impl.max_streams_pending[i] = false;
+        record.push_back(sent_frame_t{.kind = frame_kind_t::max_streams});
+      }
+    }
+
     for (auto &entry : impl.streams.all())
     {
       auto &stream = entry.second;
@@ -1341,11 +1434,21 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   {
     return std::size_t{0};
   }
+  // Section 6.6: a key that has protected too many packets must not protect
+  // another. The connection ends rather than continuing on a key that is no
+  // longer doing its job.
+  if (space.packets_encrypted >= aead_confidentiality_limit(space.write.suite().aead))
+  {
+    begin_close(impl, transport_error_aead_limit_reached, "AEAD confidentiality limit reached", false, false);
+    return std::size_t{0};
+  }
+
   auto length = protect_packet(space.write, space.write_header, out, *layout, packet_number);
   if (!length.has_value())
   {
     return std::unexpected(length.error());
   }
+  ++space.packets_encrypted;
 
   space.next_packet_number = packet_number + 1;
   if (crypto_written > 0)
@@ -1481,6 +1584,10 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
     return {};
   }
   impl.bytes_received += datagram.size();
+  // Section 10.1: the timer restarts on a packet received and processed. The
+  // datagram has not been authenticated yet, so this is refined below to only
+  // count when something in it actually opened.
+  const std::uint64_t processed_before = impl.packets_processed;
 
   // A server has to know the client's connection ID before it can answer, and
   // it only learns it from the first Initial. Setting the transport parameters
@@ -1527,12 +1634,28 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
       break;
     }
   }
+
+  if (impl.packets_processed != processed_before)
+  {
+    impl.last_activity = now;
+    impl.activity_seen = true;
+    impl.idle_since_last_receive = false;
+  }
   return {};
 }
 
 std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8_t> out, tick_t now)
 {
   auto &impl = *_impl;
+  if (auto deadline = idle_deadline(impl); deadline.has_value() && now >= *deadline)
+  {
+    // Section 10.1: silently closed and the state discarded. No
+    // CONNECTION_CLOSE goes out -- there is nobody there to read it, which is
+    // the whole reason the timer fired.
+    impl.state = connection_state_t::closed;
+    impl.close_frame_pending = false;
+    return std::size_t{0};
+  }
   if (impl.state == connection_state_t::closed)
   {
     return std::size_t{0};
@@ -1664,6 +1787,12 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   }
 
   impl.bytes_sent += written;
+  if (!impl.idle_since_last_receive && impl.recovery.ack_eliciting_in_flight())
+  {
+    impl.last_activity = now;
+    impl.activity_seen = true;
+    impl.idle_since_last_receive = true;
+  }
   if (impl.close_frame_pending)
   {
     impl.close_frame_pending = false;
@@ -1706,6 +1835,7 @@ std::optional<tick_t> connection_t::next_timeout(tick_t now) const
   // Whichever comes first: an acknowledgement this endpoint owes, or the loss
   // detection timer telling it something of its own has gone missing.
   consider(_impl->recovery.loss_detection_timer(now, recovery_context(*_impl)));
+  consider(idle_deadline(*_impl));
   return earliest;
 }
 
@@ -1813,31 +1943,57 @@ void connection_t::consume_stream(std::uint64_t id, std::size_t bytes)
   const auto before = stream->receive.read_offset();
   stream->receive.consume(bytes);
   const auto taken = stream->receive.read_offset() - before;
-  if (taken == 0)
+
+  if (taken > 0)
   {
-    return;
+    // Section 4.1: the peer may send more once this endpoint has actually
+    // taken the data. Updating on every byte would spend a frame per read, so
+    // the window is extended once it has been half consumed -- early enough
+    // that the peer never stalls waiting for credit.
+    stream->consumed_since_update += taken;
+    const auto stream_window = stream->receive.max_data() - stream->receive.read_offset();
+    if (stream->consumed_since_update * 2 >= stream_window + stream->consumed_since_update)
+    {
+      // Section 18.2: which of the three limits applies depends on the stream
+      // type. Growing every window by the bidirectional-local figure would
+      // give the wrong amount of credit to two of the three kinds.
+      const auto &parameters = _impl->config.transport_parameters;
+      const auto local_initiator = _impl->config.role == tls_role_t::client ? stream_initiator_t::client : stream_initiator_t::server;
+      const std::uint64_t increment = stream_direction(id) == stream_direction_t::unidirectional ? parameters.initial_max_stream_data_uni
+                                      : stream_initiator(id) == local_initiator                  ? parameters.initial_max_stream_data_bidi_local
+                                                                                                 : parameters.initial_max_stream_data_bidi_remote;
+      stream->receive.set_max_data(stream->receive.read_offset() + increment);
+      stream->consumed_since_update = 0;
+      stream->pending_max_stream_data = true;
+    }
+
+    _impl->consumed_since_max_data += taken;
+    const auto connection_window = _impl->streams.local_max_data() - _impl->streams.data_received();
+    if (_impl->consumed_since_max_data * 2 >= connection_window + _impl->consumed_since_max_data)
+    {
+      _impl->streams.set_local_max_data(_impl->streams.local_max_data() + _impl->consumed_since_max_data);
+      _impl->consumed_since_max_data = 0;
+      _impl->max_data_pending = true;
+    }
   }
 
-  // Section 4.1: the peer may send more once this endpoint has actually taken
-  // the data. Updating on every byte would spend a frame per read, so the
-  // window is extended once it has been half consumed -- early enough that the
-  // peer never stalls waiting for credit.
-  stream->consumed_since_update += taken;
-  const auto stream_window = stream->receive.max_data() - stream->receive.read_offset();
-  if (stream->consumed_since_update * 2 >= stream_window + stream->consumed_since_update)
+  // Returning stream credit is the same idea as returning data credit, and
+  // belongs at the same moment: once the application is done with a stream the
+  // peer may open another in its place. It runs whether or not bytes moved,
+  // because what finishes a stream is often the read that took its last byte
+  // earlier, or a reset with nothing left to take.
+  //
+  // Reaping erases from the stream map, so `stream` must not be touched after
+  // this point.
+  const auto remote_initiator = _impl->config.role == tls_role_t::client ? stream_initiator_t::server : stream_initiator_t::client;
+  for (auto direction : {stream_direction_t::bidirectional, stream_direction_t::unidirectional})
   {
-    stream->receive.set_max_data(stream->receive.read_offset() + _impl->config.transport_parameters.initial_max_stream_data_bidi_local);
-    stream->consumed_since_update = 0;
-    stream->pending_max_stream_data = true;
-  }
-
-  _impl->consumed_since_max_data += taken;
-  const auto connection_window = _impl->streams.local_max_data() - _impl->streams.data_received();
-  if (_impl->consumed_since_max_data * 2 >= connection_window + _impl->consumed_since_max_data)
-  {
-    _impl->streams.set_local_max_data(_impl->streams.local_max_data() + _impl->consumed_since_max_data);
-    _impl->consumed_since_max_data = 0;
-    _impl->max_data_pending = true;
+    const auto reaped = _impl->streams.reap_finished(direction, remote_initiator);
+    if (reaped > 0)
+    {
+      _impl->streams.grant_streams(direction, reaped);
+      _impl->max_streams_pending[direction == stream_direction_t::bidirectional ? 0 : 1] = true;
+    }
   }
 }
 

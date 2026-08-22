@@ -1465,6 +1465,160 @@ TEST_CASE("a key update cannot be initiated before the handshake is confirmed")
   CHECK_FALSE(client->key_phase());
 }
 
+TEST_CASE("an idle connection is discarded once both sides stop talking")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.max_idle_timeout = 30000;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  // Section 10.1: the effective value is the smaller of the two.
+  client_config.transport_parameters.max_idle_timeout = 5000;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  auto deadline = client->next_timeout(at(0ns));
+  REQUIRE(deadline.has_value());
+
+  std::vector<std::uint8_t> datagram(1500);
+  auto idle = client->poll_send(datagram, at(1s));
+  REQUIRE(idle.has_value());
+  CHECK(client->state() != connection_state_t::closed);
+
+  auto expired = client->poll_send(datagram, at(120s));
+  REQUIRE(expired.has_value());
+  CHECK(*expired == 0);
+  // Silently, with no CONNECTION_CLOSE: there is nobody there to read one,
+  // which is why the timer fired.
+  CHECK(client->state() == connection_state_t::closed);
+  CHECK_FALSE(client->close_reason().has_value());
+
+  SUBCASE("and a connection with no advertised timeout never expires")
+  {
+    connection_config_t forever;
+    forever.role = tls_role_t::client;
+    forever.transport_parameters = sane_parameters();
+    forever.transport_parameters.max_idle_timeout = 0;
+    auto other_server = connection_t::create(contexts.server_context, server_config);
+    REQUIRE(other_server.has_value());
+    auto patient = connection_t::create(contexts.client_context, forever, "localhost");
+    REQUIRE(patient.has_value());
+    run_handshake(*patient, *other_server, at(0ns));
+    // The server still advertises one, so the sole non-zero value applies.
+    CHECK(patient->next_timeout(at(0ns)).has_value());
+  }
+}
+
+TEST_CASE("stream credit comes back as the application finishes with streams")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  // Room for exactly one peer-initiated bidirectional stream at a time.
+  server_config.transport_parameters.initial_max_streams_bidi = 1;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  auto first = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(first.has_value());
+  // Section 4.6: the peer said one, so one it is.
+  CHECK_FALSE(client->open_stream(stream_direction_t::bidirectional).has_value());
+
+  const std::vector<std::uint8_t> payload = {'h', 'i'};
+  CHECK(client->write_stream(*first, payload, true) == payload.size());
+  run_handshake(*client, *server, at(0ns));
+
+  auto data = server->readable_stream(*first);
+  REQUIRE(data.size() == payload.size());
+  server->consume_stream(*first, data.size());
+  // The server's own half is finished too, so the stream is done with.
+  server->reset_stream(*first, 0);
+  server->consume_stream(*first, 0);
+  run_handshake(*client, *server, at(0ns));
+
+  // A MAX_STREAMS came back, so the client may open another.
+  auto second = client->open_stream(stream_direction_t::bidirectional);
+  CHECK(second.has_value());
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+}
+
+TEST_CASE("a Retry arriving after the handshake has started is ignored")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  retry_token_key_t retry_key;
+  REQUIRE(retry_key.generate().has_value());
+  const std::vector<std::uint8_t> address = {10, 1, 1, 1};
+
+  // One pair that does a Retry, purely to obtain a well-formed Retry packet.
+  connection_config_t retry_server_config;
+  retry_server_config.role = tls_role_t::server;
+  retry_server_config.transport_parameters = sane_parameters();
+  retry_server_config.retry_key = &retry_key;
+  retry_server_config.peer_address = address;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto retry_server = connection_t::create(contexts.server_context, retry_server_config);
+  REQUIRE(retry_server.has_value());
+  auto bait = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(bait.has_value());
+  std::vector<std::uint8_t> hello(1500);
+  auto hello_size = bait->poll_send(hello, at(0ns));
+  REQUIRE(hello_size.has_value());
+  hello.resize(*hello_size);
+  REQUIRE(retry_server->receive(hello, at(0ns)).has_value());
+  std::vector<std::uint8_t> retry(1500);
+  auto retry_size = retry_server->poll_send(retry, at(0ns));
+  REQUIRE(retry_size.has_value());
+  retry.resize(*retry_size);
+
+  // A separate, ordinary handshake that gets as far as a server Initial.
+  connection_config_t plain_server_config;
+  plain_server_config.role = tls_role_t::server;
+  plain_server_config.transport_parameters = sane_parameters();
+  auto server = connection_t::create(contexts.server_context, plain_server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  const auto established = client->peer_connection_id();
+  REQUIRE(client->receive(retry, at(0ns)).has_value());
+  // Section 17.2.5.2: too late. Acting on it would let anyone on the path
+  // redirect an established connection.
+  CHECK_FALSE(client->address_validated_by_retry());
+  CHECK(client->peer_connection_id() == established);
+}
+
 TEST_CASE("a configuration that cannot work is refused up front")
 {
   const auto identity = make_self_signed("localhost");

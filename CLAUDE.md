@@ -148,7 +148,12 @@ Configuration is in `.clang-tidy` at the project root.
   previous, current, next -- and derives the next one up front, since deriving
   on demand leaks when updates happen (section 6.3). Note that AEAD open is
   in place and a rejected tag may leave the buffer altered, so any speculative
-  attempt must restore the ciphertext before the next one. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+  attempt must restore the ciphertext before the next one.
+  Section 6.6 AEAD usage limits are enforced in both directions: packets
+  encrypted per key, and forgery attempts across the connection. The idle
+  timeout of section 10.1 closes a connection silently, floored at three PTOs.
+  MAX_STREAMS returns credit as the application finishes with peer-initiated
+  streams -- without it a peer that reaches the limit stays there forever. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
   transcribed from the appendix A pseudocode. A sent packet records *what it
   meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes

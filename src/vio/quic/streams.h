@@ -148,7 +148,6 @@ public:
     _peer_initial_max_stream_data_bidi_local = parameters.initial_max_stream_data_bidi_local;
     _peer_initial_max_stream_data_bidi_remote = parameters.initial_max_stream_data_bidi_remote;
     _peer_initial_max_stream_data_uni = parameters.initial_max_stream_data_uni;
-    _peer_parameters_applied = true;
 
     // Streams opened before the parameters arrived were created with a zero
     // send limit; give them the one the peer actually advertised.
@@ -227,7 +226,6 @@ public:
     auto &next = direction == stream_direction_t::bidirectional ? _next_local_bidi : _next_local_uni;
     if (next >= peer_max_streams(direction))
     {
-      _blocked_streams[direction == stream_direction_t::bidirectional ? 0 : 1] = peer_max_streams(direction);
       return std::nullopt;
     }
     const auto id = make_stream_id(_config.local_initiator, direction, next);
@@ -365,6 +363,48 @@ public:
     return direction == stream_direction_t::bidirectional ? _local_max_streams_bidi : _local_max_streams_uni;
   }
 
+  // Section 4.6: the limit is cumulative, so credit is returned by raising it
+  // rather than by decrementing anything. Without this a peer that reaches the
+  // limit is stuck there for the life of the connection however many streams
+  // it finishes.
+  void grant_streams(stream_direction_t direction, std::uint64_t additional)
+  {
+    auto &limit = direction == stream_direction_t::bidirectional ? _local_max_streams_bidi : _local_max_streams_uni;
+    if (additional > max_stream_count - limit)
+    {
+      limit = max_stream_count;
+      return;
+    }
+    limit += additional;
+  }
+
+  // Peer-initiated streams that have been fully dealt with and can be
+  // forgotten, which is what makes room for the credit above.
+  [[nodiscard]] std::uint64_t reap_finished(stream_direction_t direction, stream_initiator_t remote_initiator)
+  {
+    std::uint64_t reaped = 0;
+    for (auto it = _streams.begin(); it != _streams.end();)
+    {
+      const auto id = it->first;
+      if (stream_direction(id) != direction || stream_initiator(id) != remote_initiator)
+      {
+        ++it;
+        continue;
+      }
+      const auto &stream = it->second;
+      const bool receive_done = !stream.has_receive || stream.receive.state() == receive_state_t::data_read || stream.receive.state() == receive_state_t::reset_read;
+      const bool send_done = !stream.has_send || stream.send.state() == send_state_t::data_received || stream.send.state() == send_state_t::reset_sent;
+      if (receive_done && send_done)
+      {
+        it = _streams.erase(it);
+        ++reaped;
+        continue;
+      }
+      ++it;
+    }
+    return reaped;
+  }
+
 private:
   [[nodiscard]] std::uint64_t peer_initial_stream_limit(std::uint64_t id) const
   {
@@ -470,9 +510,6 @@ private:
   std::uint64_t _peer_initial_max_stream_data_bidi_local = 0;
   std::uint64_t _peer_initial_max_stream_data_bidi_remote = 0;
   std::uint64_t _peer_initial_max_stream_data_uni = 0;
-  bool _peer_parameters_applied = false;
-
-  std::array<std::uint64_t, 2> _blocked_streams = {};
   streams_error_t _last_open_error = streams_error_t::none;
 };
 } // namespace vio::quic

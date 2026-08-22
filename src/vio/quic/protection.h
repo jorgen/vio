@@ -56,6 +56,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -74,6 +75,41 @@ inline constexpr cipher_suite_t tls_chacha20_poly1305_sha256{crypto::aead_t::cha
 // Section 5.2. Version specific by design: a future version gets a new salt so
 // a middlebox that only understands this one cannot read its Initial packets.
 inline constexpr std::array<std::uint8_t, 20> initial_salt_v1 = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a};
+
+// Section 6.6. Overusing a key hands an attacker an advantage that grows with
+// the number of packets, so both directions are bounded: how many packets may
+// be protected under one key, and how many forgeries may be attempted against
+// the connection before it must be abandoned. The integrity limit exists
+// because QUIC, unlike TLS, ignores a packet that fails to authenticate rather
+// than tearing the connection down -- which is exactly what lets an attacker
+// keep guessing.
+[[nodiscard]] constexpr std::uint64_t aead_confidentiality_limit(crypto::aead_t aead)
+{
+  switch (aead)
+  {
+  case crypto::aead_t::aes_128_gcm:
+  case crypto::aead_t::aes_256_gcm:
+    return std::uint64_t{1} << 23;
+  case crypto::aead_t::chacha20_poly1305:
+    // Greater than the number of packets a connection can carry at all, so
+    // there is nothing to enforce.
+    break;
+  }
+  return std::numeric_limits<std::uint64_t>::max();
+}
+
+[[nodiscard]] constexpr std::uint64_t aead_integrity_limit(crypto::aead_t aead)
+{
+  switch (aead)
+  {
+  case crypto::aead_t::aes_128_gcm:
+  case crypto::aead_t::aes_256_gcm:
+    return std::uint64_t{1} << 52;
+  case crypto::aead_t::chacha20_poly1305:
+    return std::uint64_t{1} << 36;
+  }
+  return std::uint64_t{1} << 36;
+}
 
 // Section 5.8. Fixed for the version, and themselves the output of
 // HKDF-Expand-Label over a constant secret.

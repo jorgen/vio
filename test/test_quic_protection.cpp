@@ -437,6 +437,24 @@ TEST_CASE("a key update changes the packet keys and keeps the header key")
   }
 }
 
+TEST_CASE("RFC 9001 section 6.6: the AEAD usage limits")
+{
+  // Confidentiality bounds how many packets one key may protect.
+  CHECK(aead_confidentiality_limit(vio::crypto::aead_t::aes_128_gcm) == (std::uint64_t{1} << 23));
+  CHECK(aead_confidentiality_limit(vio::crypto::aead_t::aes_256_gcm) == (std::uint64_t{1} << 23));
+  // For ChaCha20 the limit exceeds the number of packets a connection can
+  // carry at all, so there is nothing to enforce.
+  CHECK(aead_confidentiality_limit(vio::crypto::aead_t::chacha20_poly1305) > (std::uint64_t{1} << 62));
+
+  // Integrity bounds how many forgeries may be attempted against the
+  // connection. QUIC needs this where TLS does not, because a packet that
+  // fails to authenticate is dropped rather than ending the connection --
+  // which is precisely what lets an attacker keep trying.
+  CHECK(aead_integrity_limit(vio::crypto::aead_t::aes_128_gcm) == (std::uint64_t{1} << 52));
+  CHECK(aead_integrity_limit(vio::crypto::aead_t::aes_256_gcm) == (std::uint64_t{1} << 52));
+  CHECK(aead_integrity_limit(vio::crypto::aead_t::chacha20_poly1305) == (std::uint64_t{1} << 36));
+}
+
 TEST_CASE("uninitialized keys refuse to work rather than producing garbage")
 {
   std::vector<std::uint8_t> packet(64, 0);
