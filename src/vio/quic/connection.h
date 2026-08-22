@@ -50,6 +50,7 @@
 #include "vio/quic/connection_id.h"
 #include "vio/quic/path.h"
 #include "vio/quic/retry_token.h"
+#include "vio/quic/stateless_reset.h"
 #include "vio/quic/stream.h"
 #include "vio/quic/tls.h"
 #include "vio/quic/transport_parameters.h"
@@ -117,6 +118,14 @@ struct connection_config_t
   // this server do work on their behalf. The key must outlive the connection;
   // it is what makes an issued token unforgeable.
   const retry_token_key_t *retry_key = nullptr;
+  // Section 10.3. Every connection ID this endpoint issues gets a reset token
+  // derived from this key, so an endpoint that restarts and reloads the key
+  // can still tell a peer to give up on a connection it no longer remembers.
+  // Without it the tokens are random, which still works for the peer but is
+  // lost the moment this endpoint forgets the connection -- which is exactly
+  // when a reset would have been useful.
+  const stateless_reset_key_t *stateless_reset_key = nullptr;
+
   // Opaque bytes identifying the peer's address. Authenticated into the token
   // so one issued to a given address cannot be replayed from another; leaving
   // it empty means the token is bound to nothing, which defeats the point.
@@ -159,6 +168,10 @@ public:
   // wherever the caller is sending, which is what a client behind a fixed
   // socket wants.
   [[nodiscard]] std::expected<void, error_t> receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address);
+
+  // Section 10.3: whether this connection was ended by a stateless reset from
+  // the peer, as opposed to a CONNECTION_CLOSE or a timeout.
+  [[nodiscard]] bool reset_by_peer() const;
 
   // How many times the peer has been observed to move. Mostly of interest to
   // a test or a log.

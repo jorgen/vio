@@ -31,6 +31,7 @@
 #include "vio/quic/packet.h"
 #include "vio/quic/connection_id_manager.h"
 #include "vio/quic/path.h"
+#include "vio/quic/stateless_reset.h"
 #include "vio/quic/protection.h"
 #include "vio/quic/retry_token.h"
 #include "vio/quic/streams.h"
@@ -275,6 +276,11 @@ struct connection_impl_t
   std::uint64_t highest_non_probing = 0;
   bool have_non_probing = false;
   std::uint64_t migrations = 0;
+  // Section 10.3: the token the peer named in its transport parameters, which
+  // covers the connection ID it chose during the handshake. Tokens for the
+  // rest arrive in NEW_CONNECTION_ID frames and live in remote_ids.
+  std::optional<stateless_reset_token_t> peer_initial_reset_token;
+  bool reset_by_peer = false;
   // Section 5.1. Two pools: what this endpoint issued and must keep accepting,
   // and what the peer issued and this endpoint may spend.
   local_connection_ids_t local_ids;
@@ -404,6 +410,26 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   const auto current = impl.recovery.rtt().pto_base() + impl.config.max_ack_delay;
   const auto fresh = initial_rtt + std::max(initial_rtt / 2 * 4, loss_granularity) + impl.config.max_ack_delay;
   return std::max(current, fresh) * 3;
+}
+
+// Section 10.3.1: only tokens for connection IDs this endpoint has actually
+// used, and never retired ones. A token for an id that was never sent to
+// cannot have provoked a reset, and checking it would widen the window in
+// which a guessed token lands.
+[[nodiscard]] bool matches_peer_reset_token(const connection_impl_t &impl, std::span<const std::uint8_t> trailing)
+{
+  if (impl.peer_initial_reset_token.has_value() && tokens_equal(trailing, *impl.peer_initial_reset_token))
+  {
+    return true;
+  }
+  for (const auto &entry : impl.remote_ids.active())
+  {
+    if (entry.has_token && tokens_equal(trailing, entry.token))
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, std::uint64_t packet_number, std::size_t datagram_size, tick_t now)
@@ -686,6 +712,9 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
 
     impl.peer_parameters = *parameters;
     impl.streams.apply_peer_parameters(*parameters);
+    // Section 10.3: the token covering the connection ID the peer chose during
+    // the handshake. Only a server sends one.
+    impl.peer_initial_reset_token = parameters->stateless_reset_token;
 
     // Section 10.1: the effective timeout is the smaller of the two advertised
     // values, or the sole one when only a single endpoint asks for a limit.
@@ -742,7 +771,11 @@ std::expected<void, error_t> replenish_connection_ids(connection_impl_t &impl)
       return std::unexpected(error_t{.code = 1, .msg = "could not build a connection id"});
     }
     stateless_reset_token_t token = {};
-    if (auto r = crypto::random_bytes(token); !r.has_value())
+    if (impl.config.stateless_reset_key != nullptr)
+    {
+      token = impl.config.stateless_reset_key->token_for(*id);
+    }
+    else if (auto r = crypto::random_bytes(token); !r.has_value())
     {
       return std::unexpected(r.error());
     }
@@ -1931,12 +1964,28 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
   // Section 5.1.1: the ID carried in the long header during the handshake is
   // sequence 0. Its stateless reset token goes out in the transport
   // parameters rather than a frame, which is why it is minted here.
-  stateless_reset_token_t initial_token = {};
-  if (auto r = crypto::random_bytes(initial_token); !r.has_value())
+  const auto initial_token = config.stateless_reset_key != nullptr ? config.stateless_reset_key->token_for(impl->local_connection_id) : stateless_reset_token_t{};
+  if (config.stateless_reset_key == nullptr)
   {
-    return std::unexpected(r.error());
+    stateless_reset_token_t random_token = {};
+    if (auto r = crypto::random_bytes(random_token); !r.has_value())
+    {
+      return std::unexpected(r.error());
+    }
+    impl->local_ids.install_initial(impl->local_connection_id, random_token);
   }
-  impl->local_ids.install_initial(impl->local_connection_id, initial_token);
+  else
+  {
+    impl->local_ids.install_initial(impl->local_connection_id, initial_token);
+  }
+
+  // Section 10.3: only a server may advertise this. A client's transport
+  // parameters are not confidentiality protected, so publishing a token there
+  // would hand anyone watching the handshake the means to kill the connection.
+  if (config.role == tls_role_t::server && !impl->local_connection_id.empty())
+  {
+    impl->config.transport_parameters.stateless_reset_token = impl->local_ids.active().front().token;
+  }
 
   // The transport parameters have to name the connection IDs this endpoint is
   // using before the handshake starts, because TLS carries them in its first
@@ -2004,6 +2053,19 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
   const std::size_t datagram_size = datagram.size();
   migration_signal_t signal;
 
+  // Section 10.3.1 compares the trailing bytes of the datagram *as received*,
+  // and this is the only chance to read them: decryption works in place, and a
+  // packet that fails to authenticate may already have had plaintext written
+  // over it by the time the AEAD rejects the tag. Looking afterwards finds
+  // whatever the failed open left behind rather than what the peer sent.
+  stateless_reset_token_t arriving_token = {};
+  bool arriving_token_present = false;
+  if (const auto trailing = trailing_token(datagram); !trailing.empty())
+  {
+    std::copy(trailing.begin(), trailing.end(), arriving_token.begin());
+    arriving_token_present = true;
+  }
+
   // A server has to know the client's connection ID before it can answer, and
   // it only learns it from the first Initial. Setting the transport parameters
   // has to wait for that too.
@@ -2058,6 +2120,29 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
     impl.last_activity = now;
     impl.activity_seen = true;
     impl.idle_since_last_receive = false;
+  }
+
+  // Section 10.3.1: the check is mandatory exactly when nothing in the
+  // datagram could be processed, which is what a reset looks like -- it is
+  // random bytes under a connection ID this endpoint no longer recognises.
+  // Skipping it when a packet did decrypt is permitted and saves the compare
+  // on every ordinary datagram.
+  if (impl.packets_processed == processed_before && impl.state != connection_state_t::closed)
+  {
+    if (arriving_token_present && matches_peer_reset_token(impl, arriving_token))
+    {
+      // Section 10.3.1: enter the draining period and send nothing further.
+      // There is nobody left to receive a CONNECTION_CLOSE, which is the whole
+      // reason the peer had to resort to this.
+      impl.reset_by_peer = true;
+      impl.state = connection_state_t::closed;
+      impl.close_frame_pending = false;
+      if (!impl.close_reason.has_value())
+      {
+        impl.close_reason = connection_close_t{.error_code = transport_error_no_error, .application = false, .reason = "stateless reset", .from_peer = true};
+      }
+      return {};
+    }
   }
 
   // Section 9.3. Only now, with the whole datagram read and its packets
@@ -2327,6 +2412,11 @@ bool connection_t::handshake_confirmed() const
 bool connection_t::address_validated_by_retry() const
 {
   return _impl->validated_by_retry;
+}
+
+bool connection_t::reset_by_peer() const
+{
+  return _impl->reset_by_peer;
 }
 
 std::uint64_t connection_t::migration_count() const

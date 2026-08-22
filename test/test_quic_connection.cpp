@@ -1956,4 +1956,74 @@ TEST_CASE("a peer that moves is followed, cautiously")
     CHECK_FALSE(server->close_reason().has_value());
   }
 }
+TEST_CASE("a stateless reset ends the connection and a lookalike does not")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  auto reset_key = stateless_reset_key_t::create();
+  REQUIRE(reset_key.has_value());
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.stateless_reset_key = &*reset_key;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+  REQUIRE_FALSE(client->reset_by_peer());
+
+  SUBCASE("the token the server advertised kills the connection")
+  {
+    // Section 10.3: the client learned this token through the handshake, so
+    // only it and the server know the value.
+    const auto token = reset_key->token_for(server->local_connection_id());
+    std::vector<std::uint8_t> reset(64);
+    auto size = build_stateless_reset(reset, token, 1200);
+    REQUIRE(size.has_value());
+    reset.resize(*size);
+
+    REQUIRE(client->receive(reset, at(1ms)).has_value());
+    CHECK(client->reset_by_peer());
+    CHECK(client->state() == connection_state_t::closed);
+
+    // Section 10.3.1: nothing further goes out on the connection.
+    std::vector<std::uint8_t> datagram(1500);
+    auto sent = client->poll_send(datagram, at(2ms));
+    REQUIRE(sent.has_value());
+    CHECK(*sent == 0);
+  }
+
+  SUBCASE("a datagram of zeroes is not a reset")
+  {
+    // The connection ids in the pool that never came with a token hold a
+    // zero-filled placeholder. Comparing against it would let anyone end the
+    // connection with a handful of zero bytes.
+    std::vector<std::uint8_t> zeroes(64, 0x00);
+    REQUIRE(client->receive(zeroes, at(1ms)).has_value());
+    CHECK_FALSE(client->reset_by_peer());
+    CHECK(client->state() == connection_state_t::connected);
+  }
+
+  SUBCASE("a token for a key the server does not hold is not a reset")
+  {
+    auto other = stateless_reset_key_t::create();
+    REQUIRE(other.has_value());
+    const auto token = other->token_for(server->local_connection_id());
+    std::vector<std::uint8_t> reset(64);
+    auto size = build_stateless_reset(reset, token, 1200);
+    REQUIRE(size.has_value());
+    reset.resize(*size);
+
+    REQUIRE(client->receive(reset, at(1ms)).has_value());
+    CHECK_FALSE(client->reset_by_peer());
+  }
+}
 }

@@ -65,6 +65,13 @@ struct connection_id_entry_t
   std::uint64_t sequence = 0;
   connection_id_t id;
   stateless_reset_token_t token = {};
+  // Whether token holds a value the peer actually supplied. The connection ID
+  // from the handshake arrives without one -- a server's token for it comes
+  // through the transport parameters instead, and a client never sends one at
+  // all. Treating the zero-filled placeholder as real would mean any datagram
+  // ending in sixteen zero bytes reads as a stateless reset, which is a way
+  // for anyone to end the connection.
+  bool has_token = false;
 };
 
 // Section 5.1.1: what this endpoint issued and must keep accepting.
@@ -75,7 +82,7 @@ public:
   void install_initial(const connection_id_t &id, const stateless_reset_token_t &token)
   {
     _entries.clear();
-    _entries.push_back(connection_id_entry_t{.sequence = 0, .id = id, .token = token});
+    _entries.push_back(connection_id_entry_t{.sequence = 0, .id = id, .token = token, .has_token = true});
     _next_sequence = 1;
   }
 
@@ -94,7 +101,7 @@ public:
 
   [[nodiscard]] const connection_id_entry_t &add(const connection_id_t &id, const stateless_reset_token_t &token)
   {
-    _entries.push_back(connection_id_entry_t{.sequence = _next_sequence, .id = id, .token = token});
+    _entries.push_back(connection_id_entry_t{.sequence = _next_sequence, .id = id, .token = token, .has_token = true});
     ++_next_sequence;
     return _entries.back();
   }
@@ -231,7 +238,7 @@ public:
       return cid_error_t::none;
     }
 
-    _entries.push_back(connection_id_entry_t{.sequence = sequence, .id = id, .token = {}});
+    _entries.push_back(connection_id_entry_t{.sequence = sequence, .id = id, .token = {}, .has_token = true});
     std::copy(token.begin(), token.end(), _entries.back().token.begin());
     mark_seen(sequence);
 
