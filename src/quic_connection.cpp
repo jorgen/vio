@@ -250,6 +250,12 @@ struct connection_impl_t
   // would advertise capacity that does not exist.
   bool max_data_pending = false;
   std::uint64_t consumed_since_max_data = 0;
+  // Section 4.1: a DATA_BLOCKED is owed. Recorded with the limit that caused
+  // it so the same number is not reported twice; a frame per blocked attempt
+  // would be a flood, and the peer learns nothing new from the second one.
+  bool data_blocked_pending = false;
+  bool data_blocked_reported = false;
+  std::uint64_t data_blocked_at = 0;
   // Section 4.6: credit to return to the peer for streams it opened and this
   // endpoint has finished with.
   std::array<bool, 2> max_streams_pending = {};
@@ -435,6 +441,54 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   return false;
 }
 
+// Section 4.1 and 4.6. A sender that stops because the peer's limit ran out
+// says so; a sender that stops because it has nothing to send says nothing.
+// The distinction matters because the peer is the only one who can unblock the
+// first case, and it cannot know it needs to unless it is told.
+void note_blocked(connection_impl_t &impl, stream_t &stream)
+{
+  if (stream.send.blocked_by_stream_limit())
+  {
+    const auto limit = stream.send.stream_limit();
+    if (!stream.data_blocked_reported || stream.data_blocked_at != limit)
+    {
+      stream.data_blocked_pending = true;
+      stream.data_blocked_reported = true;
+      stream.data_blocked_at = limit;
+      impl.streams.mark_sendable(stream);
+    }
+    return;
+  }
+  if (stream.send.blocked_by_connection_limit(impl.streams.connection_send_window()))
+  {
+    const auto limit = impl.streams.peer_max_data();
+    if (!impl.data_blocked_reported || impl.data_blocked_at != limit)
+    {
+      impl.data_blocked_pending = true;
+      impl.data_blocked_reported = true;
+      impl.data_blocked_at = limit;
+    }
+  }
+}
+
+// Whether a limit is in the way does not depend on how much room is left in
+// the packet, so it is settled before anything is written. Discovering it
+// half way through emission would leave the signal for the next packet, and a
+// caller that stops polling when poll_send returns zero would never send it --
+// which is exactly the situation where the peer most needs to hear it.
+void note_all_blocked(connection_impl_t &impl)
+{
+  const auto count = impl.streams.sendable().size();
+  for (std::size_t i = 0; i < count && i < impl.streams.sendable().size(); ++i)
+  {
+    auto *stream = impl.streams.find(impl.streams.sendable()[i]);
+    if (stream != nullptr && stream->has_send)
+    {
+      note_blocked(impl, *stream);
+    }
+  }
+}
+
 void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, std::uint64_t packet_number, std::size_t datagram_size, tick_t now)
 {
   impl.peer_address.assign(address.begin(), address.end());
@@ -579,6 +633,24 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         impl.max_streams_pending[0] = true;
         impl.max_streams_pending[1] = true;
         break;
+      case frame_kind_t::data_blocked:
+        // Section 13.3: sent again if lost, but only while still blocked and
+        // carrying the limit in force then. Forgetting that it was reported is
+        // enough -- the next attempt to send re-derives both.
+        impl.data_blocked_reported = false;
+        break;
+
+      case frame_kind_t::stream_data_blocked:
+        if (auto *stream = impl.streams.find(frame.stream_id); stream != nullptr)
+        {
+          stream->data_blocked_reported = false;
+        }
+        break;
+
+      case frame_kind_t::streams_blocked:
+        impl.streams.forget_streams_blocked();
+        break;
+
       case frame_kind_t::new_connection_id:
         requeue_new_connection_id(impl, frame.sequence);
         break;
@@ -1506,7 +1578,8 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   if (level == encryption_level_t::application && !want_close)
   {
     reap_and_grant(impl);
-    want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1] || impl.streams.has_sendable();
+    note_all_blocked(impl);
+    want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1] || impl.data_blocked_pending || impl.streams.streams_blocked_owed() || impl.streams.has_sendable();
   }
 
   if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
@@ -1737,6 +1810,41 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       }
     }
 
+    if (impl.data_blocked_pending)
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::data_blocked;
+      // Section 13.3: the limit as it stands now, not the one that was in
+      // force when the block was noticed.
+      frame.maximum = impl.streams.peer_max_data();
+      if (frames.write(frame))
+      {
+        impl.data_blocked_pending = false;
+        record.push_back(sent_frame_t{.kind = frame_kind_t::data_blocked});
+      }
+    }
+
+    for (const auto direction : {stream_direction_t::bidirectional, stream_direction_t::unidirectional})
+    {
+      std::uint64_t limit = 0;
+      if (!impl.streams.take_streams_blocked(direction, limit))
+      {
+        continue;
+      }
+      frame_t frame;
+      frame.kind = frame_kind_t::streams_blocked;
+      frame.bidirectional = direction == stream_direction_t::bidirectional;
+      frame.maximum = limit;
+      if (frames.write(frame))
+      {
+        record.push_back(sent_frame_t{.kind = frame_kind_t::streams_blocked});
+      }
+      else
+      {
+        impl.streams.requeue_streams_blocked(direction);
+      }
+    }
+
     for (std::size_t i = 0; i < impl.max_streams_pending.size(); ++i)
     {
       if (!impl.max_streams_pending[i])
@@ -1789,6 +1897,19 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
         }
       }
 
+      if (stream.data_blocked_pending && stream.has_send)
+      {
+        frame_t frame;
+        frame.kind = frame_kind_t::stream_data_blocked;
+        frame.stream_id = stream.id;
+        frame.maximum = stream.send.stream_limit();
+        if (frames.write(frame))
+        {
+          stream.data_blocked_pending = false;
+          record.push_back(sent_frame_t{.kind = frame_kind_t::stream_data_blocked, .stream_id = stream.id});
+        }
+      }
+
       if (stream.stop_sending_pending.has_value() && stream.has_receive)
       {
         frame_t frame;
@@ -1833,6 +1954,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       auto chunk = stream.send.next_chunk(available - overhead, impl.streams.connection_send_window());
       if (!chunk.has_value())
       {
+        note_blocked(impl, stream);
         continue;
       }
 

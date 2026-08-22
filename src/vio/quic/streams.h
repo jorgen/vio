@@ -116,6 +116,12 @@ struct stream_t
   std::uint64_t consumed_since_update = 0;
   // A STOP_SENDING this endpoint owes the peer.
   std::optional<std::uint64_t> stop_sending_pending;
+  // Section 4.1: a STREAM_DATA_BLOCKED is owed, carrying the limit that is
+  // stopping this stream. The value is recorded so the same limit is not
+  // reported twice -- a frame per attempt would be a flood.
+  bool data_blocked_pending = false;
+  std::uint64_t data_blocked_at = 0;
+  bool data_blocked_reported = false;
   // Whether this stream is currently on the sendable list. A hint in one
   // direction only: the list may still name a stream that has gone quiet,
   // which the next sweep drops, but a stream with work must always be on it.
@@ -125,7 +131,7 @@ struct stream_t
 // Everything that would put a frame for this stream into a packet.
 [[nodiscard]] inline bool stream_has_sendable_work(const stream_t &stream)
 {
-  return stream.reset_pending || (stream.has_send && stream.send.has_pending()) || stream.pending_max_stream_data || stream.stop_sending_pending.has_value();
+  return stream.reset_pending || (stream.has_send && stream.send.has_pending()) || stream.pending_max_stream_data || stream.stop_sending_pending.has_value() || stream.data_blocked_pending;
 }
 
 struct streams_config_t
@@ -298,11 +304,49 @@ public:
   // Opens the next stream this endpoint may initiate, or nothing when the
   // peer's limit is reached. Section 4.6: exceeding it is not permitted, so a
   // caller is told to wait rather than allowed to break the rule.
+  [[nodiscard]] bool take_streams_blocked(stream_direction_t direction, std::uint64_t &limit)
+  {
+    const std::size_t index = direction == stream_direction_t::bidirectional ? 0 : 1;
+    if (!_streams_blocked_pending[index])
+    {
+      return false;
+    }
+    _streams_blocked_pending[index] = false;
+    limit = peer_max_streams(direction);
+    return true;
+  }
+
+  void requeue_streams_blocked(stream_direction_t direction)
+  {
+    _streams_blocked_pending[direction == stream_direction_t::bidirectional ? 0 : 1] = true;
+  }
+
+  void forget_streams_blocked()
+  {
+    _streams_blocked_reported = {};
+  }
+
+  [[nodiscard]] bool streams_blocked_owed() const
+  {
+    return _streams_blocked_pending[0] || _streams_blocked_pending[1];
+  }
+
   [[nodiscard]] std::optional<std::uint64_t> open(stream_direction_t direction)
   {
     auto &next = direction == stream_direction_t::bidirectional ? _next_local_bidi : _next_local_uni;
     if (next >= peer_max_streams(direction))
     {
+      // Section 4.6: the caller has to wait, and the peer is the only one who
+      // can change that -- so tell it, once per limit, that its number is what
+      // is holding things up.
+      const std::size_t index = direction == stream_direction_t::bidirectional ? 0 : 1;
+      const auto limit = peer_max_streams(direction);
+      if (!_streams_blocked_reported[index] || _streams_blocked_at[index] != limit)
+      {
+        _streams_blocked_pending[index] = true;
+        _streams_blocked_reported[index] = true;
+        _streams_blocked_at[index] = limit;
+      }
       return std::nullopt;
     }
     const auto id = make_stream_id(_config.local_initiator, direction, next);
@@ -601,6 +645,9 @@ private:
   std::uint64_t _peer_initial_max_stream_data_bidi_local = 0;
   std::uint64_t _peer_initial_max_stream_data_bidi_remote = 0;
   std::uint64_t _peer_initial_max_stream_data_uni = 0;
+  std::array<bool, 2> _streams_blocked_pending = {};
+  std::array<bool, 2> _streams_blocked_reported = {};
+  std::array<std::uint64_t, 2> _streams_blocked_at = {};
   streams_error_t _last_open_error = streams_error_t::none;
 };
 } // namespace vio::quic

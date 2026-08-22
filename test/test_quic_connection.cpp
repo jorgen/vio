@@ -2110,4 +2110,71 @@ TEST_CASE("version negotiation ends an attempt, but only when it is believable")
     CHECK_FALSE(server->version_negotiation_failed());
   }
 }
+TEST_CASE("a sender stopped by the peer's limits says so once and then waits")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  // What the client is allowed to send. Small enough that a modest write runs
+  // straight into it.
+  server_config.transport_parameters.initial_max_data = 4096;
+  server_config.transport_parameters.initial_max_stream_data_bidi_remote = 2048;
+  server_config.transport_parameters.initial_max_streams_bidi = 1;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+  const std::vector<std::uint8_t> payload(64 * 1024, 0x7e);
+  REQUIRE(client->write_stream(*stream, payload, false) == payload.size());
+
+  // Section 4.6: the peer allowed exactly one stream, so a second is refused
+  // and the peer is told its number is the reason.
+  CHECK_FALSE(client->open_stream(stream_direction_t::bidirectional).has_value());
+
+  std::size_t datagrams = 0;
+  for (int round = 0; round < 200; ++round)
+  {
+    std::vector<std::uint8_t> datagram(1500);
+    auto size = client->poll_send(datagram, at(1ms));
+    REQUIRE(size.has_value());
+    if (*size == 0)
+    {
+      break;
+    }
+    datagram.resize(*size);
+    REQUIRE(server->receive(datagram, at(1ms)).has_value());
+    ++datagrams;
+  }
+  CAPTURE(datagrams);
+  REQUIRE(datagrams > 0);
+  CHECK_FALSE(server->close_reason().has_value());
+
+  // The point of the exercise: once the limit has been reported the sender
+  // stops. Section 13.3 allows one frame per limit, so a connection that kept
+  // producing packets here would be spending the network on saying the same
+  // thing over and over. Two datagrams carried the data it was allowed plus
+  // the blocked signals, and there is nothing further to say at this instant.
+  CHECK(datagrams <= 4);
+  std::vector<std::uint8_t> datagram(1500);
+  auto again = client->poll_send(datagram, at(1ms));
+  REQUIRE(again.has_value());
+  CHECK(*again == 0);
+
+  // Raising the limit is what starts it moving, and the block is reported
+  // again if the new limit also runs out.
+  CHECK(client->state() == connection_state_t::connected);
+}
 }

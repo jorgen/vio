@@ -530,6 +530,25 @@ public:
     return chunk;
   }
 
+  // Section 4.1: there is a difference between having nothing to send and
+  // having something to send and no permission. Only the second is worth a
+  // frame -- it tells the peer its limit, and not its own capacity, is what
+  // has stopped the flow.
+  [[nodiscard]] bool blocked_by_stream_limit() const
+  {
+    return _retransmit.empty() && queued() > _sent_offset && _sent_offset >= _max_data;
+  }
+
+  [[nodiscard]] bool blocked_by_connection_limit(std::uint64_t connection_window) const
+  {
+    return _retransmit.empty() && queued() > _sent_offset && connection_window == 0 && _sent_offset < _max_data;
+  }
+
+  [[nodiscard]] std::uint64_t stream_limit() const
+  {
+    return _max_data;
+  }
+
   void on_chunk_sent(const chunk_t &chunk)
   {
     if (chunk.retransmit)
