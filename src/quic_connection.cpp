@@ -29,6 +29,7 @@
 #include "vio/quic/frame_codec.h"
 #include "vio/quic/loss_recovery.h"
 #include "vio/quic/packet.h"
+#include "vio/quic/connection_id_manager.h"
 #include "vio/quic/path.h"
 #include "vio/quic/protection.h"
 #include "vio/quic/retry_token.h"
@@ -266,6 +267,14 @@ struct connection_impl_t
   // Set when a read may have finished a stream, cleared by the sweep that
   // returns the credit.
   bool reap_wanted = false;
+  // Section 5.1. Two pools: what this endpoint issued and must keep accepting,
+  // and what the peer issued and this endpoint may spend.
+  local_connection_ids_t local_ids;
+  remote_connection_ids_t remote_ids;
+  // Issued but not yet put in a NEW_CONNECTION_ID frame, or put in one that
+  // was lost -- section 13.3 has them retransmitted with the same sequence
+  // number, so the entry is what is queued rather than the intent to issue.
+  std::vector<connection_id_entry_t> new_ids_pending;
   // Section 8.2. The validator drives probes this endpoint sends; the queue
   // holds echoes it owes.
   path_validator_t path;
@@ -423,6 +432,23 @@ void queue_crypto_retransmit(packet_space_t &space, std::uint64_t offset, std::u
 // Section 13.3: a lost packet is repaired frame by frame, according to what
 // each frame meant. The loss policy that decides which repair applies was
 // settled in frame.h.
+// Section 13.3: a lost NEW_CONNECTION_ID goes again carrying the same sequence
+// number, so what is requeued is the entry rather than a fresh ID. If the peer
+// retired it in the meantime there is nothing left to say.
+void requeue_new_connection_id(connection_impl_t &impl, std::uint64_t sequence)
+{
+  const auto *entry = impl.local_ids.find(sequence);
+  if (entry == nullptr)
+  {
+    return;
+  }
+  const auto queued = std::any_of(impl.new_ids_pending.begin(), impl.new_ids_pending.end(), [sequence](const connection_id_entry_t &pending) { return pending.sequence == sequence; });
+  if (!queued)
+  {
+    impl.new_ids_pending.push_back(*entry);
+  }
+}
+
 void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<sent_packet_t> &lost)
 {
   for (const auto &packet : lost)
@@ -467,6 +493,14 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         impl.max_streams_pending[0] = true;
         impl.max_streams_pending[1] = true;
         break;
+      case frame_kind_t::new_connection_id:
+        requeue_new_connection_id(impl, frame.sequence);
+        break;
+
+      case frame_kind_t::retire_connection_id:
+        impl.remote_ids.requeue_retire(frame.sequence);
+        break;
+
       default:
         // PING and PADDING carry no information to repair; a stale ACK would
         // do more harm than good. Both are discard.
@@ -626,8 +660,57 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
   return {};
 }
 
+// Section 5.1.1: keep the peer stocked up to the limit it advertised, so that
+// it can rotate on migration without first having to ask. Issuing beyond the
+// limit is forbidden, and issuing nothing quietly prevents the peer from
+// migrating at all.
+std::expected<void, error_t> replenish_connection_ids(connection_impl_t &impl)
+{
+  if (!impl.peer_parameters.has_value() || !impl.handshake_complete)
+  {
+    return {};
+  }
+  const auto limit = impl.peer_parameters->active_connection_id_limit;
+  while (impl.local_ids.can_issue(limit))
+  {
+    std::array<std::uint8_t, max_connection_id_size> bytes = {};
+    auto chosen = std::span<std::uint8_t>(bytes).first(impl.config.local_connection_id_length);
+    if (auto r = crypto::random_bytes(chosen); !r.has_value())
+    {
+      return std::unexpected(r.error());
+    }
+    auto id = connection_id_t::from_bytes(chosen);
+    if (!id.has_value())
+    {
+      return std::unexpected(error_t{.code = 1, .msg = "could not build a connection id"});
+    }
+    stateless_reset_token_t token = {};
+    if (auto r = crypto::random_bytes(token); !r.has_value())
+    {
+      return std::unexpected(r.error());
+    }
+    impl.new_ids_pending.push_back(impl.local_ids.add(*id, token));
+  }
+  return {};
+}
+
+[[nodiscard]] std::uint64_t cid_error_code(cid_error_t error)
+{
+  switch (error)
+  {
+  case cid_error_t::frame_encoding:
+    return static_cast<std::uint64_t>(transport_error_code_t::frame_encoding_error);
+  case cid_error_t::limit_exceeded:
+    return static_cast<std::uint64_t>(transport_error_code_t::connection_id_limit_error);
+  case cid_error_t::protocol_violation:
+  case cid_error_t::none:
+    break;
+  }
+  return transport_error_protocol_violation;
+}
+
 // Everything a received packet's frames can do to the connection.
-std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<const std::uint8_t> payload, packet_kind_t kind, tick_t now)
+std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<const std::uint8_t> payload, packet_kind_t kind, tick_t now, const connection_id_t &destination)
 {
   const auto packet_type = frame_packet_type(kind);
   if (!packet_type.has_value())
@@ -792,6 +875,37 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       // reply beyond what the window update policy already does.
       break;
 
+    case frame_kind_t::new_connection_id:
+    {
+      // Section 19.15: an endpoint whose peer sends zero-length destination
+      // connection IDs has nothing it could vary, so offering one means the
+      // peer has lost track of the connection rather than that it is being
+      // helpful.
+      if (impl.peer_connection_id.empty())
+      {
+        begin_close(impl, transport_error_protocol_violation, "NEW_CONNECTION_ID against a zero-length connection id", false, false);
+        return ack_eliciting;
+      }
+      const auto error = impl.remote_ids.on_new(frame.sequence_number, frame.retire_prior_to, frame.connection_id, frame.stateless_reset_token, impl.config.transport_parameters.active_connection_id_limit);
+      if (error != cid_error_t::none)
+      {
+        begin_close(impl, cid_error_code(error), "NEW_CONNECTION_ID rejected", false, false);
+        return ack_eliciting;
+      }
+      break;
+    }
+
+    case frame_kind_t::retire_connection_id:
+    {
+      const auto error = impl.local_ids.on_retire(frame.sequence_number, destination);
+      if (error != cid_error_t::none)
+      {
+        begin_close(impl, cid_error_code(error), "RETIRE_CONNECTION_ID rejected", false, false);
+        return ack_eliciting;
+      }
+      break;
+    }
+
     case frame_kind_t::path_challenge:
       // Section 8.2.2: the echo is owed unconditionally, and is the only
       // evidence the peer will get that this endpoint holds this address.
@@ -806,8 +920,7 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       break;
 
     default:
-      // NEW_CONNECTION_ID, RETIRE_CONNECTION_ID and NEW_TOKEN are parsed and
-      // acknowledged but not acted on: connection ID rotation is not built.
+      // NEW_TOKEN is parsed and acknowledged but not acted on.
       break;
     }
   }
@@ -880,6 +993,10 @@ std::expected<void, error_t> receive_retry(connection_impl_t &impl, const packet
   // Initial keys follow it because they are derived from it.
   impl.peer_connection_id = header.source_id;
   impl.peer_connection_id_confirmed = true;
+  // Section 5.1.1 gives a Retry's connection ID no sequence number, but the
+  // pool has to name whatever is actually being sent to, or a later
+  // RETIRE_CONNECTION_ID would refer to an ID this endpoint never adopted.
+  impl.remote_ids.install_initial(header.source_id);
   if (auto r = install_initial_keys(impl, header.source_id); !r.has_value())
   {
     return r;
@@ -1082,6 +1199,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     // first packet it can actually read, not the first one that arrives.
     impl.peer_connection_id = header.source_id;
     impl.peer_connection_id_confirmed = true;
+    impl.remote_ids.install_initial(impl.peer_connection_id);
   }
 
   if (header.kind == packet_kind_t::handshake)
@@ -1096,7 +1214,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     }
   }
 
-  auto ack_eliciting = process_frames(impl, opened->payload, header.kind, now);
+  auto ack_eliciting = process_frames(impl, opened->payload, header.kind, now, header.destination_id);
   if (!ack_eliciting.has_value())
   {
     return std::unexpected(ack_eliciting.error());
@@ -1209,6 +1327,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     // Section 8.2.2 forbids delaying a PATH_RESPONSE, so an owed echo is by
     // itself a reason to send.
     want_path = !impl.path_responses.empty() || impl.path.challenge_due(now, impl.recovery.rtt().pto_base() + impl.config.max_ack_delay);
+    want_path = want_path || !impl.new_ids_pending.empty() || !impl.remote_ids.pending_retires().empty();
   }
 
   bool want_streams = false;
@@ -1346,6 +1465,43 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     if (wrote_handshake_done)
     {
       record.push_back(sent_frame_t{.kind = frame_kind_t::handshake_done});
+    }
+  }
+
+  if (level == encryption_level_t::application && !want_close)
+  {
+    // Section 5.1.2: retiring is also a request for a replacement, so these go
+    // out before the new IDs below and the peer sees the reason with the need.
+    auto retires = impl.remote_ids.pending_retires();
+    for (const auto sequence : retires)
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::retire_connection_id;
+      frame.sequence_number = sequence;
+      if (!frames.write(frame))
+      {
+        break;
+      }
+      impl.remote_ids.clear_pending_retire(sequence);
+      record.push_back(sent_frame_t{.kind = frame_kind_t::retire_connection_id, .sequence = sequence});
+    }
+
+    for (auto it = impl.new_ids_pending.begin(); it != impl.new_ids_pending.end();)
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::new_connection_id;
+      frame.sequence_number = it->sequence;
+      // Nothing is being forced out of use: this endpoint issues spares, it
+      // does not revoke. Section 19.15 lets Retire Prior To stay at zero.
+      frame.retire_prior_to = 0;
+      frame.connection_id = it->id;
+      frame.stateless_reset_token = it->token;
+      if (!frames.write(frame))
+      {
+        break;
+      }
+      record.push_back(sent_frame_t{.kind = frame_kind_t::new_connection_id, .sequence = it->sequence});
+      it = impl.new_ids_pending.erase(it);
     }
   }
 
@@ -1688,6 +1844,15 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
 
   auto impl = std::make_unique<detail::connection_impl_t>(std::move(*session), config);
   impl->local_connection_id = *local;
+  // Section 5.1.1: the ID carried in the long header during the handshake is
+  // sequence 0. Its stateless reset token goes out in the transport
+  // parameters rather than a frame, which is why it is minted here.
+  stateless_reset_token_t initial_token = {};
+  if (auto r = crypto::random_bytes(initial_token); !r.has_value())
+  {
+    return std::unexpected(r.error());
+  }
+  impl->local_ids.install_initial(impl->local_connection_id, initial_token);
 
   // The transport parameters have to name the connection IDs this endpoint is
   // using before the handshake starts, because TLS carries them in its first
@@ -1711,6 +1876,9 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
     }
     impl->original_destination_id = *destination;
     impl->peer_connection_id = *destination;
+    // Not a peer-issued ID yet -- the client invented it. Section 7.2 replaces
+    // it with the server's choice, and only that one carries sequence 0.
+    impl->remote_ids.install_initial(*destination);
     if (auto r = install_initial_keys(*impl, *destination); !r.has_value())
     {
       return std::unexpected(r.error());
@@ -1759,6 +1927,9 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
       {
         impl.peer_connection_id = *source;
         impl.peer_connection_id_confirmed = true;
+        // Section 5.1.1: the client'"'"'s handshake connection ID is its sequence 0.
+        // Section 7.3 authenticates it later through the transport parameter.
+        impl.remote_ids.install_initial(*source);
         auto parameters = impl.config.transport_parameters;
         parameters.original_destination_connection_id = *destination;
         impl.config.transport_parameters = parameters;
@@ -1806,6 +1977,10 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   // Section 8.2.4: an attempt that has run out of time is abandoned before
   // anything else decides what to send.
   impl.path.on_timeout(now);
+  if (auto r = replenish_connection_ids(impl); !r.has_value())
+  {
+    return std::unexpected(r.error());
+  }
   if (auto deadline = idle_deadline(impl); deadline.has_value() && now >= *deadline)
   {
     // Section 10.1: silently closed and the state discarded. No
@@ -2032,6 +2207,16 @@ bool connection_t::handshake_confirmed() const
 bool connection_t::address_validated_by_retry() const
 {
   return _impl->validated_by_retry;
+}
+
+std::size_t connection_t::peer_connection_id_count() const
+{
+  return _impl->remote_ids.active_count();
+}
+
+std::size_t connection_t::issued_connection_id_count() const
+{
+  return _impl->local_ids.active().size();
 }
 
 void connection_t::validate_path(tick_t now)

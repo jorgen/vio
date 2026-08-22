@@ -58,6 +58,7 @@ enum class transport_error_code_t : std::uint64_t
 {
   no_error = 0x00,
   frame_encoding_error = 0x07,
+  connection_id_limit_error = 0x09,
   protocol_violation = 0x0a,
 };
 
@@ -71,7 +72,6 @@ struct frame_error_t
 inline constexpr std::uint8_t stream_flag_fin = 0x01;
 inline constexpr std::uint8_t stream_flag_len = 0x02;
 inline constexpr std::uint8_t stream_flag_off = 0x04;
-inline constexpr std::size_t stateless_reset_token_size = 16;
 inline constexpr std::size_t path_data_size = 8;
 inline constexpr std::uint64_t max_stream_count = std::uint64_t{1} << 60;
 

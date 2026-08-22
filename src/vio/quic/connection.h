@@ -173,6 +173,12 @@ public:
   // address was validated before any handshake work was done.
   [[nodiscard]] bool address_validated_by_retry() const;
 
+  // Section 5.1: how many connection IDs each side currently has available.
+  // A peer that has run out cannot migrate, since section 9.5 requires it to
+  // move to an ID the old path never saw.
+  [[nodiscard]] std::size_t peer_connection_id_count() const;
+  [[nodiscard]] std::size_t issued_connection_id_count() const;
+
   // Section 8.2: asks the peer to prove it can receive at the address it is
   // sending from, by echoing unpredictable data. Costs one round trip and
   // succeeds or is abandoned on a timer; the result is readable below rather

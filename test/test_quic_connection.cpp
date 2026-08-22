@@ -1762,4 +1762,62 @@ TEST_CASE("path validation runs between two connections")
     CHECK(*deadline > at(1ms));
   }
 }
+TEST_CASE("connection ids are exchanged up to the advertised limit")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.active_connection_id_limit = 4;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.transport_parameters.active_connection_id_limit = 4;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  for (int round = 0; round < 6; ++round)
+  {
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, at(1ms));
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      REQUIRE(server->receive(datagram, at(1ms)).has_value());
+    }
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = server->poll_send(datagram, at(1ms));
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      REQUIRE(client->receive(datagram, at(1ms)).has_value());
+    }
+  }
+
+  // Section 5.1.1: neither side may exceed what the other advertised, and both
+  // should fill up to it so the peer can migrate without asking first.
+  CHECK(client->issued_connection_id_count() == 4);
+  CHECK(server->issued_connection_id_count() == 4);
+  CHECK(client->peer_connection_id_count() == 4);
+  CHECK(server->peer_connection_id_count() == 4);
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+}
 }

@@ -40,6 +40,11 @@ namespace vio::quic
 {
 inline constexpr std::size_t max_connection_id_size = 20;
 
+// Section 10.3. One token per connection ID, because it is the connection ID a
+// packet arrives on that decides which token would end it.
+inline constexpr std::size_t stateless_reset_token_size = 16;
+using stateless_reset_token_t = std::array<std::uint8_t, stateless_reset_token_size>;
+
 class connection_id_t
 {
 public:

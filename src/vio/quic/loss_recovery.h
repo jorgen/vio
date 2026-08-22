@@ -188,6 +188,9 @@ struct sent_frame_t
   std::uint64_t offset = 0;
   std::uint64_t length = 0;
   std::uint64_t stream_id = 0;
+  // NEW_CONNECTION_ID and RETIRE_CONNECTION_ID: which connection ID, since
+  // section 13.3 has both retransmitted carrying the same sequence number.
+  std::uint64_t sequence = 0;
 };
 
 struct sent_packet_t
