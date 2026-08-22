@@ -139,8 +139,16 @@ Configuration is in `.clang-tidy` at the project root.
   Everything TLS produces is kept per level until acknowledged so a lost CRYPTO
   frame can be resent byte for byte, and a PTO probe carries outstanding data
   rather than a bare PING (section 6.2.4) -- during a handshake a PING would
-  elicit an ACK while telling the peer nothing it is waiting for. Migration,
-  Retry and key update are **not** built yet. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+  elicit an ACK while telling the peer nothing it is waiting for. Connection
+  migration is **not** built yet.
+  Retry (section 17.2.5) and key update (RFC 9001 section 6) are both in.
+  `retry_token.h` seals the token under a server-held AEAD key with the client
+  address as associated data and a lifetime, because a token that is forgeable,
+  unbound or eternal proves nothing. Key update keeps three generations --
+  previous, current, next -- and derives the next one up front, since deriving
+  on demand leaks when updates happen (section 6.3). Note that AEAD open is
+  in place and a rejected tag may leave the buffer altered, so any speculative
+  attempt must restore the ciphertext before the next one. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
   transcribed from the appendix A pseudocode. A sent packet records *what it
   meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes

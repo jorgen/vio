@@ -30,6 +30,7 @@
 #include "vio/quic/loss_recovery.h"
 #include "vio/quic/packet.h"
 #include "vio/quic/protection.h"
+#include "vio/quic/retry_token.h"
 #include "vio/quic/streams.h"
 
 #include <algorithm>
@@ -152,6 +153,25 @@ struct packet_space_t
   packet_protection_t write;
   header_protection_t read_header;
   header_protection_t write_header;
+  // RFC 9001 section 6.3: the next generation is derived when the current one
+  // is installed rather than when a key update is detected. Deriving it on
+  // demand would make the time taken to process a packet depend on the Key
+  // Phase bit, which is precisely the bit header protection hides.
+  packet_protection_t read_next;
+  packet_protection_t write_next;
+  bool have_next = false;
+  // Section 6.5: a packet sent before the update but delayed by the network
+  // arrives after it, still protected with the old keys. Discarding the
+  // previous generation immediately would drop perfectly good data.
+  packet_protection_t read_previous;
+  bool have_previous = false;
+  // The phase this endpoint is sending in, and expecting to receive in.
+  bool key_phase = false;
+  // Section 6.1: another update may not begin until a packet from this phase
+  // has been acknowledged, or the peer would be left without the keys to read
+  // what comes next.
+  std::uint64_t first_packet_in_phase = 0;
+  bool phase_acknowledged = true;
   bool have_read = false;
   bool have_write = false;
   bool discarded = false;
@@ -204,6 +224,21 @@ struct connection_impl_t
 
   loss_recovery_t recovery;
   congestion_control_t congestion;
+  // The token from a Retry, repeated in every subsequent Initial (section
+  // 17.2.5.3).
+  std::vector<std::uint8_t> retry_token;
+  // A client accepts at most one Retry per connection attempt (section
+  // 17.2.5.2); a second is an injected packet or a confused server.
+  bool retry_handled = false;
+  // A server issues at most one, and validates the token that comes back.
+  // These are separate: having issued a Retry is exactly the state in which a
+  // token is expected, so conflating them means never checking the one thing
+  // the Retry was for.
+  bool retry_issued = false;
+  bool retry_validated = false;
+  bool retry_pending = false;
+  bool validated_by_retry = false;
+  std::vector<std::uint8_t> pending_retry_packet;
   streams_t streams;
   // A window is only extended when the application has actually taken the
   // data; sending MAX_DATA for bytes still sitting in a reassembly buffer
@@ -238,6 +273,32 @@ std::expected<void, error_t> install_keys(packet_space_t &space, const tls_secre
     return std::unexpected(r.error());
   }
   (read ? space.have_read : space.have_write) = true;
+  return {};
+}
+
+// Section 6.1: the next generation comes from "quic ku" applied to the current
+// secret. The header protection key is deliberately not touched -- it is what
+// conceals the Key Phase bit, so a key that changed with the phase would have
+// to be selected by the thing it hides.
+std::expected<void, error_t> derive_next_generation(packet_space_t &space)
+{
+  if (!space.have_read || !space.have_write || space.have_next)
+  {
+    return {};
+  }
+  auto next_read = space.read.next_generation();
+  if (!next_read.has_value())
+  {
+    return std::unexpected(next_read.error());
+  }
+  auto next_write = space.write.next_generation();
+  if (!next_write.has_value())
+  {
+    return std::unexpected(next_write.error());
+  }
+  space.read_next = std::move(*next_read);
+  space.write_next = std::move(*next_write);
+  space.have_next = true;
   return {};
 }
 
@@ -424,6 +485,14 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     }
   }
 
+  // Only the application space ever updates keys; Initial and Handshake are
+  // discarded long before it could matter.
+  auto &application = impl.spaces[space_index(encryption_level_t::application)];
+  if (auto r = derive_next_generation(application); !r.has_value())
+  {
+    return r;
+  }
+
   if (*advanced && !impl.handshake_complete)
   {
     impl.handshake_complete = true;
@@ -522,8 +591,13 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       {
         impl.received_handshake_ack = true;
       }
+      auto &application_space = impl.spaces[space_index(encryption_level_t::application)];
       for (const auto &acked : outcome.acknowledged)
       {
+        if (space == pn_space_t::application && acked.packet_number >= application_space.first_packet_in_phase)
+        {
+          application_space.phase_acknowledged = true;
+        }
         impl.congestion.on_packet_acked(acked);
         for (const auto &sent : acked.frames)
         {
@@ -642,12 +716,93 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
   return ack_eliciting;
 }
 
+// Section 6.1 and 6.2: one step to the next generation. The header protection
+// key is deliberately untouched.
+std::expected<void, error_t> advance_key_phase(packet_space_t &space, bool move_write)
+{
+  if (!space.have_next)
+  {
+    return {};
+  }
+  space.read_previous = std::move(space.read);
+  space.have_previous = true;
+  space.read = std::move(space.read_next);
+  if (move_write)
+  {
+    space.write = std::move(space.write_next);
+  }
+  space.have_next = false;
+  space.key_phase = !space.key_phase;
+  space.first_packet_in_phase = space.next_packet_number;
+  space.phase_acknowledged = false;
+  return derive_next_generation(space);
+}
+
+// Section 17.2.5.2. Every condition here is a discard rather than an error:
+// a Retry is unprotected apart from its integrity tag, so anyone on the path
+// can inject one, and reacting to a bad one would hand them the connection.
+std::expected<void, error_t> receive_retry(connection_impl_t &impl, const packet_header_t &header)
+{
+  if (impl.config.role != tls_role_t::client)
+  {
+    return {};
+  }
+  if (impl.retry_handled || impl.handshake_complete)
+  {
+    // At most one per connection attempt, and none once the handshake has
+    // moved on.
+    return {};
+  }
+  if (header.retry_token.empty())
+  {
+    return {};
+  }
+  if (header.source_id == impl.original_destination_id)
+  {
+    // A server that echoed back the connection ID the client invented has
+    // proved nothing; section 17.2.5.1 forbids it.
+    return {};
+  }
+  if (!verify_retry_integrity(impl.original_destination_id.bytes(), header.packet))
+  {
+    // Section 5.8 of RFC 9001: the tag is what proves the sender saw the
+    // client's Initial. Without it this is an injected packet.
+    return {};
+  }
+
+  impl.retry_token.assign(header.retry_token.begin(), header.retry_token.end());
+  impl.retry_handled = true;
+  impl.validated_by_retry = true;
+
+  // Section 17.2.5.3: the client adopts the server's connection ID, and the
+  // Initial keys follow it because they are derived from it.
+  impl.peer_connection_id = header.source_id;
+  impl.peer_connection_id_confirmed = true;
+  if (auto r = install_initial_keys(impl, header.source_id); !r.has_value())
+  {
+    return r;
+  }
+
+  // The same handshake message goes again, from the start, under the new
+  // keys. Packet numbers are deliberately not reset -- section 17.2.5.3.
+  auto &initial = impl.spaces[space_index(encryption_level_t::initial)];
+  initial.crypto_send.sent_offset = 0;
+  initial.crypto_send.retransmit.clear();
+  initial.probe_pending = false;
+  impl.recovery.discard_space(pn_space_t::initial);
+  return {};
+}
+
 std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packet_header_t &header, std::span<std::uint8_t> packet, tick_t now)
 {
-  if (header.kind == packet_kind_t::retry || header.kind == packet_kind_t::version_negotiation || header.kind == packet_kind_t::zero_rtt)
+  if (header.kind == packet_kind_t::retry)
   {
-    // Retry and Version Negotiation are not handled yet; 0-RTT is refused by
-    // construction. All three are dropped rather than treated as errors.
+    return receive_retry(impl, header);
+  }
+  if (header.kind == packet_kind_t::version_negotiation || header.kind == packet_kind_t::zero_rtt)
+  {
+    // Version Negotiation is not handled yet; 0-RTT is refused by
+    // construction. Both are dropped rather than treated as errors.
     return {};
   }
 
@@ -670,12 +825,115 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     }
   }
 
+  if (header.kind == packet_kind_t::initial && impl.config.role == tls_role_t::server && impl.config.retry_key != nullptr && !impl.retry_validated)
+  {
+    if (header.token.empty())
+    {
+      // Section 8.1.2: no token, so nothing has proved this address is real.
+      // Answering with a Retry costs the client a round trip and costs anyone
+      // spoofing a source address the ability to make this server work for
+      // them. No handshake state is built until the token comes back.
+      if (!impl.retry_issued)
+      {
+        impl.retry_pending = true;
+        impl.retry_issued = true;
+        // Section 5.2 of RFC 9001: Initial keys follow the Destination
+        // Connection ID, and after a Retry that is the one this server just
+        // told the client to use. Keeping the keys derived from the ID the
+        // client invented would leave the server unable to read its own Retry
+        // being answered. Packet numbers are deliberately left alone: section
+        // 17.2.5.3 forbids the client resetting them, so the acknowledgement
+        // state stays valid across the Retry.
+        if (auto r = install_initial_keys(impl, impl.local_connection_id); !r.has_value())
+        {
+          return r;
+        }
+      }
+      return {};
+    }
+
+    auto original = impl.config.retry_key->validate(header.token, impl.config.peer_address, now);
+    if (!original.has_value())
+    {
+      // Forged, expired, or presented from a different address. A packet that
+      // cannot be accounted for is dropped, not argued with.
+      return {};
+    }
+    impl.retry_validated = true;
+    // Section 8.1.4: the connection ID the client first chose comes back out
+    // of the token, and the handshake requires it to be echoed to the client
+    // so the client can confirm the Retry was genuine.
+    impl.original_destination_id = *original;
+    impl.validated_by_retry = true;
+    impl.address_validated = true;
+    auto parameters = impl.config.transport_parameters;
+    parameters.original_destination_connection_id = *original;
+    parameters.retry_source_connection_id = impl.local_connection_id;
+    impl.config.transport_parameters = parameters;
+    if (auto r = impl.tls.set_transport_parameters(encode_transport_parameters(parameters)); !r.has_value())
+    {
+      return std::unexpected(r.error());
+    }
+  }
+
   if (space.discarded || !space.have_read)
   {
     return {};
   }
 
-  auto opened = unprotect_packet(space.read, space.read_header, packet, header.packet_number_offset, space.acks.largest_received());
+  // The two halves are split here rather than using unprotect_packet, because
+  // which key generation applies is only knowable once the header is unmasked,
+  // and the Key Phase bit that says so is itself under header protection.
+  auto unmasked = space.read_header.remove(packet, header.packet_number_offset);
+  if (!unmasked.has_value())
+  {
+    if (is_connection_error(unmasked.error()))
+    {
+      begin_close(impl, transport_error_protocol_violation, "reserved bits set", false, false);
+    }
+    return {};
+  }
+
+  const bool phase_changed = header.kind == packet_kind_t::one_rtt && unmasked->key_phase != space.key_phase;
+  bool peer_updated = false;
+
+  // Decryption is in place, and an AEAD that rejects a tag is under no
+  // obligation to leave the buffer as it found it. Any attempt that might be
+  // followed by another therefore needs the ciphertext kept: without this the
+  // second attempt authenticates whatever the first left behind, and a key
+  // update simply never completes.
+  const std::size_t payload_offset = header.packet_number_offset + unmasked->packet_number_length;
+  std::vector<std::uint8_t> ciphertext;
+  if (phase_changed && payload_offset <= packet.size())
+  {
+    ciphertext.assign(packet.begin() + static_cast<std::ptrdiff_t>(payload_offset), packet.end());
+  }
+  const auto restore = [&]()
+  {
+    std::copy(ciphertext.begin(), ciphertext.end(), packet.begin() + static_cast<std::ptrdiff_t>(payload_offset));
+  };
+
+  auto opened = space.read.decrypt(packet, header.packet_number_offset, *unmasked, space.acks.largest_received());
+  if (phase_changed && !opened.has_value())
+  {
+    // A differing Key Phase bit means one of two things, and which one is not
+    // knowable without trying: the peer has moved on, or this is a packet from
+    // before the last update that the network delayed. Both generations are
+    // already derived, so neither costs a key schedule here -- section 6.3
+    // warns that deriving on demand leaks when updates happen.
+    if (space.have_next && impl.handshake_confirmed)
+    {
+      restore();
+      opened = space.read_next.decrypt(packet, header.packet_number_offset, *unmasked, space.acks.largest_received());
+      peer_updated = opened.has_value();
+    }
+    if (!opened.has_value() && space.have_previous)
+    {
+      restore();
+      opened = space.read_previous.decrypt(packet, header.packet_number_offset, *unmasked, space.acks.largest_received());
+    }
+  }
+
   if (!opened.has_value())
   {
     if (is_connection_error(opened.error()))
@@ -683,6 +941,18 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
       begin_close(impl, transport_error_protocol_violation, "reserved bits set", false, false);
     }
     return {};
+  }
+
+  if (peer_updated)
+  {
+    // Section 6.2: the packet opened under the next generation, so the peer
+    // really did update. Sending keys move with it, and must do so before the
+    // acknowledgement goes out -- that acknowledgement is what tells the peer
+    // the update completed.
+    if (auto r = advance_key_phase(space, true); !r.has_value())
+    {
+      return r;
+    }
   }
 
   if (space.acks.is_duplicate(opened->packet_number))
@@ -720,6 +990,35 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   // Keys for the next packet in this same datagram may depend on this one:
   // that is exactly why senders coalesce Initial before Handshake.
   return drive_tls(impl);
+}
+
+// Section 17.2.5.1. The Destination Connection ID is the one the client used
+// as its source, and the Source Connection ID is this server's own -- which is
+// what the client will address from then on.
+std::expected<std::size_t, error_t> build_retry(connection_impl_t &impl, std::span<std::uint8_t> out, tick_t now)
+{
+  if (impl.config.retry_key == nullptr)
+  {
+    return std::size_t{0};
+  }
+  auto token = impl.config.retry_key->issue(impl.original_destination_id, impl.config.peer_address, now);
+  if (!token.has_value())
+  {
+    return std::unexpected(token.error());
+  }
+
+  const std::size_t head = serialize_retry(out, quic_version_1, impl.peer_connection_id, impl.local_connection_id, *token);
+  if (head == 0 || out.size() < head + retry_integrity_tag_size)
+  {
+    return std::size_t{0};
+  }
+  auto tag = retry_integrity_tag(impl.original_destination_id.bytes(), out.first(head));
+  if (!tag.has_value())
+  {
+    return std::unexpected(tag.error());
+  }
+  std::copy(tag->begin(), tag->end(), out.begin() + static_cast<std::ptrdiff_t>(head));
+  return head + retry_integrity_tag_size;
 }
 
 // Writes the frames for one space into a packet, returning its size or zero
@@ -781,11 +1080,12 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   bool begun = false;
   if (*kind == packet_kind_t::one_rtt)
   {
-    begun = builder.begin_short(impl.peer_connection_id, false, false, packet_number, std::nullopt);
+    begun = builder.begin_short(impl.peer_connection_id, space.key_phase, false, packet_number, std::nullopt);
   }
   else
   {
-    begun = builder.begin_long(*kind, quic_version_1, impl.peer_connection_id, impl.local_connection_id, {}, packet_number, std::nullopt);
+    const auto token = *kind == packet_kind_t::initial ? std::span<const std::uint8_t>(impl.retry_token) : std::span<const std::uint8_t>{};
+    begun = builder.begin_long(*kind, quic_version_1, impl.peer_connection_id, impl.local_connection_id, token, packet_number, std::nullopt);
   }
   if (!begun)
   {
@@ -1286,6 +1586,23 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     return std::size_t{0};
   }
 
+  if (impl.retry_pending)
+  {
+    // A Retry is its own datagram: it carries no packet number, cannot be
+    // acknowledged, and nothing may be coalesced after it.
+    auto written = build_retry(impl, out, now);
+    if (!written.has_value())
+    {
+      return std::unexpected(written.error());
+    }
+    if (*written > 0)
+    {
+      impl.retry_pending = false;
+      impl.bytes_sent += *written;
+    }
+    return written;
+  }
+
   std::size_t budget = std::min(out.size(), impl.config.max_datagram_size);
   if (impl.config.role == tls_role_t::server && !impl.address_validated)
   {
@@ -1405,6 +1722,26 @@ bool connection_t::handshake_complete() const
 bool connection_t::handshake_confirmed() const
 {
   return _impl->handshake_confirmed;
+}
+
+bool connection_t::address_validated_by_retry() const
+{
+  return _impl->validated_by_retry;
+}
+
+bool connection_t::initiate_key_update()
+{
+  auto &space = _impl->spaces[space_index(encryption_level_t::application)];
+  if (!_impl->handshake_confirmed || space.discarded || !space.have_next || !space.phase_acknowledged)
+  {
+    return false;
+  }
+  return advance_key_phase(space, true).has_value();
+}
+
+bool connection_t::key_phase() const
+{
+  return _impl->spaces[space_index(encryption_level_t::application)].key_phase;
 }
 
 const connection_id_t &connection_t::local_connection_id() const

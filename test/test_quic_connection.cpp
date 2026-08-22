@@ -1150,6 +1150,321 @@ TEST_CASE("streams survive a lossy link")
   CHECK(received == payload);
 }
 
+TEST_CASE("a Retry validates the client address before any handshake work")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  retry_token_key_t retry_key;
+  REQUIRE(retry_key.generate().has_value());
+  const std::vector<std::uint8_t> address = {192, 0, 2, 1, 0x1f, 0x90};
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.retry_key = &retry_key;
+  server_config.peer_address = address;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  // The client's first Initial.
+  std::vector<std::uint8_t> first(1500);
+  auto size = client->poll_send(first, at(0ns));
+  REQUIRE(size.has_value());
+  first.resize(*size);
+  REQUIRE(server->receive(first, at(0ns)).has_value());
+
+  // The server answers with a Retry rather than doing handshake work.
+  CHECK_FALSE(server->handshake_complete());
+  std::vector<std::uint8_t> retry(1500);
+  auto retry_size = server->poll_send(retry, at(0ns));
+  REQUIRE(retry_size.has_value());
+  REQUIRE(*retry_size > 0);
+  retry.resize(*retry_size);
+
+  packet_reader_t reader(retry, 0);
+  auto header = reader.next();
+  REQUIRE(header.has_value());
+  REQUIRE(header->has_value());
+  CHECK(header->value().kind == packet_kind_t::retry);
+  CHECK_FALSE(header->value().retry_token.empty());
+
+  REQUIRE(client->receive(retry, at(0ns)).has_value());
+  CHECK(client->address_validated_by_retry());
+  // Section 17.2.5.3: the client now addresses the server by the ID it chose.
+  CHECK(client->peer_connection_id() == server->local_connection_id());
+
+  // The client comes back with the token, and only now does the server do any
+  // handshake work.
+  const auto exchange = run_handshake(*client, *server, at(0ns));
+  CAPTURE(exchange.rounds);
+  CHECK(client->handshake_complete());
+  CHECK(server->handshake_complete());
+  CHECK(server->address_validated_by_retry());
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+  CHECK(client->selected_alpn() == "h3");
+
+  SUBCASE("and the server echoed the original connection id back")
+  {
+    // Section 8.1.4: the client can only tell a genuine Retry from an injected
+    // one by seeing the connection ID it first chose come back through the
+    // handshake, which the token is what let the server recover.
+    auto parameters = client->peer_transport_parameters();
+    REQUIRE(parameters.has_value());
+    REQUIRE(parameters->original_destination_connection_id.has_value());
+    REQUIRE(parameters->retry_source_connection_id.has_value());
+    CHECK(*parameters->retry_source_connection_id == server->local_connection_id());
+  }
+}
+
+TEST_CASE("a Retry that cannot be trusted is discarded")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  retry_token_key_t retry_key;
+  REQUIRE(retry_key.generate().has_value());
+  const std::vector<std::uint8_t> address = {10, 0, 0, 1};
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.retry_key = &retry_key;
+  server_config.peer_address = address;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  const auto make_retry = [&]()
+  {
+    auto server = connection_t::create(contexts.server_context, server_config);
+    REQUIRE(server.has_value());
+    auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+    REQUIRE(client.has_value());
+    std::vector<std::uint8_t> first(1500);
+    auto size = client->poll_send(first, at(0ns));
+    REQUIRE(size.has_value());
+    first.resize(*size);
+    REQUIRE(server->receive(first, at(0ns)).has_value());
+    std::vector<std::uint8_t> retry(1500);
+    auto retry_size = server->poll_send(retry, at(0ns));
+    REQUIRE(retry_size.has_value());
+    retry.resize(*retry_size);
+    return std::make_pair(std::move(*client), std::move(retry));
+  };
+
+  SUBCASE("a corrupted integrity tag")
+  {
+    auto [client, retry] = make_retry();
+    // Section 5.8 of RFC 9001: the tag is what proves the sender saw the
+    // client's Initial. Anyone on the path can write a Retry otherwise.
+    retry[retry.size() - 1] ^= 0x01;
+    REQUIRE(client.receive(retry, at(0ns)).has_value());
+    CHECK_FALSE(client.address_validated_by_retry());
+  }
+
+  SUBCASE("a corrupted token, which the tag also covers")
+  {
+    auto [client, retry] = make_retry();
+    retry[20] ^= 0xff;
+    REQUIRE(client.receive(retry, at(0ns)).has_value());
+    CHECK_FALSE(client.address_validated_by_retry());
+  }
+
+  SUBCASE("a second Retry after the first")
+  {
+    auto [client, retry] = make_retry();
+    REQUIRE(client.receive(retry, at(0ns)).has_value());
+    CHECK(client.address_validated_by_retry());
+    const auto adopted = client.peer_connection_id();
+
+    // Section 17.2.5.2: at most one per connection attempt. A second is an
+    // injected packet trying to redirect the connection.
+    auto [ignored, second] = make_retry();
+    REQUIRE(client.receive(second, at(0ns)).has_value());
+    CHECK(client.peer_connection_id() == adopted);
+  }
+}
+
+TEST_CASE("a Retry token is bound to the address it was issued to")
+{
+  retry_token_key_t key;
+  REQUIRE(key.generate().has_value());
+
+  const auto raw = std::vector<std::uint8_t>{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+  auto original = connection_id_t::from_bytes(raw);
+  REQUIRE(original.has_value());
+  const std::vector<std::uint8_t> address = {198, 51, 100, 7};
+
+  auto token = key.issue(*original, address, at(0ns));
+  REQUIRE(token.has_value());
+
+  auto recovered = key.validate(*token, address, at(1s));
+  REQUIRE(recovered.has_value());
+  CHECK(*recovered == *original);
+
+  SUBCASE("a different address does not validate")
+  {
+    // This is the attack Retry exists to stop: a token captured from one
+    // client replayed to make the server work for a spoofed source.
+    const std::vector<std::uint8_t> other = {198, 51, 100, 8};
+    auto result = key.validate(*token, other, at(1s));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == retry_token_error_t::not_authentic);
+  }
+
+  SUBCASE("a different key does not validate")
+  {
+    retry_token_key_t stranger;
+    REQUIRE(stranger.generate().has_value());
+    auto result = stranger.validate(*token, address, at(1s));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == retry_token_error_t::not_authentic);
+  }
+
+  SUBCASE("an expired token does not validate")
+  {
+    // Without a lifetime one captured token is a permanent bypass.
+    auto result = key.validate(*token, address, at(60s));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == retry_token_error_t::expired);
+  }
+
+  SUBCASE("a token from the future does not validate")
+  {
+    auto result = key.validate(*token, address, at(0ns) - std::chrono::nanoseconds(1s));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == retry_token_error_t::expired);
+  }
+
+  SUBCASE("every single byte corruption fails to authenticate")
+  {
+    for (std::size_t index = 0; index < token->size(); index += 5)
+    {
+      CAPTURE(index);
+      auto tampered = *token;
+      tampered[index] ^= 0x40;
+      auto result = key.validate(tampered, address, at(1s));
+      REQUIRE_FALSE(result.has_value());
+    }
+  }
+
+  SUBCASE("a truncated token is malformed rather than merely wrong")
+  {
+    std::vector<std::uint8_t> short_token(token->begin(), token->end() - 1);
+    auto result = key.validate(short_token, address, at(1s));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == retry_token_error_t::malformed);
+    CHECK_FALSE(key.validate({}, address, at(1s)).has_value());
+  }
+
+  SUBCASE("a zero length connection id round trips")
+  {
+    auto empty = key.issue(connection_id_t{}, address, at(0ns));
+    REQUIRE(empty.has_value());
+    auto back = key.validate(*empty, address, at(1s));
+    REQUIRE(back.has_value());
+    CHECK(back->empty());
+  }
+}
+
+TEST_CASE("a key update carries data across the phase change")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_confirmed());
+  REQUIRE(server->handshake_confirmed());
+
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+  const std::vector<std::uint8_t> before = {'b', 'e', 'f', 'o', 'r', 'e'};
+  CHECK(client->write_stream(*id, before, false) == before.size());
+  run_handshake(*client, *server, at(0ns));
+
+  auto first = server->readable_stream(*id);
+  CHECK(std::string(reinterpret_cast<const char *>(first.data()), first.size()) == "before");
+  server->consume_stream(*id, first.size());
+
+  REQUIRE(client->initiate_key_update());
+  CHECK(client->key_phase());
+  // Section 6.1: nothing from this phase has been acknowledged yet, so
+  // updating again would leave the peer without the keys to read on.
+  CHECK_FALSE(client->initiate_key_update());
+
+  const std::vector<std::uint8_t> after = {'a', 'f', 't', 'e', 'r'};
+  CHECK(client->write_stream(*id, after, true) == after.size());
+  run_handshake(*client, *server, at(0ns));
+
+  // Section 6.2: the server detected the phase change, opened the packet with
+  // the next generation, and moved its own send keys to match.
+  CHECK(server->key_phase());
+  auto second = server->readable_stream(*id);
+  CHECK(std::string(reinterpret_cast<const char *>(second.data()), second.size()) == "after");
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+
+  SUBCASE("and traffic keeps flowing in both directions afterwards")
+  {
+    server->consume_stream(*id, second.size());
+    // The client finished its half; the server's half of the same stream is
+    // still open, and now protected by the new generation.
+    const std::vector<std::uint8_t> reply = {'o', 'k'};
+    CHECK(server->write_stream(*id, reply, true) == reply.size());
+    run_handshake(*client, *server, at(0ns));
+    auto back = client->readable_stream(*id);
+    CHECK(std::string(reinterpret_cast<const char *>(back.data()), back.size()) == "ok");
+    CHECK(client->key_phase());
+    CHECK_FALSE(client->close_reason().has_value());
+  }
+
+  SUBCASE("and once this phase is acknowledged another update is allowed")
+  {
+    // The exchange above carried an acknowledgement of a packet sent in the
+    // new phase, which is exactly the condition section 6.1 waits for.
+    CHECK(client->initiate_key_update());
+    CHECK_FALSE(client->key_phase());
+  }
+}
+
+TEST_CASE("a key update cannot be initiated before the handshake is confirmed")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  // Section 6.1: not before confirmation, because the peer may not yet have
+  // the keys the update would move away from.
+  CHECK_FALSE(client->initiate_key_update());
+  CHECK_FALSE(client->key_phase());
+}
+
 TEST_CASE("a configuration that cannot work is refused up front")
 {
   const auto identity = make_self_signed("localhost");

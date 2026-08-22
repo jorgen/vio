@@ -48,6 +48,7 @@
 
 #include "vio/error.h"
 #include "vio/quic/connection_id.h"
+#include "vio/quic/retry_token.h"
 #include "vio/quic/stream.h"
 #include "vio/quic/tls.h"
 #include "vio/quic/transport_parameters.h"
@@ -107,6 +108,17 @@ struct connection_config_t
   std::size_t max_datagram_size = 1200;
 
   std::chrono::nanoseconds max_ack_delay = std::chrono::milliseconds(25);
+
+  // Server only. When set, the first Initial from an unvalidated client is
+  // answered with a Retry rather than a handshake, which costs the client a
+  // round trip and costs anyone spoofing a source address the ability to make
+  // this server do work on their behalf. The key must outlive the connection;
+  // it is what makes an issued token unforgeable.
+  const retry_token_key_t *retry_key = nullptr;
+  // Opaque bytes identifying the peer's address. Authenticated into the token
+  // so one issued to a given address cannot be replayed from another; leaving
+  // it empty means the token is bound to nothing, which defeats the point.
+  std::vector<std::uint8_t> peer_address;
 };
 
 namespace detail
@@ -154,6 +166,17 @@ public:
   [[nodiscard]] std::optional<transport_parameters_t> peer_transport_parameters() const;
   [[nodiscard]] std::string_view selected_alpn() const;
   [[nodiscard]] std::optional<connection_close_t> close_reason() const;
+
+  // Whether this connection went through a Retry, and so whether the peer
+  // address was validated before any handshake work was done.
+  [[nodiscard]] bool address_validated_by_retry() const;
+
+  // Moves to the next set of 1-RTT keys. False when it is not permitted yet:
+  // section 6.1 forbids it before the handshake is confirmed, and forbids a
+  // second update until a packet from the current phase has been acknowledged,
+  // because otherwise the peer could be left without the keys to read on.
+  [[nodiscard]] bool initiate_key_update();
+  [[nodiscard]] bool key_phase() const;
 
   // Queues a CONNECTION_CLOSE. The frame goes out on the next poll_send.
   void close(std::uint64_t error_code, std::string_view reason, bool application = false);
