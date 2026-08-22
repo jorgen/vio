@@ -186,6 +186,13 @@ public:
   // server_name is the SNI a client sends, and is ignored for a server.
   [[nodiscard]] static std::expected<tls_session_t, error_t> create(const tls_context_t &context, std::string_view server_name = {});
 
+  // Sets the quic_transport_parameters extension. Must be called before the
+  // handshake produces its first flight. A server needs this separately from
+  // the context because one of its parameters --
+  // original_destination_connection_id -- is not known until the client's
+  // first Initial has arrived.
+  [[nodiscard]] std::expected<void, error_t> set_transport_parameters(std::span<const std::uint8_t> parameters);
+
   // Ordered CRYPTO stream bytes for one level. Reassembly happens above.
   [[nodiscard]] std::expected<void, error_t> provide_handshake_data(encryption_level_t level, std::span<const std::uint8_t> data);
 

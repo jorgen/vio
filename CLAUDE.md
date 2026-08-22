@@ -130,6 +130,14 @@ Configuration is in `.clang-tidy` at the project root.
   `transport_parameters.h` is the section 18 extension TLS carries; note that
   an absent parameter means its default and the defaults are not all zero, so
   the struct is initialised to them and decoding overwrites only what arrived.
+  `connection.h` + `src/quic_connection.cpp` is the state machine that drives
+  all of it: three packet number spaces, the Initial/Handshake/1-RTT key
+  progression, anti-amplification (section 8.1) and connection close. It is
+  sans-I/O -- datagrams in, datagrams out, `tick_t` in -- so
+  `test_quic_connection.cpp` completes a real handshake between two of them
+  with no socket. Loss recovery, congestion control, streams, flow control,
+  migration, Retry and key update are **not** built yet: handshake data is
+  dropped once packetized, so a lossy path stalls rather than recovering.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 

@@ -578,6 +578,23 @@ std::expected<tls_session_t, error_t> tls_session_t::create(const tls_context_t 
   return session;
 }
 
+std::expected<void, error_t> tls_session_t::set_transport_parameters(std::span<const std::uint8_t> parameters)
+{
+  if (_impl == nullptr || _impl->ssl == nullptr)
+  {
+    return std::unexpected(error_t{.code = 1, .msg = "tls session is not initialized"});
+  }
+  if (parameters.empty())
+  {
+    return {};
+  }
+  if (SSL_set_quic_transport_params(_impl->ssl, parameters.data(), parameters.size()) != 1)
+  {
+    return std::unexpected(tls_error("SSL_set_quic_transport_params failed"));
+  }
+  return {};
+}
+
 std::expected<void, error_t> tls_session_t::provide_handshake_data(encryption_level_t level, std::span<const std::uint8_t> data)
 {
   if (_impl == nullptr || _impl->ssl == nullptr)
