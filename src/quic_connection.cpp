@@ -2049,6 +2049,7 @@ std::vector<std::uint64_t> connection_t::readable_streams()
       out.push_back(entry.first);
     }
   }
+  std::sort(out.begin(), out.end());
   return out;
 }
 

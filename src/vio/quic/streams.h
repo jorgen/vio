@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace vio::quic
@@ -289,7 +290,7 @@ public:
     std::rotate(_sendable.begin(), _sendable.begin() + static_cast<std::ptrdiff_t>(served), _sendable.end());
   }
 
-  [[nodiscard]] std::map<std::uint64_t, stream_t> &all()
+  [[nodiscard]] std::unordered_map<std::uint64_t, stream_t> &all()
   {
     return _streams;
   }
@@ -576,7 +577,10 @@ private:
   }
 
   streams_config_t _config;
-  std::map<std::uint64_t, stream_t> _streams;
+  // Keyed by stream id, and nothing reads it in order: the send path works
+  // from the sendable list and everything else is a lookup by id. Ordering it
+  // only bought a comparison chain and a cache miss per node.
+  std::unordered_map<std::uint64_t, stream_t> _streams;
   std::vector<std::uint64_t> _sendable;
 
   std::uint64_t _local_max_data = 0;

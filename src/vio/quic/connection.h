@@ -197,6 +197,9 @@ public:
   [[nodiscard]] std::span<const std::uint8_t> readable_stream(std::uint64_t id);
   void consume_stream(std::uint64_t id, std::size_t bytes);
 
+  // Ascending by id. The connection does not hold streams in that order, so
+  // this sorts; it is a caller-facing convenience rather than anything the
+  // send path uses.
   [[nodiscard]] std::vector<std::uint64_t> readable_streams();
 
   // The two halves finish independently -- that is the whole point of
