@@ -281,6 +281,9 @@ struct connection_impl_t
   // rest arrive in NEW_CONNECTION_ID frames and live in remote_ids.
   std::optional<stateless_reset_token_t> peer_initial_reset_token;
   bool reset_by_peer = false;
+  // Section 6.2: the server answered with a version list this build cannot
+  // satisfy, so the attempt is over.
+  bool version_negotiation_failed = false;
   // Section 5.1. Two pools: what this endpoint issued and must keep accepting,
   // and what the peer issued and this endpoint may spend.
   local_connection_ids_t local_ids;
@@ -1049,6 +1052,55 @@ std::expected<void, error_t> advance_key_phase(packet_space_t &space, bool move_
   return derive_next_generation(space);
 }
 
+// Section 6.2. A Version Negotiation packet carries no authentication of any
+// kind -- it cannot, since the whole point is that the two sides share no
+// version and therefore no keys. Every condition below exists to keep that
+// from being a way for anyone on the path to end a connection:
+//
+//   Only a client acts on one, and only before anything else has been
+//   processed. Once a single genuine packet has arrived, the server has
+//   clearly agreed on a version and a later claim otherwise is a forgery.
+//
+//   A list naming the version already in use is discarded outright, which is
+//   what an attacker replaying a captured packet would produce.
+//
+// Having passed those, a client that speaks only version 1 has nowhere to go,
+// so the attempt is abandoned rather than retried.
+std::expected<void, error_t> receive_version_negotiation(connection_impl_t &impl, const packet_header_t &header)
+{
+  if (impl.config.role != tls_role_t::client)
+  {
+    return {};
+  }
+  if (impl.packets_processed > 0 || impl.retry_handled || impl.version_negotiation_failed)
+  {
+    return {};
+  }
+  if (!(header.destination_id == impl.local_connection_id))
+  {
+    return {};
+  }
+
+  const auto versions = header.supported_versions;
+  for (std::size_t offset = 0; offset + 4 <= versions.size(); offset += 4)
+  {
+    const std::uint32_t version = (static_cast<std::uint32_t>(versions[offset]) << 24) | (static_cast<std::uint32_t>(versions[offset + 1]) << 16) | (static_cast<std::uint32_t>(versions[offset + 2]) << 8) | static_cast<std::uint32_t>(versions[offset + 3]);
+    if (version == quic_version_1)
+    {
+      return {};
+    }
+  }
+
+  impl.version_negotiation_failed = true;
+  impl.state = connection_state_t::closed;
+  impl.close_frame_pending = false;
+  if (!impl.close_reason.has_value())
+  {
+    impl.close_reason = connection_close_t{.error_code = transport_error_no_error, .application = false, .reason = "no shared QUIC version", .from_peer = true};
+  }
+  return {};
+}
+
 // Section 17.2.5.2. Every condition here is a discard rather than an error:
 // a Retry is unprotected apart from its integrity tag, so anyone on the path
 // can inject one, and reacting to a bad one would hand them the connection.
@@ -1124,10 +1176,13 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   {
     return receive_retry(impl, header);
   }
-  if (header.kind == packet_kind_t::version_negotiation || header.kind == packet_kind_t::zero_rtt)
+  if (header.kind == packet_kind_t::version_negotiation)
   {
-    // Version Negotiation is not handled yet; 0-RTT is refused by
-    // construction. Both are dropped rather than treated as errors.
+    return receive_version_negotiation(impl, header);
+  }
+  if (header.kind == packet_kind_t::zero_rtt)
+  {
+    // 0-RTT is refused by construction, and dropped rather than an error.
     return {};
   }
 
@@ -2412,6 +2467,11 @@ bool connection_t::handshake_confirmed() const
 bool connection_t::address_validated_by_retry() const
 {
   return _impl->validated_by_retry;
+}
+
+bool connection_t::version_negotiation_failed() const
+{
+  return _impl->version_negotiation_failed;
 }
 
 bool connection_t::reset_by_peer() const

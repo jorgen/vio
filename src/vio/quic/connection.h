@@ -169,6 +169,10 @@ public:
   // socket wants.
   [[nodiscard]] std::expected<void, error_t> receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address);
 
+  // Section 6.2: whether the attempt ended because the server offered no
+  // version this build speaks.
+  [[nodiscard]] bool version_negotiation_failed() const;
+
   // Section 10.3: whether this connection was ended by a stateless reset from
   // the peer, as opposed to a CONNECTION_CLOSE or a timeout.
   [[nodiscard]] bool reset_by_peer() const;

@@ -501,6 +501,52 @@ struct packet_layout_t
 // which is known when the field is written. Hence begin, then frames, then
 // finish. Two bytes are reserved for Length, which section 16 permits -- only
 // a frame type has to use the shortest encoding.
+// Section 17.2.1. A server answers a version it does not speak without keeping
+// any state: the reply is built entirely from the packet that arrived, with the
+// connection IDs swapped so it routes back.
+//
+// The version field is zero, which is what identifies it -- a Version
+// Negotiation packet belongs to no version, so it cannot be parsed by version
+// rules. The remaining seven bits of the first byte are arbitrary, but the
+// 0x40 bit is set so the packet still looks like QUIC to anything demultiplexing
+// it alongside other protocols.
+[[nodiscard]] inline std::size_t build_version_negotiation(std::span<std::uint8_t> out, const connection_id_t &destination, const connection_id_t &source, std::span<const std::uint32_t> versions)
+{
+  const std::size_t needed = 1 + 4 + 1 + destination.size() + 1 + source.size() + versions.size() * 4;
+  if (versions.empty() || out.size() < needed)
+  {
+    return 0;
+  }
+
+  std::size_t position = 0;
+  out[position++] = static_cast<std::uint8_t>(header_form_long | header_fixed_bit);
+  out[position++] = 0;
+  out[position++] = 0;
+  out[position++] = 0;
+  out[position++] = 0;
+
+  const connection_id_t *ids[] = {&destination, &source};
+  for (const auto *id : ids)
+  {
+    out[position++] = static_cast<std::uint8_t>(id->size());
+    const auto bytes = id->bytes();
+    if (!bytes.empty())
+    {
+      std::memcpy(out.data() + position, bytes.data(), bytes.size());
+    }
+    position += bytes.size();
+  }
+
+  for (const auto version : versions)
+  {
+    out[position++] = static_cast<std::uint8_t>((version >> 24) & 0xff);
+    out[position++] = static_cast<std::uint8_t>((version >> 16) & 0xff);
+    out[position++] = static_cast<std::uint8_t>((version >> 8) & 0xff);
+    out[position++] = static_cast<std::uint8_t>(version & 0xff);
+  }
+  return position;
+}
+
 class packet_builder_t
 {
 public:

@@ -2026,4 +2026,88 @@ TEST_CASE("a stateless reset ends the connection and a lookalike does not")
     CHECK_FALSE(client->reset_by_peer());
   }
 }
+TEST_CASE("version negotiation ends an attempt, but only when it is believable")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  REQUIRE_FALSE(client->version_negotiation_failed());
+
+  auto build = [&](std::span<const std::uint32_t> versions, const connection_id_t &destination)
+  {
+    std::vector<std::uint8_t> packet(256);
+    const auto size = build_version_negotiation(packet, destination, client->peer_connection_id(), versions);
+    REQUIRE(size > 0);
+    packet.resize(size);
+    return packet;
+  };
+
+  SUBCASE("a list with nothing this build speaks abandons the attempt")
+  {
+    const std::array<std::uint32_t, 2> versions = {0x6b3343cf, 0xff00001d};
+    auto packet = build(versions, client->local_connection_id());
+    REQUIRE(client->receive(packet, at(1ms)).has_value());
+    CHECK(client->version_negotiation_failed());
+    CHECK(client->state() == connection_state_t::closed);
+  }
+
+  SUBCASE("a list naming the version already in use is discarded")
+  {
+    // Section 6.2. This is exactly what replaying a captured packet produces,
+    // and the packet carries no authentication at all.
+    const std::array<std::uint32_t, 2> versions = {0x6b3343cf, quic_version_1};
+    auto packet = build(versions, client->local_connection_id());
+    REQUIRE(client->receive(packet, at(1ms)).has_value());
+    CHECK_FALSE(client->version_negotiation_failed());
+  }
+
+  SUBCASE("one addressed to a different connection id is discarded")
+  {
+    const std::array<std::uint32_t, 1> versions = {0x6b3343cf};
+    std::array<std::uint8_t, 8> other_bytes = {9, 9, 9, 9, 9, 9, 9, 9};
+    auto other = connection_id_t::from_bytes(other_bytes);
+    REQUIRE(other.has_value());
+    auto packet = build(versions, *other);
+    REQUIRE(client->receive(packet, at(1ms)).has_value());
+    CHECK_FALSE(client->version_negotiation_failed());
+  }
+
+  SUBCASE("one arriving after the handshake has moved is discarded")
+  {
+    connection_config_t server_config;
+    server_config.role = tls_role_t::server;
+    server_config.transport_parameters = sane_parameters();
+    auto server = connection_t::create(contexts.server_context, server_config);
+    REQUIRE(server.has_value());
+    REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+    REQUIRE(client->handshake_complete());
+
+    const std::array<std::uint32_t, 1> versions = {0x6b3343cf};
+    auto packet = build(versions, client->local_connection_id());
+    REQUIRE(client->receive(packet, at(1ms)).has_value());
+    CHECK_FALSE(client->version_negotiation_failed());
+    CHECK(client->state() == connection_state_t::connected);
+  }
+
+  SUBCASE("a server ignores one entirely")
+  {
+    // Section 6.1: only servers send them, so one arriving at a server is a
+    // forgery by definition.
+    connection_config_t server_config;
+    server_config.role = tls_role_t::server;
+    server_config.transport_parameters = sane_parameters();
+    auto server = connection_t::create(contexts.server_context, server_config);
+    REQUIRE(server.has_value());
+
+    const std::array<std::uint32_t, 1> versions = {0x6b3343cf};
+    auto packet = build(versions, server->local_connection_id());
+    REQUIRE(server->receive(packet, at(1ms)).has_value());
+    CHECK_FALSE(server->version_negotiation_failed());
+  }
+}
 }
