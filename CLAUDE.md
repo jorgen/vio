@@ -127,6 +127,9 @@ Configuration is in `.clang-tidy` at the project root.
   `tls.h` requires (merging overlaps, bounded per section 7.5), and
   `ack_tracker.h` holds what has been received in one packet number space and
   turns it into the descending ACK encoding of section 19.3.1.
+  `transport_parameters.h` is the section 18 extension TLS carries; note that
+  an absent parameter means its default and the defaults are not all zero, so
+  the struct is initialised to them and decoding overwrites only what arrived.
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
 
