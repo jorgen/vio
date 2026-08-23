@@ -361,4 +361,37 @@ TEST_CASE("udp sockname returns correct address")
 }
 } // TEST_SUITE
 
-} // namespace
+TEST_CASE("udp ecn codepoint on a bound socket")
+{
+  // RFC 3168 / RFC 9000 section 13.4. libuv has no interface for this, so it
+  // goes through the socket underneath -- IP_TOS on the unix family, IP_ECN on
+  // Windows, which reserves IP_TOS to its QoS subsystem. The point of the test
+  // is that the option is accepted where it is supposed to be.
+  vio::event_loop_t event_loop;
+  bool verified = false;
+
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
+      {
+        auto bound = get_udp_ephemeral_port(event_loop);
+        REQUIRE_EXPECTED(bound);
+        auto socket = std::move(bound->first);
+
+        auto marked = vio::udp_set_ecn(socket, vio::udp_ecn_t::ect0);
+        REQUIRE_EXPECTED(marked);
+
+        // And back off again, which is what an endpoint does when ECN
+        // validation fails for the path.
+        auto cleared = vio::udp_set_ecn(socket, vio::udp_ecn_t::not_ect);
+        REQUIRE_EXPECTED(cleared);
+
+        verified = true;
+        event_loop.stop();
+        co_return;
+      }(event_loop, verified);
+  });
+
+  event_loop.run();
+  REQUIRE(verified);
+}
+}

@@ -80,6 +80,19 @@ struct endpoint_config_t
   // forgotten, so it outlives any one of them.
   const stateless_reset_key_t *stateless_reset_key = nullptr;
 
+  // Section 13.4. Marks outgoing datagrams ECT(0), so routers can report
+  // congestion by setting a bit rather than dropping the packet, and the peer's
+  // reported counts become something this endpoint can check and act on.
+  //
+  // Marking is applied to the socket, and the socket is shared by every
+  // connection on this endpoint. So when validation fails on one path -- a
+  // middlebox clearing the field, a peer not reporting -- marking stops for all
+  // of them. That is the conservative direction (ECN off is always safe), but
+  // it does mean one bad path costs the others the benefit. Per-datagram
+  // marking would need sendmsg with control messages instead of the socket
+  // option, and libuv's send path does not offer that.
+  bool ecn = false;
+
   // Zero means no ceiling.
   //
   // A server reachable from the internet should set this, or retry_key, or

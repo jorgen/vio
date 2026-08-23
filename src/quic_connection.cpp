@@ -162,6 +162,9 @@ struct packet_space_t
   // Phase bit, which is precisely the bit header protection hides.
   packet_protection_t read_next;
   packet_protection_t write_next;
+  // Section 13.4.2.1: the counts arrive per packet number space, so they are
+  // checked per space.
+  ecn_validator_t ecn;
   bool have_next = false;
   // Section 6.5: a packet sent before the update but delayed by the network
   // arrives after it, still protected with the old keys. Discarding the
@@ -287,6 +290,12 @@ struct connection_impl_t
   // covers the connection ID it chose during the handshake. Tokens for the
   // rest arrive in NEW_CONNECTION_ID frames and live in remote_ids.
   std::optional<stateless_reset_token_t> peer_initial_reset_token;
+  // Section 13.4: what this endpoint believes its datagrams are being marked
+  // with. Marking happens on the socket, which the connection does not own, so
+  // this is what its owner was asked to apply -- and what each sent packet
+  // records, so the peer's counts can be checked against something real.
+  // Cleared when validation fails, which is how the owner learns to stop.
+  ecn_codepoint_t ecn_sending = ecn_codepoint_t::not_ect;
   // Section 8.1.3. A server issues one after the handshake; a client keeps
   // whatever arrives for the application to store.
   std::vector<std::uint8_t> new_token_pending;
@@ -922,6 +931,61 @@ std::expected<void, error_t> replenish_connection_ids(connection_impl_t &impl)
   return transport_error_protocol_violation;
 }
 
+// Section 13.4.2.1. Everything reported is checked against what was actually
+// sent before any of it is acted on, because acting on it means letting the
+// peer influence this endpoint's sending rate.
+void apply_ecn_feedback(connection_impl_t &impl, packet_space_t &space, const frame_t &frame, const ack_outcome_t &outcome, tick_t now)
+{
+  if (!space.ecn.enabled())
+  {
+    return;
+  }
+
+  ecn_ack_report_t report;
+  report.advanced_largest_acked = outcome.advanced_largest_acked;
+  if (frame.ecn.has_value())
+  {
+    report.reported = ecn_counts_totals_t{.ect0 = frame.ecn->ect0, .ect1 = frame.ecn->ect1, .ce = frame.ecn->ce};
+  }
+
+  bool have_latest = false;
+  tick_t latest;
+  for (const auto &acked : outcome.acknowledged)
+  {
+    if (acked.ecn == ecn_codepoint_t::ect0)
+    {
+      ++report.newly_acked_ect0;
+    }
+    else if (acked.ecn == ecn_codepoint_t::ect1)
+    {
+      ++report.newly_acked_ect1;
+    }
+    if (!have_latest || acked.time_sent > latest)
+    {
+      latest = acked.time_sent;
+      have_latest = true;
+    }
+  }
+
+  const auto result = space.ecn.on_ack(report);
+  if (result.outcome == ecn_outcome_t::failed)
+  {
+    // Section 13.4.2: the path does not carry the field honestly. Marking
+    // stops for the whole connection -- the codepoint is a property of the
+    // path, not of one packet number space.
+    impl.ecn_sending = ecn_codepoint_t::not_ect;
+    for (auto &other : impl.spaces)
+    {
+      other.ecn.disable();
+    }
+    return;
+  }
+  if (result.ce_increase > 0 && have_latest)
+  {
+    impl.congestion.on_congestion_event(latest, now);
+  }
+}
+
 // Everything a received packet's frames can do to the connection.
 std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<const std::uint8_t> payload, packet_kind_t kind, tick_t now, const connection_id_t &destination, bool &non_probing)
 {
@@ -963,21 +1027,6 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
 
     case frame_kind_t::ack:
     {
-      // The ECN counts in this frame are deliberately not acted on, and this
-      // is not an oversight to be tidied up later.
-      //
-      // Section 13.4.2.1 validates a reported count against the ECN codepoints
-      // this endpoint actually applied to the packets being acknowledged.
-      // Nothing here applies any: marking needs IP_TOS / IPV6_TCLASS on send
-      // and the arriving codepoint on receive, and libuv exposes neither for
-      // UDP. So every packet leaves unmarked, and every honest peer must
-      // report zero.
-      //
-      // Treating a non-zero count as congestion would therefore mean believing
-      // a number that can only be wrong, and letting a peer set it freely --
-      // any peer could halve this endpoint's sending rate by claiming CE marks
-      // for packets that never carried them. Ignoring them is the safe reading
-      // until marking exists on both sides of the socket.
       const auto space = to_pn_space(*level_for(kind));
       auto outcome = impl.recovery.on_ack_received(space, frame, now, recovery_context(impl));
       if (outcome.malformed)
@@ -1016,6 +1065,14 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
           }
         }
       }
+      // Section 13.4.2.1, and section 7 of RFC 9002: a rise in the
+      // congestion-experienced count is a router saying it is close to
+      // dropping, and is treated exactly as loss would be -- except that
+      // nothing was actually lost, which is the whole point of ECN. It is only
+      // believed once the counts have been checked against the codepoints this
+      // endpoint applied to the packets being acknowledged.
+      apply_ecn_feedback(impl, impl.spaces[static_cast<std::size_t>(space)], frame, outcome, now);
+
       impl.congestion.on_packets_lost(outcome.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
       repair_lost(impl, space, outcome.lost);
       break;
@@ -2241,6 +2298,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   sent.ack_eliciting = crypto_written > 0 || wrote_handshake_done || wrote_ping || !record.empty();
   sent.in_flight = sent.ack_eliciting;
   sent.size = *length;
+  sent.ecn = impl.ecn_sending;
   sent.frames = std::move(record);
   impl.recovery.on_packet_sent(to_pn_space(level), std::move(sent));
   return *length;
@@ -2305,6 +2363,7 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
   else
   {
     impl->local_ids.install_initial(impl->local_connection_id, initial_token);
+  impl->ecn_sending = config.ecn;
   }
 
   // Section 10.3: only a server may advertise this. A client's transport
@@ -2771,6 +2830,11 @@ bool connection_t::address_validated_by_retry() const
 std::span<const std::uint8_t> connection_t::new_token() const
 {
   return _impl->received_new_token;
+}
+
+ecn_codepoint_t connection_t::ecn_sending() const
+{
+  return _impl->ecn_sending;
 }
 
 bool connection_t::version_negotiation_failed() const

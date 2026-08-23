@@ -48,6 +48,7 @@
 
 #include "vio/error.h"
 #include "vio/quic/connection_id.h"
+#include "vio/quic/ecn.h"
 #include "vio/quic/path.h"
 #include "vio/quic/retry_token.h"
 #include "vio/quic/stateless_reset.h"
@@ -118,6 +119,13 @@ struct connection_config_t
   std::size_t max_datagram_size = 1200;
 
   std::chrono::nanoseconds max_ack_delay = std::chrono::milliseconds(25);
+
+  // Section 13.4. The codepoint the owner of the socket is marking outgoing
+  // datagrams with, so that a sent packet records what it went out as and the
+  // peer's counts can be checked against it. Leave it at not_ect unless the
+  // socket really is marking: claiming ECT(0) without it makes validation
+  // fail against an honest peer.
+  ecn_codepoint_t ecn = ecn_codepoint_t::not_ect;
 
   // RFC 9002 section 7.7. Spreads sending over the round trip instead of
   // handing the whole congestion window to the network at once. On by default,
@@ -203,6 +211,11 @@ public:
   // puts it in connection_config_t::address_token next time saves the round
   // trip a Retry would cost.
   [[nodiscard]] std::span<const std::uint8_t> new_token() const;
+
+  // Section 13.4.2. What this connection is marking with now: not_ect once
+  // validation has failed and marking should stop. An endpoint sharing one
+  // socket across connections watches this to know when to clear the socket.
+  [[nodiscard]] ecn_codepoint_t ecn_sending() const;
 
   // Section 6.2: whether the attempt ended because the server offered no
   // version this build speaks.

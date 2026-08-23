@@ -42,6 +42,7 @@
 //
 // Time enters as a parameter. Nothing here reads a clock.
 
+#include "vio/quic/ecn.h"
 #include "vio/quic/frame_codec.h"
 #include "vio/tick.h"
 
@@ -210,6 +211,10 @@ struct sent_packet_t
   bool ack_eliciting = false;
   bool in_flight = false;
   std::size_t size = 0;
+  // Section 13.4.2.1: validating a peer's ECN counts means checking them
+  // against the codepoints this endpoint applied, so each packet has to
+  // remember what it went out marked as.
+  ecn_codepoint_t ecn = ecn_codepoint_t::not_ect;
   std::vector<sent_frame_t> frames;
 };
 
@@ -357,6 +362,10 @@ struct ack_outcome_t
   // PROTOCOL_VIOLATION. It is also the shape a confused or hostile peer takes,
   // so the caller is told rather than left to notice the numbers drifting.
   bool acknowledged_unsent = false;
+  // Section 13.4.2.1: an ACK that does not move the largest acknowledged
+  // forward may be a reordered one, and must not be allowed to fail ECN
+  // validation or report the same congestion twice.
+  bool advanced_largest_acked = false;
   // Section 19.3.1: a range that computes a packet number below zero is a
   // FRAME_ENCODING_ERROR. Absorbing it silently would let a peer move this
   // endpoint's largest-acknowledged forward with a frame that acknowledges
@@ -439,6 +448,7 @@ public:
     {
       state.largest_acked = ack.largest_acknowledged;
       state.has_largest_acked = true;
+      outcome.advanced_largest_acked = true;
     }
 
     // Walk what was actually sent, not the numbers the frame names. A single

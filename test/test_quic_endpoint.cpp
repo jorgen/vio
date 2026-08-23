@@ -128,6 +128,9 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
         endpoint_config_t server_config;
         server_config.connection.role = tls_role_t::server;
         server_config.connection.transport_parameters = sane_parameters();
+        // Section 13.4: datagrams go out marked ECT(0), so a router can report
+        // congestion by setting a bit instead of dropping the packet.
+        server_config.ecn = true;
         auto server_created = endpoint_t::create(loop, *server_context, server_config);
         REQUIRE(server_created.has_value());
         // Held in an optional so the socket can be closed before the loop is
@@ -148,6 +151,7 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
         endpoint_config_t client_config;
         client_config.connection.role = tls_role_t::client;
         client_config.connection.transport_parameters = sane_parameters();
+        client_config.ecn = true;
         auto client_created = endpoint_t::create(loop, *client_context, client_config);
         REQUIRE(client_created.has_value());
         std::optional<endpoint_t> client(std::move(*client_created));
