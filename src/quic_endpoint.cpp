@@ -135,6 +135,7 @@ struct endpoint_impl_t
   std::vector<std::unique_ptr<connection_entry_t>> connections;
   std::unordered_map<connection_id_t, connection_entry_t *> by_id;
   connection_ready_t on_connection;
+  connection_active_t on_activity;
   bool running = false;
   // One buffer for the whole endpoint, grown once and reused: a batch is built
   // by polling datagrams straight into it rather than copying them in.
@@ -641,6 +642,11 @@ void endpoint_t::on_connection(connection_ready_t handler)
   _impl->on_connection = std::move(handler);
 }
 
+void endpoint_t::on_activity(connection_active_t handler)
+{
+  _impl->on_activity = std::move(handler);
+}
+
 std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name)
 {
   auto &impl = *_impl;
@@ -856,6 +862,16 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     {
       touched.push_back(entry);
     }
+    }
+
+    // Before the flush, so anything the application writes in response goes
+    // out with the reply rather than waiting for the next wakeup.
+    if (impl.on_activity)
+    {
+      for (auto *entry : touched)
+      {
+        impl.on_activity(*entry->connection);
+      }
     }
 
     const auto now = loop_now(impl.loop);

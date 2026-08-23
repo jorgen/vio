@@ -132,6 +132,17 @@ struct endpoint_stats_t
 // connection closes.
 using connection_ready_t = std::function<void(connection_t &)>;
 
+// Called for a connection that has just taken in packets: there may be stream
+// data to read, and flow control may have opened so more can be written.
+//
+// It runs after the whole batch of arriving datagrams has been processed and
+// *before* anything is sent, which is the part that matters. Whatever the
+// handler writes joins the same flush, so an application answering a burst
+// produces a burst -- rather than one datagram per call, which is what
+// polling on a timer produces and what leaves the segmentation offload with
+// nothing to work with.
+using connection_active_t = std::function<void(connection_t &)>;
+
 namespace detail
 {
 struct endpoint_impl_t;
@@ -156,6 +167,11 @@ public:
   // do. A server uses this to learn about arrivals; a client can use it to
   // learn its dial succeeded.
   void on_connection(connection_ready_t handler);
+
+  // Every time a connection processes arriving packets. This is how an
+  // application reads without polling: drain what is readable, write what it
+  // can, and both go out with the reply this endpoint was about to send.
+  void on_activity(connection_active_t handler);
 
   // Dials. The returned pointer is owned by the endpoint and stays valid until
   // the connection closes and is reaped.

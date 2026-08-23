@@ -198,7 +198,30 @@ double socket_transfer(const certificate_t &identity, bool offload, std::size_t 
         auto port = server->local_port();
 
         connection_t *accepted = nullptr;
+        const std::size_t total = total_mb * 1024 * 1024;
+        std::size_t offered = 0;
+        std::size_t drained = 0;
+        std::uint64_t sender_stream = 0;
+        bool have_stream = false;
+        const std::vector<std::uint8_t> chunk(64 * 1024, 0x5a);
+
+        // Draining happens where the data arrives, not on a timer. Anything
+        // this writes back joins the flush the endpoint is about to make.
         server->on_connection([&accepted](connection_t &connection) { accepted = &connection; });
+        server->on_activity(
+          [&drained, &sender_stream, &have_stream](connection_t &connection)
+          {
+            if (!have_stream)
+            {
+              return;
+            }
+            auto readable = connection.readable_stream(sender_stream);
+            if (!readable.empty())
+            {
+              drained += readable.size();
+              connection.consume_stream(sender_stream, readable.size());
+            }
+          });
 
         endpoint_config_t client_config;
         client_config.connection.role = tls_role_t::client;
@@ -207,6 +230,28 @@ double socket_transfer(const certificate_t &identity, bool offload, std::size_t 
         client_config.offload = use_offload;
         auto client_made = endpoint_t::create(event_loop, *client_context, client_config);
         std::optional<endpoint_t> client(std::move(*client_made));
+
+        // Keeping the send buffer full is the whole point: a sender that runs
+        // dry between wakeups never builds a congestion window, and a sender
+        // without a window has nothing to batch.
+        auto keep_writing = [&offered, total, &chunk, &sender_stream, &have_stream](connection_t &connection)
+        {
+          if (!have_stream)
+          {
+            return;
+          }
+          while (offered < total)
+          {
+            const std::size_t want = (std::min)(chunk.size(), total - offered);
+            const auto wrote = connection.write_stream(sender_stream, std::span<const std::uint8_t>(chunk).first(want), false);
+            if (wrote == 0)
+            {
+              return;
+            }
+            offered += wrote;
+          }
+        };
+        client->on_activity(keep_writing);
 
         cancellation_t server_cancel;
         cancellation_t client_cancel;
@@ -226,46 +271,26 @@ double socket_transfer(const certificate_t &identity, bool offload, std::size_t 
         }
 
         auto stream = connection->open_stream(stream_direction_t::bidirectional);
-        const std::size_t total = total_mb * 1024 * 1024;
-        const std::vector<std::uint8_t> chunk(64 * 1024, 0x5a);
-        std::size_t offered = 0;
-        std::size_t drained = 0;
+        sender_stream = *stream;
+        have_stream = true;
 
         const auto started = std::chrono::steady_clock::now();
-        for (int round = 0; round < 40000 && drained < total; ++round)
+        keep_writing(*connection);
+        (void)client->flush();
+
+        // Only a completion check. The transfer is driven by the callbacks.
+        for (int i = 0; i < 4000 && drained < total; ++i)
         {
-          while (offered < total)
-          {
-            const std::size_t want = (std::min)(chunk.size(), total - offered);
-            const auto wrote = connection->write_stream(*stream, std::span<const std::uint8_t>(chunk).first(want), false);
-            if (wrote == 0)
-            {
-              break;
-            }
-            offered += wrote;
-          }
-          (void)client->flush();
-          if (accepted != nullptr)
-          {
-            auto readable = accepted->readable_stream(*stream);
-            if (!readable.empty())
-            {
-              drained += readable.size();
-              accepted->consume_stream(*stream, readable.size());
-            }
-          }
-          co_await sleep(event_loop, 0ms);
+          co_await sleep(event_loop, 2ms);
         }
         const auto finished = std::chrono::steady_clock::now();
         elapsed = std::chrono::duration<double>(finished - started).count();
-        // Throughput here is bounded by how often this loop gets to run, not by
-        // the socket, so the ratios are the measurement that means anything:
-        // how many datagrams each system call carried.
+
         const auto out = client->stats();
         const auto in = server->stats();
-        std::printf("%-30s %5.2f datagrams/send   %5.2f datagrams/read   (%llu sends, %llu reads, %zu MiB)\n", use_offload ? "offload on" : "offload off",
+        std::printf("%-12s %6.1f MB/s  %5.2f datagrams/send  %5.2f datagrams/read  (%llu sends, %llu reads)\n", use_offload ? "offload on" : "offload off", static_cast<double>(drained) / (1024.0 * 1024.0) / elapsed,
                     out.sends > 0 ? static_cast<double>(out.datagrams_sent) / static_cast<double>(out.sends) : 0.0, in.reads > 0 ? static_cast<double>(in.datagrams_received) / static_cast<double>(in.reads) : 0.0,
-                    static_cast<unsigned long long>(out.sends), static_cast<unsigned long long>(in.reads), drained / (1024 * 1024));
+                    static_cast<unsigned long long>(out.sends), static_cast<unsigned long long>(in.reads));
 
         server_cancel.cancel();
         client_cancel.cancel();
