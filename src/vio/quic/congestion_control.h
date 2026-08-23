@@ -126,6 +126,19 @@ public:
   }
 
 private:
+  // Section 7.7 sets the rate the bucket fills at but leaves its depth -- the
+  // largest burst allowed at once -- to the implementation. Holding it at the
+  // initial window forever caps a connection at one initial flight per wakeup
+  // however far the congestion window has grown, which makes throughput a
+  // function of timer granularity instead of the window: ten packets every 2ms
+  // is 48 Mbit/s, whatever the link underneath can do. A quarter of the window
+  // scales with the connection, and the initial window stays as the floor so a
+  // small one still gets a full flight out.
+  [[nodiscard]] std::size_t burst_capacity(std::size_t window) const
+  {
+    return (std::max)(_capacity, window / 4);
+  }
+
   [[nodiscard]] static std::uint64_t fill_rate(std::size_t window, std::chrono::nanoseconds smoothed_rtt)
   {
     const auto rtt = smoothed_rtt.count();
@@ -168,14 +181,15 @@ private:
     const auto rate = fill_rate(window, smoothed_rtt);
     if (rate == 0)
     {
-      _tokens = static_cast<std::int64_t>(_capacity);
+      _tokens = static_cast<std::int64_t>(burst_capacity(window));
       return;
     }
     const auto gained = (static_cast<std::uint64_t>(elapsed.count()) * rate) / 1000000000ULL;
     _tokens += static_cast<std::int64_t>(gained);
-    if (_tokens > static_cast<std::int64_t>(_capacity))
+    const auto ceiling_bytes = static_cast<std::int64_t>(burst_capacity(window));
+    if (_tokens > ceiling_bytes)
     {
-      _tokens = static_cast<std::int64_t>(_capacity);
+      _tokens = ceiling_bytes;
     }
   }
 
