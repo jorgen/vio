@@ -213,6 +213,129 @@ struct sent_packet_t
   std::vector<sent_frame_t> frames;
 };
 
+// The packets a space still has outstanding.
+//
+// Packet numbers are handed out in order and never reused, so this is a sorted
+// sequence by construction and there is nothing for a tree to order. What a
+// tree did buy was cheap removal from the middle, which acknowledgement needs:
+// an ACK frame names ranges, and the packets it covers can be anywhere in the
+// window. So removal marks the slot dead and the storage is compacted when the
+// dead outnumber the living -- O(1) per removal, amortised O(1) per packet
+// overall, and one allocation per growth instead of one per packet sent.
+//
+// The gain is not really the allocation. It is that acknowledgement and loss
+// detection both walk the whole window, and walking a contiguous array is a
+// different thing from chasing a pointer per packet.
+class sent_packets_t
+{
+public:
+  void insert(std::uint64_t number, sent_packet_t packet)
+  {
+    if (_entries.empty() || number > _entries.back().number)
+    {
+      _entries.push_back(entry_t{.number = number, .packet = std::move(packet), .live = true});
+      ++_live;
+      return;
+    }
+    // Out of order, which a sender does not do to itself. Kept correct rather
+    // than fast: find the slot and replace it.
+    const auto found = std::lower_bound(_entries.begin(), _entries.end(), number, [](const entry_t &entry, std::uint64_t value) { return entry.number < value; });
+    if (found != _entries.end() && found->number == number)
+    {
+      if (!found->live)
+      {
+        ++_live;
+      }
+      found->packet = std::move(packet);
+      found->live = true;
+      return;
+    }
+    _entries.insert(found, entry_t{.number = number, .packet = std::move(packet), .live = true});
+    ++_live;
+  }
+
+  [[nodiscard]] bool contains(std::uint64_t number) const
+  {
+    const auto found = std::lower_bound(_entries.begin(), _entries.end(), number, [](const entry_t &entry, std::uint64_t value) { return entry.number < value; });
+    return found != _entries.end() && found->number == number && found->live;
+  }
+
+  [[nodiscard]] bool empty() const
+  {
+    return _live == 0;
+  }
+
+  [[nodiscard]] std::size_t size() const
+  {
+    return _live;
+  }
+
+  void clear()
+  {
+    _entries.clear();
+    _live = 0;
+  }
+
+  // Slots, not packets: a walk runs over these and asks live() about each.
+  [[nodiscard]] std::size_t slots() const
+  {
+    return _entries.size();
+  }
+
+  [[nodiscard]] bool live(std::size_t index) const
+  {
+    return _entries[index].live;
+  }
+
+  [[nodiscard]] std::uint64_t number_at(std::size_t index) const
+  {
+    return _entries[index].number;
+  }
+
+  [[nodiscard]] sent_packet_t &at(std::size_t index)
+  {
+    return _entries[index].packet;
+  }
+
+  [[nodiscard]] const sent_packet_t &at(std::size_t index) const
+  {
+    return _entries[index].packet;
+  }
+
+  void remove(std::size_t index)
+  {
+    if (!_entries[index].live)
+    {
+      return;
+    }
+    _entries[index].live = false;
+    --_live;
+  }
+
+  // Called once a walk has finished rather than per removal, so a pass that
+  // acknowledges half the window costs one move of the survivors instead of
+  // one per packet.
+  void compact()
+  {
+    if (_live * 2 >= _entries.size())
+    {
+      return;
+    }
+    _entries.erase(std::remove_if(_entries.begin(), _entries.end(), [](const entry_t &entry) { return !entry.live; }), _entries.end());
+  }
+
+private:
+  struct entry_t
+  {
+    std::uint64_t number = 0;
+    sent_packet_t packet;
+    bool live = false;
+  };
+
+  std::vector<entry_t> _entries;
+  std::size_t _live = 0;
+};
+
 // The state the PTO calculation needs that lives outside loss recovery.
 struct recovery_context_t
 {
@@ -280,7 +403,7 @@ public:
       ++_ack_eliciting_in_flight;
     }
     const auto number = packet.packet_number;
-    state.sent.insert_or_assign(number, std::move(packet));
+    state.sent.insert(number, std::move(packet));
   }
 
   // Appendix A.6. The frame is taken as decoded from the wire, so ack_delay is
@@ -323,25 +446,26 @@ public:
     // bytes, so iterating the number space is a hang the peer chooses; the
     // packets in flight are bounded by the congestion window.
     bool acked_ack_eliciting = false;
-    for (auto it = state.sent.begin(); it != state.sent.end();)
+    for (std::size_t index = 0; index < state.sent.slots(); ++index)
     {
-      if (!covered(spans, it->first))
+      if (!state.sent.live(index) || !covered(spans, state.sent.number_at(index)))
       {
-        ++it;
         continue;
       }
-      if (it->second.in_flight)
+      auto &packet = state.sent.at(index);
+      if (packet.in_flight)
       {
-        _bytes_in_flight -= std::min(_bytes_in_flight, it->second.size);
+        _bytes_in_flight -= std::min(_bytes_in_flight, packet.size);
       }
-      if (it->second.ack_eliciting)
+      if (packet.ack_eliciting)
       {
         acked_ack_eliciting = true;
         --_ack_eliciting_in_flight;
       }
-      outcome.acknowledged.push_back(std::move(it->second));
-      it = state.sent.erase(it);
+      outcome.acknowledged.push_back(std::move(packet));
+      state.sent.remove(index);
     }
+    state.sent.compact();
 
     // Only the largest gives an RTT sample, and only when it is newly
     // acknowledged: a repeated ACK of an old packet would otherwise report a
@@ -393,35 +517,40 @@ public:
     const auto delay = _rtt.loss_delay();
     const auto lost_send_time = now - delay;
 
-    for (auto it = state.sent.begin(); it != state.sent.end();)
+    for (std::size_t index = 0; index < state.sent.slots(); ++index)
     {
-      if (it->first > state.largest_acked)
+      if (!state.sent.live(index))
       {
-        ++it;
         continue;
       }
-      const bool by_time = it->second.time_sent <= lost_send_time;
-      const bool by_order = state.largest_acked >= it->first + loss_packet_threshold;
+      const auto number = state.sent.number_at(index);
+      if (number > state.largest_acked)
+      {
+        continue;
+      }
+      auto &packet = state.sent.at(index);
+      const bool by_time = packet.time_sent <= lost_send_time;
+      const bool by_order = state.largest_acked >= number + loss_packet_threshold;
       if (by_time || by_order)
       {
-        if (it->second.in_flight)
+        if (packet.in_flight)
         {
-          _bytes_in_flight -= std::min(_bytes_in_flight, it->second.size);
+          _bytes_in_flight -= std::min(_bytes_in_flight, packet.size);
         }
-        if (it->second.ack_eliciting)
+        if (packet.ack_eliciting)
         {
           --_ack_eliciting_in_flight;
         }
-        lost.push_back(std::move(it->second));
-        it = state.sent.erase(it);
+        lost.push_back(std::move(packet));
+        state.sent.remove(index);
         continue;
       }
       // Not lost yet, but it will be if nothing acknowledges it: remember the
       // earliest moment that becomes true so a timer can be set for it.
-      const auto when = it->second.time_sent + delay;
+      const auto when = packet.time_sent + delay;
       state.loss_time = state.loss_time.has_value() ? std::min(*state.loss_time, when) : when;
-      ++it;
     }
+    state.sent.compact();
     return lost;
   }
 
@@ -474,13 +603,18 @@ public:
   void discard_space(pn_space_t space)
   {
     auto &state = _spaces[pn_space_to_index(space)];
-    for (const auto &entry : state.sent)
+    for (std::size_t index = 0; index < state.sent.slots(); ++index)
     {
-      if (entry.second.in_flight)
+      if (!state.sent.live(index))
       {
-        _bytes_in_flight -= std::min(_bytes_in_flight, entry.second.size);
+        continue;
       }
-      if (entry.second.ack_eliciting)
+      const auto &packet = state.sent.at(index);
+      if (packet.in_flight)
+      {
+        _bytes_in_flight -= std::min(_bytes_in_flight, packet.size);
+      }
+      if (packet.ack_eliciting)
       {
         --_ack_eliciting_in_flight;
       }
@@ -538,9 +672,15 @@ public:
   [[nodiscard]] std::vector<sent_frame_t> unacknowledged_frames(pn_space_t space) const
   {
     std::vector<sent_frame_t> out;
-    for (const auto &entry : _spaces[pn_space_to_index(space)].sent)
+    const auto &sent = _spaces[pn_space_to_index(space)].sent;
+    for (std::size_t index = 0; index < sent.slots(); ++index)
     {
-      out.insert(out.end(), entry.second.frames.begin(), entry.second.frames.end());
+      if (!sent.live(index))
+      {
+        continue;
+      }
+      const auto &frames = sent.at(index).frames;
+      out.insert(out.end(), frames.begin(), frames.end());
     }
     return out;
   }
@@ -548,7 +688,7 @@ public:
 private:
   struct space_state_t
   {
-    std::map<std::uint64_t, sent_packet_t> sent;
+    sent_packets_t sent;
     std::uint64_t largest_acked = 0;
     bool has_largest_acked = false;
     std::optional<tick_t> loss_time;
@@ -668,13 +808,9 @@ private:
         continue;
       }
       bool eliciting = false;
-      for (const auto &entry : state.sent)
+      for (std::size_t index = 0; index < state.sent.slots() && !eliciting; ++index)
       {
-        if (entry.second.ack_eliciting)
-        {
-          eliciting = true;
-          break;
-        }
+        eliciting = state.sent.live(index) && state.sent.at(index).ack_eliciting;
       }
       if (!eliciting)
       {

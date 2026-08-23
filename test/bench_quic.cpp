@@ -180,6 +180,11 @@ int main(int argc, char **argv)
   connection_config_t client_config;
   client_config.role = tls_role_t::client;
   client_config.transport_parameters = generous();
+  // This measures what the protocol machinery costs per datagram. Pacing is a
+  // rate limiter measured against a round trip, and the clock here barely
+  // moves, so leaving it on would measure the pacer and nothing else.
+  client_config.pacing = false;
+  server_config.pacing = false;
 
   auto server = connection_t::create(*server_context, server_config);
   auto client = connection_t::create(*client_context, client_config, "localhost");

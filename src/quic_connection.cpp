@@ -496,24 +496,6 @@ void note_blocked(connection_impl_t &impl, stream_t &stream)
   }
 }
 
-// Whether a limit is in the way does not depend on how much room is left in
-// the packet, so it is settled before anything is written. Discovering it
-// half way through emission would leave the signal for the next packet, and a
-// caller that stops polling when poll_send returns zero would never send it --
-// which is exactly the situation where the peer most needs to hear it.
-void note_all_blocked(connection_impl_t &impl)
-{
-  const auto count = impl.streams.sendable().size();
-  for (std::size_t i = 0; i < count && i < impl.streams.sendable().size(); ++i)
-  {
-    auto *stream = impl.streams.find(impl.streams.sendable()[i]);
-    if (stream != nullptr && stream->has_send)
-    {
-      note_blocked(impl, *stream);
-    }
-  }
-}
-
 void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, std::uint64_t packet_number, std::size_t datagram_size, tick_t now)
 {
   impl.peer_address.assign(address.begin(), address.end());
@@ -1604,7 +1586,6 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   if (level == encryption_level_t::application && !want_close)
   {
     reap_and_grant(impl);
-    note_all_blocked(impl);
     want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1] || impl.data_blocked_pending || impl.streams.streams_blocked_owed() || impl.streams.has_sendable();
   }
 
@@ -1836,20 +1817,6 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       }
     }
 
-    if (impl.data_blocked_pending)
-    {
-      frame_t frame;
-      frame.kind = frame_kind_t::data_blocked;
-      // Section 13.3: the limit as it stands now, not the one that was in
-      // force when the block was noticed.
-      frame.maximum = impl.streams.peer_max_data();
-      if (frames.write(frame))
-      {
-        impl.data_blocked_pending = false;
-        record.push_back(sent_frame_t{.kind = frame_kind_t::data_blocked});
-      }
-    }
-
     for (const auto direction : {stream_direction_t::bidirectional, stream_direction_t::unidirectional})
     {
       std::uint64_t limit = 0;
@@ -1980,7 +1947,24 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       auto chunk = stream.send.next_chunk(available - overhead, impl.streams.connection_send_window());
       if (!chunk.has_value())
       {
+        // Whether a limit is in the way is settled here, at the one moment
+        // this stream is being looked at anyway, and the frame goes into this
+        // packet rather than waiting for one the caller has no reason to ask
+        // for. Walking every stream up front to find this out was correct and
+        // cost a pass over the whole connection per packet.
         note_blocked(impl, stream);
+        if (stream.data_blocked_pending && stream.has_send)
+        {
+          frame_t blocked;
+          blocked.kind = frame_kind_t::stream_data_blocked;
+          blocked.stream_id = stream.id;
+          blocked.maximum = stream.send.stream_limit();
+          if (frames.write(blocked))
+          {
+            stream.data_blocked_pending = false;
+            record.push_back(sent_frame_t{.kind = frame_kind_t::stream_data_blocked, .stream_id = stream.id});
+          }
+        }
         continue;
       }
 
@@ -2004,6 +1988,21 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       }
     }
     impl.streams.rotate_sendable(served);
+
+    if (impl.data_blocked_pending)
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::data_blocked;
+      // Section 13.3: the limit as it stands now, not the one that was in
+      // force when the block was noticed. Written after the walk, because the
+      // walk is what discovers that the connection window is the obstacle.
+      frame.maximum = impl.streams.peer_max_data();
+      if (frames.write(frame))
+      {
+        impl.data_blocked_pending = false;
+        record.push_back(sent_frame_t{.kind = frame_kind_t::data_blocked});
+      }
+    }
   }
 
   // A probe has to elicit an acknowledgement; if nothing else in this packet
