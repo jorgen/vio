@@ -359,6 +359,51 @@ private:
     std::vector<std::uint8_t> incoming(data.begin() + static_cast<std::ptrdiff_t>(skip), data.end());
     const std::uint64_t end = start + incoming.size();
 
+    // The ordinary case, and the one worth spending code on: bytes that
+    // continue a run already held. Appending to that run keeps it in one piece
+    // for readable() at the cost of what arrived, where the general path below
+    // builds the whole run again for every arrival -- allocating it, zeroing
+    // it, and copying into it. On a stream being read more slowly than it is
+    // filled, which is every bulk transfer, that is quadratic in the amount
+    // waiting: 8 MB spent three quarters of its instructions in memset.
+    auto run = _chunks.end();
+    if (!_chunks.empty())
+    {
+      auto candidate = _chunks.lower_bound(start);
+      if (candidate == _chunks.end() || candidate->first > start)
+      {
+        if (candidate != _chunks.begin())
+        {
+          --candidate;
+          if (candidate->first + candidate->second.size() == start)
+          {
+            run = candidate;
+          }
+        }
+      }
+    }
+    if (run != _chunks.end())
+    {
+      run->second.insert(run->second.end(), incoming.begin(), incoming.end());
+      // Whatever now continues it joins it, which is how an out-of-order gap
+      // that this arrival closed gets stitched back together.
+      for (auto next = std::next(run); next != _chunks.end();)
+      {
+        const std::uint64_t run_end = run->first + run->second.size();
+        if (next->first > run_end)
+        {
+          break;
+        }
+        if (next->first + next->second.size() > run_end)
+        {
+          const auto overlap = static_cast<std::size_t>(run_end - next->first);
+          run->second.insert(run->second.end(), next->second.begin() + static_cast<std::ptrdiff_t>(overlap), next->second.end());
+        }
+        next = _chunks.erase(next);
+      }
+      return;
+    }
+
     auto first = _chunks.upper_bound(start);
     if (first != _chunks.begin())
     {

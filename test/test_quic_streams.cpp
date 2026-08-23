@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
@@ -107,6 +108,38 @@ TEST_CASE("the low two bits say who opened it and which way it runs")
 
 TEST_SUITE("quic receive stream")
 {
+TEST_CASE("filling a stream faster than it is read stays linear")
+{
+  // A receiver that does not drain on every arrival -- an application doing
+  // any work between reads -- leaves a run of bytes waiting, and every further
+  // arrival has to join it. Rebuilding that run each time is quadratic in what
+  // is waiting, which the flow control window is the only bound on: the same
+  // 8 MB that took 15 seconds here spent three quarters of its instructions in
+  // memset. This is the shape of that, small enough to run every time.
+  constexpr std::size_t piece = 1200;
+  constexpr std::size_t pieces = 20000;
+  receive_stream_t stream(static_cast<std::uint64_t>(piece) * pieces);
+  const std::vector<std::uint8_t> data(piece, 0x7a);
+
+  std::uint64_t consumed = 0;
+  const auto started = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < pieces; ++i)
+  {
+    REQUIRE(stream.receive(static_cast<std::uint64_t>(i) * piece, data, false, consumed) == stream_error_t::none);
+  }
+  const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+  // Everything arrived in order, so it is one run and readable() offers all of
+  // it at once.
+  CHECK(stream.readable().size() == piece * pieces);
+
+  // Generous by two orders of magnitude against what this costs when it is
+  // linear, and far under what it costs when it is not.
+  CHECK(elapsed < 2.0);
+  MESSAGE("24 MB of in-order arrivals took " << elapsed << "s");
+}
+
+
 TEST_CASE("data arrives in any order and reads back in one")
 {
   receive_stream_t stream(1000);

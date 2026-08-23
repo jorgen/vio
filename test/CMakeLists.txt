@@ -86,6 +86,12 @@ add_executable(vio_interop_server EXCLUDE_FROM_ALL interop_server.cpp)
 CmDepTargetLinkLibrary(vio_interop_server PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
 target_include_directories(vio_interop_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# A transfer with the network taken out of it: the one repeatable measurement
+# of what the protocol costs, and what a profiler should be pointed at.
+add_executable(vio_profile_quic EXCLUDE_FROM_ALL profile_quic.cpp)
+CmDepTargetLinkLibrary(vio_profile_quic PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+target_include_directories(vio_profile_quic PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # What the AEAD costs per packet, for comparing against another stack's crypto.
 add_executable(vio_crypto_bench EXCLUDE_FROM_ALL crypto_bench.cpp)
 CmDepTargetLinkLibrary(vio_crypto_bench PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
