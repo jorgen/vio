@@ -818,7 +818,17 @@ std::expected<bool, error_t> tls_session_t::advance()
     if (_impl->alert.has_value())
     {
       ERR_clear_error();
-      return std::unexpected(error_t{.code = static_cast<int>(*_impl->alert), .msg = "TLS handshake failed with alert " + std::to_string(*_impl->alert)});
+      std::string detail = "TLS handshake failed with alert " + std::to_string(*_impl->alert);
+      // A certificate alert says only that verification failed; the reason it
+      // failed is what a caller can act on.
+      if (const auto verify = SSL_get_verify_result(_impl->ssl); verify != X509_V_OK)
+      {
+        const char *text = X509_verify_cert_error_string(verify);
+        detail += " (certificate: ";
+        detail += text != nullptr ? text : "unknown";
+        detail += ")";
+      }
+      return std::unexpected(error_t{.code = static_cast<int>(*_impl->alert), .msg = detail});
     }
     return std::unexpected(tls_error("SSL_do_handshake failed"));
   }

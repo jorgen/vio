@@ -421,12 +421,24 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
   auto serving = [](endpoint_t &endpoint, cancellation_t &token) -> detached_task_t { co_await endpoint.run(&token); }(client, cancel);
   (void)serving;
 
+  // The endpoint owns what connect() returned and reaps it once it has closed
+  // and drained, so the pointer is only good for as long as the endpoint still
+  // holds a connection. Checking that before each use is what keeps a stalled
+  // handshake -- which closes, drains and is collected while this loop is still
+  // running -- from turning into a use-after-free.
   connection_t *connection = *connected;
   std::size_t opened = 0;
+  bool alive = true;
   // 30 seconds is above every timeout the runner applies, so a hang here is
   // reported as a failed download rather than a killed container.
   for (int elapsed = 0; elapsed < 9000 && !state.finished() && !state.failed; ++elapsed)
   {
+    if (client.connection_count() == 0)
+    {
+      alive = false;
+      state.failed = true;
+      break;
+    }
     // A request per stream, opened as the peer's limit allows rather than all
     // at once: the multiplexing test asks for thousands of files, and the
     // credit for them arrives in MAX_STREAMS as earlier ones finish.
@@ -454,7 +466,10 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
   }
 
   bool ok = state.finished() && !state.failed;
-  connection->close(0, "done", true);
+  if (alive && client.connection_count() > 0)
+  {
+    connection->close(0, "done", true);
+  }
   co_await sleep(loop, 50ms);
   cancel.cancel();
   co_await sleep(loop, 50ms);
@@ -475,6 +490,18 @@ task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
   tls.alpn = {"hq-interop"};
   tls.key_log_path = environment("SSLKEYLOGFILE");
   tls.ca_certificates_pem = read_file(environment("CERTS", "/certs") + "/ca.pem");
+  // The runner inflates its certificate with twenty subject alternative names
+  // of 250 random characters, to make the server's handshake flight large
+  // enough for the amplification test. A DNS label may not exceed 63 octets
+  // (RFC 1035 section 2.3.4), so those names are malformed, and LibreSSL
+  // rejects the whole certificate for it rather than skipping the bad entries
+  // and matching the valid "server" that sits alongside them -- which is what
+  // OpenSSL does, and why every other endpoint verifies it happily.
+  //
+  // None of these test cases is about certificate validation, so the harness
+  // stops checking rather than misreport a transport result. vio's own default
+  // is unchanged and still verifies.
+  tls.verify_peer = false;
   auto context = tls_context_t::create(tls);
   if (!context.has_value())
   {
