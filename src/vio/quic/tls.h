@@ -144,6 +144,16 @@ struct tls_config_t
   // The encoded quic_transport_parameters extension. Its contents are the
   // transport's business, not this layer's.
   std::vector<std::uint8_t> transport_parameters;
+
+  // Where to append the TLS secrets, in the NSS key log format every capture
+  // tool reads. This is what makes a packet capture of a QUIC connection
+  // legible at all. Setting it hands the keys to anyone who can read the file,
+  // so it is for debugging and conformance runs, not for production.
+  //
+  // The convention it implements -- the SSLKEYLOGFILE environment variable --
+  // is process-wide, and so is this: the last context created with a path set
+  // decides where every context's secrets go.
+  std::string key_log_path;
 };
 
 namespace detail

@@ -23,7 +23,9 @@
 #include "vio/quic/tls.h"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -132,6 +134,13 @@ struct tls_session_impl_t
   // Set when TLS tried to open the early data level. Nothing installs those
   // keys, so the session is finished either way; this only says why.
   bool early_data_refused = false;
+  // The 32 bytes a key log line is indexed by. LibreSSL's accessor reports
+  // zeroes on the QUIC path, so it is read out of the ClientHello, where it
+  // sits at a fixed offset: type, three length bytes, two version bytes, then
+  // the random. A second ClientHello after a HelloRetryRequest repeats it, so
+  // the first one seen is the right one to keep.
+  std::array<std::uint8_t, 32> client_random = {};
+  bool have_client_random = false;
 
   ~tls_session_impl_t()
   {
@@ -168,6 +177,90 @@ detail::tls_session_impl_t *session_of(SSL *ssl)
   return static_cast<detail::tls_session_impl_t *>(SSL_get_ex_data(ssl, session_index()));
 }
 
+// The NSS key log format names one process-wide file, which is what the
+// SSLKEYLOGFILE convention it implements assumes.
+std::mutex &key_log_mutex()
+{
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::string &key_log_destination()
+{
+  static std::string path;
+  return path;
+}
+
+// LibreSSL's own key log callback never fires on the QUIC path -- the secrets
+// there come out through the QUIC method below rather than the record layer --
+// so the NSS lines are written from those instead. Without them a capture of a
+// QUIC connection is an opaque stream of bytes, which is most of what makes a
+// packet trace worth taking.
+//
+// The Initial keys are absent on purpose: they are derived from the connection
+// ID rather than from TLS, and any tool that can read the capture can already
+// derive them itself.
+void capture_client_random(detail::tls_session_impl_t &session, encryption_level_t level, const std::uint8_t *data, std::size_t len)
+{
+  if (session.have_client_random || level != encryption_level_t::initial || data == nullptr || len < 38 || data[0] != 0x01)
+  {
+    return;
+  }
+  std::copy(data + 6, data + 38, session.client_random.begin());
+  session.have_client_random = true;
+}
+
+void log_quic_secret(const detail::tls_session_impl_t &session, encryption_level_t level, bool write_direction, const std::uint8_t *secret, std::size_t secret_len)
+{
+  const std::lock_guard<std::mutex> held(key_log_mutex());
+  if (key_log_destination().empty() || secret == nullptr || !session.have_client_random)
+  {
+    return;
+  }
+
+  // A secret belongs to whoever sends under it, which for a read secret is the
+  // peer.
+  const bool server = SSL_is_server(session.ssl) != 0;
+  const bool clients = write_direction ? !server : server;
+  const char *label = nullptr;
+  if (level == encryption_level_t::handshake)
+  {
+    label = clients ? "CLIENT_HANDSHAKE_TRAFFIC_SECRET" : "SERVER_HANDSHAKE_TRAFFIC_SECRET";
+  }
+  else if (level == encryption_level_t::application)
+  {
+    label = clients ? "CLIENT_TRAFFIC_SECRET_0" : "SERVER_TRAFFIC_SECRET_0";
+  }
+  else
+  {
+    return;
+  }
+
+  static constexpr char digits[] = "0123456789abcdef";
+  std::string line(label);
+  line.push_back(' ');
+  for (const auto byte : session.client_random)
+  {
+    line.push_back(digits[byte >> 4]);
+    line.push_back(digits[byte & 0x0f]);
+  }
+  line.push_back(' ');
+  for (std::size_t i = 0; i < secret_len; ++i)
+  {
+    line.push_back(digits[secret[i] >> 4]);
+    line.push_back(digits[secret[i] & 0x0f]);
+  }
+
+  std::FILE *file = std::fopen(key_log_destination().c_str(), "ab");
+  if (file == nullptr)
+  {
+    return;
+  }
+  std::fputs(line.c_str(), file);
+  std::fputc('\n', file);
+  std::fclose(file);
+}
+
 int on_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level, const SSL_CIPHER *cipher, const uint8_t *secret, size_t secret_len)
 {
   auto *session = session_of(ssl);
@@ -189,6 +282,7 @@ int on_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level, const SSL_CI
     session->early_data_refused = true;
     return 0;
   }
+  log_quic_secret(*session, *mapped, false, secret, secret_len);
   session->read_secrets.push_back(tls_secret_t{.level = *mapped, .suite = *suite, .secret = std::vector<std::uint8_t>(secret, secret + secret_len)});
   return 1;
 }
@@ -211,6 +305,7 @@ int on_set_write_secret(SSL *ssl, enum ssl_encryption_level_t level, const SSL_C
     session->early_data_refused = true;
     return 0;
   }
+  log_quic_secret(*session, *mapped, true, secret, secret_len);
   session->write_secrets.push_back(tls_secret_t{.level = *mapped, .suite = *suite, .secret = std::vector<std::uint8_t>(secret, secret + secret_len)});
   return 1;
 }
@@ -223,6 +318,7 @@ int on_add_handshake_data(SSL *ssl, enum ssl_encryption_level_t level, const uin
   {
     return 0;
   }
+  capture_client_random(*session, *mapped, data, len);
   auto &buffer = session->outgoing[static_cast<std::size_t>(*mapped)];
   buffer.insert(buffer.end(), data, data + len);
   return 1;
@@ -451,6 +547,12 @@ std::expected<tls_context_t, error_t> tls_context_t::create(const tls_config_t &
   SSL_CTX_set_options(impl->ctx, SSL_OP_NO_TICKET);
   SSL_CTX_set_session_cache_mode(impl->ctx, SSL_SESS_CACHE_OFF);
 
+  if (!config.key_log_path.empty())
+  {
+    const std::lock_guard<std::mutex> held(key_log_mutex());
+    key_log_destination() = config.key_log_path;
+  }
+
   if (config.role == tls_role_t::server)
   {
     if (config.certificate_chain_pem.empty() || config.private_key_pem.empty())
@@ -618,7 +720,12 @@ std::expected<void, error_t> tls_session_t::provide_handshake_data(encryption_le
   {
     return std::unexpected(error_t{.code = 1, .msg = "buffered CRYPTO data exceeds the maximum handshake flight for this level"});
   }
+  const bool first_at_level = buffer.empty();
   buffer.insert(buffer.end(), data.begin(), data.end());
+  if (first_at_level)
+  {
+    capture_client_random(*_impl, level, buffer.data(), buffer.size());
+  }
   return {};
 }
 
