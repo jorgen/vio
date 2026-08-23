@@ -435,7 +435,7 @@ public:
 
   [[nodiscard]] std::uint64_t queued() const
   {
-    return _base + _data.size();
+    return _base + queued_bytes();
   }
 
   [[nodiscard]] bool fin_queued() const
@@ -612,9 +612,8 @@ public:
     const std::uint64_t prefix = acknowledged_prefix_end();
     if (prefix > _base)
     {
-      const std::size_t drop = static_cast<std::size_t>((std::min<std::uint64_t>)(prefix - _base, _data.size()));
-      _data.erase(_data.begin(), _data.begin() + static_cast<std::ptrdiff_t>(drop));
-      _base += drop;
+      const std::size_t drop = static_cast<std::size_t>((std::min<std::uint64_t>)(prefix - _base, queued_bytes()));
+      retire(drop);
     }
 
     if (_state == send_state_t::data_sent && prefix >= queued())
@@ -665,11 +664,36 @@ private:
       return {};
     }
     const std::size_t index = static_cast<std::size_t>(offset - _base);
-    if (index >= _data.size())
+    const std::size_t available = queued_bytes();
+    if (index >= available)
     {
       return {};
     }
-    return std::span<const std::uint8_t>(_data).subspan(index, (std::min)(amount, _data.size() - index));
+    return std::span<const std::uint8_t>(_data).subspan(_head + index, (std::min)(amount, available - index));
+  }
+
+  [[nodiscard]] std::size_t queued_bytes() const
+  {
+    return _data.size() - _head;
+  }
+
+  // Acknowledged bytes can never be asked for again, but dropping them by
+  // erasing from the front moves everything still queued -- once per
+  // acknowledgement. On a body handed over in one write that is quadratic in
+  // its size: a 20 MB response spent seconds of CPU moving its own tail
+  // around, which showed up as a transfer running two orders of magnitude
+  // slower than the peer's. The retired prefix is left where it is and the
+  // buffer is compacted only once it is at least half dead, which is O(1) per
+  // byte amortised.
+  void retire(std::size_t drop)
+  {
+    _head += drop;
+    _base += drop;
+    if (_head * 2 >= _data.size())
+    {
+      _data.erase(_data.begin(), _data.begin() + static_cast<std::ptrdiff_t>(_head));
+      _head = 0;
+    }
   }
 
   void insert_acknowledged(std::uint64_t start, std::uint64_t end)
@@ -702,6 +726,7 @@ private:
   }
 
   std::vector<std::uint8_t> _data;
+  std::size_t _head = 0;
   std::vector<range_t> _retransmit;
   // Offset to end, merged and disjoint.
   std::map<std::uint64_t, std::uint64_t> _acknowledged;
