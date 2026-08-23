@@ -333,3 +333,137 @@ TEST_CASE("a faster path is paced faster")
   CHECK(*quick_wait < *slow_wait);
 }
 }
+
+TEST_SUITE("quic hystart")
+{
+// RFC 9406. Slow start otherwise ends only at a loss, which on a path that
+// does not drop means it ends long after the window passed what the path can
+// carry -- and everything past that point is queue the connection then pays
+// for. Watching the round trip time ends it at the right place instead.
+
+// A round is one round trip, and what makes it one is that the next flight is
+// already on the wire while the last one is being acknowledged. Sending a
+// flight and then draining it before sending the next would put a single
+// packet in each round, which is not what a sender does and not what the
+// algorithm is measuring.
+struct pipeline_t
+{
+  static constexpr int flight = 12;
+  congestion_control_t &control;
+  std::uint64_t sent = 0;
+  std::uint64_t acked = 0;
+
+  void send()
+  {
+    for (int i = 0; i < flight; ++i)
+    {
+      control.on_packet_sent(sent++);
+    }
+  }
+
+  void round(std::chrono::nanoseconds rtt)
+  {
+    send();
+    for (int i = 0; i < flight; ++i)
+    {
+      control.on_rtt_sample(rtt);
+      control.on_packet_acked(packet(acked, at(0ns)));
+      control.on_ack_round_progress(acked);
+      ++acked;
+    }
+  }
+};
+
+TEST_CASE("a round trip time that climbs ends slow start without a loss")
+{
+  congestion_control_t control(datagram);
+  CHECK(control.hystart_phase() == hystart_phase_t::slow_start);
+
+  pipeline_t pipe{control};
+  pipe.send();
+  // A steady path. Nothing here should be mistaken for a queue.
+  for (int i = 0; i < 3; ++i)
+  {
+    pipe.round(20ms);
+  }
+  CHECK(control.hystart_phase() == hystart_phase_t::slow_start);
+  CHECK(control.in_slow_start());
+
+  // The minimum of this round rises well past an eighth of the last one, which
+  // is a queue filling rather than jitter.
+  pipe.round(40ms);
+  CHECK(control.hystart_phase() == hystart_phase_t::conservative);
+
+  // Confirmed over the following rounds, so slow start ends at the window that
+  // found the queue rather than at the one that overflowed it.
+  const auto window_at_detection = control.window();
+  for (int i = 0; i < 6; ++i)
+  {
+    pipe.round(40ms);
+  }
+  CHECK(control.hystart_phase() == hystart_phase_t::finished);
+  CHECK_FALSE(control.in_slow_start());
+  CHECK(control.slow_start_threshold() < (std::numeric_limits<std::size_t>::max)());
+  CHECK(control.window() >= window_at_detection);
+}
+
+TEST_CASE("a rise that does not hold puts slow start back")
+{
+  congestion_control_t control(datagram);
+  pipeline_t pipe{control};
+  pipe.send();
+  for (int i = 0; i < 3; ++i)
+  {
+    pipe.round(20ms);
+  }
+  pipe.round(40ms);
+  REQUIRE(control.hystart_phase() == hystart_phase_t::conservative);
+
+  // One slow round is not a queue. Dropping back below the baseline says so,
+  // and full growth resumes rather than the connection giving up its slow
+  // start over a transient.
+  pipe.round(18ms);
+  CHECK(control.hystart_phase() == hystart_phase_t::slow_start);
+  CHECK(control.in_slow_start());
+}
+
+TEST_CASE("growth is a quarter of slow start while a rise is being confirmed")
+{
+  congestion_control_t control(datagram);
+  pipeline_t pipe{control};
+  pipe.send();
+  for (int i = 0; i < 3; ++i)
+  {
+    pipe.round(20ms);
+  }
+  pipe.round(40ms);
+  REQUIRE(control.hystart_phase() == hystart_phase_t::conservative);
+
+  const auto before = control.window();
+  pipe.round(40ms);
+  const auto growth = control.window() - before;
+  // A dozen datagrams acknowledged, where slow start would have added all
+  // twelve.
+  CHECK(growth > 0);
+  CHECK(growth < pipeline_t::flight * datagram);
+}
+
+TEST_CASE("a loss ends the question")
+{
+  congestion_control_t control(datagram);
+  pipeline_t pipe{control};
+  pipe.send();
+  for (int i = 0; i < 3; ++i)
+  {
+    pipe.round(20ms);
+  }
+  pipe.round(40ms);
+  REQUIRE(control.hystart_phase() == hystart_phase_t::conservative);
+
+  // Slow start is over for the ordinary reason, so there is nothing left to
+  // decide and the round trip time stops being consulted.
+  rtt_estimator_t rtt;
+  control.on_packets_lost({packet(pipe.sent, at(0ns))}, at(1s), rtt, 25ms, std::optional<vio::tick_t>(at(0ns)));
+  CHECK(control.hystart_phase() == hystart_phase_t::finished);
+}
+}

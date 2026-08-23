@@ -199,6 +199,39 @@ private:
   bool _have_last = false;
 };
 
+// RFC 9406. Slow start doubles the window every round trip and only stops when
+// something is lost, which on a path that does not drop -- a deep buffer, a
+// loopback, a link with a large queue -- means it stops long after the window
+// passed what the path can carry. Everything above that point sits in a queue,
+// so the connection spends the rest of the transfer paying a round trip time it
+// created itself. HyStart++ watches the round trip time instead of waiting for
+// a loss: when the minimum RTT of a round rises meaningfully above the previous
+// round's, the queue is filling, and slow start gives way to a slower growth
+// while it checks whether the rise was real.
+struct hystart_constants_t
+{
+  static constexpr std::chrono::microseconds min_rtt_thresh{4000};
+  static constexpr std::chrono::microseconds max_rtt_thresh{16000};
+  static constexpr std::int64_t min_rtt_divisor = 8;
+  // Fewer samples than this in a round says nothing about the path.
+  static constexpr std::uint32_t samples_needed = 8;
+  // Growth during the conservative phase, as a divisor of what slow start
+  // would have added.
+  static constexpr std::size_t css_growth_divisor = 4;
+  // Rounds of conservative growth before the rise is believed.
+  static constexpr std::uint32_t css_rounds = 5;
+};
+
+enum class hystart_phase_t : std::uint8_t
+{
+  // Growing at the full slow start rate, watching the round trip time.
+  slow_start,
+  // A rise was seen; growing at a quarter rate while it is confirmed.
+  conservative,
+  // Either confirmed, or slow start ended for some other reason.
+  finished,
+};
+
 class congestion_control_t
 {
 public:
@@ -238,6 +271,87 @@ public:
     return _window < _slow_start_threshold;
   }
 
+  [[nodiscard]] hystart_phase_t hystart_phase() const
+  {
+    return _hystart;
+  }
+
+  // The largest packet number sent so far, which is what ends a round: a round
+  // is over once something sent after it began has been acknowledged.
+  void on_packet_sent(std::uint64_t packet_number)
+  {
+    _largest_sent = (std::max)(_largest_sent, packet_number);
+  }
+
+  // One round trip sample, from the acknowledgement that produced it.
+  void on_rtt_sample(std::chrono::nanoseconds latest)
+  {
+    if (latest <= std::chrono::nanoseconds::zero() || _hystart == hystart_phase_t::finished || !in_slow_start())
+    {
+      return;
+    }
+    _current_round_min_rtt = (std::min)(_current_round_min_rtt, latest);
+    ++_rtt_samples;
+
+    if (_hystart != hystart_phase_t::slow_start || _rtt_samples < hystart_constants_t::samples_needed || _last_round_min_rtt == unset_rtt || _current_round_min_rtt == unset_rtt)
+    {
+      return;
+    }
+    // Section 4.2: an eighth of the previous round's minimum, held between 4ms
+    // and 16ms so neither a very fast path nor a very slow one makes the test
+    // meaningless.
+    const auto eighth = _last_round_min_rtt / hystart_constants_t::min_rtt_divisor;
+    const auto threshold = (std::max<std::chrono::nanoseconds>)(hystart_constants_t::min_rtt_thresh, (std::min<std::chrono::nanoseconds>)(eighth, hystart_constants_t::max_rtt_thresh));
+    if (_current_round_min_rtt >= _last_round_min_rtt + threshold)
+    {
+      _css_baseline_min_rtt = _current_round_min_rtt;
+      _hystart = hystart_phase_t::conservative;
+      _css_rounds = 0;
+    }
+  }
+
+  // A round ends when an acknowledgement covers something sent after it began.
+  void on_ack_round_progress(std::uint64_t acknowledged_packet_number)
+  {
+    if (_hystart == hystart_phase_t::finished || !in_slow_start())
+    {
+      return;
+    }
+    if (!_round_started)
+    {
+      _round_started = true;
+      _round_end = _largest_sent;
+      return;
+    }
+    if (acknowledged_packet_number < _round_end)
+    {
+      return;
+    }
+
+    if (_hystart == hystart_phase_t::conservative)
+    {
+      ++_css_rounds;
+      if (_current_round_min_rtt < _css_baseline_min_rtt)
+      {
+        // Section 4.2: the rise did not hold, so it was a transient rather
+        // than a queue, and full growth resumes.
+        _hystart = hystart_phase_t::slow_start;
+      }
+      else if (_css_rounds >= hystart_constants_t::css_rounds)
+      {
+        // Believed. Slow start is over at the window that found the queue,
+        // rather than at the one that overflowed it.
+        _slow_start_threshold = _window;
+        _hystart = hystart_phase_t::finished;
+      }
+    }
+
+    _last_round_min_rtt = _current_round_min_rtt;
+    _current_round_min_rtt = unset_rtt;
+    _rtt_samples = 0;
+    _round_end = _largest_sent;
+  }
+
   // Appendix B.5: a packet sent before the recovery period began carries no
   // new information about the path, so acknowledging it must not grow the
   // window.
@@ -254,7 +368,9 @@ public:
     }
     if (_window < _slow_start_threshold)
     {
-      _window += packet.size;
+      // Section 4.2: a quarter of the usual growth while a suspected queue is
+      // being confirmed, so a real one is not made much worse by the checking.
+      _window += _hystart == hystart_phase_t::conservative ? packet.size / hystart_constants_t::css_growth_divisor : packet.size;
       return;
     }
     // Congestion avoidance: about one datagram per round trip. The division is
@@ -275,6 +391,9 @@ public:
     }
     _recovery_start = now;
     _recovery_started = true;
+    // Slow start is over for the ordinary reason, so there is nothing left for
+    // HyStart++ to decide.
+    _hystart = hystart_phase_t::finished;
     _slow_start_threshold = (std::max)(_window / 2, minimum_congestion_window(_max_datagram_size));
     _window = _slow_start_threshold;
     _avoidance_remainder = 0;
@@ -361,5 +480,16 @@ private:
   std::size_t _avoidance_remainder = 0;
   tick_t _recovery_start;
   bool _recovery_started = false;
+
+  static constexpr std::chrono::nanoseconds unset_rtt = std::chrono::nanoseconds::max();
+  hystart_phase_t _hystart = hystart_phase_t::slow_start;
+  std::chrono::nanoseconds _last_round_min_rtt = unset_rtt;
+  std::chrono::nanoseconds _current_round_min_rtt = unset_rtt;
+  std::chrono::nanoseconds _css_baseline_min_rtt = unset_rtt;
+  std::uint32_t _rtt_samples = 0;
+  std::uint32_t _css_rounds = 0;
+  std::uint64_t _largest_sent = 0;
+  std::uint64_t _round_end = 0;
+  bool _round_started = false;
 };
 } // namespace vio::quic

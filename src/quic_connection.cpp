@@ -1288,6 +1288,10 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
           application_space.phase_acknowledged = true;
         }
         impl.congestion.on_packet_acked(acked);
+        if (space == pn_space_t::application)
+        {
+          impl.congestion.on_ack_round_progress(acked.packet_number);
+        }
         for (const auto &sent : acked.frames)
         {
           if (sent.kind != frame_kind_t::stream)
@@ -1327,6 +1331,10 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
           impl.qlog_pending_lost.push_back(packet.packet_number);
         }
         impl.qlog_metrics_pending = true;
+      }
+      if (space == pn_space_t::application && outcome.rtt_updated)
+      {
+        impl.congestion.on_rtt_sample(impl.recovery.rtt().latest());
       }
       impl.congestion.on_packets_lost(outcome.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
       repair_lost(impl, space, outcome.lost);
@@ -2660,6 +2668,10 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     }
     impl.qlog->end_array();
     impl.qlog->end_event();
+  }
+  if (sent.in_flight && to_pn_space(level) == pn_space_t::application)
+  {
+    impl.congestion.on_packet_sent(packet_number);
   }
   sent.frames = std::move(record);
   impl.recovery.on_packet_sent(to_pn_space(level), std::move(sent));
