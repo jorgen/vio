@@ -445,6 +445,117 @@ TEST_CASE("a migrated server stops rationing once the new path is validated")
   CHECK(after_validation > rationed * 3);
 }
 
+TEST_CASE("stream credit comes back for a stream that finished on an acknowledgement")
+{
+  // Section 4.6: the peer may open another stream once this endpoint is done
+  // with one, and MAX_STREAMS is how it is told. A stream is done when both
+  // directions are, and the second direction usually finishes on the
+  // acknowledgement of what was sent back -- which arrives long after the
+  // application's last read.
+  //
+  // Scanning for finished streams only when the application reads deadlocks
+  // exactly there: a peer that has spent its allowance sends no more requests,
+  // so nothing reads, so nothing is reaped, so no credit is returned, so it
+  // sends no more requests. The interop runner's multiplexing case stalled at
+  // 198 of 2000 files against this.
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  auto parameters = sane_parameters();
+  parameters.initial_max_streams_bidi = 2;
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = parameters;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = parameters;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  auto pump = [&](vio::tick_t now)
+  {
+    for (int round = 0; round < 8; ++round)
+    {
+      bool moved = false;
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = client->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        REQUIRE(server->receive(datagram, now).has_value());
+        moved = true;
+      }
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = server->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        REQUIRE(client->receive(datagram, now).has_value());
+        moved = true;
+      }
+      if (!moved)
+      {
+        return;
+      }
+    }
+  };
+
+  // The allowance is two, and spending it must leave nothing.
+  std::vector<std::uint64_t> opened;
+  for (int i = 0; i < 2; ++i)
+  {
+    auto id = client->open_stream(stream_direction_t::bidirectional);
+    REQUIRE(id.has_value());
+    opened.push_back(*id);
+    const std::vector<std::uint8_t> request(8, 0x3f);
+    REQUIRE(client->write_stream(*id, request, true) == request.size());
+  }
+  CHECK_FALSE(client->open_stream(stream_direction_t::bidirectional).has_value());
+
+  pump(at(1ms));
+
+  // The server reads each request to its end and answers it. After this the
+  // application has nothing left to do, and every remaining transition on
+  // these streams happens because of an acknowledgement.
+  for (const auto id : server->readable_streams())
+  {
+    auto readable = server->readable_stream(id);
+    server->consume_stream(id, readable.size());
+    const std::vector<std::uint8_t> answer(4, 0x5a);
+    REQUIRE(server->write_stream(id, answer, true) == answer.size());
+  }
+
+  pump(at(2ms));
+  // The client reads what came back, which is the last thing it does.
+  for (const auto id : client->readable_streams())
+  {
+    client->consume_stream(id, client->readable_stream(id).size());
+  }
+  // Past max_ack_delay: two response packets do not meet the two-packet
+  // threshold of section 13.2.2, so the acknowledgement that finishes these
+  // streams is a delayed one and only leaves on the timer.
+  pump(at(60ms));
+  pump(at(120ms));
+
+  CHECK(client->open_stream(stream_direction_t::bidirectional).has_value());
+}
+
 TEST_CASE("a datagram that is not for this connection is dropped, not fatal")
 {
   const auto identity = make_self_signed("localhost");

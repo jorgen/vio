@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -177,6 +178,10 @@ struct server_state_t
 {
   std::string www;
   std::size_t served = 0;
+  // A request is small, but nothing says it arrives in one piece -- with
+  // thousands of streams open at once some of them do not. Consuming the bytes
+  // and then insisting on finding the newline among them loses the request.
+  std::map<std::uint64_t, std::string> pending;
 };
 
 // HTTP/0.9 over the hq-interop ALPN: a request is "GET /name" and a newline,
@@ -190,7 +195,8 @@ void answer_requests(server_state_t &state, connection_t &connection)
     {
       continue;
     }
-    const std::string request(reinterpret_cast<const char *>(readable.data()), readable.size());
+    auto &request = state.pending[id];
+    request.append(reinterpret_cast<const char *>(readable.data()), readable.size());
     connection.consume_stream(id, readable.size());
     const auto newline = request.find('\n');
     if (newline == std::string::npos)
@@ -208,6 +214,7 @@ void answer_requests(server_state_t &state, connection_t &connection)
       name.pop_back();
     }
     const auto file = base_name(name);
+    state.pending.erase(id);
     if (file.empty())
     {
       continue;

@@ -1287,6 +1287,18 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
           if (auto *stream = impl.streams.find(sent.stream_id); stream != nullptr && stream->has_send)
           {
             stream->send.on_range_acknowledged(sent.offset, sent.length);
+            // Section 4.6: this is the other way a stream finishes, and the
+            // one nothing else notices. A stream the application has already
+            // read to the end is still live until the peer acknowledges what
+            // was sent back on it, and that acknowledgement arrives here --
+            // long after the last read. Without a scan from this side, credit
+            // for such a stream is never returned, and a peer that has spent
+            // its allowance waits for a MAX_STREAMS that waits on a request it
+            // cannot send.
+            if (stream->send.state() == send_state_t::data_received)
+            {
+              impl.reap_wanted = true;
+            }
           }
         }
       }
