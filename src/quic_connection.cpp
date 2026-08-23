@@ -44,6 +44,12 @@ namespace vio::quic
 {
 namespace
 {
+// Section 6.2.4 of RFC 9002 permits two.
+constexpr std::uint8_t probes_per_timeout = 2;
+} // namespace
+
+namespace
+{
 constexpr std::size_t space_count = 3;
 
 // The three packet number spaces of section 12.3. Early data has no space of
@@ -149,9 +155,13 @@ struct packet_space_t
   ack_tracker_t acks;
   crypto_sender_t crypto_send;
   std::uint64_t next_packet_number = 0;
-  // Set when a PTO expires here: the next packet must be ack-eliciting even if
-  // there is nothing to say.
-  bool probe_pending = false;
+  // How many ack-eliciting packets a expired PTO still owes this space. Section
+  // 6.2.4 allows two, and two is what is sent: a probe is the only thing moving
+  // on a connection that has gone quiet, so losing the single packet that was
+  // meant to restart it costs another whole backoff interval -- and the
+  // intervals double. On a path dropping 30% of packets that is the difference
+  // between a handshake finishing and a handshake taking tens of seconds.
+  std::uint8_t probes_pending = 0;
   packet_protection_t read;
   packet_protection_t write;
   header_protection_t read_header;
@@ -412,7 +422,7 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   space.discarded = true;
   space.have_read = false;
   space.have_write = false;
-  space.probe_pending = false;
+  space.probes_pending = 0;
   space.crypto_send = crypto_sender_t{};
   impl.recovery.discard_space(to_pn_space(level));
 }
@@ -482,7 +492,7 @@ inline constexpr std::chrono::nanoseconds new_token_lifetime = std::chrono::hour
     {
       continue;
     }
-    if (space.crypto_send.has_pending() || space.probe_pending)
+    if (space.crypto_send.has_pending() || space.probes_pending > 0)
     {
       return true;
     }
@@ -1622,7 +1632,7 @@ std::expected<void, error_t> receive_retry(connection_impl_t &impl, const packet
   auto &initial = impl.spaces[space_index(encryption_level_t::initial)];
   initial.crypto_send.sent_offset = 0;
   initial.crypto_send.retransmit.clear();
-  initial.probe_pending = false;
+  initial.probes_pending = 0;
   impl.recovery.discard_space(pn_space_t::initial);
   return {};
 }
@@ -2035,7 +2045,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   const bool want_ack = allow_empty_ack ? ack_owed : must_ack;
   const bool want_handshake_done = level == encryption_level_t::application && impl.config.role == tls_role_t::server && impl.handshake_complete && !impl.handshake_done_sent;
   const bool want_close = impl.close_frame_pending && space.have_write;
-  const bool want_probe = space.probe_pending;
+  const bool want_probe = space.probes_pending > 0;
 
   bool want_path = false;
   if (level == encryption_level_t::application && !want_close)
@@ -2595,7 +2605,10 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   {
     impl.handshake_done_sent = true;
   }
-  space.probe_pending = false;
+  if (space.probes_pending > 0)
+  {
+    --space.probes_pending;
+  }
   impl.streams.on_data_sent(stream_bytes_written);
 
   // Section 2 of RFC 9002: ACK, PADDING and CONNECTION_CLOSE neither elicit an
@@ -2967,7 +2980,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
           continue;
         }
         auto &space = impl.spaces[space_index(level)];
-        space.probe_pending = true;
+        space.probes_pending = probes_per_timeout;
         // Section 6.2.4: a probe should carry data. During a handshake a bare
         // PING would elicit an acknowledgement while telling the peer nothing
         // it is waiting for, so anything still outstanding goes again.
@@ -2989,7 +3002,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   bool probing = impl.close_frame_pending;
   for (auto level : ordered_levels)
   {
-    probing = probing || impl.spaces[space_index(level)].probe_pending;
+    probing = probing || impl.spaces[space_index(level)].probes_pending > 0;
   }
   if (!probing && impl.recovery.bytes_in_flight() >= impl.congestion.window())
   {
