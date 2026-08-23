@@ -120,11 +120,11 @@ struct connection_config_t
 
   std::chrono::nanoseconds max_ack_delay = std::chrono::milliseconds(25);
 
-  // Section 13.4. The codepoint the owner of the socket is marking outgoing
-  // datagrams with, so that a sent packet records what it went out as and the
-  // peer's counts can be checked against it. Leave it at not_ect unless the
-  // socket really is marking: claiming ECT(0) without it makes validation
-  // fail against an honest peer.
+  // Section 13.4. The codepoint this connection's datagrams go out marked
+  // with, recorded on each sent packet so the peer's reported counts can be
+  // checked against it. Leave it at not_ect unless whatever owns the socket
+  // really is applying it -- claiming ECT(0) without sending it makes
+  // validation fail against a peer doing everything right.
   ecn_codepoint_t ecn = ecn_codepoint_t::not_ect;
 
   // RFC 9002 section 7.7. Spreads sending over the round trip instead of
@@ -205,6 +205,11 @@ public:
   // wherever the caller is sending, which is what a client behind a fixed
   // socket wants.
   [[nodiscard]] std::expected<void, error_t> receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address);
+
+  // The same, told what ECN codepoint the datagram carried when it arrived.
+  // Section 13.4.2: the counts this endpoint reports back are what let the peer
+  // react to congestion a router signalled instead of waiting for loss.
+  [[nodiscard]] std::expected<void, error_t> receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address, ecn_codepoint_t ecn);
 
   // Section 8.1.3: a token the server issued for use on a later connection to
   // it, if one arrived. Empty otherwise. An application that keeps this and

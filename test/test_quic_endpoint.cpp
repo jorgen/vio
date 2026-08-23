@@ -103,12 +103,13 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
   const auto identity = make_self_signed("localhost");
   event_loop_t event_loop;
   bool handshaken = false;
+  bool ecn_still_on = false;
   std::string received;
 
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, std::string &received) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, bool &ecn_still_on, std::string &received) -> task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -203,6 +204,13 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
           }
         }
 
+        // Section 13.4.2: both sides marked, both reported, and neither
+        // validator objected. If either half were broken -- marking without
+        // reporting, or reporting counts that did not account for what was
+        // sent -- validation would have failed and the codepoint would have
+        // dropped to not_ect. That it did not is the end-to-end check.
+        ecn_still_on = connection->ecn_sending() == ecn_codepoint_t::ect0 && accepted != nullptr && accepted->ecn_sending() == ecn_codepoint_t::ect0;
+
         server_cancel.cancel();
         client_cancel.cancel();
         // Cancelling stops the read loops; destroying the endpoints closes
@@ -214,12 +222,13 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
         client.reset();
         co_await sleep(loop, 50ms);
         loop.stop();
-      }(event_loop, identity, handshaken, received);
+      }(event_loop, identity, handshaken, ecn_still_on, received);
     });
 
   event_loop.run();
   CHECK(handshaken);
   CHECK(received == "over a real socket");
+  CHECK(ecn_still_on);
 }
 TEST_CASE("a Retry is answered without building a connection for it")
 {

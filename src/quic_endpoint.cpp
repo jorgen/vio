@@ -191,6 +191,27 @@ void index_connection(endpoint_impl_t &impl, connection_entry_t &entry)
   }
 }
 
+// libuv creates the UDP socket lazily: a handle that has neither bound nor
+// sent has no descriptor at all. Its own recv_start binds implicitly when that
+// happens, and anything reading or marking the socket directly needs the same,
+// because both start from a descriptor.
+void ensure_socket(endpoint_impl_t &impl)
+{
+  if (udp_fileno(impl.udp).has_value())
+  {
+    return;
+  }
+  // IPv4, matching what libuv's own deferred bind would have chosen. Binding
+  // dual-stack here instead would quietly change the socket's family out from
+  // under a caller that then sends to an IPv4 peer, and the raw sendmsg has no
+  // business guessing. A caller that wants dual-stack calls bind() and says so.
+  sockaddr_in any = {};
+  if (uv_ip4_addr("0.0.0.0", 0, &any) == 0)
+  {
+    (void)udp_bind(impl.udp, reinterpret_cast<const sockaddr *>(&any));
+  }
+}
+
 [[nodiscard]] connection_entry_t *find_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram)
 {
   const auto invariant = parse_invariant_header(datagram);
@@ -536,6 +557,7 @@ void endpoint_t::on_connection(connection_ready_t handler)
 std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name)
 {
   auto &impl = *_impl;
+  ensure_socket(impl);
   auto config = impl.config.connection;
   config.role = tls_role_t::client;
   config.stateless_reset_key = impl.config.stateless_reset_key;
@@ -581,10 +603,17 @@ std::size_t endpoint_t::connection_count() const
 task_t<void> endpoint_t::run(cancellation_t *cancel)
 {
   auto &impl = *_impl;
-  auto reader = udp_create_reader(impl.udp);
+  ensure_socket(impl);
+  // Our own read rather than libuv's, so the ECN codepoint the kernel reports
+  // alongside each datagram survives to the connection that needs it.
+  auto reader = datagram_reader_t::create(impl.loop, impl.udp);
   if (!reader.has_value())
   {
     co_return;
+  }
+  if (impl.config.ecn)
+  {
+    (void)reader->receive_ecn(true);
   }
   impl.running = true;
 
@@ -635,9 +664,10 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
       break;
     }
     auto &datagram = received.value();
-    std::span<std::uint8_t> bytes(reinterpret_cast<std::uint8_t *>(datagram.data->base), datagram.data->len);
+    std::span<std::uint8_t> bytes(datagram.data);
+    const auto arriving_ecn = static_cast<ecn_codepoint_t>(datagram.ecn);
     const auto now = loop_now(impl.loop);
-    const auto *sender = datagram.get_sender();
+    const auto *sender = datagram.sender();
 
     auto *entry = find_connection(impl, bytes);
     if (entry == nullptr)
@@ -686,7 +716,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     // replay it had already seen or a packet carrying nothing but probing
     // frames. That is a way to steer a server away from the real peer.
     const auto migrations_before = entry->connection->migration_count();
-    if (!entry->connection->receive(bytes, now, peer).has_value())
+    if (!entry->connection->receive(bytes, now, peer, arriving_ecn).has_value())
     {
       // The connection has decided it cannot continue. It still gets to send
       // whatever it wanted to say about that.

@@ -37,6 +37,7 @@
 // be driven exactly in a test.
 
 #include "vio/quic/frame_codec.h"
+#include "vio/quic/ecn.h"
 #include "vio/tick.h"
 
 #include <algorithm>
@@ -69,6 +70,10 @@ struct ack_frame_t
   std::uint64_t ack_delay = 0;
   std::uint64_t first_ack_range = 0;
   std::vector<ack_range_t> ranges;
+  // Section 13.4.2: what arrived carrying each codepoint, cumulative for the
+  // life of the connection. Absent until something marked has been seen --
+  // sending zeroes would tell the peer its marks are being erased.
+  std::optional<ecn_counts_totals_t> ecn;
 };
 
 class ack_tracker_t
@@ -93,11 +98,32 @@ public:
 
   // Records a packet whose payload has been authenticated. Duplicates are
   // idempotent: they neither widen a range nor count toward the next ACK.
-  void on_packet_received(std::uint64_t packet_number, bool ack_eliciting, tick_t now)
+  void on_packet_received(std::uint64_t packet_number, bool ack_eliciting, tick_t now, ecn_codepoint_t ecn = ecn_codepoint_t::not_ect)
   {
     if (is_duplicate(packet_number))
     {
       return;
+    }
+
+    // Section 13.4.2: counted per packet, not per datagram, and only for
+    // packets that authenticated -- an attacker who could make us count
+    // forged CE marks could make us report congestion that never happened.
+    switch (ecn)
+    {
+    case ecn_codepoint_t::ect0:
+      ++_ecn.ect0;
+      _saw_ecn = true;
+      break;
+    case ecn_codepoint_t::ect1:
+      ++_ecn.ect1;
+      _saw_ecn = true;
+      break;
+    case ecn_codepoint_t::ce:
+      ++_ecn.ce;
+      _saw_ecn = true;
+      break;
+    case ecn_codepoint_t::not_ect:
+      break;
     }
 
     if (!_received_any || packet_number > _largest_received)
@@ -166,6 +192,10 @@ public:
     }
 
     ack_frame_t frame;
+    if (_saw_ecn)
+    {
+      frame.ecn = _ecn;
+    }
 
     // Section 13.2.5: the delay is measured from the arrival of the packet
     // being reported as largest. A clock that ran backwards reports zero
@@ -296,5 +326,7 @@ private:
   std::uint64_t _ack_eliciting_since_ack = 0;
   bool _ack_pending = false;
   bool _received_any = false;
+  ecn_counts_totals_t _ecn;
+  bool _saw_ecn = false;
 };
 } // namespace vio::quic

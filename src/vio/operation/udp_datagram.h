@@ -147,6 +147,24 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
   {
     return std::unexpected(error_t{.code = UV_EINVAL, .msg = "only a router may set the congestion experienced codepoint"});
   }
+  // A dual-stack socket cannot be handed a bare IPv4 destination: sendmsg wants
+  // the socket's family. libuv converts internally; doing our own send means
+  // doing our own conversion to the IPv4-mapped form.
+  sockaddr_storage mapped = {};
+  auto name = udp_sockname(udp);
+  if (name.has_value() && name->ss_family == AF_INET6 && address != nullptr && address->sa_family == AF_INET)
+  {
+    const auto *in4 = reinterpret_cast<const sockaddr_in *>(address);
+    auto *in6 = reinterpret_cast<sockaddr_in6 *>(&mapped);
+    in6->sin6_family = AF_INET6;
+    in6->sin6_port = in4->sin_port;
+    auto *bytes = reinterpret_cast<std::uint8_t *>(&in6->sin6_addr);
+    bytes[10] = 0xff;
+    bytes[11] = 0xff;
+    std::memcpy(bytes + 12, &in4->sin_addr, 4);
+    address = reinterpret_cast<const sockaddr *>(&mapped);
+  }
+
   const bool ipv6 = address != nullptr && address->sa_family == AF_INET6;
   const int value = static_cast<int>(ecn);
 

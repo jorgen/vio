@@ -1377,7 +1377,7 @@ struct migration_signal_t
   std::uint64_t highest_non_probing = 0;
 };
 
-std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packet_header_t &header, std::span<std::uint8_t> packet, tick_t now, migration_signal_t &signal)
+std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packet_header_t &header, std::span<std::uint8_t> packet, tick_t now, migration_signal_t &signal, ecn_codepoint_t ecn)
 {
   if (header.kind == packet_kind_t::retry)
   {
@@ -1635,7 +1635,10 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     signal.saw_non_probing = true;
     signal.highest_non_probing = opened->packet_number;
   }
-  space.acks.on_packet_received(opened->packet_number, *ack_eliciting, now);
+  // Section 13.4.2: only a packet that authenticated is counted. Counting
+  // what a forged datagram claimed would let anyone make this endpoint report
+  // congestion the network never signalled.
+  space.acks.on_packet_received(opened->packet_number, *ack_eliciting, now, ecn);
   ++impl.packets_processed;
 
   // Keys for the next packet in this same datagram may depend on this one:
@@ -1807,6 +1810,14 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       frame.first_ack_range = ack->first_ack_range;
       frame.ack_range_count = ranges.count();
       frame.ack_ranges = ranges.bytes();
+      if (ack->ecn.has_value())
+      {
+        // Section 13.4.2: reporting the totals is what lets the peer react to a
+        // router's congestion signal instead of waiting for something to be
+        // lost. Only sent once something marked has actually arrived -- an
+        // all-zero report would tell a peer its marks were being erased.
+        frame.ecn = ecn_counts_t{.ect0 = ack->ecn->ect0, .ect1 = ack->ecn->ect1, .ce = ack->ecn->ce};
+      }
       wrote_ack = frames.write(frame);
     }
   }
@@ -2363,8 +2374,8 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
   else
   {
     impl->local_ids.install_initial(impl->local_connection_id, initial_token);
-  impl->ecn_sending = config.ecn;
   }
+  impl->ecn_sending = config.ecn;
 
   // Section 10.3: only a server may advertise this. A client's transport
   // parameters are not confidentiality protected, so publishing a token there
@@ -2422,10 +2433,15 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
 
 std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datagram, tick_t now)
 {
-  return receive(datagram, now, {});
+  return receive(datagram, now, {}, ecn_codepoint_t::not_ect);
 }
 
 std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address)
+{
+  return receive(datagram, now, peer_address, ecn_codepoint_t::not_ect);
+}
+
+std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address, ecn_codepoint_t ecn)
 {
   auto &impl = *_impl;
   if (impl.state == connection_state_t::closed || datagram.empty())
@@ -2492,7 +2508,7 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
     }
     const auto header = next->value();
     const auto offset = static_cast<std::size_t>(header.packet.data() - datagram.data());
-    if (auto r = receive_packet(impl, header, datagram.subspan(offset, header.packet.size()), now, signal); !r.has_value())
+    if (auto r = receive_packet(impl, header, datagram.subspan(offset, header.packet.size()), now, signal, ecn); !r.has_value())
     {
       return r;
     }
