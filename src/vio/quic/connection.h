@@ -112,6 +112,17 @@ struct connection_config_t
 
   std::chrono::nanoseconds max_ack_delay = std::chrono::milliseconds(25);
 
+  // RFC 9002 section 7.7. Spreads sending over the round trip instead of
+  // handing the whole congestion window to the network at once. On by default,
+  // because the section requires either this or an explicit burst limit and
+  // this is the better of the two.
+  //
+  // Turn it off when something outside this connection already decides when
+  // bytes leave -- a scheduler shared across connections, or a test driving a
+  // simulated clock, where pacing measured against a round trip that is being
+  // fast-forwarded means nothing.
+  bool pacing = true;
+
   // Server only. When set, the first Initial from an unvalidated client is
   // answered with a Retry rather than a handshake, which costs the client a
   // round trip and costs anyone spoofing a source address the ability to make

@@ -68,6 +68,118 @@ namespace vio::quic
 // Section 7.6.1.
 inline constexpr std::int64_t persistent_congestion_threshold = 3;
 
+// RFC 9002 section 7.7. The congestion window says how much may be outstanding;
+// it says nothing about how fast it may leave. Handing a whole window to the
+// network at once is a burst, and a burst is how a path that could have carried
+// the traffic drops it anyway -- the queue at the narrowest hop overflows on the
+// spike rather than on the average.
+//
+// A leaky bucket, as the section suggests: it fills at N * cwnd / smoothed_rtt
+// bytes per second and is capped at the burst this endpoint is willing to send
+// back to back, which section 7.2 puts at the initial window. N is 1.25, large
+// enough that jitter in the RTT estimate does not leave the window unused.
+class pacer_t
+{
+public:
+  explicit pacer_t(std::size_t max_datagram_size = 1200)
+    : _capacity(initial_congestion_window(max_datagram_size == 0 ? 1200 : max_datagram_size))
+    , _tokens(static_cast<std::int64_t>(_capacity))
+  {
+  }
+
+  [[nodiscard]] bool ready(tick_t now, std::size_t window, std::chrono::nanoseconds smoothed_rtt, std::size_t datagram_size)
+  {
+    refill(now, window, smoothed_rtt);
+    return _tokens >= static_cast<std::int64_t>(datagram_size);
+  }
+
+  void on_sent(tick_t now, std::size_t bytes, std::size_t window, std::chrono::nanoseconds smoothed_rtt)
+  {
+    refill(now, window, smoothed_rtt);
+    _tokens -= static_cast<std::int64_t>(bytes);
+  }
+
+  // When the bucket will hold enough for another datagram. Nothing means it
+  // already does.
+  [[nodiscard]] std::optional<tick_t> next_departure(tick_t now, std::size_t window, std::chrono::nanoseconds smoothed_rtt, std::size_t datagram_size) const
+  {
+    if (_tokens >= static_cast<std::int64_t>(datagram_size))
+    {
+      return std::nullopt;
+    }
+    const auto rate = fill_rate(window, smoothed_rtt);
+    if (rate == 0)
+    {
+      return std::nullopt;
+    }
+    const auto needed = static_cast<std::uint64_t>(static_cast<std::int64_t>(datagram_size) - _tokens);
+    // rate is bytes per second; invert without losing the sub-millisecond
+    // resolution the whole exercise depends on.
+    const auto wait = std::chrono::nanoseconds(static_cast<std::int64_t>((needed * 1000000000ULL) / rate));
+    return now + wait;
+  }
+
+  void reset()
+  {
+    _tokens = static_cast<std::int64_t>(_capacity);
+    _have_last = false;
+  }
+
+private:
+  [[nodiscard]] static std::uint64_t fill_rate(std::size_t window, std::chrono::nanoseconds smoothed_rtt)
+  {
+    const auto rtt = smoothed_rtt.count();
+    if (rtt <= 0 || window == 0)
+    {
+      return 0;
+    }
+    // N = 1.25, as 5/4, in bytes per second.
+    const auto numerator = static_cast<std::uint64_t>(window) * 5ULL * 1000000000ULL;
+    return numerator / (static_cast<std::uint64_t>(rtt) * 4ULL);
+  }
+
+  void refill(tick_t now, std::size_t window, std::chrono::nanoseconds smoothed_rtt)
+  {
+    if (!_have_last)
+    {
+      _last = now;
+      _have_last = true;
+      return;
+    }
+    if (now <= _last)
+    {
+      return;
+    }
+    auto elapsed = now - _last;
+    _last = now;
+    // A connection that has been idle would otherwise accumulate an unbounded
+    // credit and spend it in one burst, which is the thing being prevented.
+    // The cap is generous enough that ordinary scheduling jitter is absorbed.
+    const auto ceiling = std::chrono::seconds(1);
+    if (elapsed > ceiling)
+    {
+      elapsed = ceiling;
+    }
+    const auto rate = fill_rate(window, smoothed_rtt);
+    if (rate == 0)
+    {
+      _tokens = static_cast<std::int64_t>(_capacity);
+      return;
+    }
+    const auto gained = (static_cast<std::uint64_t>(elapsed.count()) * rate) / 1000000000ULL;
+    _tokens += static_cast<std::int64_t>(gained);
+    if (_tokens > static_cast<std::int64_t>(_capacity))
+    {
+      _tokens = static_cast<std::int64_t>(_capacity);
+    }
+  }
+
+  std::size_t _capacity = 0;
+  std::int64_t _tokens = 0;
+  tick_t _last;
+  bool _have_last = false;
+};
+
 class congestion_control_t
 {
 public:

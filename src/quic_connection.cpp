@@ -229,6 +229,7 @@ struct connection_impl_t
 
   loss_recovery_t recovery;
   congestion_control_t congestion;
+  pacer_t pacer;
   // The token from a Retry, repeated in every subsequent Initial (section
   // 17.2.5.3).
   std::vector<std::uint8_t> retry_token;
@@ -441,6 +442,30 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
   return false;
 }
 
+// Whether anything waiting to go out is the kind of thing pacing exists to
+// spread. Section 7.7 of RFC 9002 asks that packets carrying only ACK frames
+// not be paced -- delaying an acknowledgement slows the peer's recovery, and an
+// ACK is not what bursts a path.
+[[nodiscard]] bool wants_paced_content(const connection_impl_t &impl)
+{
+  if (impl.close_frame_pending)
+  {
+    return false;
+  }
+  for (const auto &space : impl.spaces)
+  {
+    if (space.discarded)
+    {
+      continue;
+    }
+    if (space.crypto_send.has_pending() || space.probe_pending)
+    {
+      return true;
+    }
+  }
+  return !impl.streams.sendable().empty();
+}
+
 // Section 4.1 and 4.6. A sender that stops because the peer's limit ran out
 // says so; a sender that stops because it has nothing to send says nothing.
 // The distinction matters because the peer is the only one who can unblock the
@@ -505,6 +530,7 @@ void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, 
   // Section 9.4.
   impl.congestion.reset();
   impl.recovery.reset_rtt();
+  impl.pacer.reset();
 
   // Section 9.5. If the peer has supplied no spare, the connection keeps the
   // one it has: a linkable connection is better than an unusable one, and the
@@ -2425,6 +2451,16 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     return std::size_t{0};
   }
 
+  // Section 7.7 of RFC 9002: the window says how much may be outstanding, the
+  // pacer says how fast it may leave. A probe and a CONNECTION_CLOSE are
+  // exempt for the same reason they are exempt from the window -- both exist
+  // to get the connection unstuck.
+  const bool paceable = impl.config.pacing && !probing && wants_paced_content(impl);
+  if (paceable && !impl.pacer.ready(now, impl.congestion.window(), impl.recovery.rtt().smoothed(), impl.config.max_datagram_size))
+  {
+    return std::size_t{0};
+  }
+
   if (impl.retry_pending)
   {
     // A Retry is its own datagram: it carries no packet number, cannot be
@@ -2518,6 +2554,10 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   }
 
   impl.bytes_sent += written;
+  if (paceable)
+  {
+    impl.pacer.on_sent(now, written, impl.congestion.window(), impl.recovery.rtt().smoothed());
+  }
   if (!impl.idle_since_last_receive && impl.recovery.ack_eliciting_in_flight())
   {
     impl.last_activity = now;
@@ -2568,6 +2608,13 @@ std::optional<tick_t> connection_t::next_timeout(tick_t now) const
   consider(_impl->recovery.loss_detection_timer(now, recovery_context(*_impl)));
   consider(idle_deadline(*_impl));
   consider(_impl->path.deadline());
+  if (_impl->config.pacing && wants_paced_content(*_impl))
+  {
+    // Section 7.7: when the pacer is what is holding a packet, the caller has
+    // to be told when to come back or the connection stalls until some other
+    // timer happens to fire.
+    consider(_impl->pacer.next_departure(now, _impl->congestion.window(), _impl->recovery.rtt().smoothed(), _impl->config.max_datagram_size));
+  }
   return earliest;
 }
 

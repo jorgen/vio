@@ -245,4 +245,91 @@ TEST_CASE("losing nothing that was in flight is not a congestion event")
     CHECK(congestion.window() == start);
   }
 }
+TEST_CASE("the pacer lets a burst out and then meters the rest")
+{
+  // RFC 9002 section 7.7. The window says how much may be outstanding; the
+  // pacer says how fast. Handing a whole window over at once is the burst that
+  // overflows the queue at the narrowest hop even when the path could have
+  // carried the average.
+  pacer_t pacer(datagram);
+  const auto window = initial_congestion_window(datagram);
+  constexpr auto rtt = 100ms;
+
+  std::size_t burst = 0;
+  while (pacer.ready(at(0ns), window, rtt, datagram))
+  {
+    pacer.on_sent(at(0ns), datagram, window, rtt);
+    burst += datagram;
+    REQUIRE(burst <= window * 2);
+  }
+  // Section 7.2: the burst is bounded by the initial window.
+  CHECK(burst >= window - datagram);
+  CHECK(burst <= window);
+}
+
+TEST_CASE("the pacer says when to come back")
+{
+  pacer_t pacer(datagram);
+  const auto window = initial_congestion_window(datagram);
+  constexpr auto rtt = 100ms;
+
+  while (pacer.ready(at(0ns), window, rtt, datagram))
+  {
+    pacer.on_sent(at(0ns), datagram, window, rtt);
+  }
+  auto departure = pacer.next_departure(at(0ns), window, rtt, datagram);
+  REQUIRE(departure.has_value());
+  CHECK(*departure > at(0ns));
+
+  // At a rate of 1.25 * window per round trip, a further datagram is due well
+  // inside one -- otherwise the window would go unused.
+  CHECK(*departure - at(0ns) < rtt);
+  CHECK(pacer.ready(*departure, window, rtt, datagram));
+}
+
+TEST_CASE("an idle connection does not bank an unlimited burst")
+{
+  // The whole point is to bound what leaves at once, so time spent quiet must
+  // not turn into credit that is spent in one go.
+  pacer_t pacer(datagram);
+  const auto window = initial_congestion_window(datagram);
+  constexpr auto rtt = 10ms;
+
+  while (pacer.ready(at(0ns), window, rtt, datagram))
+  {
+    pacer.on_sent(at(0ns), datagram, window, rtt);
+  }
+
+  std::size_t after_idle = 0;
+  const auto later = at(60s);
+  while (pacer.ready(later, window, rtt, datagram))
+  {
+    pacer.on_sent(later, datagram, window, rtt);
+    after_idle += datagram;
+    REQUIRE(after_idle <= window * 2);
+  }
+  CHECK(after_idle <= window);
+}
+
+TEST_CASE("a faster path is paced faster")
+{
+  const auto window = initial_congestion_window(datagram);
+  pacer_t slow(datagram);
+  pacer_t quick(datagram);
+
+  while (slow.ready(at(0ns), window, 200ms, datagram))
+  {
+    slow.on_sent(at(0ns), datagram, window, 200ms);
+  }
+  while (quick.ready(at(0ns), window, 20ms, datagram))
+  {
+    quick.on_sent(at(0ns), datagram, window, 20ms);
+  }
+
+  auto slow_wait = slow.next_departure(at(0ns), window, 200ms, datagram);
+  auto quick_wait = quick.next_departure(at(0ns), window, 20ms, datagram);
+  REQUIRE(slow_wait.has_value());
+  REQUIRE(quick_wait.has_value());
+  CHECK(*quick_wait < *slow_wait);
+}
 }

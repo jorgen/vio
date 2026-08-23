@@ -860,6 +860,13 @@ TEST_CASE("a stream larger than one packet is reassembled")
   connection_config_t client_config;
   client_config.role = tls_role_t::client;
   client_config.transport_parameters = sane_parameters();
+  // This drives a simulated clock by jumping to whatever deadline comes next,
+  // which makes every round trip look enormous. Pacing is measured against the
+  // round trip, so leaving it on would have the test throttling itself against
+  // an RTT that is an artefact of how it advances time. What is under test
+  // here is reassembly.
+  client_config.pacing = false;
+  server_config.pacing = false;
 
   auto server = connection_t::create(contexts.server_context, server_config);
   REQUIRE(server.has_value());
