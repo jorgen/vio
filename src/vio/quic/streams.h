@@ -160,9 +160,9 @@ public:
   // The peer's transport parameters, once the handshake produced them.
   void apply_peer_parameters(const transport_parameters_t &parameters)
   {
-    _peer_max_data = std::max(_peer_max_data, parameters.initial_max_data);
-    _peer_max_streams_bidi = std::max(_peer_max_streams_bidi, parameters.initial_max_streams_bidi);
-    _peer_max_streams_uni = std::max(_peer_max_streams_uni, parameters.initial_max_streams_uni);
+    _peer_max_data = (std::max)(_peer_max_data, parameters.initial_max_data);
+    _peer_max_streams_bidi = (std::max)(_peer_max_streams_bidi, parameters.initial_max_streams_bidi);
+    _peer_max_streams_uni = (std::max)(_peer_max_streams_uni, parameters.initial_max_streams_uni);
     _peer_initial_max_stream_data_bidi_local = parameters.initial_max_stream_data_bidi_local;
     _peer_initial_max_stream_data_bidi_remote = parameters.initial_max_stream_data_bidi_remote;
     _peer_initial_max_stream_data_uni = parameters.initial_max_stream_data_uni;
@@ -206,18 +206,18 @@ public:
 
   void set_peer_max_data(std::uint64_t value)
   {
-    _peer_max_data = std::max(_peer_max_data, value);
+    _peer_max_data = (std::max)(_peer_max_data, value);
   }
 
   void set_local_max_data(std::uint64_t value)
   {
-    _local_max_data = std::max(_local_max_data, value);
+    _local_max_data = (std::max)(_local_max_data, value);
   }
 
   void set_peer_max_streams(stream_direction_t direction, std::uint64_t value)
   {
     auto &target = direction == stream_direction_t::bidirectional ? _peer_max_streams_bidi : _peer_max_streams_uni;
-    target = std::max(target, value);
+    target = (std::max)(target, value);
   }
 
   [[nodiscard]] std::uint64_t peer_max_streams(stream_direction_t direction) const
@@ -292,7 +292,7 @@ public:
   // down would wait however long that took.
   void rotate_sendable(std::size_t served)
   {
-    served = std::min(served, _sendable.size());
+    served = (std::min)(served, _sendable.size());
     std::rotate(_sendable.begin(), _sendable.begin() + static_cast<std::ptrdiff_t>(served), _sendable.end());
   }
 
@@ -606,7 +606,7 @@ private:
     // generous advertised limit is millions of objects from one packet.
     auto &opened = direction == stream_direction_t::bidirectional ? _remote_bidi_opened : _remote_uni_opened;
     const std::uint64_t index = stream_index(id);
-    opened = std::max(opened, index + 1);
+    opened = (std::max)(opened, index + 1);
 
     auto &stream = _streams[id];
     stream.id = id;

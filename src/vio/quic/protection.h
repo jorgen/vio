@@ -95,7 +95,7 @@ inline constexpr std::array<std::uint8_t, 20> initial_salt_v1 = {0x38, 0x76, 0x2
     // there is nothing to enforce.
     break;
   }
-  return std::numeric_limits<std::uint64_t>::max();
+  return (std::numeric_limits<std::uint64_t>::max)();
 }
 
 [[nodiscard]] constexpr std::uint64_t aead_integrity_limit(crypto::aead_t aead)

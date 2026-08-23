@@ -145,13 +145,13 @@ private:
   std::size_t size = out.size();
   if (received_size <= 43)
   {
-    size = std::min(size, received_size - 1);
+    size = (std::min)(size, received_size - 1);
   }
   else
   {
     // Well under the three-times ceiling, and large enough that it cannot be
     // told apart from a packet carrying a connection ID.
-    size = std::min(size, std::min<std::size_t>(received_size - 1, 64));
+    size = (std::min)(size, (std::min<std::size_t>)(received_size - 1, 64));
   }
   if (size < minimum_stateless_reset_size)
   {

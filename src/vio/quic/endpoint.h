@@ -80,8 +80,14 @@ struct endpoint_config_t
   // forgotten, so it outlives any one of them.
   const stateless_reset_key_t *stateless_reset_key = nullptr;
 
-  // Zero means no ceiling. A server without one will accept connections until
-  // it runs out of memory.
+  // Zero means no ceiling.
+  //
+  // A server reachable from the internet should set this, or retry_key, or
+  // both. Without either, one Initial packet from a spoofed source address
+  // buys a whole connection's worth of state -- a TLS session, key schedules,
+  // per-space buffers -- and nothing has proved the address was real. A Retry
+  // makes the sender prove it before any of that is built (section 8.1.2); a
+  // ceiling bounds the damage when they can.
   std::size_t max_connections = 0;
 
   // How long a closed connection is kept so that late packets meet a
@@ -125,6 +131,13 @@ public:
 
   // Reads until cancelled, routing datagrams and running timers. This is the
   // whole endpoint: nothing else needs to be driven.
+  //
+  // Shutting down has an order to it. Cancelling stops the read loop, and
+  // destroying the endpoint closes its socket -- and the socket must be closed
+  // before the event loop is asked to stop, because event_loop_t::stop() runs
+  // the loop until nothing is left open. A socket still live at that point is
+  // a loop that never returns. The endpoint also has to outlive this
+  // coroutine, which holds a reference to it.
   [[nodiscard]] task_t<void> run(cancellation_t *cancel = nullptr);
 
   // Pushes whatever every connection currently wants to send onto the socket.

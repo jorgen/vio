@@ -427,8 +427,8 @@ inline constexpr std::chrono::nanoseconds new_token_lifetime = std::chrono::hour
 [[nodiscard]] std::chrono::nanoseconds path_abandon_timeout(const connection_impl_t &impl)
 {
   const auto current = impl.recovery.rtt().pto_base() + impl.config.max_ack_delay;
-  const auto fresh = initial_rtt + std::max(initial_rtt / 2 * 4, loss_granularity) + impl.config.max_ack_delay;
-  return std::max(current, fresh) * 3;
+  const auto fresh = initial_rtt + (std::max)(initial_rtt / 2 * 4, loss_granularity) + impl.config.max_ack_delay;
+  return (std::max)(current, fresh) * 3;
 }
 
 // Section 10.3.1: only tokens for connection IDs this endpoint has actually
@@ -550,7 +550,7 @@ void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, 
     return std::nullopt;
   }
   const auto pto = impl.recovery.rtt().pto_base() + impl.config.max_ack_delay;
-  const auto period = std::max(impl.idle_timeout, pto * 3);
+  const auto period = (std::max)(impl.idle_timeout, pto * 3);
   return impl.last_activity + period;
 }
 
@@ -823,7 +823,7 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     std::uint64_t effective = 0;
     if (local != 0 && remote != 0)
     {
-      effective = std::min(local, remote);
+      effective = (std::min)(local, remote);
     }
     else
     {
@@ -1798,7 +1798,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     const std::size_t header_cost = 1 + varint_size(crypto_offset);
     if (available > header_cost + 1 && span_end > crypto_offset)
     {
-      std::size_t amount = static_cast<std::size_t>(std::min<std::uint64_t>(span_end - crypto_offset, available));
+      std::size_t amount = static_cast<std::size_t>((std::min<std::uint64_t>)(span_end - crypto_offset, available));
       while (amount > 0 && header_cost + varint_size(amount) + amount > available)
       {
         --amount;
@@ -2171,7 +2171,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     const std::size_t overhead = builder.header_length() + default_aead_expansion;
     if (expand_to > overhead)
     {
-      const std::size_t target = std::min(expand_to - overhead, capacity);
+      const std::size_t target = (std::min)(expand_to - overhead, capacity);
       if (target > frames.written())
       {
         frame_t padding;
@@ -2603,7 +2603,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     return written;
   }
 
-  std::size_t budget = std::min(out.size(), impl.config.max_datagram_size);
+  std::size_t budget = (std::min)(out.size(), impl.config.max_datagram_size);
   if (impl.config.role == tls_role_t::server && !impl.address_validated)
   {
     // Section 8.1: three times what has arrived, and not a byte more.
@@ -2613,7 +2613,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
       return std::size_t{0};
     }
     const std::uint64_t remaining = allowance - impl.bytes_sent;
-    budget = static_cast<std::size_t>(std::min<std::uint64_t>(budget, remaining));
+    budget = static_cast<std::size_t>((std::min<std::uint64_t>)(budget, remaining));
   }
   if (budget == 0)
   {

@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 #include <doctest/doctest.h>
@@ -126,8 +127,13 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
         endpoint_config_t server_config;
         server_config.connection.role = tls_role_t::server;
         server_config.connection.transport_parameters = sane_parameters();
-        auto server = endpoint_t::create(loop, *server_context, server_config);
-        REQUIRE(server.has_value());
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        // Held in an optional so the socket can be closed before the loop is
+        // stopped. event_loop_t::stop() closes its own handles and then runs
+        // the loop until nothing is left; a socket still open at that point
+        // means it never returns.
+        std::optional<endpoint_t> server(std::move(*server_created));
 
         auto bind_address = ip4_addr("127.0.0.1", 0);
         REQUIRE(bind_address.has_value());
@@ -141,8 +147,9 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
         endpoint_config_t client_config;
         client_config.connection.role = tls_role_t::client;
         client_config.connection.transport_parameters = sane_parameters();
-        auto client = endpoint_t::create(loop, *client_context, client_config);
-        REQUIRE(client.has_value());
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
 
         cancellation_t server_cancel;
         cancellation_t client_cancel;
@@ -193,7 +200,14 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
 
         server_cancel.cancel();
         client_cancel.cancel();
-        co_await sleep(loop, 20ms);
+        // Cancelling stops the read loops; destroying the endpoints closes
+        // their sockets. Both have to happen before the loop is asked to stop,
+        // in that order -- run() holds a reference to the endpoint, so the
+        // endpoint must outlive it.
+        co_await sleep(loop, 50ms);
+        server.reset();
+        client.reset();
+        co_await sleep(loop, 50ms);
         loop.stop();
       }(event_loop, identity, handshaken, received);
     });

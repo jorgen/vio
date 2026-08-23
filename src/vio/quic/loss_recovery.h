@@ -135,14 +135,14 @@ public:
 
     // min_rtt deliberately ignores acknowledgment delay: it is the floor the
     // adjustment below is judged plausible against.
-    _minimum = std::min(_minimum, latest);
+    _minimum = (std::min)(_minimum, latest);
 
     auto delay = ack_delay;
     if (handshake_confirmed)
     {
       // Before confirmation the peer has not yet promised a max_ack_delay, so
       // its claim cannot be held to one.
-      delay = std::min(delay, max_ack_delay);
+      delay = (std::min)(delay, max_ack_delay);
     }
 
     auto adjusted = latest;
@@ -167,15 +167,15 @@ public:
   // application space, and only once the handshake is confirmed.
   [[nodiscard]] std::chrono::nanoseconds pto_base() const
   {
-    return _smoothed + std::max(_variation * 4, loss_granularity);
+    return _smoothed + (std::max)(_variation * 4, loss_granularity);
   }
 
   // Section 6.1.2.
   [[nodiscard]] std::chrono::nanoseconds loss_delay() const
   {
-    const auto base = std::max(_latest, _smoothed);
+    const auto base = (std::max)(_latest, _smoothed);
     const auto scaled = (base * loss_time_threshold_numerator) / loss_time_threshold_denominator;
-    return std::max(scaled, loss_granularity);
+    return (std::max)(scaled, loss_granularity);
   }
 
 private:
@@ -390,7 +390,7 @@ public:
     {
       return;
     }
-    state.largest_sent = state.has_sent ? std::max(state.largest_sent, packet.packet_number) : packet.packet_number;
+    state.largest_sent = state.has_sent ? (std::max)(state.largest_sent, packet.packet_number) : packet.packet_number;
     state.has_sent = true;
     if (packet.in_flight)
     {
@@ -455,7 +455,7 @@ public:
       auto &packet = state.sent.at(index);
       if (packet.in_flight)
       {
-        _bytes_in_flight -= std::min(_bytes_in_flight, packet.size);
+        _bytes_in_flight -= (std::min)(_bytes_in_flight, packet.size);
       }
       if (packet.ack_eliciting)
       {
@@ -479,7 +479,7 @@ public:
           continue;
         }
         const std::uint64_t scale = context.ack_delay_exponent >= 63 ? 0 : ack.ack_delay << context.ack_delay_exponent;
-        const auto delay = std::chrono::microseconds(static_cast<std::int64_t>(std::min<std::uint64_t>(scale, std::numeric_limits<std::int64_t>::max())));
+        const auto delay = std::chrono::microseconds(static_cast<std::int64_t>((std::min<std::uint64_t>)(scale, (std::numeric_limits<std::int64_t>::max)())));
         // Section 5.3: the application space is the only one whose ACK delay
         // is bounded by max_ack_delay, and only after confirmation.
         _rtt.on_rtt_sample(now - packet.time_sent, delay, context.handshake_confirmed && space == pn_space_t::application, context.max_ack_delay);
@@ -535,7 +535,7 @@ public:
       {
         if (packet.in_flight)
         {
-          _bytes_in_flight -= std::min(_bytes_in_flight, packet.size);
+          _bytes_in_flight -= (std::min)(_bytes_in_flight, packet.size);
         }
         if (packet.ack_eliciting)
         {
@@ -548,7 +548,7 @@ public:
       // Not lost yet, but it will be if nothing acknowledges it: remember the
       // earliest moment that becomes true so a timer can be set for it.
       const auto when = packet.time_sent + delay;
-      state.loss_time = state.loss_time.has_value() ? std::min(*state.loss_time, when) : when;
+      state.loss_time = state.loss_time.has_value() ? (std::min)(*state.loss_time, when) : when;
     }
     state.sent.compact();
     return lost;
@@ -612,7 +612,7 @@ public:
       const auto &packet = state.sent.at(index);
       if (packet.in_flight)
       {
-        _bytes_in_flight -= std::min(_bytes_in_flight, packet.size);
+        _bytes_in_flight -= (std::min)(_bytes_in_flight, packet.size);
       }
       if (packet.ack_eliciting)
       {
@@ -760,7 +760,7 @@ private:
       {
         continue;
       }
-      earliest = earliest.has_value() ? std::min(*earliest, *state.loss_time) : *state.loss_time;
+      earliest = earliest.has_value() ? (std::min)(*earliest, *state.loss_time) : *state.loss_time;
     }
     return earliest;
   }
@@ -787,7 +787,7 @@ private:
 
   [[nodiscard]] std::pair<std::optional<tick_t>, std::optional<pn_space_t>> pto_time(tick_t now, const recovery_context_t &context) const
   {
-    auto duration = _rtt.pto_base() * (std::int64_t{1} << std::min<std::uint64_t>(_pto_count, 20));
+    auto duration = _rtt.pto_base() * (std::int64_t{1} << (std::min<std::uint64_t>)(_pto_count, 20));
 
     if (!ack_eliciting_in_flight())
     {
@@ -826,7 +826,7 @@ private:
           // handshake is confirmed, and nothing above it can be either.
           break;
         }
-        space_duration += context.max_ack_delay * (std::int64_t{1} << std::min<std::uint64_t>(_pto_count, 20));
+        space_duration += context.max_ack_delay * (std::int64_t{1} << (std::min<std::uint64_t>)(_pto_count, 20));
       }
 
       const auto candidate = state.time_of_last_ack_eliciting + space_duration;

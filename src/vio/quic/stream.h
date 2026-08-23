@@ -183,7 +183,7 @@ public:
   {
     // A limit only ever moves up: section 4.1 makes them cumulative, and
     // honouring a smaller one would strand data already in flight.
-    _max_data = std::max(_max_data, value);
+    _max_data = (std::max)(_max_data, value);
   }
 
   // Returns how much new data this contributed, so the caller can charge it
@@ -297,7 +297,7 @@ public:
     {
       return;
     }
-    const std::size_t taken = std::min(bytes, it->second.size());
+    const std::size_t taken = (std::min)(bytes, it->second.size());
     _read_offset += taken;
     if (taken == it->second.size())
     {
@@ -374,8 +374,8 @@ private:
     std::uint64_t merged_end = end;
     for (; last != _chunks.end() && last->first <= end; ++last)
     {
-      merged_start = std::min(merged_start, last->first);
-      merged_end = std::max(merged_end, last->first + last->second.size());
+      merged_start = (std::min)(merged_start, last->first);
+      merged_end = (std::max)(merged_end, last->first + last->second.size());
     }
 
     if (merged_start == start && merged_end == end && first == last)
@@ -445,7 +445,7 @@ public:
 
   void set_max_data(std::uint64_t value)
   {
-    _max_data = std::max(_max_data, value);
+    _max_data = (std::max)(_max_data, value);
   }
 
   // Whether the peer's limit, not the connection's, is what is holding this
@@ -496,7 +496,7 @@ public:
     if (!_retransmit.empty())
     {
       const auto &range = _retransmit.front();
-      const std::size_t amount = static_cast<std::size_t>(std::min<std::uint64_t>(range.length, limit));
+      const std::size_t amount = static_cast<std::size_t>((std::min<std::uint64_t>)(range.length, limit));
       if (amount == 0)
       {
         return std::nullopt;
@@ -510,10 +510,10 @@ public:
       return chunk;
     }
 
-    const std::uint64_t allowed = std::min(_max_data, _sent_offset + connection_window);
+    const std::uint64_t allowed = (std::min)(_max_data, _sent_offset + connection_window);
     const std::uint64_t remaining = queued() > _sent_offset ? queued() - _sent_offset : 0;
     const std::uint64_t permitted = allowed > _sent_offset ? allowed - _sent_offset : 0;
-    const std::size_t amount = static_cast<std::size_t>(std::min<std::uint64_t>(std::min(remaining, permitted), limit));
+    const std::size_t amount = static_cast<std::size_t>((std::min<std::uint64_t>)((std::min)(remaining, permitted), limit));
 
     // An empty STREAM frame is still worth sending if it carries the FIN and
     // everything before it has gone.
@@ -556,7 +556,7 @@ public:
       auto &front = _retransmit.front();
       const std::uint64_t taken = chunk.data.size();
       front.offset += taken;
-      front.length -= std::min(front.length, taken);
+      front.length -= (std::min)(front.length, taken);
       if (front.length == 0)
       {
         _retransmit.erase(_retransmit.begin());
@@ -612,7 +612,7 @@ public:
     const std::uint64_t prefix = acknowledged_prefix_end();
     if (prefix > _base)
     {
-      const std::size_t drop = static_cast<std::size_t>(std::min<std::uint64_t>(prefix - _base, _data.size()));
+      const std::size_t drop = static_cast<std::size_t>((std::min<std::uint64_t>)(prefix - _base, _data.size()));
       _data.erase(_data.begin(), _data.begin() + static_cast<std::ptrdiff_t>(drop));
       _base += drop;
     }
@@ -669,7 +669,7 @@ private:
     {
       return {};
     }
-    return std::span<const std::uint8_t>(_data).subspan(index, std::min(amount, _data.size() - index));
+    return std::span<const std::uint8_t>(_data).subspan(index, (std::min)(amount, _data.size() - index));
   }
 
   void insert_acknowledged(std::uint64_t start, std::uint64_t end)
@@ -688,8 +688,8 @@ private:
     std::uint64_t merged_end = end;
     for (; last != _acknowledged.end() && last->first <= end; ++last)
     {
-      merged_start = std::min(merged_start, last->first);
-      merged_end = std::max(merged_end, last->second);
+      merged_start = (std::min)(merged_start, last->first);
+      merged_end = (std::max)(merged_end, last->second);
     }
     _acknowledged.erase(first, last);
     _acknowledged.emplace(merged_start, merged_end);

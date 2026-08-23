@@ -56,7 +56,7 @@ namespace vio::quic
 // datagrams.
 [[nodiscard]] constexpr std::size_t initial_congestion_window(std::size_t max_datagram_size)
 {
-  return std::min<std::size_t>(10 * max_datagram_size, std::max<std::size_t>(14720, 2 * max_datagram_size));
+  return (std::min<std::size_t>)(10 * max_datagram_size, (std::max<std::size_t>)(14720, 2 * max_datagram_size));
 }
 
 // Section 7.2: the floor a loss can drive the window to.
@@ -138,7 +138,7 @@ private:
     // otherwise wrap and come back out as a tiny rate, which would stall
     // sending rather than merely mis-pace it.
     constexpr std::uint64_t window_ceiling = std::uint64_t{1} << 32;
-    const auto bounded = std::min(static_cast<std::uint64_t>(window), window_ceiling);
+    const auto bounded = (std::min)(static_cast<std::uint64_t>(window), window_ceiling);
     const auto numerator = bounded * 5ULL * 1000000000ULL;
     return numerator / (static_cast<std::uint64_t>(rtt) * 4ULL);
   }
@@ -261,7 +261,7 @@ public:
     }
     _recovery_start = now;
     _recovery_started = true;
-    _slow_start_threshold = std::max(_window / 2, minimum_congestion_window(_max_datagram_size));
+    _slow_start_threshold = (std::max)(_window / 2, minimum_congestion_window(_max_datagram_size));
     _window = _slow_start_threshold;
     _avoidance_remainder = 0;
   }
@@ -278,7 +278,7 @@ public:
       {
         continue;
       }
-      latest_loss = latest_loss.has_value() ? std::max(*latest_loss, packet.time_sent) : packet.time_sent;
+      latest_loss = latest_loss.has_value() ? (std::max)(*latest_loss, packet.time_sent) : packet.time_sent;
     }
     if (!latest_loss.has_value())
     {
@@ -328,8 +328,8 @@ private:
       {
         continue;
       }
-      earliest = earliest.has_value() ? std::min(*earliest, packet.time_sent) : packet.time_sent;
-      latest = latest.has_value() ? std::max(*latest, packet.time_sent) : packet.time_sent;
+      earliest = earliest.has_value() ? (std::min)(*earliest, packet.time_sent) : packet.time_sent;
+      latest = latest.has_value() ? (std::max)(*latest, packet.time_sent) : packet.time_sent;
       ++counted;
     }
     if (counted < 2 || !earliest.has_value())
@@ -343,7 +343,7 @@ private:
   std::size_t _window = 0;
   // Section B.3 starts this at infinity so the connection begins in slow
   // start; the largest representable value is that, for this purpose.
-  std::size_t _slow_start_threshold = std::numeric_limits<std::size_t>::max();
+  std::size_t _slow_start_threshold = (std::numeric_limits<std::size_t>::max)();
   std::size_t _avoidance_remainder = 0;
   tick_t _recovery_start;
   bool _recovery_started = false;
