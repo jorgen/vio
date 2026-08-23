@@ -50,18 +50,16 @@ std::string environment(const char *name, std::string fallback = {})
 // that can pin a ciphersuite and move itself, neither of which is exposed.
 bool supported(std::string_view role, std::string_view testcase)
 {
-  const bool server = role == "server";
-  if (testcase == "handshake" || testcase == "transfer" || testcase == "multiconnect" || testcase == "retry" || testcase == "rebind-port" || testcase == "rebind-addr" || testcase == "keyupdate")
+  static constexpr std::string_view both[] = {
+    "handshake", "transfer", "longrtt", "multiplexing", "retry", "keyupdate", "ecn", "amplificationlimit", "handshakeloss", "transferloss", "handshakecorruption", "transfercorruption", "ipv6", "blackhole", "rebind-port", "rebind-addr",
+  };
+  if (std::find(std::begin(both), std::end(both), testcase) != std::end(both))
   {
     return true;
   }
   // Passive on the server side: the client is the one that has to do something
   // this endpoint cannot.
-  if (server && (testcase == "chacha20" || testcase == "versionnegotiation" || testcase == "connectionmigration"))
-  {
-    return true;
-  }
-  return false;
+  return role == "server" && (testcase == "chacha20" || testcase == "connectionmigration");
 }
 
 std::vector<std::uint8_t> read_file(const std::string &path)
@@ -488,18 +486,7 @@ task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
   const bool key_update = testcase == "keyupdate";
   bool ok = true;
 
-  if (testcase == "multiconnect")
-  {
-    // The point of the test is many handshakes, so each file gets its own.
-    for (const auto &single : requests)
-    {
-      ok = co_await fetch(loop, *context, {single}, directory, false) && ok;
-    }
-  }
-  else
-  {
-    ok = co_await fetch(loop, *context, requests, directory, key_update);
-  }
+  ok = co_await fetch(loop, *context, requests, directory, key_update);
 
   co_return ok ? 0 : 1;
 }

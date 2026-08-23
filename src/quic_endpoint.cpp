@@ -211,16 +211,25 @@ void index_connection(endpoint_impl_t &impl, connection_entry_t &entry)
 // sent has no descriptor at all. Its own recv_start binds implicitly when that
 // happens, and anything reading or marking the socket directly needs the same,
 // because both start from a descriptor.
-void ensure_socket(endpoint_impl_t &impl)
+// An endpoint that was never bound gets its socket here. The family has to
+// match the peer it is about to be used for: a socket bound to 0.0.0.0 cannot
+// send to an IPv6 address at all, so a client dialling one has to say which it
+// needs rather than take the default and fail.
+void ensure_socket(endpoint_impl_t &impl, int family = AF_INET)
 {
   if (udp_fileno(impl.udp).has_value())
   {
     return;
   }
-  // IPv4, matching what libuv's own deferred bind would have chosen. Binding
-  // dual-stack here instead would quietly change the socket's family out from
-  // under a caller that then sends to an IPv4 peer, and the raw sendmsg has no
-  // business guessing. A caller that wants dual-stack calls bind() and says so.
+  if (family == AF_INET6)
+  {
+    sockaddr_in6 any = {};
+    if (uv_ip6_addr("::", 0, &any) == 0 && udp_bind(impl.udp, reinterpret_cast<const sockaddr *>(&any)).has_value())
+    {
+      return;
+    }
+  }
+  // IPv4 otherwise, matching what libuv's own deferred bind would have chosen.
   sockaddr_in any = {};
   if (uv_ip4_addr("0.0.0.0", 0, &any) == 0)
   {
@@ -675,7 +684,7 @@ void endpoint_t::on_activity(connection_active_t handler)
 std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name)
 {
   auto &impl = *_impl;
-  ensure_socket(impl);
+  ensure_socket(impl, address != nullptr ? address->sa_family : AF_INET);
   auto config = impl.config.connection;
   config.role = tls_role_t::client;
   config.stateless_reset_key = impl.config.stateless_reset_key;

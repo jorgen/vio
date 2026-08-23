@@ -150,6 +150,20 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
 //
 // RFC 3168 forbids an endpoint from setting CE itself -- only a router may --
 // and Windows enforces it with WSAEINVAL. Nothing here should ever ask for it.
+// An IPv4 destination as a dual-stack socket reports it: ::ffff:a.b.c.d. The
+// datagram leaves as IPv4, which decides which options the kernel will read
+// for it.
+[[nodiscard]] inline bool is_ipv4_mapped(const sockaddr *address)
+{
+  if (address == nullptr || address->sa_family != AF_INET6)
+  {
+    return false;
+  }
+  static constexpr std::uint8_t prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+  const auto *bytes = reinterpret_cast<const std::uint8_t *>(&reinterpret_cast<const sockaddr_in6 *>(address)->sin6_addr);
+  return std::memcmp(bytes, prefix, sizeof(prefix)) == 0;
+}
+
 [[nodiscard]] inline std::expected<std::size_t, error_t> send_datagram(udp_t &udp, std::span<const std::uint8_t> bytes, const sockaddr *address, udp_ecn_t ecn)
 {
   auto fd = udp_fileno(udp);
@@ -179,7 +193,17 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
     address = reinterpret_cast<const sockaddr *>(&mapped);
   }
 
-  const bool ipv6 = address != nullptr && address->sa_family == AF_INET6;
+  // The address handed to the kernel is whatever the mapping left behind, and
+  // its length has to match that.
+  const bool address_is_ipv6 = address != nullptr && address->sa_family == AF_INET6;
+  // Which control message carries the codepoint is a different question: it
+  // follows the family the datagram actually leaves as, and one addressed to
+  // an IPv4-mapped address leaves as IPv4 however the socket is bound. That
+  // path reads IP_TOS; IPV6_TCLASS is accepted there and quietly does nothing,
+  // so marking it that way puts the packets on the wire unmarked. A dual-stack
+  // socket sees every IPv4 peer in the mapped form, so this is the common case
+  // rather than a corner of one.
+  const bool ipv6 = address_is_ipv6 && !is_ipv4_mapped(address);
   const int value = static_cast<int>(ecn);
 
 #if defined(_WIN32)
@@ -232,7 +256,7 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
   alignas(cmsghdr) std::array<std::uint8_t, CMSG_SPACE(sizeof(int))> control = {};
   msghdr message = {};
   message.msg_name = const_cast<sockaddr *>(address);
-  message.msg_namelen = ipv6 ? static_cast<socklen_t>(sizeof(sockaddr_in6)) : static_cast<socklen_t>(sizeof(sockaddr_in));
+  message.msg_namelen = address_is_ipv6 ? static_cast<socklen_t>(sizeof(sockaddr_in6)) : static_cast<socklen_t>(sizeof(sockaddr_in));
   message.msg_iov = &vector;
   message.msg_iovlen = 1;
 
@@ -311,7 +335,17 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
     std::memcpy(raw + 12, &in4->sin_addr, 4);
     address = reinterpret_cast<const sockaddr *>(&mapped);
   }
-  const bool ipv6 = address != nullptr && address->sa_family == AF_INET6;
+  // The address handed to the kernel is whatever the mapping left behind, and
+  // its length has to match that.
+  const bool address_is_ipv6 = address != nullptr && address->sa_family == AF_INET6;
+  // Which control message carries the codepoint is a different question: it
+  // follows the family the datagram actually leaves as, and one addressed to
+  // an IPv4-mapped address leaves as IPv4 however the socket is bound. That
+  // path reads IP_TOS; IPV6_TCLASS is accepted there and quietly does nothing,
+  // so marking it that way puts the packets on the wire unmarked. A dual-stack
+  // socket sees every IPv4 peer in the mapped form, so this is the common case
+  // rather than a corner of one.
+  const bool ipv6 = address_is_ipv6 && !is_ipv4_mapped(address);
 
 #if defined(_WIN32)
 #if defined(UDP_SEND_MSG_SIZE)
@@ -340,7 +374,7 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
   alignas(cmsghdr) std::array<std::uint8_t, CMSG_SPACE(sizeof(std::uint16_t)) + CMSG_SPACE(sizeof(int))> control = {};
   msghdr message = {};
   message.msg_name = const_cast<sockaddr *>(address);
-  message.msg_namelen = ipv6 ? static_cast<socklen_t>(sizeof(sockaddr_in6)) : static_cast<socklen_t>(sizeof(sockaddr_in));
+  message.msg_namelen = address_is_ipv6 ? static_cast<socklen_t>(sizeof(sockaddr_in6)) : static_cast<socklen_t>(sizeof(sockaddr_in));
   message.msg_iov = &vector;
   message.msg_iovlen = 1;
   message.msg_control = control.data();
