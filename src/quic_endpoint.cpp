@@ -154,7 +154,8 @@ void route_by(endpoint_impl_t &impl, connection_entry_t &entry, const connection
 
 void index_connection(endpoint_impl_t &impl, connection_entry_t &entry)
 {
-  for (const auto &id : entry.connection->issued_connection_ids())
+  const auto issued = entry.connection->issued_connection_ids();
+  for (const auto &id : issued)
   {
     route_by(impl, entry, id);
   }
@@ -165,7 +166,27 @@ void index_connection(endpoint_impl_t &impl, connection_entry_t &entry)
   // unmatched, and each one would be read as a new connection. The value is
   // not known until the first Initial has been processed, so this runs on
   // every flush rather than once at accept.
-  route_by(impl, entry, entry.connection->original_destination_id());
+  const auto &original = entry.connection->original_destination_id();
+  route_by(impl, entry, original);
+
+  // Section 5.1.1: an id the peer has retired is one this endpoint no longer
+  // answers to, so it comes out of the table. Leaving it in would keep a
+  // rotating connection's every past id routable for the life of the
+  // connection -- the table would only ever grow, and a datagram addressed to
+  // a withdrawn id would be delivered instead of drawing a stateless reset.
+  const auto still_routed = [&](const connection_id_t &id)
+  { return (!original.empty() && id == original) || std::find(issued.begin(), issued.end(), id) != issued.end(); };
+
+  for (auto it = entry.routed.begin(); it != entry.routed.end();)
+  {
+    if (still_routed(*it))
+    {
+      ++it;
+      continue;
+    }
+    impl.by_id.erase(*it);
+    it = entry.routed.erase(it);
+  }
 }
 
 [[nodiscard]] connection_entry_t *find_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram)

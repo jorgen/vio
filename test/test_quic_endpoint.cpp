@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -312,5 +313,159 @@ TEST_CASE("a Retry is answered without building a connection for it")
   CHECK(handshaken);
   CHECK(through_retry);
   CHECK(accepted_connections == 1);
+}
+TEST_CASE("one server port keeps two clients apart")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  std::size_t accepted = 0;
+  std::string first_message;
+  std::string second_message;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &accepted, std::string &first_message, std::string &second_message) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.connection.transport_parameters = sane_parameters();
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        std::vector<connection_t *> arrivals;
+        server->on_connection([&arrivals](connection_t &connection) { arrivals.push_back(&connection); });
+
+        // Two clients on their own sockets, so they reach the server from two
+        // different addresses and can only be told apart by connection id.
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        client_config.connection.transport_parameters = sane_parameters();
+        auto first_created = endpoint_t::create(loop, *client_context, client_config);
+        auto second_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(first_created.has_value());
+        REQUIRE(second_created.has_value());
+        std::optional<endpoint_t> first(std::move(*first_created));
+        std::optional<endpoint_t> second(std::move(*second_created));
+
+        cancellation_t server_cancel;
+        cancellation_t first_cancel;
+        cancellation_t second_cancel;
+        auto run_one = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); };
+        auto server_run = run_one(*server, server_cancel);
+        auto first_run = run_one(*first, first_cancel);
+        auto second_run = run_one(*second, second_cancel);
+        (void)server_run;
+        (void)first_run;
+        (void)second_run;
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+        auto first_dial = first->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        auto second_dial = second->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        REQUIRE(first_dial.has_value());
+        REQUIRE(second_dial.has_value());
+
+        for (int i = 0; i < 300 && !((*first_dial)->handshake_complete() && (*second_dial)->handshake_complete()); ++i)
+        {
+          co_await sleep(loop, 5ms);
+        }
+        REQUIRE((*first_dial)->handshake_complete());
+        REQUIRE((*second_dial)->handshake_complete());
+        accepted = server->connection_count();
+
+        auto say = [](connection_t &connection, endpoint_t &endpoint, const std::string &text)
+        {
+          auto stream = connection.open_stream(stream_direction_t::bidirectional);
+          REQUIRE(stream.has_value());
+          const std::vector<std::uint8_t> payload(text.begin(), text.end());
+          (void)connection.write_stream(*stream, payload, true);
+          (void)endpoint.flush();
+          return *stream;
+        };
+        const auto first_stream = say(**first_dial, *first, "from the first client");
+        const auto second_stream = say(**second_dial, *second, "from the second client");
+
+        for (int i = 0; i < 300; ++i)
+        {
+          if (arrivals.size() == 2)
+          {
+            bool done = true;
+            for (auto *arrival : arrivals)
+            {
+              auto a = arrival->readable_stream(first_stream);
+              auto b = arrival->readable_stream(second_stream);
+              const auto readable = a.empty() ? b : a;
+              if (readable.empty())
+              {
+                done = false;
+              }
+            }
+            if (done)
+            {
+              break;
+            }
+          }
+          co_await sleep(loop, 5ms);
+        }
+
+        if (arrivals.size() == 2)
+        {
+          // Each server-side connection holds exactly one client's message,
+          // which is the whole job of demultiplexing on connection id.
+          std::vector<std::string> heard;
+          for (auto *arrival : arrivals)
+          {
+            auto a = arrival->readable_stream(first_stream);
+            auto b = arrival->readable_stream(second_stream);
+            const auto readable = a.empty() ? b : a;
+            heard.emplace_back(reinterpret_cast<const char *>(readable.data()), readable.size());
+          }
+          std::sort(heard.begin(), heard.end());
+          first_message = heard.front();
+          second_message = heard.back();
+        }
+
+        server_cancel.cancel();
+        first_cancel.cancel();
+        second_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        server.reset();
+        first.reset();
+        second.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, accepted, first_message, second_message);
+    });
+
+  event_loop.run();
+  CHECK(accepted == 2);
+  CHECK(first_message == "from the first client");
+  CHECK(second_message == "from the second client");
 }
 }
