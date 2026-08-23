@@ -78,3 +78,9 @@ add_test(NAME vio_tests COMMAND vio_tests)
 add_executable(vio_bench EXCLUDE_FROM_ALL bench_quic.cpp)
 CmDepTargetLinkLibrary(vio_bench PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
 target_include_directories(vio_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# A server for a foreign QUIC implementation to talk to. Needs a second
+# process, so it is not part of the suite.
+add_executable(vio_interop_server EXCLUDE_FROM_ALL interop_server.cpp)
+CmDepTargetLinkLibrary(vio_interop_server PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+target_include_directories(vio_interop_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
