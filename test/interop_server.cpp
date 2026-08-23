@@ -162,6 +162,10 @@ int main(int argc, char **argv)
         config.connection.role = tls_role_t::server;
         config.connection.transport_parameters = parameters();
         config.ecn = true;
+        if (std::getenv("VIO_NO_PACING") != nullptr)
+        {
+          config.connection.pacing = false;
+        }
         if (qlog_dir != nullptr)
         {
           config.qlog_directory = qlog_dir;

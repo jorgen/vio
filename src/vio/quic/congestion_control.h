@@ -78,6 +78,11 @@ inline constexpr std::int64_t persistent_congestion_threshold = 3;
 // bytes per second and is capped at the burst this endpoint is willing to send
 // back to back, which section 7.2 puts at the initial window. N is 1.25, large
 // enough that jitter in the RTT estimate does not leave the window unused.
+// How often the sender is in a position to spend pacing tokens. Sending is
+// driven from the event loop's timers, whose resolution is a millisecond, so
+// this is the grain the bucket has to be sized against rather than a knob.
+inline constexpr std::chrono::milliseconds pacing_wakeup_interval{2};
+
 class pacer_t
 {
 public:
@@ -125,18 +130,31 @@ public:
     _have_last = false;
   }
 
+
 private:
   // Section 7.7 sets the rate the bucket fills at but leaves its depth -- the
-  // largest burst allowed at once -- to the implementation. Holding it at the
-  // initial window forever caps a connection at one initial flight per wakeup
-  // however far the congestion window has grown, which makes throughput a
-  // function of timer granularity instead of the window: ten packets every 2ms
-  // is 48 Mbit/s, whatever the link underneath can do. A quarter of the window
-  // scales with the connection, and the initial window stays as the floor so a
-  // small one still gets a full flight out.
-  [[nodiscard]] std::size_t burst_capacity(std::size_t window) const
+  // largest burst allowed at once -- to the implementation, and the depth is
+  // what decides whether pacing costs throughput or merely shapes it.
+  //
+  // A bucket is only drained when something looks at it, and here that is an
+  // event loop whose timers resolve to a millisecond. Tokens the rate delivers
+  // between two wakeups can never be spent if the depth is below them: the
+  // sender empties the bucket, returns nothing, and waits for a timer while the
+  // path sits idle. Measured on a loopback path -- 260us round trip, a bucket
+  // of 29 KB against a rate of 800 MB/s -- it stalled with fewer than one
+  // datagram of credit and cost 40% of the throughput.
+  //
+  // So the depth is what the rate delivers across one wakeup: on a path slower
+  // than the timer that is a fraction of the window and pacing does its job,
+  // and on a path faster than the timer it reaches the window, where the
+  // congestion window is already the bound on a burst. Pacing below the grain
+  // of the clock driving it is not something this loop can do, and pretending
+  // otherwise only leaves the link empty.
+  [[nodiscard]] std::size_t burst_capacity(std::size_t window, std::uint64_t rate) const
   {
-    return (std::max)(_capacity, window / 4);
+    const auto per_wakeup = (rate / 1000) * static_cast<std::uint64_t>(pacing_wakeup_interval.count());
+    const auto wanted = (std::max<std::uint64_t>)(_capacity, per_wakeup);
+    return static_cast<std::size_t>((std::min<std::uint64_t>)(wanted, (std::max<std::uint64_t>)(window, _capacity)));
   }
 
   [[nodiscard]] static std::uint64_t fill_rate(std::size_t window, std::chrono::nanoseconds smoothed_rtt)
@@ -181,12 +199,12 @@ private:
     const auto rate = fill_rate(window, smoothed_rtt);
     if (rate == 0)
     {
-      _tokens = static_cast<std::int64_t>(burst_capacity(window));
+      _tokens = static_cast<std::int64_t>(burst_capacity(window, 0));
       return;
     }
     const auto gained = (static_cast<std::uint64_t>(elapsed.count()) * rate) / 1000000000ULL;
     _tokens += static_cast<std::int64_t>(gained);
-    const auto ceiling_bytes = static_cast<std::int64_t>(burst_capacity(window));
+    const auto ceiling_bytes = static_cast<std::int64_t>(burst_capacity(window, rate));
     if (_tokens > ceiling_bytes)
     {
       _tokens = ceiling_bytes;
