@@ -351,6 +351,29 @@ void qlog_writer_t::begin_array(std::string_view key)
   _state->first_in_scope = true;
 }
 
+void qlog_writer_t::begin_array()
+{
+  if (_state == nullptr || _state->closed || _state->suppressed > 0)
+  {
+    return;
+  }
+  std::string &out = _state->buffer;
+  separate(out, _state->first_in_scope);
+  out.push_back('[');
+  _state->first_in_scope = true;
+}
+
+void qlog_writer_t::field_element(std::uint64_t value)
+{
+  if (_state == nullptr || _state->closed || _state->suppressed > 0)
+  {
+    return;
+  }
+  std::string &out = _state->buffer;
+  separate(out, _state->first_in_scope);
+  append_number(out, value);
+}
+
 void qlog_writer_t::end_array()
 {
   if (_state == nullptr || _state->closed || _state->suppressed > 0)

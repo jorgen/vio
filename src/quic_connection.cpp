@@ -1172,8 +1172,47 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       }
       else if (frame.kind == frame_kind_t::ack)
       {
-        impl.qlog->field_number("largest_acknowledged", frame.largest_acknowledged);
         impl.qlog->field_number("ack_delay", frame.ack_delay);
+        // The ranges are what a reader of a trace is actually after -- which
+        // packets this acknowledges, not just the highest. qvis draws its
+        // acknowledgement coverage straight from these.
+        impl.qlog->begin_array("acked_ranges");
+        std::uint64_t largest = frame.largest_acknowledged;
+        bool ranges_valid = frame.largest_acknowledged >= frame.first_ack_range;
+        if (ranges_valid)
+        {
+          std::uint64_t smallest = frame.largest_acknowledged - frame.first_ack_range;
+          impl.qlog->begin_array();
+          impl.qlog->field_element(smallest);
+          impl.qlog->field_element(largest);
+          impl.qlog->end_array();
+          ack_range_reader_t ranges(frame.ack_ranges);
+          for (std::uint64_t seen = 0; seen < frame.ack_range_count; ++seen)
+          {
+            auto range = ranges.next();
+            if (!range.has_value() || smallest < range->gap + 2)
+            {
+              break;
+            }
+            largest = smallest - range->gap - 2;
+            if (largest < range->length)
+            {
+              break;
+            }
+            smallest = largest - range->length;
+            impl.qlog->begin_array();
+            impl.qlog->field_element(smallest);
+            impl.qlog->field_element(largest);
+            impl.qlog->end_array();
+          }
+        }
+        impl.qlog->end_array();
+        if (frame.ecn.has_value())
+        {
+          impl.qlog->field_number("ect0", frame.ecn->ect0);
+          impl.qlog->field_number("ect1", frame.ecn->ect1);
+          impl.qlog->field_number("ce", frame.ecn->ce);
+        }
       }
       else if (frame.kind == frame_kind_t::max_data || frame.kind == frame_kind_t::max_stream_data || frame.kind == frame_kind_t::max_streams)
       {
@@ -1187,7 +1226,7 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       else if (frame.kind == frame_kind_t::connection_close)
       {
         impl.qlog->field_number("error_code", frame.error_code);
-        impl.qlog->field_bool("application", frame.application_error);
+        impl.qlog->field_string("error_space", frame.application_error ? "application" : "transport");
       }
       impl.qlog->end_object();
     }

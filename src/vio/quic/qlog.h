@@ -73,7 +73,12 @@ public:
   void begin_object();
 
   void begin_array(std::string_view key);
+  // An unkeyed array, for an element of an array.
+  void begin_array();
   void end_array();
+
+  // A bare value in an array, which is how qlog spells an acknowledged range.
+  void field_element(std::uint64_t value);
 
   void close_trace();
 
