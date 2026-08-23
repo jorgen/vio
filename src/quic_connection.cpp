@@ -963,6 +963,21 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
 
     case frame_kind_t::ack:
     {
+      // The ECN counts in this frame are deliberately not acted on, and this
+      // is not an oversight to be tidied up later.
+      //
+      // Section 13.4.2.1 validates a reported count against the ECN codepoints
+      // this endpoint actually applied to the packets being acknowledged.
+      // Nothing here applies any: marking needs IP_TOS / IPV6_TCLASS on send
+      // and the arriving codepoint on receive, and libuv exposes neither for
+      // UDP. So every packet leaves unmarked, and every honest peer must
+      // report zero.
+      //
+      // Treating a non-zero count as congestion would therefore mean believing
+      // a number that can only be wrong, and letting a peer set it freely --
+      // any peer could halve this endpoint's sending rate by claiming CE marks
+      // for packets that never carried them. Ignoring them is the safe reading
+      // until marking exists on both sides of the socket.
       const auto space = to_pn_space(*level_for(kind));
       auto outcome = impl.recovery.on_ack_received(space, frame, now, recovery_context(impl));
       if (outcome.malformed)
