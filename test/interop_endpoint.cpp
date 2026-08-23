@@ -43,23 +43,21 @@ std::string environment(const char *name, std::string fallback = {})
   return value != nullptr ? std::string(value) : fallback;
 }
 
-// What this endpoint is prepared to be measured on. The rest are declined:
-// resumption and zerortt need session tickets, which are deliberately compiled
-// out; http3 needs a protocol that does not exist here yet; v2 needs a version
-// this endpoint does not offer; chacha20 and connectionmigration need a client
-// that can pin a ciphersuite and move itself, neither of which is exposed.
-bool supported(std::string_view role, std::string_view testcase)
+// What this endpoint is prepared to be measured on.
+//
+// These are not the runner's test case names: it tells each side what it needs
+// that side to do, so most of its cases arrive here as "transfer" and the
+// endpoint never learns which test it is part of. What is left is a short list.
+//
+// Declined: resumption and zerortt need session tickets, which are deliberately
+// compiled out; http3 needs a protocol that does not exist here yet; v2 needs a
+// version this endpoint does not offer; chacha20 needs a client that can pin a
+// ciphersuite; connectionmigration asks a server to advertise a preferred
+// address, which this one has none to give.
+bool supported(std::string_view, std::string_view testcase)
 {
-  static constexpr std::string_view both[] = {
-    "handshake", "transfer", "longrtt", "multiplexing", "retry", "keyupdate", "ecn", "amplificationlimit", "handshakeloss", "transferloss", "handshakecorruption", "transfercorruption", "ipv6", "blackhole", "rebind-port", "rebind-addr",
-  };
-  if (std::find(std::begin(both), std::end(both), testcase) != std::end(both))
-  {
-    return true;
-  }
-  // Passive on the server side: the client is the one that has to do something
-  // this endpoint cannot.
-  return role == "server" && (testcase == "chacha20" || testcase == "connectionmigration");
+  static constexpr std::string_view known[] = {"handshake", "transfer", "multiconnect", "retry", "keyupdate", "ecn"};
+  return std::find(std::begin(known), std::end(known), testcase) != std::end(known);
 }
 
 std::vector<std::uint8_t> read_file(const std::string &path)
@@ -424,31 +422,33 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
   (void)serving;
 
   connection_t *connection = *connected;
-  bool sent = false;
+  std::size_t opened = 0;
   // 30 seconds is above every timeout the runner applies, so a hang here is
   // reported as a failed download rather than a killed container.
-  for (int elapsed = 0; elapsed < 3000 && !state.finished() && !state.failed; ++elapsed)
+  for (int elapsed = 0; elapsed < 9000 && !state.finished() && !state.failed; ++elapsed)
   {
-    if (!sent && connection->handshake_complete())
+    // A request per stream, opened as the peer's limit allows rather than all
+    // at once: the multiplexing test asks for thousands of files, and the
+    // credit for them arrives in MAX_STREAMS as earlier ones finish.
+    if (connection->handshake_complete())
     {
-      for (std::size_t index = 0; index < batch.size(); ++index)
+      while (opened < batch.size())
       {
         auto stream = connection->open_stream(stream_direction_t::bidirectional);
         if (!stream.has_value())
         {
-          state.failed = true;
           break;
         }
-        state.downloads[index].stream = *stream;
-        const std::string line = "GET " + batch[index].path + "\r\n";
+        state.downloads[opened].stream = *stream;
+        const std::string line = "GET " + batch[opened].path + "\r\n";
         const auto bytes = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(line.data()), line.size());
         if (connection->write_stream(*stream, bytes, true) != bytes.size())
         {
           state.failed = true;
           break;
         }
+        ++opened;
       }
-      sent = true;
     }
     co_await sleep(loop, 10ms);
   }
@@ -486,7 +486,18 @@ task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
   const bool key_update = testcase == "keyupdate";
   bool ok = true;
 
-  ok = co_await fetch(loop, *context, requests, directory, key_update);
+  if (testcase == "multiconnect")
+  {
+    // The point of that test is many handshakes, so each file gets its own.
+    for (const auto &single : requests)
+    {
+      ok = co_await fetch(loop, *context, {single}, directory, false) && ok;
+    }
+  }
+  else
+  {
+    ok = co_await fetch(loop, *context, requests, directory, key_update);
+  }
 
   co_return ok ? 0 : 1;
 }

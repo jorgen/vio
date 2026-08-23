@@ -187,6 +187,40 @@ TEST_CASE("closing twice is harmless")
   std::remove(path.c_str());
 }
 
+TEST_CASE("a trace is complete on disk before it is closed")
+{
+  // How a trace is usually collected: the process is killed rather than asked
+  // to stop, so a destructor never runs. A file that only becomes readable on
+  // a clean exit is unreadable exactly when it is wanted.
+  const std::string path = "vio_qlog_live.qlog";
+  auto writer = qlog_writer_t::create(path, "server", odcid, tick_t::from_nanoseconds(std::chrono::nanoseconds(0)));
+  REQUIRE(writer != nullptr);
+
+  CHECK(balanced(read_back(path)));
+
+  // Past the flush threshold, so what is on disk is more than the preamble.
+  for (int i = 0; i < 400; ++i)
+  {
+    writer->begin_event(tick_t::from_nanoseconds(std::chrono::milliseconds(i)), "transport", "packet_sent");
+    writer->field_number("packet_number", static_cast<std::uint64_t>(i));
+    writer->field_string("packet_type", "1RTT");
+    writer->end_event();
+  }
+
+  const auto mid = read_back(path);
+  CHECK(balanced(mid));
+  CHECK(mid.find("[0,\"transport\",\"packet_sent\"") != std::string::npos);
+  CHECK(mid.size() > 1000);
+
+  writer.reset();
+  const auto after = read_back(path);
+  CHECK(balanced(after));
+  CHECK(after.size() >= mid.size());
+  // Closing writes the terminator once, not twice.
+  CHECK(after.find("]}]}]}]}") == std::string::npos);
+  std::remove(path.c_str());
+}
+
 TEST_CASE("a path that cannot be opened yields no writer rather than a crash")
 {
   auto writer = qlog_writer_t::create("no_such_directory_here/trace.qlog", "server", odcid, tick_t::from_nanoseconds(std::chrono::nanoseconds(0)));

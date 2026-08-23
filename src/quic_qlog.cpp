@@ -94,6 +94,12 @@ void append_signed(std::string &out, std::int64_t value)
 }
 } // namespace
 
+// What closes the document. It is written after every flush and then seeked
+// back over, so a trace on disk is a complete one at every point where nothing
+// is part-written -- which is what makes it readable after the process is
+// killed rather than only after it exits.
+constexpr char trace_terminator[] = "]}]}\n";
+
 struct qlog_writer_t::state_t
 {
   std::FILE *file = nullptr;
@@ -110,6 +116,30 @@ struct qlog_writer_t::state_t
   // fields landing in the outer event and its end closing that one early.
   bool in_event = false;
   int suppressed = 0;
+
+  // A killed process never runs a destructor, and a trace is most wanted when
+  // the run it describes ended badly. Everything buffered goes out followed by
+  // the terminator, and unless this is the last flush the file position is put
+  // back over it so the next write continues the events array.
+  void flush(bool final)
+  {
+    if (file == nullptr)
+    {
+      return;
+    }
+    if (!buffer.empty())
+    {
+      std::fwrite(buffer.data(), 1, buffer.size(), file);
+      buffer.clear();
+    }
+    const auto length = std::strlen(trace_terminator);
+    std::fwrite(trace_terminator, 1, length, file);
+    std::fflush(file);
+    if (!final)
+    {
+      std::fseek(file, -static_cast<long>(length), SEEK_CUR);
+    }
+  }
 };
 
 std::unique_ptr<qlog_writer_t> qlog_writer_t::create(const std::string &path, std::string_view vantage_point, std::span<const std::uint8_t> odcid, tick_t reference)
@@ -134,6 +164,7 @@ std::unique_ptr<qlog_writer_t> qlog_writer_t::create(const std::string &path, st
   out.append("\",\"event_fields\":[\"relative_time\",\"category\",\"event\",\"data\"],\"configuration\":{\"time_units\":\"us\"},\"common_fields\":{\"protocol_type\":\"QUIC_HTTP3\",\"reference_time\":\"");
   append_number(out, static_cast<std::uint64_t>(reference.since_origin().count() / 1000));
   out.append("\"},\"events\":[");
+  writer->_state->flush(false);
   return writer;
 }
 
@@ -149,14 +180,12 @@ void qlog_writer_t::close_trace()
     return;
   }
   _state->closed = true;
-  _state->buffer.append("]}]}\n");
+  _state->flush(true);
   if (_state->file != nullptr)
   {
-    std::fwrite(_state->buffer.data(), 1, _state->buffer.size(), _state->file);
     std::fclose(_state->file);
     _state->file = nullptr;
   }
-  _state->buffer.clear();
 }
 
 void qlog_writer_t::begin_event(tick_t now, std::string_view category, std::string_view name)
@@ -208,13 +237,11 @@ void qlog_writer_t::end_event()
   _state->buffer.append("}]");
   _state->first_in_scope = false;
 
-  // Flushing per event would make tracing dominate the cost of the thing
-  // being traced. A trace of a run that ends in a crash keeps whatever the
-  // last complete block held.
-  if (_state->buffer.size() >= 32 * 1024 && _state->file != nullptr)
+  // Flushing per event would make tracing dominate the cost of the thing being
+  // traced; a trace cut short keeps everything up to the last block.
+  if (_state->buffer.size() >= 8 * 1024)
   {
-    std::fwrite(_state->buffer.data(), 1, _state->buffer.size(), _state->file);
-    _state->buffer.clear();
+    _state->flush(false);
   }
 }
 
