@@ -1735,7 +1735,25 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   }
 
   const bool want_crypto = space.crypto_send.has_pending();
-  const bool want_ack = space.acks.has_received() && (space.acks.should_send_ack(now, impl.config.max_ack_delay) || (allow_empty_ack && space.acks.ack_pending()));
+  // Section 13.2.1 draws a line the previous reading of this missed. An
+  // endpoint MUST acknowledge ack-eliciting Initial and Handshake packets
+  // *immediately*, but 1-RTT packets only within its advertised
+  // max_ack_delay -- and section 13.2.2 says two ack-eliciting packets is
+  // when to stop waiting.
+  //
+  // Building a packet merely because an acknowledgement was pending collapsed
+  // that distinction: every arriving 1-RTT packet drew one back. Twice the
+  // packets, and worse, it clocked the sender at one packet per
+  // acknowledgement, so a window that could carry a burst never sent one.
+  //
+  // So the two questions are separated. Whether an acknowledgement is worth a
+  // packet of its own, and whether to include one in a packet already being
+  // built for other reasons -- which is always worth it, since the frame is
+  // small and the packet is going anyway.
+  const bool handshake_space = level == encryption_level_t::initial || level == encryption_level_t::handshake;
+  const bool ack_owed = space.acks.has_received() && space.acks.ack_pending();
+  const bool must_ack = ack_owed && (handshake_space || space.acks.should_send_ack(now, impl.config.max_ack_delay));
+  const bool want_ack = allow_empty_ack ? ack_owed : must_ack;
   const bool want_handshake_done = level == encryption_level_t::application && impl.config.role == tls_role_t::server && impl.handshake_complete && !impl.handshake_done_sent;
   const bool want_close = impl.close_frame_pending && space.have_write;
   const bool want_probe = space.probe_pending;
@@ -1756,7 +1774,8 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1] || impl.data_blocked_pending || impl.streams.streams_blocked_owed() || impl.streams.has_sendable();
   }
 
-  if (!want_crypto && !want_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
+  // Only must_ack justifies a packet by itself; want_ack merely rides along.
+  if (!want_crypto && !must_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
   {
     return std::size_t{0};
   }

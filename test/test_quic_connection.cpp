@@ -266,6 +266,13 @@ TEST_CASE("a client and a server complete a handshake over byte arrays")
   {
     CHECK(exchange.rounds < 12);
     std::vector<std::uint8_t> datagram(1500);
+    // Section 13.2.1: a 1-RTT acknowledgement may wait out max_ack_delay, so
+    // each side can still owe one when the handshake finishes. It leaves on
+    // the first poll after that delay. What "settles" means is that nothing
+    // follows it -- an acknowledgement must not draw another.
+    (void)client->poll_send(datagram, at(1s));
+    (void)server->poll_send(datagram, at(1s));
+
     auto client_idle = client->poll_send(datagram, at(1s));
     REQUIRE(client_idle.has_value());
     CHECK(*client_idle == 0);
@@ -1897,6 +1904,19 @@ TEST_CASE("a peer that moves is followed, cautiously")
   REQUIRE(client->handshake_complete());
   REQUIRE(server->handshake_complete());
   CHECK(server->migration_count() == 0);
+
+  // The path has to exist before it can be left. Migration is a 1-RTT concept
+  // -- section 9.3 compares against the address the connection is already
+  // using -- and the handshake runs entirely in the Initial and Handshake
+  // spaces, so until a 1-RTT packet arrives the server has no address to
+  // compare against and simply adopts whatever it first sees.
+  auto warmup = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(warmup.has_value());
+  const std::vector<std::uint8_t> hello = {'h', 'o', 'm', 'e'};
+  REQUIRE(client->write_stream(*warmup, hello, true) == hello.size());
+  REQUIRE(deliver_to_server(at(0ns), home) > 0);
+  deliver_to_client(at(0ns));
+  REQUIRE(server->migration_count() == 0);
 
   // Something non-probing to carry the news: section 9.1 says a packet of
   // probing frames alone proves nothing about where the peer is.
