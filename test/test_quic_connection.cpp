@@ -355,6 +355,96 @@ TEST_CASE("a server will not amplify before the address is validated")
   CHECK(sent > 0);
 }
 
+TEST_CASE("a migrated server stops rationing once the new path is validated")
+{
+  // Section 9.3 puts a server back under the section 8 amplification limit when
+  // the peer's address changes, and section 8.2 makes a matching PATH_RESPONSE
+  // the validation that lifts it. A server that never lifts it still works --
+  // it just spends the rest of the connection sending three bytes per byte that
+  // arrives, which is a crawl rather than an outage, and so goes unnoticed.
+  // picoquic's NAT rebinding test took 19.9s for 2 MB against this bug.
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  const std::vector<std::uint8_t> first_address = {10, 0, 0, 1, 0, 80};
+  const std::vector<std::uint8_t> second_address = {10, 0, 0, 1, 0, 81};
+
+  auto client_to_server = [&](vio::tick_t now, std::span<const std::uint8_t> address)
+  {
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        return;
+      }
+      datagram.resize(*size);
+      REQUIRE(server->receive(datagram, now, address).has_value());
+    }
+  };
+
+  auto server_to_client = [&](vio::tick_t now)
+  {
+    std::size_t total = 0;
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = server->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        return total;
+      }
+      total += *size;
+      datagram.resize(*size);
+      REQUIRE(client->receive(datagram, now).has_value());
+    }
+  };
+
+  // A request, so the server has a stream to answer on, and an answer far
+  // larger than any amplification budget the migration will allow.
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+  const std::vector<std::uint8_t> request(16, 0x21);
+  REQUIRE(client->write_stream(*id, request, true) == request.size());
+  client_to_server(at(1ms), first_address);
+  (void)server_to_client(at(1ms));
+
+  const std::vector<std::uint8_t> answer(256 * 1024, 0x61);
+  REQUIRE(server->write_stream(*id, answer, true) == answer.size());
+  (void)server_to_client(at(2ms));
+
+  // The address changes underneath the connection. Only the datagram that
+  // arrived here counts towards what the server may send back.
+  const auto migrations_before = server->migration_count();
+  client_to_server(at(3ms), second_address);
+  REQUIRE(server->migration_count() > migrations_before);
+
+  const auto rationed = server_to_client(at(3ms));
+  CHECK(rationed > 0);
+
+  // Section 8.2: the client answers the challenge, and the budget goes away.
+  client_to_server(at(4ms), second_address);
+  const auto after_validation = server_to_client(at(4ms));
+  CHECK(after_validation > rationed * 3);
+}
+
 TEST_CASE("a datagram that is not for this connection is dropped, not fatal")
 {
   const auto identity = make_self_signed("localhost");

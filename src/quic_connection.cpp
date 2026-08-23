@@ -1215,7 +1215,14 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       // Section 8.2.3. An echo that matches nothing outstanding is ignored
       // rather than treated as an error -- a stale response and a forged one
       // are indistinguishable, and neither is worth ending a connection over.
-      (void)impl.path.on_response(frame.path_data);
+      if (impl.path.on_response(frame.path_data))
+      {
+        // Section 8.2: a matching response is what address validation means.
+        // The anti-amplification limit that the migration imposed lifts here,
+        // or the connection spends the rest of its life rationed to three
+        // times whatever arrives.
+        impl.address_validated = true;
+      }
       break;
 
     case frame_kind_t::new_token:
