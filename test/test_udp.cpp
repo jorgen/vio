@@ -418,4 +418,85 @@ TEST_CASE("a datagram carries its ECN codepoint through our own recvmsg")
   // came through, which is the bug this whole path exists to fix.
   CHECK(seen_ecn == static_cast<int>(vio::udp_ecn_t::ect0));
 }
+TEST_CASE("one send carries several datagrams through segmentation offload")
+{
+  // The change that moves throughput most: one system call puts several
+  // datagrams on the wire, and one read can take several off it. Whether the
+  // kernel and interface actually coalesce on the way in is theirs to decide --
+  // what has to hold either way is that the pieces come back whole, in order,
+  // and with the right boundaries.
+  vio::event_loop_t event_loop;
+  bool verified = false;
+  bool segmented = false;
+  std::vector<std::string> pieces;
+
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &event_loop, bool &verified, bool &segmented, std::vector<std::string> &pieces) -> vio::task_t<void>
+      {
+        auto receiver_pair = get_udp_ephemeral_port(event_loop);
+        REQUIRE_EXPECTED(receiver_pair);
+        int port = receiver_pair->second;
+        auto receiver = std::move(receiver_pair->first);
+
+        auto reader_or_err = vio::datagram_reader_t::create(event_loop, receiver);
+        REQUIRE_EXPECTED(reader_or_err);
+        auto reader = std::move(reader_or_err.value());
+        // Refusal is allowed -- it depends on the kernel and the interface --
+        // so the result is noted rather than required.
+        const bool coalescing = reader.receive_coalesced(65536).has_value();
+        (void)coalescing;
+
+        auto sender_pair = get_udp_ephemeral_port(event_loop);
+        REQUIRE_EXPECTED(sender_pair);
+        auto sender = std::move(sender_pair->first);
+
+        auto destination = vio::ip4_addr("127.0.0.1", port);
+        REQUIRE_EXPECTED(destination);
+
+        // Five segments of a hundred bytes, each filled with its own index.
+        // Every segment is full length except the last, which is the rule that
+        // makes a batch decodable at the far end.
+        constexpr std::size_t segment = 100;
+        constexpr std::size_t count = 5;
+        std::vector<std::uint8_t> batch(segment * count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+          std::fill(batch.begin() + static_cast<std::ptrdiff_t>(i * segment), batch.begin() + static_cast<std::ptrdiff_t>((i + 1) * segment), static_cast<std::uint8_t>('a' + i));
+        }
+
+        auto sent = vio::send_segments(sender, batch, segment, reinterpret_cast<const sockaddr *>(&destination.value()), vio::udp_ecn_t::not_ect);
+        if (!sent.has_value())
+        {
+          // No segmentation here. Nothing to test, and not a failure of ours.
+          verified = true;
+          event_loop.stop();
+          co_return;
+        }
+        segmented = true;
+
+        for (std::size_t i = 0; i < count; ++i)
+        {
+          auto received = co_await reader;
+          REQUIRE_EXPECTED(received);
+          pieces.emplace_back(reinterpret_cast<const char *>(received->data.data()), received->data.size());
+        }
+
+        verified = true;
+        event_loop.stop();
+      }(event_loop, verified, segmented, pieces);
+  });
+
+  event_loop.run();
+  REQUIRE(verified);
+  if (segmented)
+  {
+    REQUIRE(pieces.size() == 5);
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+    {
+      CAPTURE(i);
+      CHECK(pieces[i].size() == 100);
+      CHECK(pieces[i] == std::string(100, static_cast<char>('a' + i)));
+    }
+  }
+}
 }

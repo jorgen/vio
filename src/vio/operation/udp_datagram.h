@@ -49,6 +49,7 @@
 #include <deque>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -57,6 +58,7 @@
 #else
 #include <cerrno>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <sys/socket.h>
 #endif
 
@@ -83,6 +85,10 @@ namespace detail
 // usually has more than one waiting, and the syscall is the expensive part.
 inline constexpr std::size_t datagram_batch = 32;
 inline constexpr std::size_t datagram_capacity = 1500;
+// With receive coalescing the kernel hands back many datagrams as one buffer,
+// so the read has to be able to hold them. 64 KiB is the ceiling both Linux
+// and Windows work to.
+inline constexpr std::size_t coalesced_capacity = 65536;
 // Room for the control messages a datagram can carry. Generous: the kernel
 // truncates rather than fails, and a truncated control buffer silently loses
 // the codepoint.
@@ -99,6 +105,14 @@ struct datagram_reader_state_t
 #else
   int fd = -1;
 #endif
+  // Reused across reads rather than a stack buffer, because coalescing makes
+  // it far too large to put on the stack once per datagram.
+  std::vector<std::uint8_t> scratch = std::vector<std::uint8_t>(datagram_capacity);
+  std::size_t coalescing = 0;
+  // Calls made and datagrams they carried. The ratio is what receive
+  // coalescing changes.
+  std::uint64_t reads = 0;
+  std::uint64_t datagrams = 0;
   std::deque<std::expected<datagram_t, error_t>> ready;
   std::coroutine_handle<> continuation;
   bool cancelled = false;
@@ -246,6 +260,131 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
 #endif
 }
 
+// Sends several datagrams as one buffer, letting the kernel cut it into pieces
+// of segment_size on the way out.
+//
+// This is the send-side offload -- UDP_SEGMENT on Linux, USO on Windows -- and
+// it is the change that moves throughput most, because it divides the number of
+// system calls per megabyte by however many segments fit in a batch.
+//
+// The shape it demands: every segment must be exactly segment_size except the
+// last, which may be shorter. There is no length list, so that rule is the only
+// thing that makes the batch decodable, and a caller that mixes sizes silently
+// corrupts the stream rather than failing.
+//
+// Whether the kernel or the interface actually honours it is not knowable in
+// advance; if it refuses, the error comes back and the caller falls back to
+// sending one at a time.
+[[nodiscard]] inline std::expected<std::size_t, error_t> send_segments(udp_t &udp, std::span<const std::uint8_t> bytes, std::size_t segment_size, const sockaddr *address, udp_ecn_t ecn)
+{
+  if (segment_size == 0 || bytes.empty())
+  {
+    return std::size_t{0};
+  }
+  if (bytes.size() <= segment_size)
+  {
+    // One segment is just a datagram; the offload has nothing to do.
+    return send_datagram(udp, bytes, address, ecn);
+  }
+
+  auto fd = udp_fileno(udp);
+  if (!fd.has_value())
+  {
+    return std::unexpected(fd.error());
+  }
+  if (ecn == udp_ecn_t::ce)
+  {
+    return std::unexpected(error_t{.code = UV_EINVAL, .msg = "only a router may set the congestion experienced codepoint"});
+  }
+
+  sockaddr_storage mapped = {};
+  auto name = udp_sockname(udp);
+  if (name.has_value() && name->ss_family == AF_INET6 && address != nullptr && address->sa_family == AF_INET)
+  {
+    const auto *in4 = reinterpret_cast<const sockaddr_in *>(address);
+    auto *in6 = reinterpret_cast<sockaddr_in6 *>(&mapped);
+    in6->sin6_family = AF_INET6;
+    in6->sin6_port = in4->sin_port;
+    auto *raw = reinterpret_cast<std::uint8_t *>(&in6->sin6_addr);
+    raw[10] = 0xff;
+    raw[11] = 0xff;
+    std::memcpy(raw + 12, &in4->sin_addr, 4);
+    address = reinterpret_cast<const sockaddr *>(&mapped);
+  }
+  const bool ipv6 = address != nullptr && address->sa_family == AF_INET6;
+
+#if defined(_WIN32)
+#if defined(UDP_SEND_MSG_SIZE)
+  const auto socket_handle = reinterpret_cast<SOCKET>(*fd);
+  // Windows carries the segment size as a socket option rather than a control
+  // message, so it is set for the send and cleared again -- anything else would
+  // leave the next ordinary send being cut up.
+  DWORD size = static_cast<DWORD>(segment_size);
+  if (setsockopt(socket_handle, IPPROTO_UDP, UDP_SEND_MSG_SIZE, reinterpret_cast<const char *>(&size), sizeof(size)) != 0)
+  {
+    return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "the socket would not segment sends"});
+  }
+  auto sent = send_datagram(udp, bytes, address, ecn);
+  DWORD off = 0;
+  (void)setsockopt(socket_handle, IPPROTO_UDP, UDP_SEND_MSG_SIZE, reinterpret_cast<const char *>(&off), sizeof(off));
+  return sent;
+#else
+  return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this Windows SDK has no UDP_SEND_MSG_SIZE"});
+#endif
+#else
+#if defined(UDP_SEGMENT)
+  iovec vector = {};
+  vector.iov_base = const_cast<std::uint8_t *>(bytes.data());
+  vector.iov_len = bytes.size();
+
+  alignas(cmsghdr) std::array<std::uint8_t, CMSG_SPACE(sizeof(std::uint16_t)) + CMSG_SPACE(sizeof(int))> control = {};
+  msghdr message = {};
+  message.msg_name = const_cast<sockaddr *>(address);
+  message.msg_namelen = ipv6 ? static_cast<socklen_t>(sizeof(sockaddr_in6)) : static_cast<socklen_t>(sizeof(sockaddr_in));
+  message.msg_iov = &vector;
+  message.msg_iovlen = 1;
+  message.msg_control = control.data();
+  message.msg_controllen = static_cast<decltype(message.msg_controllen)>(control.size());
+
+  cmsghdr *header = CMSG_FIRSTHDR(&message);
+  header->cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
+  header->cmsg_level = SOL_UDP;
+  header->cmsg_type = UDP_SEGMENT;
+  const std::uint16_t size = static_cast<std::uint16_t>(segment_size);
+  std::memcpy(CMSG_DATA(header), &size, sizeof(size));
+  std::size_t used = CMSG_SPACE(sizeof(std::uint16_t));
+
+  if (ecn != udp_ecn_t::not_ect)
+  {
+    cmsghdr *next = CMSG_NXTHDR(&message, header);
+    if (next != nullptr)
+    {
+      next->cmsg_len = CMSG_LEN(sizeof(int));
+      next->cmsg_level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
+#if defined(IPV6_TCLASS)
+      next->cmsg_type = ipv6 ? IPV6_TCLASS : IP_TOS;
+#else
+      next->cmsg_type = IP_TOS;
+#endif
+      const int codepoint = static_cast<int>(ecn);
+      std::memcpy(CMSG_DATA(next), &codepoint, sizeof(codepoint));
+      used += CMSG_SPACE(sizeof(int));
+    }
+  }
+  message.msg_controllen = static_cast<decltype(message.msg_controllen)>(used);
+
+  const ssize_t sent = ::sendmsg(static_cast<int>(*fd), &message, 0);
+  if (sent < 0)
+  {
+    return std::unexpected(error_t{.code = -errno, .msg = "segmented sendmsg failed"});
+  }
+  return static_cast<std::size_t>(sent);
+#else
+  return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this system has no UDP_SEGMENT"});
+#endif
+#endif
+}
+
 // Reads datagrams from a socket libuv owns, using our own recvmsg so the
 // control messages survive.
 //
@@ -322,6 +461,53 @@ public:
     return reader;
   }
 
+  // Asks the kernel to hand back several datagrams in one read, coalesced into
+  // a single buffer, and to report the segment size so they can be taken apart
+  // again. Reading a megabyte then costs a fraction of the system calls.
+  //
+  // This is a receive-side offload -- UDP_GRO on Linux, URO on Windows -- so
+  // whether it does anything depends on the kernel and the interface. Asking
+  // for it and being refused is not a failure worth reporting upward; the
+  // reads simply arrive one at a time as before.
+  [[nodiscard]] std::expected<void, error_t> receive_coalesced(std::size_t max_size)
+  {
+    if (!_state)
+    {
+      return std::unexpected(error_t{.code = UV_EINVAL, .msg = "reader is not open"});
+    }
+    if (max_size == 0)
+    {
+      _state->coalescing = 0;
+      _state->scratch.assign(detail::datagram_capacity, 0);
+      return {};
+    }
+
+    const int value = static_cast<int>((std::min)(max_size, detail::coalesced_capacity));
+#if defined(_WIN32)
+#if defined(UDP_RECV_MAX_COALESCED_SIZE)
+    if (setsockopt(_state->socket, IPPROTO_UDP, UDP_RECV_MAX_COALESCED_SIZE, reinterpret_cast<const char *>(&value), sizeof(value)) != 0)
+    {
+      return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "the socket would not coalesce receives"});
+    }
+#else
+    return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this Windows SDK has no UDP_RECV_MAX_COALESCED_SIZE"});
+#endif
+#else
+#if defined(UDP_GRO)
+    const int on = 1;
+    if (setsockopt(_state->fd, IPPROTO_UDP, UDP_GRO, &on, sizeof(on)) != 0)
+    {
+      return std::unexpected(error_t{.code = -errno, .msg = "the socket would not coalesce receives"});
+    }
+#else
+    return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this system has no UDP_GRO"});
+#endif
+#endif
+    _state->coalescing = static_cast<std::size_t>(value);
+    _state->scratch.assign(static_cast<std::size_t>(value) + detail::datagram_capacity, 0);
+    return {};
+  }
+
   // Asks the kernel to report the ECN codepoint of arriving datagrams. Without
   // this the control message never appears and every datagram reads as not_ect.
   [[nodiscard]] std::expected<void, error_t> receive_ecn(bool on)
@@ -359,6 +545,30 @@ public:
     }
     return {};
 #endif
+  }
+
+  // The next datagram already in hand, without suspending. One wakeup usually
+  // pulls a run of them off the socket, and a caller that wants to answer them
+  // together has to be able to see the whole run first.
+  [[nodiscard]] std::optional<std::expected<datagram_t, error_t>> try_next()
+  {
+    if (!_state || _state->ready.empty())
+    {
+      return std::nullopt;
+    }
+    auto front = std::move(_state->ready.front());
+    _state->ready.pop_front();
+    return front;
+  }
+
+  [[nodiscard]] std::uint64_t reads() const
+  {
+    return _state ? _state->reads : 0;
+  }
+
+  [[nodiscard]] std::uint64_t datagrams() const
+  {
+    return _state ? _state->datagrams : 0;
   }
 
   void cancel()
@@ -439,19 +649,26 @@ namespace detail
 {
 // One wakeup's worth of reading. Everything platform-specific about pulling a
 // datagram and its control messages out of the kernel is here.
+//
+// A read may come back holding several datagrams at once when receive
+// coalescing is on: the kernel concatenates consecutive datagrams from the same
+// flow and reports the segment size in a control message. Every segment is
+// full-length except possibly the last, which is what makes taking them apart
+// again unambiguous.
 inline void drain_socket(datagram_reader_state_t &state)
 {
   for (std::size_t taken = 0; taken < datagram_batch; ++taken)
   {
-    std::array<std::uint8_t, datagram_capacity> payload = {};
     std::array<std::uint8_t, datagram_control_capacity> control = {};
     sockaddr_storage from = {};
     udp_ecn_t ecn = udp_ecn_t::not_ect;
+    std::size_t segment = 0;
+    std::size_t length = 0;
 
 #if defined(_WIN32)
     WSABUF buffer = {};
-    buffer.buf = reinterpret_cast<CHAR *>(payload.data());
-    buffer.len = static_cast<ULONG>(payload.size());
+    buffer.buf = reinterpret_cast<CHAR *>(state.scratch.data());
+    buffer.len = static_cast<ULONG>(state.scratch.size());
 
     WSAMSG message = {};
     message.name = reinterpret_cast<LPSOCKADDR>(&from);
@@ -489,16 +706,23 @@ inline void drain_socket(datagram_reader_state_t &state)
         INT value = 0;
         std::memcpy(&value, WSA_CMSG_DATA(header), sizeof(value));
         ecn = ecn_from_traffic_class(value);
+        continue;
       }
-#else
-      (void)header;
+#endif
+#if defined(UDP_COALESCED_INFO)
+      if (header->cmsg_level == IPPROTO_UDP && header->cmsg_type == UDP_COALESCED_INFO && header->cmsg_len >= WSA_CMSG_LEN(sizeof(DWORD)))
+      {
+        DWORD value = 0;
+        std::memcpy(&value, WSA_CMSG_DATA(header), sizeof(value));
+        segment = static_cast<std::size_t>(value);
+      }
 #endif
     }
-    const std::size_t length = static_cast<std::size_t>(received);
+    length = static_cast<std::size_t>(received);
 #else
     iovec vector = {};
-    vector.iov_base = payload.data();
-    vector.iov_len = payload.size();
+    vector.iov_base = state.scratch.data();
+    vector.iov_len = state.scratch.size();
 
     msghdr message = {};
     message.msg_name = &from;
@@ -532,6 +756,15 @@ inline void drain_socket(datagram_reader_state_t &state)
 
     for (cmsghdr *header = CMSG_FIRSTHDR(&message); header != nullptr; header = CMSG_NXTHDR(&message, header))
     {
+#if defined(UDP_GRO)
+      if (header->cmsg_level == IPPROTO_UDP && header->cmsg_type == UDP_GRO && header->cmsg_len == CMSG_LEN(sizeof(int)))
+      {
+        int value = 0;
+        std::memcpy(&value, CMSG_DATA(header), sizeof(value));
+        segment = value > 0 ? static_cast<std::size_t>(value) : 0;
+        continue;
+      }
+#endif
       const bool v4 = header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_TOS;
 #if defined(IPV6_TCLASS)
       const bool v6 = header->cmsg_level == IPPROTO_IPV6 && header->cmsg_type == IPV6_TCLASS;
@@ -558,14 +791,36 @@ inline void drain_socket(datagram_reader_state_t &state)
         ecn = ecn_from_traffic_class(static_cast<int>(value));
       }
     }
-    const std::size_t length = static_cast<std::size_t>(received);
+    length = static_cast<std::size_t>(received);
 #endif
 
-    datagram_t datagram;
-    datagram.data.assign(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(length));
-    datagram.from = from;
-    datagram.ecn = ecn;
-    deliver(state, std::move(datagram));
+    ++state.reads;
+
+    // Without a segment size the read holds exactly one datagram, which is the
+    // ordinary case and the only one when coalescing is off.
+    if (segment == 0 || segment >= length)
+    {
+      ++state.datagrams;
+      datagram_t datagram;
+      datagram.data.assign(state.scratch.begin(), state.scratch.begin() + static_cast<std::ptrdiff_t>(length));
+      datagram.from = from;
+      datagram.ecn = ecn;
+      deliver(state, std::move(datagram));
+      continue;
+    }
+
+    // Coalesced: every segment is full-length except the last. They came from
+    // one flow, so they share a sender and a codepoint.
+    for (std::size_t offset = 0; offset < length; offset += segment)
+    {
+      ++state.datagrams;
+      const std::size_t piece = (std::min)(segment, length - offset);
+      datagram_t datagram;
+      datagram.data.assign(state.scratch.begin() + static_cast<std::ptrdiff_t>(offset), state.scratch.begin() + static_cast<std::ptrdiff_t>(offset + piece));
+      datagram.from = from;
+      datagram.ecn = ecn;
+      deliver(state, std::move(datagram));
+    }
   }
 }
 } // namespace detail

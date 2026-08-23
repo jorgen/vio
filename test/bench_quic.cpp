@@ -18,6 +18,11 @@
 #include <vio/quic/frame_codec.h>
 #include <vio/quic/packet.h>
 #include <vio/quic/protection.h>
+#include <vio/event_loop.h>
+#include <vio/operation/tcp.h>
+#include <vio/operation/sleep.h>
+#include <vio/quic/endpoint.h>
+#include <vio/task.h>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -149,6 +154,131 @@ void operator delete(void *p) noexcept
 void operator delete(void *p, std::size_t) noexcept
 {
   std::free(p);
+}
+
+// The same transfer over a real socket, which is the only place the
+// segmentation offloads can show. Everything above the socket is identical
+// with them on or off; what changes is how many system calls a megabyte costs.
+double socket_transfer(const certificate_t &identity, bool offload, std::size_t megabytes)
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  event_loop_t loop;
+  double seconds = 0;
+
+  loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &event_loop, const certificate_t &pem, bool use_offload, std::size_t total_mb, double &elapsed) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = pem.certificate_pem;
+        server_tls.private_key_pem = pem.private_key_pem;
+        server_tls.alpn = {"bench"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = pem.certificate_pem;
+        client_tls.alpn = {"bench"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.connection.transport_parameters = generous();
+        server_config.connection.pacing = false;
+        server_config.offload = use_offload;
+        auto server_made = endpoint_t::create(event_loop, *server_context, server_config);
+        std::optional<endpoint_t> server(std::move(*server_made));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        (void)server->bind(reinterpret_cast<const sockaddr *>(&*bind_address));
+        auto port = server->local_port();
+
+        connection_t *accepted = nullptr;
+        server->on_connection([&accepted](connection_t &connection) { accepted = &connection; });
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        client_config.connection.transport_parameters = generous();
+        client_config.connection.pacing = false;
+        client_config.offload = use_offload;
+        auto client_made = endpoint_t::create(event_loop, *client_context, client_config);
+        std::optional<endpoint_t> client(std::move(*client_made));
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto run_one = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); };
+        auto server_run = run_one(*server, server_cancel);
+        auto client_run = run_one(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        connection_t *connection = *dialled;
+
+        for (int i = 0; i < 600 && !connection->handshake_complete(); ++i)
+        {
+          co_await sleep(event_loop, 5ms);
+        }
+
+        auto stream = connection->open_stream(stream_direction_t::bidirectional);
+        const std::size_t total = total_mb * 1024 * 1024;
+        const std::vector<std::uint8_t> chunk(64 * 1024, 0x5a);
+        std::size_t offered = 0;
+        std::size_t drained = 0;
+
+        const auto started = std::chrono::steady_clock::now();
+        for (int round = 0; round < 40000 && drained < total; ++round)
+        {
+          while (offered < total)
+          {
+            const std::size_t want = (std::min)(chunk.size(), total - offered);
+            const auto wrote = connection->write_stream(*stream, std::span<const std::uint8_t>(chunk).first(want), false);
+            if (wrote == 0)
+            {
+              break;
+            }
+            offered += wrote;
+          }
+          (void)client->flush();
+          if (accepted != nullptr)
+          {
+            auto readable = accepted->readable_stream(*stream);
+            if (!readable.empty())
+            {
+              drained += readable.size();
+              accepted->consume_stream(*stream, readable.size());
+            }
+          }
+          co_await sleep(event_loop, 0ms);
+        }
+        const auto finished = std::chrono::steady_clock::now();
+        elapsed = std::chrono::duration<double>(finished - started).count();
+        // Throughput here is bounded by how often this loop gets to run, not by
+        // the socket, so the ratios are the measurement that means anything:
+        // how many datagrams each system call carried.
+        const auto out = client->stats();
+        const auto in = server->stats();
+        std::printf("%-30s %5.2f datagrams/send   %5.2f datagrams/read   (%llu sends, %llu reads, %zu MiB)\n", use_offload ? "offload on" : "offload off",
+                    out.sends > 0 ? static_cast<double>(out.datagrams_sent) / static_cast<double>(out.sends) : 0.0, in.reads > 0 ? static_cast<double>(in.datagrams_received) / static_cast<double>(in.reads) : 0.0,
+                    static_cast<unsigned long long>(out.sends), static_cast<unsigned long long>(in.reads), drained / (1024 * 1024));
+
+        server_cancel.cancel();
+        client_cancel.cancel();
+        co_await sleep(event_loop, 50ms);
+        server.reset();
+        client.reset();
+        co_await sleep(event_loop, 50ms);
+        event_loop.stop();
+      }(loop, identity, offload, megabytes, seconds);
+    });
+
+  loop.run();
+  return seconds;
 }
 
 int main(int argc, char **argv)
@@ -366,5 +496,10 @@ int main(int argc, char **argv)
   std::snprintf(label, sizeof(label), "%zu concurrent streams", stream_count);
   print(label, many);
 
+  // Over a real socket, with and without the segmentation offloads. This is
+  // the only measurement where they can show at all.
+  std::printf("\n");
+  (void)socket_transfer(identity, false, 8);
+  (void)socket_transfer(identity, true, 8);
   return 0;
 }

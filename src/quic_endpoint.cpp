@@ -46,6 +46,14 @@ constexpr std::size_t max_datagram = 1500;
 // is fine enough not to be the thing that delays them.
 constexpr std::chrono::milliseconds timer_granularity{2};
 
+// How many datagrams one batch may carry. Linux caps a segmented send at 64
+// pieces, which is also comfortably more than a single flush usually produces.
+constexpr int max_batch_datagrams = 64;
+
+// What one coalesced read may hold. Large enough that a burst arrives in a
+// single call, small enough to stay a sensible allocation per endpoint.
+constexpr std::size_t coalesced_receive_size = 64 * 1024;
+
 // The address as bytes, for the two places that need to compare or authenticate
 // one: section 9.3 asks whether the peer has moved, and section 8.1.4 binds a
 // Retry token to the address it was issued to. Only equality and opacity are
@@ -128,6 +136,13 @@ struct endpoint_impl_t
   std::unordered_map<connection_id_t, connection_entry_t *> by_id;
   connection_ready_t on_connection;
   bool running = false;
+  // One buffer for the whole endpoint, grown once and reused: a batch is built
+  // by polling datagrams straight into it rather than copying them in.
+  std::vector<std::uint8_t> batch;
+  // Whether the send-side offload is worth attempting. Cleared the first time
+  // a route refuses it, because it will keep refusing.
+  bool segmenting = false;
+  endpoint_stats_t stats;
   // Section 10.3.3 suggests a ceiling on stateless resets. The reason is not
   // amplification -- every reset is smaller than the packet that drew it -- but
   // work: each one costs an HMAC and a draw from the random pool, so without a
@@ -460,20 +475,92 @@ void send_retry(endpoint_impl_t &impl, const packet_header_t &header, const sock
   return raw;
 }
 
+// Hands the batch to the kernel as one send when there is more than one
+// datagram in it, and as an ordinary send otherwise.
+void flush_batch(endpoint_impl_t &impl, connection_entry_t &entry, std::size_t used, std::size_t segment, std::size_t count)
+{
+  if (used == 0)
+  {
+    return;
+  }
+  const auto *address = reinterpret_cast<const sockaddr *>(&entry.peer);
+  const auto ecn = entry.connection->ecn_sending();
+  const std::span<const std::uint8_t> bytes(impl.batch.data(), used);
+
+  if (count > 1 && impl.segmenting)
+  {
+    if (send_segments(impl.udp, bytes, segment, address, static_cast<udp_ecn_t>(ecn)).has_value())
+    {
+      ++impl.stats.sends;
+      impl.stats.datagrams_sent += count;
+      return;
+    }
+    // The offload was refused after all -- a route or interface that will not
+    // do it. Stop asking, and fall through to sending the batch one datagram
+    // at a time so nothing is lost this time either.
+    impl.segmenting = false;
+  }
+
+  for (std::size_t offset = 0; offset < used; offset += segment)
+  {
+    const std::size_t piece = (std::min)(segment, used - offset);
+    send_to(impl, bytes.subspan(offset, piece), address, ecn);
+    ++impl.stats.sends;
+    ++impl.stats.datagrams_sent;
+  }
+}
+
 void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
 {
-  std::array<std::uint8_t, max_datagram> out = {};
-  for (int guard = 0; guard < 64; ++guard)
+  // Datagrams are polled straight into one buffer so that a run of them can
+  // leave in a single call. Segmentation has one rule -- every piece the same
+  // size except the last -- so a batch ends as soon as a datagram breaks it.
+  // QUIC obliges more often than it looks: a sender with data to send fills
+  // packets to the datagram size, and the short one is the tail of the burst.
+  std::size_t used = 0;
+  std::size_t segment = 0;
+  std::size_t count = 0;
+
+  for (int guard = 0; guard < max_batch_datagrams; ++guard)
   {
-    auto size = entry.connection->poll_send(out, now);
+    if (impl.batch.size() < used + max_datagram)
+    {
+      impl.batch.resize(used + max_datagram);
+    }
+    auto size = entry.connection->poll_send(std::span<std::uint8_t>(impl.batch).subspan(used, max_datagram), now);
     if (!size.has_value() || *size == 0)
     {
       break;
     }
-    // Section 13.4.2: the connection stops marking on its own when validation
-    // fails, and nothing else on this socket is affected.
-    send_to(impl, std::span<const std::uint8_t>(out).first(*size), reinterpret_cast<const sockaddr *>(&entry.peer), entry.connection->ecn_sending());
+
+    if (count == 0)
+    {
+      segment = *size;
+    }
+    else if (*size > segment)
+    {
+      // Longer than the batch's segment size cannot ride in it at all: send
+      // what is held and start again from this one.
+      flush_batch(impl, entry, used, segment, count);
+      std::copy(impl.batch.begin() + static_cast<std::ptrdiff_t>(used), impl.batch.begin() + static_cast<std::ptrdiff_t>(used + *size), impl.batch.begin());
+      used = 0;
+      segment = *size;
+      count = 0;
+    }
+
+    const bool closes_batch = *size < segment;
+    used += *size;
+    ++count;
+    if (closes_batch)
+    {
+      // A short datagram is only ever the last piece.
+      flush_batch(impl, entry, used, segment, count);
+      used = 0;
+      segment = 0;
+      count = 0;
+    }
   }
+  flush_batch(impl, entry, used, segment, count);
 
   // Connection IDs are issued as the connection runs, and each one is another
   // way for a datagram to reach it.
@@ -600,6 +687,11 @@ std::size_t endpoint_t::connection_count() const
   return _impl->connections.size();
 }
 
+endpoint_stats_t endpoint_t::stats() const
+{
+  return _impl->stats;
+}
+
 task_t<void> endpoint_t::run(cancellation_t *cancel)
 {
   auto &impl = *_impl;
@@ -614,6 +706,13 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
   if (impl.config.ecn)
   {
     (void)reader->receive_ecn(true);
+  }
+  if (impl.config.offload)
+  {
+    // Both directions are attempts. Either may be refused, and neither refusal
+    // is worth reporting: the endpoint just does one datagram per call.
+    (void)reader->receive_coalesced(coalesced_receive_size);
+    impl.segmenting = true;
   }
   impl.running = true;
 
@@ -652,6 +751,11 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     stop_reading = cancel->register_callback([reader = &*reader]() { reader->cancel(); });
   }
 
+  // Datagrams that arrived together are answered together. One wakeup usually
+  // pulls a run of them off the socket, and replying to each in turn would
+  // leave every reply its own system call -- which is exactly the cost the
+  // send-side offload exists to remove, given something to batch.
+  std::vector<connection_entry_t *> touched;
   for (;;)
   {
     auto received = co_await *reader;
@@ -663,7 +767,18 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     {
       break;
     }
-    auto &datagram = received.value();
+    impl.stats.reads = reader->reads();
+    impl.stats.datagrams_received = reader->datagrams();
+    touched.clear();
+
+    std::optional<std::expected<datagram_t, error_t>> next = std::move(received);
+    for (; next.has_value(); next = reader->try_next())
+    {
+    if (!next->has_value())
+    {
+      break;
+    }
+    auto &datagram = next->value();
     std::span<std::uint8_t> bytes(datagram.data);
     const auto arriving_ecn = static_cast<ecn_codepoint_t>(datagram.ecn);
     const auto now = loop_now(impl.loop);
@@ -719,8 +834,11 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     if (!entry->connection->receive(bytes, now, peer, arriving_ecn).has_value())
     {
       // The connection has decided it cannot continue. It still gets to send
-      // whatever it wanted to say about that.
-      flush_entry(impl, *entry, now);
+      // whatever it wanted to say about that, with the rest of this batch.
+      if (std::find(touched.begin(), touched.end(), entry) == touched.end())
+      {
+        touched.push_back(entry);
+      }
       continue;
     }
     if (entry->connection->migration_count() != migrations_before)
@@ -734,7 +852,17 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     {
       index_connection(impl, *entry);
     }
-    flush_entry(impl, *entry, now);
+    if (std::find(touched.begin(), touched.end(), entry) == touched.end())
+    {
+      touched.push_back(entry);
+    }
+    }
+
+    const auto now = loop_now(impl.loop);
+    for (auto *entry : touched)
+    {
+      flush_entry(impl, *entry, now);
+    }
     reap(impl, now);
   }
 

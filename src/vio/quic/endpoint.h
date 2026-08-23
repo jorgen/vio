@@ -91,6 +91,17 @@ struct endpoint_config_t
   // codepoint at all.
   bool ecn = false;
 
+  // Segmentation offload: several datagrams handed to the kernel in one send,
+  // and several taken back in one read. This is the setting that decides how
+  // many system calls a megabyte costs, and on a busy connection that is most
+  // of the cost that is not encryption.
+  //
+  // On by default because it degrades quietly: a kernel, route or interface
+  // that will not do it simply refuses, and the endpoint goes back to one
+  // datagram per call without anything being lost. Linux and Windows 11 both
+  // offer it; macOS does not.
+  bool offload = true;
+
   // Zero means no ceiling.
   //
   // A server reachable from the internet should set this, or retry_key, or
@@ -104,6 +115,16 @@ struct endpoint_config_t
   // How long a closed connection is kept so that late packets meet a
   // connection rather than a stateless reset. Section 10.2.
   std::chrono::milliseconds draining_period{3000};
+};
+
+// What the socket cost. The two ratios are the point of the segmentation
+// offloads: how many datagrams each system call carried.
+struct endpoint_stats_t
+{
+  std::uint64_t sends = 0;
+  std::uint64_t datagrams_sent = 0;
+  std::uint64_t reads = 0;
+  std::uint64_t datagrams_received = 0;
 };
 
 // Handed to the application when a connection arrives or is dialled. The
@@ -158,6 +179,10 @@ public:
   std::expected<void, error_t> flush();
 
   [[nodiscard]] std::size_t connection_count() const;
+
+  // Section 13.4 aside, this is how to tell whether the offloads are doing
+  // anything: datagrams divided by calls.
+  [[nodiscard]] endpoint_stats_t stats() const;
 
 private:
   endpoint_t() = default;
