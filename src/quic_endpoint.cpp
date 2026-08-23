@@ -106,6 +106,9 @@ namespace detail
 {
 struct connection_entry_t
 {
+  // What a connection_handle_t names. Never reused, so a handle to a collected
+  // connection resolves to nothing rather than to whatever took its place.
+  std::uint64_t id = 0;
   std::unique_ptr<connection_t> connection;
   sockaddr_storage peer = {};
   std::vector<std::uint8_t> peer_bytes;
@@ -134,6 +137,8 @@ struct endpoint_impl_t
 
   std::vector<std::unique_ptr<connection_entry_t>> connections;
   std::unordered_map<connection_id_t, connection_entry_t *> by_id;
+  std::unordered_map<std::uint64_t, connection_entry_t *> by_handle;
+  std::uint64_t next_connection_id = 1;
   connection_ready_t on_connection;
   connection_active_t on_activity;
   bool running = false;
@@ -499,6 +504,7 @@ void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connecti
   }
 
   auto entry = std::make_unique<connection_entry_t>();
+  entry->id = impl.next_connection_id++;
   entry->connection = std::make_unique<connection_t>(std::move(*created));
   attach_qlog(impl, *entry->connection, header.destination_id, true, now);
   entry->peer_bytes = config.peer_address;
@@ -506,6 +512,7 @@ void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connecti
 
   auto *raw = entry.get();
   impl.connections.push_back(std::move(entry));
+  impl.by_handle[raw->id] = raw;
   index_connection(impl, *raw);
   return raw;
 }
@@ -631,6 +638,7 @@ void reap(endpoint_impl_t &impl, tick_t now)
     {
       impl.by_id.erase(id);
     }
+    impl.by_handle.erase(entry.id);
     it = impl.connections.erase(it);
   }
 }
@@ -681,7 +689,7 @@ void endpoint_t::on_activity(connection_active_t handler)
   _impl->on_activity = std::move(handler);
 }
 
-std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name)
+std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name)
 {
   auto &impl = *_impl;
   ensure_socket(impl, address != nullptr ? address->sa_family : AF_INET);
@@ -699,6 +707,7 @@ std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *addre
   }
 
   auto entry = std::make_unique<connection_entry_t>();
+  entry->id = impl.next_connection_id++;
   entry->connection = std::make_unique<connection_t>(std::move(*created));
   attach_qlog(impl, *entry->connection, entry->connection->original_destination_id(), false, loop_now(impl.loop));
   entry->peer_bytes = config.peer_address;
@@ -706,9 +715,16 @@ std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *addre
 
   auto *raw = entry.get();
   impl.connections.push_back(std::move(entry));
+  impl.by_handle[raw->id] = raw;
   index_connection(impl, *raw);
   flush_entry(impl, *raw, loop_now(impl.loop));
-  return raw->connection.get();
+  return connection_handle_t(raw->id);
+}
+
+connection_t *endpoint_t::connection(connection_handle_t handle)
+{
+  const auto found = _impl->by_handle.find(handle._id);
+  return found == _impl->by_handle.end() ? nullptr : found->second->connection.get();
 }
 
 std::expected<void, error_t> endpoint_t::flush()

@@ -428,21 +428,18 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
   auto serving = [](endpoint_t &endpoint, cancellation_t &token) -> detached_task_t { co_await endpoint.run(&token); }(client, cancel);
   (void)serving;
 
-  // The endpoint owns what connect() returned and reaps it once it has closed
-  // and drained, so the pointer is only good for as long as the endpoint still
-  // holds a connection. Checking that before each use is what keeps a stalled
-  // handshake -- which closes, drains and is collected while this loop is still
-  // running -- from turning into a use-after-free.
-  connection_t *connection = *connected;
+  // Asked for each time round the loop rather than kept: the endpoint collects
+  // a connection once it has closed and drained, which is exactly what a
+  // stalled handshake does while this is still running.
+  const auto handle = *connected;
   std::size_t opened = 0;
-  bool alive = true;
   // 30 seconds is above every timeout the runner applies, so a hang here is
   // reported as a failed download rather than a killed container.
   for (int elapsed = 0; elapsed < 9000 && !state.finished() && !state.failed; ++elapsed)
   {
-    if (client.connection_count() == 0)
+    connection_t *connection = client.connection(handle);
+    if (connection == nullptr)
     {
-      alive = false;
       state.failed = true;
       break;
     }
@@ -473,7 +470,7 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
   }
 
   bool ok = state.finished() && !state.failed;
-  if (alive && client.connection_count() > 0)
+  if (auto *connection = client.connection(handle); connection != nullptr)
   {
     connection->close(0, "done", true);
   }

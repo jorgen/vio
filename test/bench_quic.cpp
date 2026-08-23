@@ -263,7 +263,7 @@ double socket_transfer(const certificate_t &identity, bool offload, std::size_t 
 
         auto target = ip4_addr("127.0.0.1", *port);
         auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
-        connection_t *connection = *dialled;
+        connection_t *connection = client->connection(*dialled);
 
         for (int i = 0; i < 600 && !connection->handshake_complete(); ++i)
         {

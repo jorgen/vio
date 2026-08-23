@@ -133,6 +133,41 @@ struct endpoint_stats_t
   std::uint64_t datagrams_received = 0;
 };
 
+// Names a connection an endpoint owns.
+//
+// The endpoint collects a connection once it has closed and its draining
+// period has elapsed, and that can happen at any point the application is not
+// looking: an idle timeout, a peer that stopped answering, a handshake that
+// never finished. A pointer handed out when the connection was dialled has no
+// way to say when it happened, so what dialling returns is a name to ask with
+// rather than an address to dereference.
+class connection_handle_t
+{
+public:
+  constexpr connection_handle_t() = default;
+
+  // False for a handle that never named anything. A handle whose connection
+  // has since been collected still reads as valid -- only the endpoint can
+  // answer that, which is what connection() is for.
+  [[nodiscard]] constexpr bool valid() const
+  {
+    return _id != 0;
+  }
+
+  friend constexpr bool operator==(connection_handle_t left, connection_handle_t right)
+  {
+    return left._id == right._id;
+  }
+
+private:
+  friend class endpoint_t;
+  explicit constexpr connection_handle_t(std::uint64_t id)
+    : _id(id)
+  {
+  }
+  std::uint64_t _id = 0;
+};
+
 // Handed to the application when a connection arrives or is dialled. The
 // endpoint owns the connection; this is a borrowed view of it, valid until the
 // connection closes.
@@ -181,7 +216,12 @@ public:
 
   // Dials. The returned pointer is owned by the endpoint and stays valid until
   // the connection closes and is reaped.
-  [[nodiscard]] std::expected<connection_t *, error_t> connect(const sockaddr *address, std::string_view server_name);
+  [[nodiscard]] std::expected<connection_handle_t, error_t> connect(const sockaddr *address, std::string_view server_name);
+
+  // The connection that handle names, or nullptr once the endpoint has
+  // collected it. Ask each time it is needed rather than keeping what this
+  // returns across anything that might let the endpoint run.
+  [[nodiscard]] connection_t *connection(connection_handle_t handle);
 
   // Reads until cancelled, routing datagrams and running timers. This is the
   // whole endpoint: nothing else needs to be driven.

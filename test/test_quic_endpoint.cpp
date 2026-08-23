@@ -168,7 +168,8 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
         REQUIRE(target.has_value());
         auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
         REQUIRE(dialled.has_value());
-        connection_t *connection = *dialled;
+        connection_t *connection = client->connection(*dialled);
+        REQUIRE(connection != nullptr);
 
         // The endpoints drive themselves from here: the handshake is several
         // round trips, and nothing in this test hands either side a packet.
@@ -299,7 +300,8 @@ TEST_CASE("a Retry is answered without building a connection for it")
         REQUIRE(target.has_value());
         auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
         REQUIRE(dialled.has_value());
-        connection_t *connection = *dialled;
+        connection_t *connection = client->connection(*dialled);
+        REQUIRE(connection != nullptr);
 
         for (int i = 0; i < 300 && !connection->handshake_complete(); ++i)
         {
@@ -404,12 +406,17 @@ TEST_CASE("one server port keeps two clients apart")
         REQUIRE(first_dial.has_value());
         REQUIRE(second_dial.has_value());
 
-        for (int i = 0; i < 300 && !((*first_dial)->handshake_complete() && (*second_dial)->handshake_complete()); ++i)
+        auto *first_connection = first->connection(*first_dial);
+        auto *second_connection = second->connection(*second_dial);
+        REQUIRE(first_connection != nullptr);
+        REQUIRE(second_connection != nullptr);
+
+        for (int i = 0; i < 300 && !(first_connection->handshake_complete() && second_connection->handshake_complete()); ++i)
         {
           co_await sleep(loop, 5ms);
         }
-        REQUIRE((*first_dial)->handshake_complete());
-        REQUIRE((*second_dial)->handshake_complete());
+        REQUIRE(first_connection->handshake_complete());
+        REQUIRE(second_connection->handshake_complete());
         accepted = server->connection_count();
 
         auto say = [](connection_t &connection, endpoint_t &endpoint, const std::string &text)
@@ -421,8 +428,8 @@ TEST_CASE("one server port keeps two clients apart")
           (void)endpoint.flush();
           return *stream;
         };
-        const auto first_stream = say(**first_dial, *first, "from the first client");
-        const auto second_stream = say(**second_dial, *second, "from the second client");
+        const auto first_stream = say(*first_connection, *first, "from the first client");
+        const auto second_stream = say(*second_connection, *second, "from the second client");
 
         for (int i = 0; i < 300; ++i)
         {
@@ -480,5 +487,70 @@ TEST_CASE("one server port keeps two clients apart")
   CHECK(accepted == 2);
   CHECK(first_message == "from the first client");
   CHECK(second_message == "from the second client");
+}
+
+TEST_CASE("a handle stops naming a connection the endpoint has collected")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  // What dialling returns has to survive the connection going away, because
+  // the endpoint decides when that happens and the application is not asked.
+  // The point of a handle rather than a pointer is that the answer becomes
+  // nothing rather than becoming freed memory.
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool named_before = false;
+  bool named_after = true;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &before, bool &after) -> task_t<void>
+      {
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t config;
+        config.connection.role = tls_role_t::client;
+        config.connection.transport_parameters = sane_parameters();
+        // Short enough that the test does not wait out the section 10.2
+        // default.
+        config.draining_period = std::chrono::milliseconds(10);
+
+        auto made = endpoint_t::create(loop, *client_context, config);
+        REQUIRE(made.has_value());
+        std::optional<endpoint_t> client(std::move(*made));
+
+        // Nothing is listening there, so the handshake will never finish.
+        auto target = ip4_addr("127.0.0.1", 1);
+        REQUIRE(target.has_value());
+        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        REQUIRE(dialled.has_value());
+
+        before = client->connection(*dialled) != nullptr;
+
+        auto *connection = client->connection(*dialled);
+        REQUIRE(connection != nullptr);
+        connection->close(0, "done", true);
+        (void)client->flush();
+        co_await sleep(loop, 60ms);
+        (void)client->flush();
+
+        after = client->connection(*dialled) != nullptr;
+
+        client.reset();
+        co_await sleep(loop, 20ms);
+        loop.stop();
+      }(event_loop, identity, named_before, named_after);
+    });
+
+  event_loop.run();
+  CHECK(named_before);
+  CHECK_FALSE(named_after);
 }
 }
