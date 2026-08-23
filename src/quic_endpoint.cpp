@@ -50,6 +50,12 @@ constexpr std::chrono::milliseconds timer_granularity{2};
 // pieces, which is also comfortably more than a single flush usually produces.
 constexpr int max_batch_datagrams = 64;
 
+// A segmented send is one message to the kernel, so the whole batch has to fit
+// what a UDP datagram may hold. Sixty-four segments of the usual size is past
+// that and the kernel answers EMSGSIZE, so the batch is bounded by bytes as
+// well as by count.
+constexpr std::size_t max_batch_bytes = 65535;
+
 // What one coalesced read may hold. Large enough that a burst arrives in a
 // single call, small enough to stay a sensible allocation per endpoint.
 constexpr std::size_t coalesced_receive_size = 64 * 1024;
@@ -531,16 +537,22 @@ void flush_batch(endpoint_impl_t &impl, connection_entry_t &entry, std::size_t u
 
   if (count > 1 && impl.segmenting)
   {
-    if (send_segments(impl.udp, bytes, segment, address, static_cast<udp_ecn_t>(ecn)).has_value())
+    auto segmented = send_segments(impl.udp, bytes, segment, address, static_cast<udp_ecn_t>(ecn));
+    if (segmented.has_value())
     {
       ++impl.stats.sends;
       impl.stats.datagrams_sent += count;
       return;
     }
-    // The offload was refused after all -- a route or interface that will not
-    // do it. Stop asking, and fall through to sending the batch one datagram
-    // at a time so nothing is lost this time either.
-    impl.segmenting = false;
+    // A batch too large for one message says nothing about whether the offload
+    // works, and abandoning it for the life of the endpoint over one is how a
+    // connection ends up making a system call per packet for everything after
+    // its window first grew. Anything else is a route or an interface refusing,
+    // which will not change while this endpoint runs.
+    if (segmented.error().code != -EMSGSIZE)
+    {
+      impl.segmenting = false;
+    }
   }
 
   for (std::size_t offset = 0; offset < used; offset += segment)
@@ -565,6 +577,15 @@ void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
 
   for (int guard = 0; guard < max_batch_datagrams; ++guard)
   {
+    // Stop short of what a segmented send can carry, rather than finding out
+    // from the kernel.
+    if (used != 0 && used + max_datagram > max_batch_bytes)
+    {
+      flush_batch(impl, entry, used, segment, count);
+      used = 0;
+      segment = 0;
+      count = 0;
+    }
     if (impl.batch.size() < used + max_datagram)
     {
       impl.batch.resize(used + max_datagram);
