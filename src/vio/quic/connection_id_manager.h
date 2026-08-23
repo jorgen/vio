@@ -65,6 +65,12 @@ struct connection_id_entry_t
   std::uint64_t sequence = 0;
   connection_id_t id;
   stateless_reset_token_t token = {};
+  // Whether this endpoint has ever addressed a packet to this connection ID.
+  // Section 10.3.1 forbids testing an arriving datagram against the reset
+  // token of an id that was never used: a reset can only have been provoked by
+  // something that was sent, and checking the rest only widens the set of
+  // values that would end the connection.
+  bool used = false;
   // Whether token holds a value the peer actually supplied. The connection ID
   // from the handshake arrives without one -- a server's token for it comes
   // through the transport parameters instead, and a client never sends one at
@@ -168,7 +174,7 @@ public:
   void install_initial(const connection_id_t &id)
   {
     _entries.clear();
-    _entries.push_back(connection_id_entry_t{.sequence = 0, .id = id, .token = {}});
+    _entries.push_back(connection_id_entry_t{.sequence = 0, .id = id, .token = {}, .used = true});
     _current = 0;
     _have_current = true;
   }
@@ -287,6 +293,7 @@ public:
     }
     const auto retiring = _current;
     _current = found->sequence;
+    found->used = true;
     _have_current = true;
     retire(retiring);
     _entries.erase(std::remove_if(_entries.begin(), _entries.end(), [retiring](const connection_id_entry_t &entry) { return entry.sequence == retiring; }), _entries.end());

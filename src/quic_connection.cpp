@@ -443,7 +443,7 @@ inline constexpr std::chrono::nanoseconds new_token_lifetime = std::chrono::hour
   }
   for (const auto &entry : impl.remote_ids.active())
   {
-    if (entry.has_token && tokens_equal(trailing, entry.token))
+    if (entry.used && entry.has_token && tokens_equal(trailing, entry.token))
     {
       return true;
     }

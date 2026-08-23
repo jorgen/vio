@@ -133,8 +133,13 @@ private:
     {
       return 0;
     }
-    // N = 1.25, as 5/4, in bytes per second.
-    const auto numerator = static_cast<std::uint64_t>(window) * 5ULL * 1000000000ULL;
+    // N = 1.25, as 5/4, in bytes per second. The window is clamped first
+    // because it is multiplied by a billion: an implausibly large one would
+    // otherwise wrap and come back out as a tiny rate, which would stall
+    // sending rather than merely mis-pace it.
+    constexpr std::uint64_t window_ceiling = std::uint64_t{1} << 32;
+    const auto bounded = std::min(static_cast<std::uint64_t>(window), window_ceiling);
+    const auto numerator = bounded * 5ULL * 1000000000ULL;
     return numerator / (static_cast<std::uint64_t>(rtt) * 4ULL);
   }
 

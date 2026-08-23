@@ -125,6 +125,14 @@ struct endpoint_impl_t
   std::unordered_map<connection_id_t, connection_entry_t *> by_id;
   connection_ready_t on_connection;
   bool running = false;
+  // Section 10.3.3 suggests a ceiling on stateless resets. The reason is not
+  // amplification -- every reset is smaller than the packet that drew it -- but
+  // work: each one costs an HMAC and a draw from the random pool, so without a
+  // limit a stream of spoofed short-header datagrams buys an attacker that
+  // much of this endpoint's CPU per packet they send.
+  std::size_t reset_allowance = 0;
+  tick_t reset_allowance_refilled;
+  bool reset_allowance_started = false;
 };
 } // namespace detail
 
@@ -225,9 +233,30 @@ void send_version_negotiation(endpoint_impl_t &impl, const invariant_header_t &i
 // memory of. It is only useful once the peer holds a token, which means only
 // after a handshake got far enough for one to have been sent, so a long header
 // -- which in this version only appears during the handshake -- is left alone.
-void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address)
+// Refilled once a second rather than continuously: a reset is a rare answer to
+// a genuine loss of state, so a modest steady allowance is generous for the
+// real case and stingy for a flood.
+constexpr std::size_t stateless_resets_per_second = 64;
+
+[[nodiscard]] bool allow_stateless_reset(endpoint_impl_t &impl, tick_t now)
 {
-  if (impl.config.stateless_reset_key == nullptr)
+  if (!impl.reset_allowance_started || now - impl.reset_allowance_refilled >= std::chrono::seconds(1))
+  {
+    impl.reset_allowance = stateless_resets_per_second;
+    impl.reset_allowance_refilled = now;
+    impl.reset_allowance_started = true;
+  }
+  if (impl.reset_allowance == 0)
+  {
+    return false;
+  }
+  --impl.reset_allowance;
+  return true;
+}
+
+void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address, tick_t now)
+{
+  if (impl.config.stateless_reset_key == nullptr || !allow_stateless_reset(impl, now))
   {
     return;
   }
@@ -522,13 +551,20 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
       entry = accept_connection(impl, bytes, sender);
       if (entry == nullptr)
       {
-        send_stateless_reset(impl, bytes, sender);
+        send_stateless_reset(impl, bytes, sender, now);
         continue;
       }
     }
 
     const auto peer = address_bytes(sender);
     const bool fresh = entry->routed.empty() || entry->connection->original_destination_id().empty();
+    // Only a rise across this one datagram means the connection accepted a
+    // move. The running total does not: it stays above zero for the rest of
+    // the connection, so testing it would redirect on any later datagram from
+    // any address -- including one the connection itself refused, such as a
+    // replay it had already seen or a packet carrying nothing but probing
+    // frames. That is a way to steer a server away from the real peer.
+    const auto migrations_before = entry->connection->migration_count();
     if (!entry->connection->receive(bytes, now, peer).has_value())
     {
       // The connection has decided it cannot continue. It still gets to send
@@ -536,7 +572,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
       flush_entry(impl, *entry, now);
       continue;
     }
-    if (!entry->peer_bytes.empty() && peer != entry->peer_bytes && entry->connection->migration_count() > 0)
+    if (entry->connection->migration_count() != migrations_before)
     {
       // Section 9.3: the connection accepted the move, so replies go to the
       // new address from here on.

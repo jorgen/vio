@@ -1951,6 +1951,38 @@ TEST_CASE("a peer that moves is followed, cautiously")
     CHECK(sent <= 3 * 1500);
   }
 
+  SUBCASE("a replay from a third address does not move the connection again")
+  {
+    // What the endpoint keys its send address on. A packet that arrives from
+    // somewhere new but tells the connection nothing it has not already heard
+    // must not count as a move, or anyone able to replay a captured datagram
+    // could steer the server away from the real peer.
+    std::vector<std::vector<std::uint8_t>> captured;
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, at(1ms));
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      captured.push_back(datagram);
+      REQUIRE(server->receive(datagram, at(1ms), away).has_value());
+    }
+    REQUIRE_FALSE(captured.empty());
+    REQUIRE(server->migration_count() == 1);
+
+    const std::vector<std::uint8_t> elsewhere = {10, 0, 0, 3, 0xc0, 0x02};
+    for (auto &datagram : captured)
+    {
+      auto copy = datagram;
+      REQUIRE(server->receive(copy, at(2ms), elsewhere).has_value());
+    }
+    CHECK(server->migration_count() == 1);
+  }
+
   SUBCASE("the peer that moved is answered at the new address")
   {
     REQUIRE(deliver_to_server(at(1ms), away) > 0);
