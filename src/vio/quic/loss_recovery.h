@@ -669,9 +669,13 @@ public:
   // probe should carry data rather than a bare PING when there is any, and
   // for a handshake that is the difference between recovering and deadlocking:
   // a PING tells the peer nothing it needs.
-  [[nodiscard]] std::vector<sent_frame_t> unacknowledged_frames(pn_space_t space) const
+  // Handed to the caller one at a time rather than collected. The only caller
+  // wants the CRYPTO frames, and a probe firing on a connection with a full
+  // window would otherwise copy every frame record it is holding -- and
+  // allocate to do it -- to find the few it cares about.
+  template <typename visitor_t>
+  void for_each_unacknowledged_frame(pn_space_t space, visitor_t &&visit) const
   {
-    std::vector<sent_frame_t> out;
     const auto &sent = _spaces[pn_space_to_index(space)].sent;
     for (std::size_t index = 0; index < sent.slots(); ++index)
     {
@@ -679,10 +683,11 @@ public:
       {
         continue;
       }
-      const auto &frames = sent.at(index).frames;
-      out.insert(out.end(), frames.begin(), frames.end());
+      for (const auto &frame : sent.at(index).frames)
+      {
+        visit(frame);
+      }
     }
-    return out;
   }
 
 private:

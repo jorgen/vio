@@ -2552,13 +2552,14 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
         // Section 6.2.4: a probe should carry data. During a handshake a bare
         // PING would elicit an acknowledgement while telling the peer nothing
         // it is waiting for, so anything still outstanding goes again.
-        for (const auto &frame : impl.recovery.unacknowledged_frames(*expiry.probe_space))
-        {
-          if (frame.kind == frame_kind_t::crypto)
-          {
-            queue_crypto_retransmit(space, frame.offset, frame.length);
-          }
-        }
+        impl.recovery.for_each_unacknowledged_frame(*expiry.probe_space,
+                                                    [&space](const sent_frame_t &frame)
+                                                    {
+                                                      if (frame.kind == frame_kind_t::crypto)
+                                                      {
+                                                        queue_crypto_retransmit(space, frame.offset, frame.length);
+                                                      }
+                                                    });
       }
     }
   }
