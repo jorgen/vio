@@ -626,61 +626,6 @@ enum class udp_ecn_t : std::uint8_t
   ce = 0x03,
 };
 
-// Marks every datagram this socket sends with the given ECN codepoint.
-//
-// libuv has no interface for this, so it goes through the socket underneath.
-// Which option that is differs by platform in a way worth naming: the unix
-// family sets the whole TOS or traffic-class byte and expects the caller to own
-// the other six bits, while Windows refuses IP_TOS outright -- it is reserved
-// to the QoS subsystem there -- and exposes the two ECN bits on their own.
-//
-// Marking is per socket rather than per datagram. That is enough for QUIC: an
-// endpoint marks everything on a path while validating and stops marking on the
-// whole path when validation fails (RFC 9000 section 13.4.2), so the codepoint
-// never needs to vary from one datagram to the next.
-inline std::expected<void, error_t> udp_set_ecn(udp_t &udp, udp_ecn_t codepoint)
-{
-  auto name = udp_sockname(udp);
-  if (!name.has_value())
-  {
-    return std::unexpected(name.error());
-  }
-  auto fd = udp_fileno(udp);
-  if (!fd.has_value())
-  {
-    return std::unexpected(fd.error());
-  }
-  const bool ipv6 = name->ss_family == AF_INET6;
-  const int value = static_cast<int>(codepoint);
-
-#ifdef _WIN32
-  const auto socket_handle = reinterpret_cast<SOCKET>(*fd);
-#if defined(IP_ECN) && defined(IPV6_ECN)
-  const int level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
-  const int option = ipv6 ? IPV6_ECN : IP_ECN;
-  if (setsockopt(socket_handle, level, option, reinterpret_cast<const char *>(&value), sizeof(value)) != 0)
-  {
-    return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "could not set the ECN codepoint on the socket"});
-  }
-  return {};
-#else
-  (void)socket_handle;
-  (void)value;
-  (void)ipv6;
-  return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this Windows SDK has no IP_ECN"});
-#endif
-#else
-  const int socket_handle = static_cast<int>(*fd);
-  const int level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
-  const int option = ipv6 ? IPV6_TCLASS : IP_TOS;
-  if (setsockopt(socket_handle, level, option, &value, sizeof(value)) != 0)
-  {
-    return std::unexpected(error_t{.code = -errno, .msg = "could not set the ECN codepoint on the socket"});
-  }
-  return {};
-#endif
-}
-
 // Binds one socket that accepts both IPv6 and IPv4-mapped peers. libuv clears
 // IPV6_V6ONLY when UV_UDP_IPV6ONLY is absent, so binding [::] is enough; hosts
 // without IPv6 fall back to 0.0.0.0.

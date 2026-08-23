@@ -7,6 +7,7 @@
 #include <vio/event_loop.h>
 #include <vio/operation/tcp.h>
 #include <vio/operation/udp.h>
+#include <vio/operation/udp_datagram.h>
 #include <vio/task.h>
 
 #include "require_expected.h"
@@ -361,37 +362,60 @@ TEST_CASE("udp sockname returns correct address")
 }
 } // TEST_SUITE
 
-TEST_CASE("udp ecn codepoint on a bound socket")
+TEST_CASE("a datagram carries its ECN codepoint through our own recvmsg")
 {
-  // RFC 3168 / RFC 9000 section 13.4. libuv has no interface for this, so it
-  // goes through the socket underneath -- IP_TOS on the unix family, IP_ECN on
-  // Windows, which reserves IP_TOS to its QoS subsystem. The point of the test
-  // is that the option is accepted where it is supposed to be.
+  // The whole reason for taking the read away from libuv. libuv's recvmsg
+  // leaves msg_control null, so the codepoint the kernel reports alongside the
+  // payload is dropped before anything can see it. This reads the socket
+  // directly and asks for the control message.
   vio::event_loop_t event_loop;
   bool verified = false;
+  int seen_ecn = -1;
+  std::string seen_payload;
 
   event_loop.run_in_loop([&] {
-    return [](vio::event_loop_t &event_loop, bool &verified) -> vio::task_t<void>
+    return [](vio::event_loop_t &event_loop, bool &verified, int &seen_ecn, std::string &seen_payload) -> vio::task_t<void>
       {
-        auto bound = get_udp_ephemeral_port(event_loop);
-        REQUIRE_EXPECTED(bound);
-        auto socket = std::move(bound->first);
+        auto receiver_pair = get_udp_ephemeral_port(event_loop);
+        REQUIRE_EXPECTED(receiver_pair);
+        int port = receiver_pair->second;
+        auto receiver = std::move(receiver_pair->first);
 
-        auto marked = vio::udp_set_ecn(socket, vio::udp_ecn_t::ect0);
-        REQUIRE_EXPECTED(marked);
+        auto reader_or_err = vio::datagram_reader_t::create(event_loop, receiver);
+        REQUIRE_EXPECTED(reader_or_err);
+        auto reader = std::move(reader_or_err.value());
+        REQUIRE_EXPECTED(reader.receive_ecn(true));
 
-        // And back off again, which is what an endpoint does when ECN
-        // validation fails for the path.
-        auto cleared = vio::udp_set_ecn(socket, vio::udp_ecn_t::not_ect);
-        REQUIRE_EXPECTED(cleared);
+        auto sender_pair = get_udp_ephemeral_port(event_loop);
+        REQUIRE_EXPECTED(sender_pair);
+        auto sender = std::move(sender_pair->first);
+
+        auto destination = vio::ip4_addr("127.0.0.1", port);
+        REQUIRE_EXPECTED(destination);
+        const std::string message = "marked";
+        // Section 13.4 of RFC 9000: marked per datagram, in a control message.
+        // Windows has no socket option for the outgoing codepoint at all, and
+        // per-datagram is the better shape anyway -- one socket can carry
+        // several connections whose paths disagree about ECN.
+        const std::span<const std::uint8_t> payload(reinterpret_cast<const std::uint8_t *>(message.data()), message.size());
+        auto sent = vio::send_datagram(sender, payload, reinterpret_cast<const sockaddr *>(&destination.value()), vio::udp_ecn_t::ect0);
+        REQUIRE_EXPECTED(sent);
+
+        auto received = co_await reader;
+        REQUIRE_EXPECTED(received);
+        seen_payload.assign(received->data.begin(), received->data.end());
+        seen_ecn = static_cast<int>(received->ecn);
 
         verified = true;
         event_loop.stop();
-        co_return;
-      }(event_loop, verified);
+      }(event_loop, verified, seen_ecn, seen_payload);
   });
 
   event_loop.run();
   REQUIRE(verified);
+  CHECK(seen_payload == "marked");
+  // ECT(0) is 0b10. Arriving as not_ect would mean the control message never
+  // came through, which is the bug this whole path exists to fix.
+  CHECK(seen_ecn == static_cast<int>(vio::udp_ecn_t::ect0));
 }
 }

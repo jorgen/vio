@@ -84,13 +84,11 @@ struct endpoint_config_t
   // congestion by setting a bit rather than dropping the packet, and the peer's
   // reported counts become something this endpoint can check and act on.
   //
-  // Marking is applied to the socket, and the socket is shared by every
-  // connection on this endpoint. So when validation fails on one path -- a
-  // middlebox clearing the field, a peer not reporting -- marking stops for all
-  // of them. That is the conservative direction (ECN off is always safe), but
-  // it does mean one bad path costs the others the benefit. Per-datagram
-  // marking would need sendmsg with control messages instead of the socket
-  // option, and libuv's send path does not offer that.
+  // The codepoint travels with each datagram in a control message rather than
+  // sitting on the socket, so connections sharing this port can disagree about
+  // it: one still marking, one that has given up on its path. That is also the
+  // only shape Windows offers -- it has no socket option for the outgoing
+  // codepoint at all.
   bool ecn = false;
 
   // Zero means no ceiling.

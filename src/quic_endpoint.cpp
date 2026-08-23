@@ -25,6 +25,7 @@
 #include "vio/operation/sleep.h"
 #include "vio/quic/packet.h"
 #include "vio/crypto.h"
+#include "vio/operation/udp_datagram.h"
 #include "vio/quic/stateless_reset.h"
 
 #include <algorithm>
@@ -122,10 +123,7 @@ struct endpoint_impl_t
   const tls_context_t &context;
   endpoint_config_t config;
   udp_t udp;
-  // Whether the socket is really marking. Set only once the option has been
-  // accepted, because a connection that claims ECT(0) it is not sending would
-  // fail its own validation against an honest peer.
-  bool ecn_marking = false;
+
   std::vector<std::unique_ptr<connection_entry_t>> connections;
   std::unordered_map<connection_id_t, connection_entry_t *> by_id;
   connection_ready_t on_connection;
@@ -193,19 +191,6 @@ void index_connection(endpoint_impl_t &impl, connection_entry_t &entry)
   }
 }
 
-// Section 13.4: marking is attempted, never assumed. A platform or a socket
-// that refuses the option leaves the endpoint unmarked rather than claiming a
-// codepoint it is not applying -- which would fail validation against a peer
-// doing everything right.
-void enable_ecn_if_asked(endpoint_impl_t &impl)
-{
-  if (!impl.config.ecn)
-  {
-    return;
-  }
-  impl.ecn_marking = udp_set_ecn(impl.udp, udp_ecn_t::ect0).has_value();
-}
-
 [[nodiscard]] connection_entry_t *find_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram)
 {
   const auto invariant = parse_invariant_header(datagram);
@@ -242,12 +227,20 @@ void enable_ecn_if_asked(endpoint_impl_t &impl)
   return std::find(impl.config.supported_versions.begin(), impl.config.supported_versions.end(), version) != impl.config.supported_versions.end();
 }
 
-void send_to(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, const sockaddr *address)
+// The codepoint travels with the datagram rather than sitting on the socket,
+// so two connections on one port can disagree about ECN -- one still marking,
+// one that has given up on its path -- without either affecting the other.
+void send_to(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, const sockaddr *address, ecn_codepoint_t ecn = ecn_codepoint_t::not_ect)
 {
   // A datagram that cannot be handed to the socket is dropped rather than
   // retried: QUIC treats loss as ordinary, and every path here has a
   // retransmission behind it.
-  (void)udp_try_send(impl.udp, bytes, address);
+  if (ecn == ecn_codepoint_t::not_ect)
+  {
+    (void)udp_try_send(impl.udp, bytes, address);
+    return;
+  }
+  (void)send_datagram(impl.udp, bytes, address, static_cast<udp_ecn_t>(ecn));
 }
 
 // Section 6.1. Built entirely from the packet that arrived, so a server can
@@ -427,7 +420,7 @@ void send_retry(endpoint_impl_t &impl, const packet_header_t &header, const sock
   config.stateless_reset_key = impl.config.stateless_reset_key;
   config.peer_address = address_bytes(address);
   config.peer_host_address = host_address_bytes(address);
-  config.ecn = impl.ecn_marking ? ecn_codepoint_t::ect0 : ecn_codepoint_t::not_ect;
+  config.ecn = impl.config.ecn ? ecn_codepoint_t::ect0 : ecn_codepoint_t::not_ect;
 
   auto created = connection_t::create(impl.context, config);
   if (!created.has_value())
@@ -456,22 +449,14 @@ void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
     {
       break;
     }
-    send_to(impl, std::span<const std::uint8_t>(out).first(*size), reinterpret_cast<const sockaddr *>(&entry.peer));
+    // Section 13.4.2: the connection stops marking on its own when validation
+    // fails, and nothing else on this socket is affected.
+    send_to(impl, std::span<const std::uint8_t>(out).first(*size), reinterpret_cast<const sockaddr *>(&entry.peer), entry.connection->ecn_sending());
   }
 
   // Connection IDs are issued as the connection runs, and each one is another
   // way for a datagram to reach it.
   index_connection(impl, entry);
-
-  if (impl.ecn_marking && entry.connection->ecn_sending() == ecn_codepoint_t::not_ect)
-  {
-    // Section 13.4.2: this connection's validation failed, so the field is not
-    // surviving its path. The socket is shared, so marking stops for every
-    // connection on it -- losing the benefit rather than acting on counts that
-    // have been shown to be untrustworthy.
-    impl.ecn_marking = false;
-    (void)udp_set_ecn(impl.udp, udp_ecn_t::not_ect);
-  }
 
   if (!entry.announced && entry.connection->handshake_complete() && impl.on_connection)
   {
@@ -526,13 +511,7 @@ std::expected<endpoint_t, error_t> endpoint_t::create(event_loop_t &loop, const 
 
 std::expected<void, error_t> endpoint_t::bind(const sockaddr *address)
 {
-  auto bound = udp_bind(_impl->udp, address);
-  if (!bound.has_value())
-  {
-    return bound;
-  }
-  enable_ecn_if_asked(*_impl);
-  return {};
+  return udp_bind(_impl->udp, address);
 }
 
 std::expected<std::uint16_t, error_t> endpoint_t::local_port() const
@@ -557,19 +536,12 @@ void endpoint_t::on_connection(connection_ready_t handler)
 std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name)
 {
   auto &impl = *_impl;
-  if (impl.config.ecn && !impl.ecn_marking)
-  {
-    // A client may never call bind(), and an unbound socket has no family to
-    // set the option against until it does. libuv binds implicitly on first
-    // send, so this is the next best moment.
-    enable_ecn_if_asked(impl);
-  }
   auto config = impl.config.connection;
   config.role = tls_role_t::client;
   config.stateless_reset_key = impl.config.stateless_reset_key;
   config.peer_address = address_bytes(address);
   config.peer_host_address = host_address_bytes(address);
-  config.ecn = impl.ecn_marking ? ecn_codepoint_t::ect0 : ecn_codepoint_t::not_ect;
+  config.ecn = impl.config.ecn ? ecn_codepoint_t::ect0 : ecn_codepoint_t::not_ect;
 
   auto created = connection_t::create(impl.context, config, server_name);
   if (!created.has_value())
