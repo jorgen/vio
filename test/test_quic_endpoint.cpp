@@ -216,4 +216,101 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
   CHECK(handshaken);
   CHECK(received == "over a real socket");
 }
+TEST_CASE("a Retry is answered without building a connection for it")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool handshaken = false;
+  bool through_retry = false;
+  std::size_t accepted_connections = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, bool &through_retry, std::size_t &accepted_connections) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        retry_token_key_t retry_key;
+        REQUIRE(retry_key.generate().has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.connection.transport_parameters = sane_parameters();
+        server_config.retry_key = &retry_key;
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        connection_t *accepted = nullptr;
+        server->on_connection([&accepted](connection_t &connection) { accepted = &connection; });
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        client_config.connection.transport_parameters = sane_parameters();
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        REQUIRE(dialled.has_value());
+        connection_t *connection = *dialled;
+
+        for (int i = 0; i < 300 && !connection->handshake_complete(); ++i)
+        {
+          co_await sleep(loop, 5ms);
+        }
+        handshaken = connection->handshake_complete();
+        through_retry = connection->address_validated_by_retry();
+        // Section 8.1.2: the first Initial carried no token and cost the server
+        // nothing. Exactly one connection exists, built when the token came
+        // back -- not two, and not one per Initial the client sent.
+        accepted_connections = server->connection_count();
+
+        server_cancel.cancel();
+        client_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        server.reset();
+        client.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, handshaken, through_retry, accepted_connections);
+    });
+
+  event_loop.run();
+  CHECK(handshaken);
+  CHECK(through_retry);
+  CHECK(accepted_connections == 1);
+}
 }

@@ -24,6 +24,7 @@
 
 #include "vio/operation/sleep.h"
 #include "vio/quic/packet.h"
+#include "vio/crypto.h"
 #include "vio/quic/stateless_reset.h"
 
 #include <algorithm>
@@ -286,7 +287,77 @@ void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> d
   send_to(impl, std::span<const std::uint8_t>(out).first(*size), address);
 }
 
-[[nodiscard]] connection_entry_t *accept_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address)
+// The Initial header, token included, without committing to anything. The
+// endpoint needs the token before it decides whether this datagram is worth a
+// connection at all.
+[[nodiscard]] std::optional<packet_header_t> peek_initial(const endpoint_impl_t &impl, std::span<const std::uint8_t> datagram)
+{
+  packet_reader_t reader(datagram, impl.config.connection.local_connection_id_length);
+  auto next = reader.next();
+  if (!next.has_value() || !next->has_value())
+  {
+    return std::nullopt;
+  }
+  const auto header = next->value();
+  if (header.kind != packet_kind_t::initial)
+  {
+    return std::nullopt;
+  }
+  return header;
+}
+
+// Section 8.1.2, done the way the section intends: without building anything.
+//
+// A Retry exists so that a server need not spend state on an address that has
+// not been proven. Answering from inside a connection object would defeat it --
+// the connection, its TLS session and its key schedules would already have been
+// allocated by the time the Retry went out, and a flood of Initials with
+// spoofed source addresses would cost exactly as much as if there were no Retry
+// at all. So this is built from the packet that arrived and nothing else, and
+// the state that would have held the exchange together is instead sealed into
+// the token: the connection ID the client first chose, which section 7.3 makes
+// the server echo back so the client can tell the Retry was genuine.
+void send_retry(endpoint_impl_t &impl, const packet_header_t &header, const sockaddr *address, tick_t now)
+{
+  // The connection ID the client is told to use from here on. It is invented
+  // now and never remembered; the client returns it as the Destination
+  // Connection ID of its next Initial, and that is where it comes back from.
+  std::array<std::uint8_t, max_connection_id_size> chosen = {};
+  auto bytes = std::span<std::uint8_t>(chosen).first(impl.config.connection.local_connection_id_length);
+  if (!bytes.empty() && !crypto::random_bytes(bytes).has_value())
+  {
+    return;
+  }
+  auto source = connection_id_t::from_bytes(bytes);
+  if (!source.has_value())
+  {
+    return;
+  }
+
+  auto token = impl.config.retry_key->issue(header.destination_id, address_bytes(address), now);
+  if (!token.has_value())
+  {
+    return;
+  }
+
+  std::array<std::uint8_t, max_datagram> out = {};
+  const std::size_t head = serialize_retry(out, quic_version_1, header.source_id, *source, *token);
+  if (head == 0 || out.size() < head + retry_integrity_tag_size)
+  {
+    return;
+  }
+  // Section 5.8 of RFC 9001: the tag is what proves this came from someone who
+  // saw the client's Initial, rather than anyone who can write a packet.
+  auto tag = retry_integrity_tag(header.destination_id.bytes(), std::span<const std::uint8_t>(out).first(head));
+  if (!tag.has_value())
+  {
+    return;
+  }
+  std::copy(tag->begin(), tag->end(), out.begin() + static_cast<std::ptrdiff_t>(head));
+  send_to(impl, std::span<const std::uint8_t>(out).first(head + retry_integrity_tag_size), address);
+}
+
+[[nodiscard]] connection_entry_t *accept_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address, const packet_header_t &header)
 {
   if (impl.config.connection.role != tls_role_t::server)
   {
@@ -297,18 +368,6 @@ void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> d
     return nullptr;
   }
 
-  // Only an Initial starts a connection. Anything else with an unknown
-  // connection ID is either late, misrouted, or an attempt to make this
-  // endpoint allocate for a handshake that will never happen.
-  const auto invariant = parse_invariant_header(datagram);
-  if (!invariant.has_value() || !invariant->long_header)
-  {
-    return nullptr;
-  }
-  if ((datagram[0] & long_packet_type_mask) != 0x00)
-  {
-    return nullptr;
-  }
   // Section 14.1: a datagram carrying an Initial is at least 1200 bytes. A
   // smaller one cannot be a genuine connection attempt, and accepting it would
   // let a tiny packet buy a whole connection's worth of state.
@@ -318,6 +377,14 @@ void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> d
   }
 
   auto config = impl.config.connection;
+  if (impl.config.retry_key != nullptr && !header.token.empty())
+  {
+    // This Initial is the answer to a Retry this endpoint sent and kept no
+    // record of. The connection ID it is addressed to is the one that Retry
+    // named, and section 7.3 has the handshake echo that exact value back, so
+    // the connection has to adopt it rather than invent its own.
+    config.local_connection_id_override = header.destination_id;
+  }
   config.retry_key = impl.config.retry_key;
   config.stateless_reset_key = impl.config.stateless_reset_key;
   config.peer_address = address_bytes(address);
@@ -548,7 +615,26 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
         send_version_negotiation(impl, *invariant, sender);
         continue;
       }
-      entry = accept_connection(impl, bytes, sender);
+      // Only an Initial starts a connection. Anything else addressed to a
+      // connection ID this endpoint does not know is late, misrouted, or an
+      // attempt to make it allocate for a handshake that will never happen.
+      const auto initial = peek_initial(impl, bytes);
+      if (!initial.has_value())
+      {
+        send_stateless_reset(impl, bytes, sender, now);
+        continue;
+      }
+
+      if (impl.config.retry_key != nullptr && initial->token.empty())
+      {
+        // Section 8.1.2: nothing has proved this address is real, so it is
+        // answered without building anything. Whatever comes back carries the
+        // token, and only then is a connection worth the memory.
+        send_retry(impl, *initial, sender, now);
+        continue;
+      }
+
+      entry = accept_connection(impl, bytes, sender, *initial);
       if (entry == nullptr)
       {
         send_stateless_reset(impl, bytes, sender, now);

@@ -101,6 +101,13 @@ struct connection_config_t
   tls_role_t role = tls_role_t::server;
   transport_parameters_t transport_parameters;
 
+  // The connection ID this endpoint should answer to, instead of inventing one.
+  // A server that answered an earlier Initial with a Retry has already told the
+  // client which id to use, and the handshake requires that exact value to come
+  // back as retry_source_connection_id -- so a connection built for the second
+  // Initial has to adopt it rather than choose afresh.
+  std::optional<connection_id_t> local_connection_id_override;
+
   // Length of the connection IDs this endpoint issues. A short header carries
   // no length field, so this is the only way an incoming 1-RTT packet can be
   // parsed; it cannot change once a connection is running.

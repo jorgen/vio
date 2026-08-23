@@ -2262,16 +2262,20 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
     return std::unexpected(error_t{.code = 1, .msg = "max datagram size is below the 1200 bytes section 14 requires"});
   }
 
-  std::array<std::uint8_t, max_connection_id_size> scratch = {};
-  auto local_bytes = std::span<std::uint8_t>(scratch).first(config.local_connection_id_length);
-  if (!local_bytes.empty())
+  std::optional<connection_id_t> local = config.local_connection_id_override;
+  if (!local.has_value())
   {
-    if (auto r = crypto::random_bytes(local_bytes); !r.has_value())
+    std::array<std::uint8_t, max_connection_id_size> scratch = {};
+    auto local_bytes = std::span<std::uint8_t>(scratch).first(config.local_connection_id_length);
+    if (!local_bytes.empty())
     {
-      return std::unexpected(r.error());
+      if (auto r = crypto::random_bytes(local_bytes); !r.has_value())
+      {
+        return std::unexpected(r.error());
+      }
     }
+    local = connection_id_t::from_bytes(local_bytes);
   }
-  auto local = connection_id_t::from_bytes(local_bytes);
   if (!local.has_value())
   {
     return std::unexpected(error_t{.code = 1, .msg = "could not build a local connection id"});
