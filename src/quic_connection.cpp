@@ -1185,6 +1185,12 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
         begin_close(impl, cid_error_code(error), "NEW_CONNECTION_ID rejected", false, false);
         return ack_eliciting;
       }
+      // A Retire Prior To can have retired the id this endpoint is addressing
+      // packets to, in which case remote_ids has already moved to a live one.
+      if (const auto *chosen = impl.remote_ids.current(); chosen != nullptr && !(*chosen == impl.peer_connection_id))
+      {
+        impl.peer_connection_id = *chosen;
+      }
       break;
     }
 

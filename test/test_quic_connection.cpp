@@ -1944,8 +1944,10 @@ TEST_CASE("a peer that moves is followed, cautiously")
 
     // Section 9.5: the connection moves to an id the old path never carried,
     // or an observer of both paths links them on sight. The one left behind is
-    // retired, so the pool shrinks.
-    CHECK(server->peer_connection_id_count() == available_before - 1);
+    // kept rather than retired -- the peer may still have it bound to the path
+    // it is using, and section 5.1.2 leaves retirement to whoever owns the id.
+    CHECK(server->peer_connection_id_count() == available_before);
+    CHECK(server->peer_connection_id_count() > 1);
   }
 
   SUBCASE("the new address earns its allowance from scratch")

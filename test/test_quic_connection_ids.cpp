@@ -210,7 +210,7 @@ TEST_CASE("a truncated reset token is a frame encoding error")
   CHECK(remote.on_new(1, 0, make_id(2), short_token, generous_limit) == cid_error_t::frame_encoding);
 }
 
-TEST_CASE("switching to an unused id retires the one left behind")
+TEST_CASE("switching to an unused id leaves the old one for the peer to retire")
 {
   // Section 9.5: a new path must not reuse the connection ID the old one was
   // seen with, or an observer links the two.
@@ -227,8 +227,57 @@ TEST_CASE("switching to an unused id retires the one left behind")
   CHECK(remote.switch_to_unused());
   REQUIRE(remote.current() != nullptr);
   CHECK(*remote.current() == make_id(2));
+
+  // Nothing is owed. The peer whose address moved under it -- a NAT rebinding
+  // it never asked for -- still has the old ID bound to the path it is using,
+  // and a RETIRE_CONNECTION_ID naming it is a protocol violation from there.
+  // picoquic answers one with "cannot delete path through which packet
+  // arrives"; retirement is the peer's call, via its own Retire Prior To.
+  CHECK(remote.pending_retires().empty());
+
+  // Only ids the peer has never seen on the old path qualify, so a second
+  // switch with nothing fresh left stays put rather than going back.
+  CHECK_FALSE(remote.has_unused());
+  CHECK_FALSE(remote.switch_to_unused());
+  REQUIRE(remote.current() != nullptr);
+  CHECK(*remote.current() == make_id(2));
+}
+
+TEST_CASE("a Retire Prior To covering the id in use moves to a live one")
+{
+  // The peer is entitled to retire the ID this endpoint is addressing packets
+  // to. Keeping it is wrong twice over: the peer has discarded it, and the
+  // RETIRE_CONNECTION_ID owed for it would ride in a packet the frame names,
+  // which section 5.1.2 makes a protocol violation.
+  remote_connection_ids_t remote;
+  remote.install_initial(make_id(1));
+  REQUIRE(remote.current() != nullptr);
+  CHECK(*remote.current() == make_id(1));
+
+  REQUIRE(remote.on_new(1, 0, make_id(2), make_token(1), generous_limit) == cid_error_t::none);
+  REQUIRE(remote.on_new(2, 2, make_id(3), make_token(2), generous_limit) == cid_error_t::none);
+
+  // Sequences 0 and 1 are gone, so the id in use cannot still be sequence 0.
+  REQUIRE(remote.current() != nullptr);
+  CHECK(*remote.current() == make_id(3));
+
   const auto &owed = remote.pending_retires();
   CHECK(std::find(owed.begin(), owed.end(), std::uint64_t{0}) != owed.end());
+  CHECK(std::find(owed.begin(), owed.end(), std::uint64_t{1}) != owed.end());
+}
+
+TEST_CASE("a Retire Prior To arriving with its own replacement lands on that one")
+{
+  // Section 19.15 allows retire_prior_to to equal the sequence it arrives on,
+  // which retires everything older in the same breath as supplying the
+  // replacement. The id in use has to end up being the one that survived.
+  remote_connection_ids_t remote;
+  remote.install_initial(make_id(1));
+  REQUIRE(remote.on_new(1, 0, make_id(2), make_token(1), generous_limit) == cid_error_t::none);
+  REQUIRE(remote.on_new(2, 2, make_id(3), make_token(2), generous_limit) == cid_error_t::none);
+  REQUIRE(remote.current() != nullptr);
+  CHECK(*remote.current() == make_id(3));
+  CHECK(remote.active_count() == 1);
 }
 
 TEST_CASE("a retire stays owed until it is sent, and can be put back")

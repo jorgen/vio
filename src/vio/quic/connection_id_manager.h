@@ -227,6 +227,7 @@ public:
         }
         ++it;
       }
+      adopt_current_if_retired();
     }
 
     if (sequence < _largest_retire_prior_to)
@@ -247,6 +248,7 @@ public:
     _entries.push_back(connection_id_entry_t{.sequence = sequence, .id = id, .token = {}, .has_token = true});
     std::copy(token.begin(), token.end(), _entries.back().token.begin());
     mark_seen(sequence);
+    adopt_current_if_retired();
 
     if (static_cast<std::uint64_t>(_entries.size()) > local_limit)
     {
@@ -284,19 +286,23 @@ public:
 
   // Section 9.5: a new path wants an ID that has never been seen on the old
   // one, or the two paths are trivially linkable.
+  //
+  // The one it leaves behind is kept rather than retired. Retiring is a SHOULD
+  // (section 5.1.2) and the peer is the one that knows when it is done with an
+  // ID: a peer whose address changed underneath it -- a NAT rebinding, which it
+  // never asked for -- still has that ID bound to the path it is using, and
+  // retiring it unilaterally is a protocol violation from where it sits. The
+  // peer's own Retire Prior To is what drives retirement.
   [[nodiscard]] bool switch_to_unused()
   {
-    const auto found = std::find_if(_entries.begin(), _entries.end(), [this](const connection_id_entry_t &entry) { return entry.sequence != _current; });
+    const auto found = std::find_if(_entries.begin(), _entries.end(), [this](const connection_id_entry_t &entry) { return entry.sequence != _current && !entry.used; });
     if (found == _entries.end())
     {
       return false;
     }
-    const auto retiring = _current;
     _current = found->sequence;
     found->used = true;
     _have_current = true;
-    retire(retiring);
-    _entries.erase(std::remove_if(_entries.begin(), _entries.end(), [retiring](const connection_id_entry_t &entry) { return entry.sequence == retiring; }), _entries.end());
     return true;
   }
 
@@ -307,7 +313,7 @@ public:
 
   [[nodiscard]] bool has_unused() const
   {
-    return std::any_of(_entries.begin(), _entries.end(), [this](const connection_id_entry_t &entry) { return entry.sequence != _current; });
+    return std::any_of(_entries.begin(), _entries.end(), [this](const connection_id_entry_t &entry) { return entry.sequence != _current && !entry.used; });
   }
 
   [[nodiscard]] std::span<const connection_id_entry_t> active() const
@@ -316,6 +322,28 @@ public:
   }
 
 private:
+  // Section 5.1.2: the peer can retire the very ID this endpoint is addressing
+  // packets to. Continuing to use it is wrong twice over -- the peer has
+  // discarded it, and the RETIRE_CONNECTION_ID owed for it would travel in a
+  // packet the frame names, which section 5.1.2 makes a protocol violation.
+  void adopt_current_if_retired()
+  {
+    const auto still_here = std::find_if(_entries.begin(), _entries.end(), [this](const connection_id_entry_t &entry) { return entry.sequence == _current; });
+    if (_have_current && still_here != _entries.end())
+    {
+      return;
+    }
+    const auto lowest = std::min_element(_entries.begin(), _entries.end(), [](const connection_id_entry_t &left, const connection_id_entry_t &right) { return left.sequence < right.sequence; });
+    if (lowest == _entries.end())
+    {
+      _have_current = false;
+      return;
+    }
+    _current = lowest->sequence;
+    lowest->used = true;
+    _have_current = true;
+  }
+
   void retire(std::uint64_t sequence)
   {
     mark_seen(sequence);
