@@ -1316,7 +1316,8 @@ TEST_CASE("a Retry token is bound to the address it was issued to")
 
   auto recovered = key.validate(*token, address, at(1s));
   REQUIRE(recovered.has_value());
-  CHECK(*recovered == *original);
+  CHECK(recovered->kind == address_token_kind_t::retry);
+  CHECK(recovered->original_destination_id == *original);
 
   SUBCASE("a different address does not validate")
   {
@@ -1379,7 +1380,7 @@ TEST_CASE("a Retry token is bound to the address it was issued to")
     REQUIRE(empty.has_value());
     auto back = key.validate(*empty, address, at(1s));
     REQUIRE(back.has_value());
-    CHECK(back->empty());
+    CHECK(back->original_destination_id.empty());
   }
 }
 
@@ -2183,5 +2184,109 @@ TEST_CASE("a sender stopped by the peer's limits says so once and then waits")
   // Raising the limit is what starts it moving, and the block is reported
   // again if the new limit also runs out.
   CHECK(client->state() == connection_state_t::connected);
+}
+TEST_CASE("a token from one connection saves a round trip on the next")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  retry_token_key_t key;
+  REQUIRE(key.generate().has_value());
+
+  const std::vector<std::uint8_t> address = {4, 192, 168, 1, 5, 0xc0, 0x11};
+  // Section 8.1.3: the same address without the port, since the port will not
+  // survive to the next connection.
+  const std::vector<std::uint8_t> host = {4, 192, 168, 1, 5};
+
+  auto make_server = [&](std::vector<std::uint8_t> token_for_client)
+  {
+    connection_config_t config;
+    config.role = tls_role_t::server;
+    config.transport_parameters = sane_parameters();
+    config.retry_key = &key;
+    config.peer_address = address;
+    config.peer_host_address = host;
+    (void)token_for_client;
+    return connection_t::create(contexts.server_context, config);
+  };
+  auto make_client = [&](std::vector<std::uint8_t> token)
+  {
+    connection_config_t config;
+    config.role = tls_role_t::client;
+    config.transport_parameters = sane_parameters();
+    config.address_token = std::move(token);
+    return connection_t::create(contexts.client_context, config, "localhost");
+  };
+
+  std::vector<std::uint8_t> issued;
+  {
+    auto server = make_server({});
+    REQUIRE(server.has_value());
+    auto client = make_client({});
+    REQUIRE(client.has_value());
+
+    // No token to present, so the server spends a Retry proving the address.
+    REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+    REQUIRE(client->handshake_complete());
+    CHECK(client->address_validated_by_retry());
+
+    // The token rides out once the handshake is confirmed, so keep pumping.
+    for (int round = 0; round < 6 && client->new_token().empty(); ++round)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = server->poll_send(datagram, at(1ms));
+      REQUIRE(size.has_value());
+      if (*size > 0)
+      {
+        datagram.resize(*size);
+        REQUIRE(client->receive(datagram, at(1ms)).has_value());
+        continue;
+      }
+      auto back = client->poll_send(datagram, at(1ms));
+      REQUIRE(back.has_value());
+      if (*back > 0)
+      {
+        datagram.resize(*back);
+        REQUIRE(server->receive(datagram, at(1ms)).has_value());
+      }
+    }
+    issued.assign(client->new_token().begin(), client->new_token().end());
+  }
+
+  REQUIRE_FALSE(issued.empty());
+
+  SUBCASE("presenting it means no Retry is needed")
+  {
+    auto server = make_server({});
+    REQUIRE(server.has_value());
+    auto client = make_client(issued);
+    REQUIRE(client.has_value());
+
+    REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+    REQUIRE(client->handshake_complete());
+    // Section 8.1.3: the address was proven by the token, so the round trip a
+    // Retry would have cost was not spent.
+    CHECK_FALSE(client->address_validated_by_retry());
+    CHECK_FALSE(server->close_reason().has_value());
+  }
+
+  SUBCASE("a token issued for a different host does not validate")
+  {
+    connection_config_t config;
+    config.role = tls_role_t::server;
+    config.transport_parameters = sane_parameters();
+    config.retry_key = &key;
+    config.peer_address = {4, 10, 0, 0, 9, 0xc0, 0x11};
+    config.peer_host_address = {4, 10, 0, 0, 9};
+    auto server = connection_t::create(contexts.server_context, config);
+    REQUIRE(server.has_value());
+    auto client = make_client(issued);
+    REQUIRE(client.has_value());
+
+    // The token is bound to the host it was issued to, so this one falls back
+    // to a Retry rather than being taken at face value.
+    REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+    CHECK(client->address_validated_by_retry());
+  }
 }
 }

@@ -141,6 +141,17 @@ struct connection_config_t
   // so one issued to a given address cannot be replayed from another; leaving
   // it empty means the token is bound to nothing, which defeats the point.
   std::vector<std::uint8_t> peer_address;
+
+  // Section 8.1.3: the same address without the port, which is what a
+  // NEW_TOKEN token is bound to. The port almost never survives to the next
+  // connection, so a token bound to it could never be redeemed.
+  std::vector<std::uint8_t> peer_host_address;
+
+  // Client only. A token from a NEW_TOKEN frame on an earlier connection to
+  // this server, presented in every Initial so the server can skip the round
+  // trip a Retry would cost. Section 8.1.3 forbids reusing a token from a
+  // Retry here.
+  std::vector<std::uint8_t> address_token;
 };
 
 namespace detail
@@ -179,6 +190,12 @@ public:
   // wherever the caller is sending, which is what a client behind a fixed
   // socket wants.
   [[nodiscard]] std::expected<void, error_t> receive(std::span<std::uint8_t> datagram, tick_t now, std::span<const std::uint8_t> peer_address);
+
+  // Section 8.1.3: a token the server issued for use on a later connection to
+  // it, if one arrived. Empty otherwise. An application that keeps this and
+  // puts it in connection_config_t::address_token next time saves the round
+  // trip a Retry would cost.
+  [[nodiscard]] std::span<const std::uint8_t> new_token() const;
 
   // Section 6.2: whether the attempt ended because the server offered no
   // version this build speaks.

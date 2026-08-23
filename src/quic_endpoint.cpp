@@ -76,6 +76,20 @@ constexpr std::chrono::milliseconds timer_granularity{2};
   }
   return out;
 }
+
+// Section 8.1.3: the same address with the port left off. A NEW_TOKEN token is
+// meant to be redeemed on a later connection, and the client's port will
+// almost certainly have changed by then, so binding one to the port would make
+// it unredeemable.
+[[nodiscard]] std::vector<std::uint8_t> host_address_bytes(const sockaddr *address)
+{
+  auto out = address_bytes(address);
+  if (out.size() >= 2)
+  {
+    out.resize(out.size() - 2);
+  }
+  return out;
+}
 } // namespace
 
 namespace detail
@@ -278,6 +292,7 @@ void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> d
   config.retry_key = impl.config.retry_key;
   config.stateless_reset_key = impl.config.stateless_reset_key;
   config.peer_address = address_bytes(address);
+  config.peer_host_address = host_address_bytes(address);
 
   auto created = connection_t::create(impl.context, config);
   if (!created.has_value())
@@ -395,6 +410,7 @@ std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *addre
   config.role = tls_role_t::client;
   config.stateless_reset_key = impl.config.stateless_reset_key;
   config.peer_address = address_bytes(address);
+  config.peer_host_address = host_address_bytes(address);
 
   auto created = connection_t::create(impl.context, config, server_name);
   if (!created.has_value())

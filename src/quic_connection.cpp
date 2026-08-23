@@ -287,6 +287,11 @@ struct connection_impl_t
   // covers the connection ID it chose during the handshake. Tokens for the
   // rest arrive in NEW_CONNECTION_ID frames and live in remote_ids.
   std::optional<stateless_reset_token_t> peer_initial_reset_token;
+  // Section 8.1.3. A server issues one after the handshake; a client keeps
+  // whatever arrives for the application to store.
+  std::vector<std::uint8_t> new_token_pending;
+  bool new_token_issued = false;
+  std::vector<std::uint8_t> received_new_token;
   bool reset_by_peer = false;
   // Section 6.2: the server answered with a version list this build cannot
   // satisfy, so the attempt is over.
@@ -412,6 +417,10 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
 //
 //   Move to a connection ID the old path never carried (section 9.5), or an
 //   observer of both paths can trivially link them.
+// Section 8.1.3: a token meant for a later connection is worth little if it
+// expires in the seconds a Retry token lives for.
+inline constexpr std::chrono::nanoseconds new_token_lifetime = std::chrono::hours(24);
+
 // Section 8.2.4: three times the larger of the current PTO and a PTO computed
 // from the initial RTT, because a new path may be slower than the one in use
 // and the estimate in hand describes the old one.
@@ -659,6 +668,13 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         impl.streams.forget_streams_blocked();
         break;
 
+      case frame_kind_t::new_token:
+        // Section 13.3: retransmitted if lost. The same token goes again --
+        // section 8.1.3 asks that every NEW_TOKEN be unique except when
+        // repairing exactly this.
+        impl.new_token_issued = false;
+        break;
+
       case frame_kind_t::new_connection_id:
         requeue_new_connection_id(impl, frame.sequence);
         break;
@@ -826,6 +842,30 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
       impl.state = connection_state_t::connected;
     }
   }
+  return {};
+}
+
+// Section 8.1.3: hand the client something it can present next time, so the
+// next connection to this server need not spend a round trip on a Retry. Only
+// once the handshake is confirmed -- before that the address has not been
+// proven and the token would be a gift to whoever spoofed it.
+std::expected<void, error_t> issue_new_token(connection_impl_t &impl, tick_t now)
+{
+  if (impl.config.role != tls_role_t::server || impl.new_token_issued || !impl.handshake_confirmed)
+  {
+    return {};
+  }
+  if (impl.config.retry_key == nullptr || impl.config.peer_host_address.empty())
+  {
+    return {};
+  }
+  auto token = impl.config.retry_key->issue_new_token(impl.config.peer_host_address, now);
+  if (!token.has_value())
+  {
+    return std::unexpected(token.error());
+  }
+  impl.new_token_pending = std::move(*token);
+  impl.new_token_issued = true;
   return {};
 }
 
@@ -1100,8 +1140,23 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       (void)impl.path.on_response(frame.path_data);
       break;
 
+    case frame_kind_t::new_token:
+      // Section 19.7: only a server sends these, and a zero-length one is a
+      // frame encoding error rather than an empty gift.
+      if (impl.config.role != tls_role_t::client)
+      {
+        begin_close(impl, transport_error_protocol_violation, "NEW_TOKEN from a client", false, false);
+        return ack_eliciting;
+      }
+      if (frame.data.empty())
+      {
+        begin_close(impl, static_cast<std::uint64_t>(transport_error_code_t::frame_encoding_error), "empty NEW_TOKEN", false, false);
+        return ack_eliciting;
+      }
+      impl.received_new_token.assign(frame.data.begin(), frame.data.end());
+      break;
+
     default:
-      // NEW_TOKEN is parsed and acknowledged but not acted on.
       break;
     }
   }
@@ -1287,39 +1342,75 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
 
   if (header.kind == packet_kind_t::initial && impl.config.role == tls_role_t::server && impl.config.retry_key != nullptr && !impl.retry_validated)
   {
+    // Section 8.1.2: nothing has proved this address is real. Answering with a
+    // Retry costs the client a round trip and costs anyone spoofing a source
+    // address the ability to make this server work for them. No handshake
+    // state is built until the token comes back.
+    const auto answer_with_retry = [&]() -> std::expected<void, error_t>
+    {
+      if (impl.retry_issued)
+      {
+        return {};
+      }
+      impl.retry_pending = true;
+      impl.retry_issued = true;
+      // Section 5.2 of RFC 9001: Initial keys follow the Destination
+      // Connection ID, and after a Retry that is the one this server just told
+      // the client to use. Keeping the keys derived from the ID the client
+      // invented would leave the server unable to read its own Retry being
+      // answered. Packet numbers are deliberately left alone: section 17.2.5.3
+      // forbids the client resetting them, so the acknowledgement state stays
+      // valid across the Retry.
+      return install_initial_keys(impl, impl.local_connection_id);
+    };
+
     if (header.token.empty())
     {
-      // Section 8.1.2: no token, so nothing has proved this address is real.
-      // Answering with a Retry costs the client a round trip and costs anyone
-      // spoofing a source address the ability to make this server work for
-      // them. No handshake state is built until the token comes back.
-      if (!impl.retry_issued)
+      if (auto r = answer_with_retry(); !r.has_value())
       {
-        impl.retry_pending = true;
-        impl.retry_issued = true;
-        // Section 5.2 of RFC 9001: Initial keys follow the Destination
-        // Connection ID, and after a Retry that is the one this server just
-        // told the client to use. Keeping the keys derived from the ID the
-        // client invented would leave the server unable to read its own Retry
-        // being answered. Packet numbers are deliberately left alone: section
-        // 17.2.5.3 forbids the client resetting them, so the acknowledgement
-        // state stays valid across the Retry.
-        if (auto r = install_initial_keys(impl, impl.local_connection_id); !r.has_value())
-        {
-          return r;
-        }
+        return r;
       }
       return {};
     }
 
-    auto original = impl.config.retry_key->validate(header.token, impl.config.peer_address, now);
-    if (!original.has_value())
+    // Section 8.1.3: a token from a NEW_TOKEN frame is bound to the address
+    // without its port and carries no connection ID, so it is tried against
+    // that and only accepted as what it says it is. Accepting it as a Retry
+    // token would skip the original-connection-ID check that ties a Retry to
+    // the exchange it belongs to.
+    bool reused_earlier_token = false;
+    if (!impl.retry_issued && !impl.config.peer_host_address.empty())
     {
-      // Forged, expired, or presented from a different address. A packet that
-      // cannot be accounted for is dropped, not argued with.
-      return {};
+      auto reused = impl.config.retry_key->validate(header.token, impl.config.peer_host_address, now, new_token_lifetime);
+      reused_earlier_token = reused.has_value() && reused->kind == address_token_kind_t::new_token;
     }
-    impl.retry_validated = true;
+
+    if (reused_earlier_token)
+    {
+      // The address is proven, so no Retry is spent. Nothing else follows from
+      // it: unlike a Retry token this one names no connection ID, so the
+      // handshake carries no original_destination_connection_id to echo.
+      impl.address_validated = true;
+      impl.retry_validated = true;
+    }
+    else
+    {
+      auto validated = impl.config.retry_key->validate(header.token, impl.config.peer_address, now);
+      if (!validated.has_value() || validated->kind != address_token_kind_t::retry)
+      {
+        // Forged, expired, presented from a different address, or the wrong
+        // kind of token entirely. Section 8.1.3 permits discarding the packet,
+        // but a client that cached a token which has since expired would then
+        // never get in at all -- so it is answered with a Retry, which is both
+        // the proof this server wanted and a fresh token for the client.
+        if (auto r = answer_with_retry(); !r.has_value())
+        {
+          return r;
+        }
+        return {};
+      }
+      const auto original = std::optional<connection_id_t>(validated->original_destination_id);
+      impl.retry_validated = true;
     // Section 8.1.4: the connection ID the client first chose comes back out
     // of the token, and the handshake requires it to be echoed to the client
     // so the client can confirm the Retry was genuine.
@@ -1330,9 +1421,10 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     parameters.original_destination_connection_id = *original;
     parameters.retry_source_connection_id = impl.local_connection_id;
     impl.config.transport_parameters = parameters;
-    if (auto r = impl.tls.set_transport_parameters(encode_transport_parameters(parameters)); !r.has_value())
-    {
-      return std::unexpected(r.error());
+      if (auto r = impl.tls.set_transport_parameters(encode_transport_parameters(parameters)); !r.has_value())
+      {
+        return std::unexpected(r.error());
+      }
     }
   }
 
@@ -1579,7 +1671,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     // Section 8.2.2 forbids delaying a PATH_RESPONSE, so an owed echo is by
     // itself a reason to send.
     want_path = !impl.path_responses.empty() || impl.path.challenge_due(now, impl.recovery.rtt().pto_base() + impl.config.max_ack_delay);
-    want_path = want_path || !impl.new_ids_pending.empty() || !impl.remote_ids.pending_retires().empty();
+    want_path = want_path || !impl.new_ids_pending.empty() || !impl.remote_ids.pending_retires().empty() || !impl.new_token_pending.empty();
   }
 
   bool want_streams = false;
@@ -1603,7 +1695,10 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   }
   else
   {
-    const auto token = *kind == packet_kind_t::initial ? std::span<const std::uint8_t>(impl.retry_token) : std::span<const std::uint8_t>{};
+    // Section 8.1.3: a Retry replaces whatever token was being carried, so the
+    // Retry token wins when there is one.
+    const auto carried = !impl.retry_token.empty() ? std::span<const std::uint8_t>(impl.retry_token) : std::span<const std::uint8_t>(impl.config.address_token);
+    const auto token = *kind == packet_kind_t::initial ? carried : std::span<const std::uint8_t>{};
     begun = builder.begin_long(*kind, quic_version_1, impl.peer_connection_id, impl.local_connection_id, token, packet_number, std::nullopt);
   }
   if (!begun)
@@ -1736,6 +1831,18 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       }
       impl.remote_ids.clear_pending_retire(sequence);
       record.push_back(sent_frame_t{.kind = frame_kind_t::retire_connection_id, .sequence = sequence});
+    }
+
+    if (!impl.new_token_pending.empty())
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::new_token;
+      frame.data = impl.new_token_pending;
+      if (frames.write(frame))
+      {
+        record.push_back(sent_frame_t{.kind = frame_kind_t::new_token});
+        impl.new_token_pending.clear();
+      }
     }
 
     for (auto it = impl.new_ids_pending.begin(); it != impl.new_ids_pending.end();)
@@ -2388,6 +2495,10 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   {
     return std::unexpected(r.error());
   }
+  if (auto r = issue_new_token(impl, now); !r.has_value())
+  {
+    return std::unexpected(r.error());
+  }
   if (auto deadline = idle_deadline(impl); deadline.has_value() && now >= *deadline)
   {
     // Section 10.1: silently closed and the state discarded. No
@@ -2635,6 +2746,11 @@ bool connection_t::handshake_confirmed() const
 bool connection_t::address_validated_by_retry() const
 {
   return _impl->validated_by_retry;
+}
+
+std::span<const std::uint8_t> connection_t::new_token() const
+{
+  return _impl->received_new_token;
 }
 
 bool connection_t::version_negotiation_failed() const
