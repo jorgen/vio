@@ -86,6 +86,11 @@ add_executable(vio_interop_server EXCLUDE_FROM_ALL interop_server.cpp)
 CmDepTargetLinkLibrary(vio_interop_server PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
 target_include_directories(vio_interop_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# What the AEAD costs per packet, for comparing against another stack's crypto.
+add_executable(vio_crypto_bench EXCLUDE_FROM_ALL crypto_bench.cpp)
+CmDepTargetLinkLibrary(vio_crypto_bench PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+target_include_directories(vio_crypto_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The endpoint the QUIC Interop Runner drives, as both client and server. Its
 # whole interface is the environment, so it takes no arguments.
 add_executable(vio_interop_endpoint EXCLUDE_FROM_ALL interop_endpoint.cpp)
