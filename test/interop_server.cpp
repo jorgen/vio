@@ -129,6 +129,7 @@ int main(int argc, char **argv)
   const char *name = argc > 4 ? argv[4] : "test.example.com";
   const int seconds = argc > 5 ? std::atoi(argv[5]) : 15;
   const bool use_retry = argc > 6 && std::strcmp(argv[6], "retry") == 0;
+  const char *qlog_dir = argc > 7 ? argv[7] : nullptr;
 
   const auto identity = make_self_signed(name);
   write_file(cert_path, identity.certificate_pem);
@@ -141,7 +142,7 @@ int main(int argc, char **argv)
   loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &event_loop, const identity_t &pem, int listen_port, const char *protocol, int lifetime, bool retry, int &handshakes, std::size_t &bytes_read, std::size_t &answered) -> task_t<void>
+      return [](event_loop_t &event_loop, const identity_t &pem, int listen_port, const char *protocol, int lifetime, bool retry, const char *qlog_dir, int &handshakes, std::size_t &bytes_read, std::size_t &answered) -> task_t<void>
       {
         tls_config_t tls;
         tls.role = tls_role_t::server;
@@ -161,6 +162,10 @@ int main(int argc, char **argv)
         config.connection.role = tls_role_t::server;
         config.connection.transport_parameters = parameters();
         config.ecn = true;
+        if (qlog_dir != nullptr)
+        {
+          config.qlog_directory = qlog_dir;
+        }
 
         // A Retry forces the client to prove it can receive at the address it
         // claims, which is the address-validation half of the anti-amplification
@@ -263,7 +268,7 @@ int main(int argc, char **argv)
         server.reset();
         co_await sleep(event_loop, 50ms);
         event_loop.stop();
-      }(loop, identity, port, alpn, seconds, use_retry, handshakes, bytes_read, answered);
+      }(loop, identity, port, alpn, seconds, use_retry, qlog_dir, handshakes, bytes_read, answered);
     });
 
   loop.run();

@@ -56,6 +56,7 @@
 #include <memory>
 #include <string_view>
 #include <unordered_map>
+#include <string>
 #include <vector>
 
 namespace vio::quic
@@ -79,6 +80,11 @@ struct endpoint_config_t
   // Section 10.3. Also what lets this endpoint answer for connections it has
   // forgotten, so it outlives any one of them.
   const stateless_reset_key_t *stateless_reset_key = nullptr;
+
+  // Where to write a qlog trace per connection, named for the connection ID
+  // the client first chose so both ends of the same connection can be found
+  // and loaded together. Empty traces nothing.
+  std::string qlog_directory;
 
   // Section 13.4. Marks outgoing datagrams ECT(0), so routers can report
   // congestion by setting a bit rather than dropping the packet, and the peer's

@@ -425,7 +425,31 @@ void send_retry(endpoint_impl_t &impl, const packet_header_t &header, const sock
   send_to(impl, std::span<const std::uint8_t>(out).first(head + retry_integrity_tag_size), address);
 }
 
-[[nodiscard]] connection_entry_t *accept_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address, const packet_header_t &header)
+// Named for the connection ID the client first chose, which is the one
+// identifier both ends agree on before anything else is settled -- so a trace
+// from each side of the same connection can be found and loaded together.
+void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connection_id_t &odcid, bool server, tick_t reference)
+{
+  if (impl.config.qlog_directory.empty())
+  {
+    return;
+  }
+  std::string path = impl.config.qlog_directory;
+  if (!path.empty() && path.back() != '/' && path.back() != '\\')
+  {
+    path.push_back('/');
+  }
+  static constexpr char digits[] = "0123456789abcdef";
+  for (const auto byte : odcid.bytes())
+  {
+    path.push_back(digits[byte >> 4]);
+    path.push_back(digits[byte & 0x0f]);
+  }
+  path.append(server ? ".server.qlog" : ".client.qlog");
+  connection.set_qlog(qlog_writer_t::create(path, server ? "server" : "client", odcid.bytes(), reference));
+}
+
+[[nodiscard]] connection_entry_t *accept_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address, const packet_header_t &header, tick_t now)
 {
   if (impl.config.connection.role != tls_role_t::server)
   {
@@ -467,6 +491,7 @@ void send_retry(endpoint_impl_t &impl, const packet_header_t &header, const sock
 
   auto entry = std::make_unique<connection_entry_t>();
   entry->connection = std::make_unique<connection_t>(std::move(*created));
+  attach_qlog(impl, *entry->connection, header.destination_id, true, now);
   entry->peer_bytes = config.peer_address;
   std::memcpy(&entry->peer, address, address->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in));
 
@@ -666,6 +691,7 @@ std::expected<connection_t *, error_t> endpoint_t::connect(const sockaddr *addre
 
   auto entry = std::make_unique<connection_entry_t>();
   entry->connection = std::make_unique<connection_t>(std::move(*created));
+  attach_qlog(impl, *entry->connection, entry->connection->original_destination_id(), false, loop_now(impl.loop));
   entry->peer_bytes = config.peer_address;
   std::memcpy(&entry->peer, address, address->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in));
 
@@ -820,7 +846,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
         continue;
       }
 
-      entry = accept_connection(impl, bytes, sender, *initial);
+      entry = accept_connection(impl, bytes, sender, *initial, now);
       if (entry == nullptr)
       {
         send_stateless_reset(impl, bytes, sender, now);

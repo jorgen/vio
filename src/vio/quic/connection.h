@@ -50,6 +50,7 @@
 #include "vio/quic/connection_id.h"
 #include "vio/quic/ecn.h"
 #include "vio/quic/path.h"
+#include "vio/quic/qlog.h"
 #include "vio/quic/retry_token.h"
 #include "vio/quic/stateless_reset.h"
 #include "vio/quic/stream.h"
@@ -291,6 +292,12 @@ public:
 
   // Queues a CONNECTION_CLOSE. The frame goes out on the next poll_send.
   void close(std::uint64_t error_code, std::string_view reason, bool application = false);
+
+  // Traces this connection to a qlog file. The connection owns the writer, so
+  // the trace is closed when the connection is. Nothing is traced without
+  // one, and the checks around each event are a null pointer test.
+  void set_qlog(std::unique_ptr<qlog_writer_t> writer);
+  [[nodiscard]] bool tracing() const;
 
   // Opens the next stream this endpoint may initiate, or nothing when the
   // peer's limit is reached. Section 4.6 forbids exceeding it, so a caller is

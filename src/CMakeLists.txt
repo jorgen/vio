@@ -15,6 +15,7 @@ else()
             crypto_encoding.cpp
             quic_tls.cpp
             quic_connection.cpp
+            quic_qlog.cpp
             quic_endpoint.cpp
         )
     else()
@@ -25,6 +26,7 @@ else()
             crypto_encoding.cpp
             quic_tls.cpp
             quic_connection.cpp
+            quic_qlog.cpp
             quic_endpoint.cpp
         )
         target_compile_definitions(vio PUBLIC VIO_STATIC_DEFINE)

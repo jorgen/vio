@@ -282,6 +282,12 @@ struct connection_impl_t
   // non-probing packet that put them there -- reordering must not drag the
   // connection back to an address the peer has already left.
   std::vector<std::uint8_t> peer_address;
+  std::unique_ptr<qlog_writer_t> qlog;
+  // Recovery events discovered while a packet_received event is still open.
+  // They describe the packet but are not part of it, so they wait for it to
+  // close rather than nesting inside its frame list.
+  std::vector<std::uint64_t> qlog_pending_lost;
+  bool qlog_metrics_pending = false;
   bool peer_address_known = false;
   std::uint64_t highest_non_probing = 0;
   bool have_non_probing = false;
@@ -512,6 +518,149 @@ void note_blocked(connection_impl_t &impl, stream_t &stream)
       impl.data_blocked_at = limit;
     }
   }
+}
+
+// The qlog frame_type names are the RFC's frame names in lower case, which is
+// what qvis matches on.
+[[nodiscard]] std::string_view qlog_frame_name(frame_kind_t kind)
+{
+  switch (kind)
+  {
+  case frame_kind_t::padding:
+    return "padding";
+  case frame_kind_t::ping:
+    return "ping";
+  case frame_kind_t::ack:
+    return "ack";
+  case frame_kind_t::reset_stream:
+    return "reset_stream";
+  case frame_kind_t::stop_sending:
+    return "stop_sending";
+  case frame_kind_t::crypto:
+    return "crypto";
+  case frame_kind_t::new_token:
+    return "new_token";
+  case frame_kind_t::stream:
+    return "stream";
+  case frame_kind_t::max_data:
+    return "max_data";
+  case frame_kind_t::max_stream_data:
+    return "max_stream_data";
+  case frame_kind_t::max_streams:
+    return "max_streams";
+  case frame_kind_t::data_blocked:
+    return "data_blocked";
+  case frame_kind_t::stream_data_blocked:
+    return "stream_data_blocked";
+  case frame_kind_t::streams_blocked:
+    return "streams_blocked";
+  case frame_kind_t::new_connection_id:
+    return "new_connection_id";
+  case frame_kind_t::retire_connection_id:
+    return "retire_connection_id";
+  case frame_kind_t::path_challenge:
+    return "path_challenge";
+  case frame_kind_t::path_response:
+    return "path_response";
+  case frame_kind_t::connection_close:
+    return "connection_close";
+  case frame_kind_t::handshake_done:
+    return "handshake_done";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string_view qlog_packet_name(packet_kind_t kind)
+{
+  switch (kind)
+  {
+  case packet_kind_t::initial:
+    return "initial";
+  case packet_kind_t::zero_rtt:
+    return "0RTT";
+  case packet_kind_t::handshake:
+    return "handshake";
+  case packet_kind_t::retry:
+    return "retry";
+  case packet_kind_t::one_rtt:
+    return "1RTT";
+  case packet_kind_t::version_negotiation:
+    return "version_negotiation";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] packet_kind_t packet_kind_for_level(encryption_level_t level)
+{
+  switch (level)
+  {
+  case encryption_level_t::initial:
+    return packet_kind_t::initial;
+  case encryption_level_t::handshake:
+    return packet_kind_t::handshake;
+  default:
+    return packet_kind_t::one_rtt;
+  }
+}
+
+// What the recovery and congestion state looked like after whatever just
+// happened. qvis draws its congestion graph from these, so one goes out after
+// every acknowledgement and every loss rather than on a timer.
+void qlog_lost(connection_impl_t &impl, const std::vector<sent_packet_t> &lost, tick_t now)
+{
+  if (impl.qlog == nullptr)
+  {
+    return;
+  }
+  for (const auto &packet : lost)
+  {
+    impl.qlog->begin_event(now, "recovery", "packet_lost");
+    impl.qlog->begin_object("header");
+    impl.qlog->field_number("packet_number", packet.packet_number);
+    impl.qlog->field_number("packet_size", packet.size);
+    impl.qlog->end_object();
+    impl.qlog->end_event();
+  }
+}
+
+// Whatever the frames of a just-closed packet turned up.
+void qlog_drain_pending(connection_impl_t &impl, tick_t now)
+{
+  if (impl.qlog == nullptr)
+  {
+    return;
+  }
+  for (const auto number : impl.qlog_pending_lost)
+  {
+    impl.qlog->begin_event(now, "recovery", "packet_lost");
+    impl.qlog->begin_object("header");
+    impl.qlog->field_number("packet_number", number);
+    impl.qlog->end_object();
+    impl.qlog->end_event();
+  }
+  impl.qlog_pending_lost.clear();
+}
+
+void qlog_metrics(connection_impl_t &impl, tick_t now)
+{
+  if (impl.qlog == nullptr)
+  {
+    return;
+  }
+  impl.qlog->begin_event(now, "recovery", "metrics_updated");
+  impl.qlog->field_number("cwnd", impl.congestion.window());
+  impl.qlog->field_number("bytes_in_flight", impl.recovery.bytes_in_flight());
+  const auto smoothed = std::chrono::duration_cast<std::chrono::microseconds>(impl.recovery.rtt().smoothed()).count();
+  const auto latest = std::chrono::duration_cast<std::chrono::microseconds>(impl.recovery.rtt().latest()).count();
+  if (smoothed > 0)
+  {
+    impl.qlog->field_number("smoothed_rtt", static_cast<std::uint64_t>(smoothed));
+  }
+  if (latest > 0)
+  {
+    impl.qlog->field_number("latest_rtt", static_cast<std::uint64_t>(latest));
+  }
+  impl.qlog->end_event();
 }
 
 void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, std::uint64_t packet_number, std::size_t datagram_size, tick_t now)
@@ -1005,6 +1154,43 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       return ack_eliciting;
     }
     const auto &frame = next->value();
+    if (impl.qlog != nullptr)
+    {
+      impl.qlog->begin_object();
+      impl.qlog->field_string("frame_type", qlog_frame_name(frame.kind));
+      if (frame.kind == frame_kind_t::stream)
+      {
+        impl.qlog->field_number("stream_id", frame.stream_id);
+        impl.qlog->field_number("offset", frame.offset);
+        impl.qlog->field_number("length", frame.data.size());
+        impl.qlog->field_bool("fin", frame.fin);
+      }
+      else if (frame.kind == frame_kind_t::crypto)
+      {
+        impl.qlog->field_number("offset", frame.offset);
+        impl.qlog->field_number("length", frame.data.size());
+      }
+      else if (frame.kind == frame_kind_t::ack)
+      {
+        impl.qlog->field_number("largest_acknowledged", frame.largest_acknowledged);
+        impl.qlog->field_number("ack_delay", frame.ack_delay);
+      }
+      else if (frame.kind == frame_kind_t::max_data || frame.kind == frame_kind_t::max_stream_data || frame.kind == frame_kind_t::max_streams)
+      {
+        impl.qlog->field_number("maximum", frame.maximum);
+      }
+      else if (frame.kind == frame_kind_t::new_connection_id || frame.kind == frame_kind_t::retire_connection_id)
+      {
+        impl.qlog->field_number("sequence_number", frame.sequence_number);
+        impl.qlog->field_number("retire_prior_to", frame.retire_prior_to);
+      }
+      else if (frame.kind == frame_kind_t::connection_close)
+      {
+        impl.qlog->field_number("error_code", frame.error_code);
+        impl.qlog->field_bool("application", frame.application_error);
+      }
+      impl.qlog->end_object();
+    }
     const auto properties = frame_properties(frame.type);
     if (properties.has_value() && properties->ack_eliciting)
     {
@@ -1073,6 +1259,14 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       // endpoint applied to the packets being acknowledged.
       apply_ecn_feedback(impl, impl.spaces[static_cast<std::size_t>(space)], frame, outcome, now);
 
+      if (impl.qlog != nullptr)
+      {
+        for (const auto &packet : outcome.lost)
+        {
+          impl.qlog_pending_lost.push_back(packet.packet_number);
+        }
+        impl.qlog_metrics_pending = true;
+      }
       impl.congestion.on_packets_lost(outcome.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
       repair_lost(impl, space, outcome.lost);
       break;
@@ -1633,7 +1827,28 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   }
 
   bool non_probing = false;
+  if (impl.qlog != nullptr)
+  {
+    impl.qlog->begin_event(now, "transport", "packet_received");
+    impl.qlog->field_string("packet_type", qlog_packet_name(header.kind));
+    impl.qlog->begin_object("header");
+    impl.qlog->field_number("packet_number", opened->packet_number);
+    impl.qlog->field_number("packet_size", opened->payload.size());
+    impl.qlog->end_object();
+    impl.qlog->begin_array("frames");
+  }
   auto ack_eliciting = process_frames(impl, opened->payload, header.kind, now, header.destination_id, non_probing);
+  if (impl.qlog != nullptr)
+  {
+    impl.qlog->end_array();
+    impl.qlog->end_event();
+    qlog_drain_pending(impl, now);
+    if (impl.qlog_metrics_pending)
+    {
+      impl.qlog_metrics_pending = false;
+      qlog_metrics(impl, now);
+    }
+  }
   if (!ack_eliciting.has_value())
   {
     return std::unexpected(ack_eliciting.error());
@@ -2342,6 +2557,46 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   sent.in_flight = sent.ack_eliciting;
   sent.size = *length;
   sent.ecn = impl.ecn_sending;
+  if (impl.qlog != nullptr)
+  {
+    impl.qlog->begin_event(now, "transport", "packet_sent");
+    impl.qlog->field_string("packet_type", qlog_packet_name(packet_kind_for_level(level)));
+    impl.qlog->begin_object("header");
+    impl.qlog->field_number("packet_number", packet_number);
+    impl.qlog->field_number("packet_size", *length);
+    impl.qlog->end_object();
+    impl.qlog->begin_array("frames");
+    if (wrote_ack)
+    {
+      // The ACK is not in the record: section 2 of RFC 9002 leaves it
+      // untracked for loss, so nothing retransmits it. It is still the frame
+      // the reader of a trace most wants to see.
+      impl.qlog->begin_object();
+      impl.qlog->field_string("frame_type", "ack");
+      impl.qlog->end_object();
+    }
+    for (const auto &logged : record)
+    {
+      impl.qlog->begin_object();
+      impl.qlog->field_string("frame_type", qlog_frame_name(logged.kind));
+      if (logged.kind == frame_kind_t::stream || logged.kind == frame_kind_t::crypto)
+      {
+        if (logged.kind == frame_kind_t::stream)
+        {
+          impl.qlog->field_number("stream_id", logged.stream_id);
+        }
+        impl.qlog->field_number("offset", logged.offset);
+        impl.qlog->field_number("length", logged.length);
+      }
+      else if (logged.kind == frame_kind_t::new_connection_id || logged.kind == frame_kind_t::retire_connection_id)
+      {
+        impl.qlog->field_number("sequence_number", logged.sequence);
+      }
+      impl.qlog->end_object();
+    }
+    impl.qlog->end_array();
+    impl.qlog->end_event();
+  }
   sent.frames = std::move(record);
   impl.recovery.on_packet_sent(to_pn_space(level), std::move(sent));
   return *length;
@@ -2647,8 +2902,10 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     auto expiry = impl.recovery.on_loss_detection_timeout(now, context);
     if (expiry.loss_space.has_value())
     {
+      qlog_lost(impl, expiry.lost, now);
       impl.congestion.on_packets_lost(expiry.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
       repair_lost(impl, *expiry.loss_space, expiry.lost);
+      qlog_metrics(impl, now);
     }
     if (expiry.probe_space.has_value())
     {
@@ -2973,6 +3230,16 @@ std::string_view connection_t::selected_alpn() const
 std::optional<connection_close_t> connection_t::close_reason() const
 {
   return _impl->close_reason;
+}
+
+void connection_t::set_qlog(std::unique_ptr<qlog_writer_t> writer)
+{
+  _impl->qlog = std::move(writer);
+}
+
+bool connection_t::tracing() const
+{
+  return _impl->qlog != nullptr;
 }
 
 void connection_t::close(std::uint64_t error_code, std::string_view reason, bool application)
