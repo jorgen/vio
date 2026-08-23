@@ -208,6 +208,17 @@ public:
   // Section 5.1: how many connection IDs each side currently has available.
   // A peer that has run out cannot migrate, since section 9.5 requires it to
   // move to an ID the old path never saw.
+  // Section 7.2: the unpredictable value the client put in the Destination
+  // Connection ID of its first Initial. A server has to keep answering to it
+  // until the client has seen the server's own choice and switched, which is
+  // why a demultiplexer routes on it as well as on the issued ids.
+  [[nodiscard]] const connection_id_t &original_destination_id() const;
+
+  // Every connection ID this endpoint currently accepts as a destination.
+  // A demultiplexer needs all of them, not just the handshake one, or a peer
+  // that rotates becomes unreachable.
+  [[nodiscard]] std::vector<connection_id_t> issued_connection_ids() const;
+
   [[nodiscard]] std::size_t peer_connection_id_count() const;
   [[nodiscard]] std::size_t issued_connection_id_count() const;
 

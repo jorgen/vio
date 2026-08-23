@@ -2606,6 +2606,21 @@ std::uint64_t connection_t::migration_count() const
   return _impl->migrations;
 }
 
+const connection_id_t &connection_t::original_destination_id() const
+{
+  return _impl->original_destination_id;
+}
+
+std::vector<connection_id_t> connection_t::issued_connection_ids() const
+{
+  std::vector<connection_id_t> out;
+  for (const auto &entry : _impl->local_ids.active())
+  {
+    out.push_back(entry.id);
+  }
+  return out;
+}
+
 std::size_t connection_t::peer_connection_id_count() const
 {
   return _impl->remote_ids.active_count();

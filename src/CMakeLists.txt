@@ -15,6 +15,7 @@ else()
             crypto_encoding.cpp
             quic_tls.cpp
             quic_connection.cpp
+            quic_endpoint.cpp
         )
     else()
         add_library(vio STATIC
@@ -24,6 +25,7 @@ else()
             crypto_encoding.cpp
             quic_tls.cpp
             quic_connection.cpp
+            quic_endpoint.cpp
         )
         target_compile_definitions(vio PUBLIC VIO_STATIC_DEFINE)
     endif()

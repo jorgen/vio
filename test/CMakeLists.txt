@@ -24,6 +24,7 @@ add_executable(vio_tests
     test_quic_path.cpp
     test_quic_connection_ids.cpp
     test_quic_stateless_reset.cpp
+    test_quic_endpoint.cpp
     test_quic_congestion.cpp
     test_quic_streams.cpp
     test_http_client.cpp

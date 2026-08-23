@@ -1,0 +1,205 @@
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <doctest/doctest.h>
+#include <vio/event_loop.h>
+#include <vio/operation/sleep.h>
+#include <vio/operation/tcp.h>
+#include <vio/quic/endpoint.h>
+#include <vio/task.h>
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
+// A QUIC handshake over a real UDP socket. Everything below the endpoint has
+// been exercised by handing byte arrays between two connections; this is the
+// first test where datagrams are demultiplexed by connection ID, timers come
+// from the event loop, and nothing hands either side its cue.
+
+namespace
+{
+using namespace std::chrono_literals;
+
+struct certificate_t
+{
+  std::vector<std::uint8_t> certificate_pem;
+  std::vector<std::uint8_t> private_key_pem;
+};
+
+std::vector<std::uint8_t> read_bio(BIO *bio)
+{
+  std::vector<std::uint8_t> out(static_cast<std::size_t>(BIO_pending(bio)));
+  if (!out.empty())
+  {
+    BIO_read(bio, out.data(), static_cast<int>(out.size()));
+  }
+  return out;
+}
+
+certificate_t make_self_signed(const char *common_name)
+{
+  EVP_PKEY *key = nullptr;
+  EVP_PKEY_CTX *context = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+  REQUIRE(EVP_PKEY_keygen_init(context) == 1);
+  REQUIRE(EVP_PKEY_CTX_set_ec_paramgen_curve_nid(context, NID_X9_62_prime256v1) == 1);
+  REQUIRE(EVP_PKEY_keygen(context, &key) == 1);
+  EVP_PKEY_CTX_free(context);
+
+  X509 *certificate = X509_new();
+  X509_set_version(certificate, 2);
+  ASN1_INTEGER_set(X509_get_serialNumber(certificate), 1);
+  X509_gmtime_adj(X509_getm_notBefore(certificate), 0);
+  X509_gmtime_adj(X509_getm_notAfter(certificate), 31536000L);
+  REQUIRE(X509_set_pubkey(certificate, key) == 1);
+  X509_NAME *name = X509_get_subject_name(certificate);
+  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>(common_name), -1, -1, 0);
+  REQUIRE(X509_set_issuer_name(certificate, name) == 1);
+  const std::string alt_name = std::string("DNS:") + common_name;
+  X509_EXTENSION *basic = X509V3_EXT_conf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
+  X509_add_ext(certificate, basic, -1);
+  X509_EXTENSION_free(basic);
+  X509_EXTENSION *san = X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name, alt_name.c_str());
+  X509_add_ext(certificate, san, -1);
+  X509_EXTENSION_free(san);
+  REQUIRE(X509_sign(certificate, key, EVP_sha256()) > 0);
+
+  BIO *certificate_bio = BIO_new(BIO_s_mem());
+  BIO *key_bio = BIO_new(BIO_s_mem());
+  REQUIRE(PEM_write_bio_X509(certificate_bio, certificate) == 1);
+  REQUIRE(PEM_write_bio_PrivateKey(key_bio, key, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+  certificate_t out{.certificate_pem = read_bio(certificate_bio), .private_key_pem = read_bio(key_bio)};
+  BIO_free(certificate_bio);
+  BIO_free(key_bio);
+  X509_free(certificate);
+  EVP_PKEY_free(key);
+  return out;
+}
+
+vio::quic::transport_parameters_t sane_parameters()
+{
+  vio::quic::transport_parameters_t parameters;
+  parameters.max_idle_timeout = 30000;
+  parameters.initial_max_data = 1048576;
+  parameters.initial_max_stream_data_bidi_local = 262144;
+  parameters.initial_max_stream_data_bidi_remote = 262144;
+  parameters.initial_max_streams_bidi = 16;
+  parameters.active_connection_id_limit = 4;
+  return parameters;
+}
+} // namespace
+
+TEST_SUITE("quic endpoint")
+{
+TEST_CASE("a client and a server reach each other over a UDP socket")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool handshaken = false;
+  std::string received;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, std::string &received) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.connection.transport_parameters = sane_parameters();
+        auto server = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server.has_value());
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        connection_t *accepted = nullptr;
+        server->on_connection([&accepted](connection_t &connection) { accepted = &connection; });
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        client_config.connection.transport_parameters = sane_parameters();
+        auto client = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client.has_value());
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        REQUIRE(dialled.has_value());
+        connection_t *connection = *dialled;
+
+        // The endpoints drive themselves from here: the handshake is several
+        // round trips, and nothing in this test hands either side a packet.
+        for (int i = 0; i < 200 && !connection->handshake_complete(); ++i)
+        {
+          co_await sleep(loop, 5ms);
+        }
+        handshaken = connection->handshake_complete();
+
+        if (handshaken)
+        {
+          auto stream = connection->open_stream(stream_direction_t::bidirectional);
+          if (stream.has_value())
+          {
+            const std::string message = "over a real socket";
+            const std::vector<std::uint8_t> payload(message.begin(), message.end());
+            (void)connection->write_stream(*stream, payload, true);
+            (void)client->flush();
+
+            for (int i = 0; i < 200; ++i)
+            {
+              if (accepted != nullptr)
+              {
+                auto readable = accepted->readable_stream(*stream);
+                if (readable.size() >= message.size())
+                {
+                  received.assign(reinterpret_cast<const char *>(readable.data()), readable.size());
+                  break;
+                }
+              }
+              co_await sleep(loop, 5ms);
+            }
+          }
+        }
+
+        server_cancel.cancel();
+        client_cancel.cancel();
+        co_await sleep(loop, 20ms);
+        loop.stop();
+      }(event_loop, identity, handshaken, received);
+    });
+
+  event_loop.run();
+  CHECK(handshaken);
+  CHECK(received == "over a real socket");
+}
+}
