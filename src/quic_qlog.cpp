@@ -100,6 +100,10 @@ void append_signed(std::string &out, std::int64_t value)
 // killed rather than only after it exits.
 constexpr char trace_terminator[] = "]}]}\n";
 
+// How much of a connection is written out one event at a time. Comfortably
+// past a handshake and whatever follows it, and far short of a transfer.
+constexpr std::uint64_t early_events = 256;
+
 struct qlog_writer_t::state_t
 {
   std::FILE *file = nullptr;
@@ -116,6 +120,7 @@ struct qlog_writer_t::state_t
   // fields landing in the outer event and its end closing that one early.
   bool in_event = false;
   int suppressed = 0;
+  std::uint64_t events_written = 0;
 
   // A killed process never runs a destructor, and a trace is most wanted when
   // the run it describes ended badly. Everything buffered goes out followed by
@@ -237,9 +242,14 @@ void qlog_writer_t::end_event()
   _state->buffer.append("}]");
   _state->first_in_scope = false;
 
-  // Flushing per event would make tracing dominate the cost of the thing being
-  // traced; a trace cut short keeps everything up to the last block.
-  if (_state->buffer.size() >= 8 * 1024)
+  // A connection is written out event by event until it is clearly not a short
+  // one, and in blocks after that. Buffering loses whatever it holds when the
+  // process is killed, and a handshake is a few hundred bytes -- the entire
+  // trace of a short connection is exactly what would go missing. Paying that
+  // per event for a bulk transfer instead costs several times the throughput,
+  // which would distort the timing a trace exists to show.
+  ++_state->events_written;
+  if (_state->events_written <= early_events || _state->buffer.size() >= 8 * 1024)
   {
     _state->flush(false);
   }
