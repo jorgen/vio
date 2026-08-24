@@ -228,7 +228,15 @@ private:
 // while it checks whether the rise was real.
 struct hystart_constants_t
 {
-  static constexpr std::chrono::microseconds min_rtt_thresh{4000};
+  // RFC 9406 recommends 4ms here, and says an implementation may pick its own.
+  // 4ms is a floor, and on a low latency path it is the term that wins: at a
+  // 20ms round trip the eighth below is 2.5ms, so the floor -- not the path --
+  // decides, and nothing is noticed until the queue is already several times
+  // the bandwidth-delay product. 1ms lets the proportional term do the work it
+  // was written to do. Detecting early is cheap because the conservative phase
+  // has to confirm the rise before slow start actually ends: a false positive
+  // costs a few rounds at quarter growth, not a lost window.
+  static constexpr std::chrono::microseconds min_rtt_thresh{1000};
   static constexpr std::chrono::microseconds max_rtt_thresh{16000};
   static constexpr std::int64_t min_rtt_divisor = 8;
   // Fewer samples than this in a round says nothing about the path.
@@ -301,6 +309,15 @@ public:
     _largest_sent = (std::max)(_largest_sent, packet_number);
   }
 
+  // Section 4.2: an eighth of the round's minimum, held between the floor and
+  // ceiling above so neither a very fast path nor a very slow one makes the
+  // test meaningless.
+  [[nodiscard]] static std::chrono::nanoseconds rise_threshold(std::chrono::nanoseconds base)
+  {
+    const auto eighth = base / hystart_constants_t::min_rtt_divisor;
+    return (std::max<std::chrono::nanoseconds>)(hystart_constants_t::min_rtt_thresh, (std::min<std::chrono::nanoseconds>)(eighth, hystart_constants_t::max_rtt_thresh));
+  }
+
   // One round trip sample, from the acknowledgement that produced it.
   void on_rtt_sample(std::chrono::nanoseconds latest)
   {
@@ -315,12 +332,7 @@ public:
     {
       return;
     }
-    // Section 4.2: an eighth of the previous round's minimum, held between 4ms
-    // and 16ms so neither a very fast path nor a very slow one makes the test
-    // meaningless.
-    const auto eighth = _last_round_min_rtt / hystart_constants_t::min_rtt_divisor;
-    const auto threshold = (std::max<std::chrono::nanoseconds>)(hystart_constants_t::min_rtt_thresh, (std::min<std::chrono::nanoseconds>)(eighth, hystart_constants_t::max_rtt_thresh));
-    if (_current_round_min_rtt >= _last_round_min_rtt + threshold)
+    if (_current_round_min_rtt >= _last_round_min_rtt + rise_threshold(_last_round_min_rtt))
     {
       _css_baseline_min_rtt = _current_round_min_rtt;
       _hystart = hystart_phase_t::conservative;
@@ -354,6 +366,18 @@ public:
         // Section 4.2: the rise did not hold, so it was a transient rather
         // than a queue, and full growth resumes.
         _hystart = hystart_phase_t::slow_start;
+      }
+      else if (_css_baseline_min_rtt != unset_rtt && _current_round_min_rtt != unset_rtt && _current_round_min_rtt >= _css_baseline_min_rtt + rise_threshold(_css_baseline_min_rtt))
+      {
+        // Measured against the baseline this phase started from, not against
+        // the round before it: the rise that opened the phase would otherwise
+        // close it again on the same evidence. Past the baseline by a further
+        // threshold means a further round's worth of queue arrived while the
+        // phase was making up its mind, which is the confirmation it exists to
+        // get. Serving out the remaining rounds would only add to the queue
+        // being complained about.
+        _slow_start_threshold = _window;
+        _hystart = hystart_phase_t::finished;
       }
       else if (_css_rounds >= hystart_constants_t::css_rounds)
       {

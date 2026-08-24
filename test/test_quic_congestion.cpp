@@ -427,6 +427,28 @@ TEST_CASE("a rise that does not hold puts slow start back")
   CHECK(control.in_slow_start());
 }
 
+TEST_CASE("a rise that keeps climbing does not wait out the confirmation")
+{
+  congestion_control_t control(datagram);
+  pipeline_t pipe{control};
+  pipe.send();
+  for (int i = 0; i < 3; ++i)
+  {
+    pipe.round(20ms);
+  }
+  pipe.round(40ms);
+  REQUIRE(control.hystart_phase() == hystart_phase_t::conservative);
+
+  // The queue did not stop at the depth that was noticed -- another round
+  // trip's worth of it arrived. That is what the confirmation phase is there
+  // to establish, so serving out its remaining rounds would only add to the
+  // queue being complained about. Slow start ends here rather than three
+  // rounds later.
+  pipe.round(60ms);
+  CHECK(control.hystart_phase() == hystart_phase_t::finished);
+  CHECK_FALSE(control.in_slow_start());
+}
+
 TEST_CASE("growth is a quarter of slow start while a rise is being confirmed")
 {
   congestion_control_t control(datagram);
