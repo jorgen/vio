@@ -172,8 +172,32 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   `congestion_control.h` is section 7 NewReno on top of it: slow start,
   recovery periods (a lost round trip is one congestion event, not one per
   packet), congestion avoidance with the integer remainder carried, and
-  persistent congestion. `poll_send` will not exceed the window, except for a
+  persistent congestion. Slow start ends on a rising round trip time
+  (HyStart++, RFC 9406) with two deliberate departures from the RFC's
+  recommended constants: `min_rtt_thresh` is 1ms rather than 4ms, because on a
+  low latency path the 4ms floor -- not the path -- decides, and the
+  conservative phase ends early when the round trip time climbs *past the
+  baseline it started from* rather than serving out all five rounds. Both exist
+  because the recommended values left the window at roughly eleven times the
+  bandwidth-delay product on a 20ms path; measured against picoquic they are
+  worth 128 -> 163 Mbps and 150 -> 78ms of queue. A cap on slow start growth
+  against the delivered rate was tried and reverted: it needs an
+  application-limited signal the controller does not have, and without one it
+  throttles a sender that simply has little to send. `poll_send` will not exceed the window, except for a
   PTO probe or a CONNECTION_CLOSE, which section 7.5 exempts.
+  **QUIC version 2 (RFC 9369)** is supported on both sides. It is version 1
+  with a different Initial salt, different HKDF labels, a different Retry key
+  and nonce, and long header type codes moved on by one; all of it is selected
+  from the version rather than duplicated. The version rides on the connection
+  (`connection_config_t::version` for a client to propose, adopted from the
+  client's first Initial by a server) and reaches the key schedule through
+  `packet_protection_t`, which has to remember it because every later key
+  generation is derived from the same labels. `endpoint_config_t::supported_versions`
+  defaults to both, so a v2 client is accepted and anything else still gets a
+  Version Negotiation. Verified against RFC 9369 Appendix A.1 and against
+  picoquic (`picoquicdemo -v 6b3343cf`), including ChaCha20 and HelloRetryRequest.
+  Compatible version negotiation (RFC 9368) is not implemented.
+
   `stream.h` and `streams.h` are sections 2 to 4: a stream is two independent
   halves that share an identifier, each with its own state machine and its own
   flow control limit, which is why `connection_t` asks
