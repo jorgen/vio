@@ -423,10 +423,12 @@ branch on the kind of close (defined in `ssl_engine.h`):
   under the old LibreSSL backend TLS 1.3 resumption could not work in either direction — its server
   never issued NewSessionTicket (`num_tickets` defaults to 0, and setting it to 2 with
   `SSL_SESS_CACHE_SERVER` still produced no ticket bytes) and its client never emitted
-  `pre_shared_key`, so only TLS 1.2 resumption (ticket in-handshake) was ever verified. BoringSSL
-  implements both sides, so the path is open — but it has **not been re-tested since the move**, so
-  treat TLS 1.3 resumption as unverified rather than working. `SSL_CTX_set_num_tickets(2)` is
-  correct on this backend.
+  `pre_shared_key`, so only TLS 1.2 resumption (ticket in-handshake) was ever verified. On
+  BoringSSL it works: `test_ssl_deep.cpp` now runs the same resumption check at **both** TLS 1.2
+  and TLS 1.3, and the 1.3 case resumes off a post-handshake NewSessionTicket. Note the two are
+  separate `TEST_CASE`s rather than `SUBCASE`s — the body stands up a server and an event loop, and
+  re-entering it for a second subcase in one process hangs. `SSL_CTX_set_num_tickets(2)` is correct
+  on this backend.
 - **`ssl_*_writev` / `ssl_*_shutdown`**: vectored writes coalesce buffers into one TLS record and
   go through the same producer high-water throttle as `begin_write` (the coalesced plaintext is
   owned in the write slot, so it survives being parked for backpressure); half-close sends a

@@ -274,23 +274,24 @@ TEST_CASE("TLS 1.3-only handshake round-trips")
   REQUIRE(verified);
 }
 
-TEST_CASE("session resumption: a second connection reuses the cached session")
+// Both versions deliver a resumption ticket, at different points: 1.2 inside
+// the handshake, 1.3 after it. The plumbing under test -- new-session callback
+// -> cache -> SSL_set_session -> reuse -- is the same either way, and the loops
+// below drain to end of stream so a post-handshake ticket arrives before the
+// connection goes away. Separate cases rather than subcases: the body stands up
+// a server and an event loop, which wants a clean process state each time.
+static void check_session_resumption(vio::tls_protocol_version version)
 {
   auto certs = make_cert_set("localhost");
   vio::ssl_config_t server_config{.ca_mem = certs.ca_cert, .cert_mem = certs.cert, .key_mem = certs.key};
   server_config.enable_session_cache = true; // issue resumption tickets
-  // Pin TLS 1.2: its session ticket is delivered within the handshake, so
-  // resumption is deterministic. (The session-cache plumbing being verified --
-  // new-session callback -> cache -> SSL_set_session -> reuse -- is
-  // version-independent. TLS 1.3 post-handshake ticket delivery with the bundled
-  // LibreSSL is a known follow-up; see the caveat in the docs.)
-  server_config.min_protocol = vio::tls_protocol_version::tls1_2;
-  server_config.max_protocol = vio::tls_protocol_version::tls1_2;
+  server_config.min_protocol = version;
+  server_config.max_protocol = version;
   vio::ssl_session_cache_t cache;
   vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
   client_config.session_cache = &cache;
-  client_config.min_protocol = vio::tls_protocol_version::tls1_2;
-  client_config.max_protocol = vio::tls_protocol_version::tls1_2;
+  client_config.min_protocol = version;
+  client_config.max_protocol = version;
   bool second_resumed = false;
 
   run_loop(
@@ -370,6 +371,16 @@ TEST_CASE("session resumption: a second connection reuses the cached session")
       el.stop();
     });
   REQUIRE(second_resumed);
+}
+
+TEST_CASE("session resumption: TLS 1.2 carries the ticket in the handshake")
+{
+  check_session_resumption(vio::tls_protocol_version::tls1_2);
+}
+
+TEST_CASE("session resumption: TLS 1.3 sends the ticket after the handshake")
+{
+  check_session_resumption(vio::tls_protocol_version::tls1_3);
 }
 
 TEST_CASE("OCSP staple: the server's stapled response is delivered to a requesting client")
