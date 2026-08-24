@@ -469,7 +469,7 @@ int main(int argc, char **argv)
     ids.push_back(*opened);
   }
 
-  const std::vector<std::uint8_t> small(256, 0x33);
+  const std::vector<std::uint8_t> small_payload(256, 0x33);
   report_t many;
   g_allocations = 0;
   g_bytes_allocated = 0;
@@ -480,7 +480,7 @@ int main(int argc, char **argv)
   {
     for (auto stream : ids)
     {
-      (void)client->write_stream(stream, small, false);
+      (void)client->write_stream(stream, small_payload, false);
     }
     for (;;)
     {
