@@ -49,7 +49,8 @@ REST service library), but stands alone as a general-purpose networking toolkit.
 - **TCP, TLS, UDP, DNS, files, timers, a thread pool, and event pipes** — one
   uniform coroutine surface over libuv.
 - **TLS** via BoringSSL through a compile-time SSL-backend seam (LibreSSL and
-  OpenSSL selectable), with ALPN, SNI, OCSP stapling, and session resumption.
+  OpenSSL arms exist in the seam), with ALPN, SNI, OCSP stapling, and session
+  resumption.
 - **Cancellation & timeouts** are first-class: pass a `cancellation_t*` to any
   cancellable op and cancel it from a watchdog coroutine.
 - **Backpressure-aware reads**: a queue reader, a **zero-copy `read_into`** that
@@ -274,9 +275,11 @@ are build-time only; neither ends up in the binary. Without an assembler
 BoringSSL's configure step stops rather than silently producing a build with no
 AES-NI in it, so a working Windows build is one that actually got the assembly.
 
-`VIO_SSL_BACKEND` selects the backend (`boringssl` by default, `libressl` or
-`openssl` against a system install). vio speaks the OpenSSL `SSL_*`/`BIO` API
-through `src/vio/ssl_backend.h`, which is the only place the three diverge.
+`VIO_SSL_BACKEND` selects the backend. vio speaks the OpenSSL `SSL_*`/`BIO` API
+through `src/vio/ssl_backend.h`, which is the only place the three diverge —
+but `boringssl` is the only value the build wires up today; the `libressl` and
+`openssl` arms keep the source portable and would each need fetching and linking
+before they could be selected.
 
 ## Consuming vio
 

@@ -53,12 +53,16 @@ else()
     # Select the SSL backend. PUBLIC so the define propagates to header-only
     # consumers (the seam #errors on a missing/ambiguous backend, catching a
     # header/library mismatch at compile time).
-    if(VIO_SSL_BACKEND STREQUAL "libressl")
-        target_compile_definitions(vio PUBLIC VIO_SSL_BACKEND_LIBRESSL)
-    elseif(VIO_SSL_BACKEND STREQUAL "openssl")
-        target_compile_definitions(vio PUBLIC VIO_SSL_BACKEND_OPENSSL)
-    elseif(VIO_SSL_BACKEND STREQUAL "boringssl")
+    # The seam carries libressl and openssl arms so the source keeps compiling
+    # against them, but the link line below names BoringSSL and nothing fetches
+    # the others -- so selecting one would compile for one library and link
+    # another. Refuse instead. A build directory configured before the BoringSSL
+    # move has the old value cached and lands here: delete it, or reconfigure
+    # with -DVIO_SSL_BACKEND=boringssl.
+    if(VIO_SSL_BACKEND STREQUAL "boringssl")
         target_compile_definitions(vio PUBLIC VIO_SSL_BACKEND_BORINGSSL)
+    elseif(VIO_SSL_BACKEND STREQUAL "libressl" OR VIO_SSL_BACKEND STREQUAL "openssl")
+        message(FATAL_ERROR "VIO_SSL_BACKEND='${VIO_SSL_BACKEND}': only boringssl is wired into the build. Wiring another means fetching it and pointing the BoringSSL::SSL/::Crypto targets at it.")
     else()
         message(FATAL_ERROR "Unknown VIO_SSL_BACKEND '${VIO_SSL_BACKEND}' (expected libressl|openssl|boringssl)")
     endif()

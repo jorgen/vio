@@ -14,8 +14,9 @@ option(VIO_BUILD_EXAMPLES "Build vio examples" ON)
 option(VIO_INSTALL "Generate install and package-config rules for vio" ON)
 
 # SSL backend selection. vio speaks the OpenSSL SSL_*/BIO API through a compile-time
-# seam (src/vio/ssl_backend.h). BoringSSL is what gets bundled and tested; the other
-# two are reachable against a system install and share the same seam.
+# seam (src/vio/ssl_backend.h). BoringSSL is the one the build wires up; the other
+# two exist as source-level arms of that seam and would each need fetching and
+# linking before they could be selected here.
 set(VIO_SSL_BACKEND "boringssl" CACHE STRING "SSL backend: libressl, openssl, or boringssl")
 set_property(CACHE VIO_SSL_BACKEND PROPERTY STRINGS libressl openssl boringssl)
 
