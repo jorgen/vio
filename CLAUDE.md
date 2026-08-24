@@ -1,6 +1,6 @@
 # VIO Project
 
-C++ async I/O library built on libuv with C++20 coroutines and libressl for TLS.
+C++ async I/O library built on libuv with C++20 coroutines and BoringSSL for TLS.
 
 ## Build
 
@@ -116,9 +116,9 @@ Configuration is in `.clang-tidy` at the project root.
   `test_quic_protection.cpp` reproduces the A.2/A.3/A.5 packets byte for byte.
   That is the only external check on the stack: everything below `protection.h`
   is tested only against itself. `tls.h` + `src/quic_tls.cpp` is the seam onto
-  LibreSSL's QUIC API (`SSL_CTX_set_quic_method`): CRYPTO bytes in and out,
+  BoringSSL's QUIC API (`SSL_CTX_set_quic_method`): CRYPTO bytes in and out,
   traffic secrets out per level, ALPN and transport parameters across. It
-  buffers incoming CRYPTO data per level, because LibreSSL accepts it only at
+  buffers incoming CRYPTO data per level, because the library accepts it only at
   the level it is currently reading while a peer may legitimately have the next
   level already in flight. 0-RTT is refused there explicitly rather than
   silently. `test_quic_tls.cpp` runs a full handshake with no socket under it
@@ -183,27 +183,33 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   how much credit the stream consumed, and a later frame implying a different
   one is a FINAL_SIZE_ERROR.
 - `test/` - Tests using doctest
-- `3rdparty/` - libuv, libressl, doctest, cmakerc, ada (fetched via cmake-dep)
+- `3rdparty/` - libuv, boringssl, doctest, cmakerc, ada (fetched via cmake-dep)
 
 ## Dependencies (toggles & install)
 
 Every dependency is togglable between the bundled fetch and a pre-installed copy.
 The knobs are **auto-declared by cmake-dep** from each `CmDepFetchPackage` call in
 `CMake/3rdPartyPackages.cmake`, prefixed by the project name (uppercased
-`PROJECT_NAME` → `VIO`): `VIO_USE_SYSTEM_{LIBUV,LIBRESSL,ADA,DOCTEST,CMAKERC}`
+`PROJECT_NAME` → `VIO`): `VIO_USE_SYSTEM_{LIBUV,BORINGSSL,ADA,DOCTEST,CMAKERC}`
 (default `OFF`) and `VIO_<DEP>_{VERSION,URL,SHA256}` overrides to fetch a different
-version/URL/hash without editing the packages file (e.g. a newer LibreSSL). When a
-toggle is `ON`, cmake-dep skips the fetch; `CMake/Build3rdParty.cmake` then drives
-libuv/ada/doctest through `CmDepAddPackage` (which owns the find-vs-build branch),
-while cmakerc (`include()`-based) and libressl (ExternalProject) branch by hand on
-the `${name}_USE_SYSTEM` signal, and `src/CMakeLists.txt` handles the system-libuv
-link (`libuv::uv_a`). `find_package(LibreSSL)` uses the config a CMake-built
-LibreSSL installs (`lib/cmake/LibreSSL/LibreSSLConfig.cmake`).
+version/URL/hash without editing the packages file. BoringSSL has no releases and
+no stable ABI, so it is pinned by commit and `VIO_BORINGSSL_URL`/`SHA256` are the
+overrides that matter. When a toggle is `ON`, cmake-dep skips the fetch;
+`CMake/Build3rdParty.cmake` then drives libuv/ada/doctest/boringssl through
+`CmDepAddPackage` (which owns the find-vs-build branch), while cmakerc
+(`include()`-based) branches by hand on the `${name}_USE_SYSTEM` signal, and
+`src/CMakeLists.txt` handles the system-libuv link (`libuv::uv_a`). BoringSSL
+builds in-tree (SYSTEM EXCLUDE_FROM_ALL, so none of its install rules or extra
+targets reach this project) and publishes plain `crypto`/`ssl` targets, aliased to
+`BoringSSL::Crypto`/`BoringSSL::SSL` so the link line reads the same either way.
+**Building it needs Go on `PATH`, and NASM on Windows** -- without an assembler its
+configure stops rather than handing back a build with no AES-NI, which is the trap
+LibreSSL fell into and the reason for the move.
 
 `VIO_INSTALL` (default `ON`) installs headers + the `vio` lib and, **when built
 against system deps**, a relocatable `find_package(vio)` package config
 (`vio::vio`, from `CMake/vioConfig.cmake.in`, which `find_dependency`s
-libuv/LibreSSL/ada and exports the bundled `cmrc-base`/`vio_default_certs`). A
+libuv/BoringSSL/ada and exports the bundled `cmrc-base`/`vio_default_certs`). A
 bundled-deps build vendors targets that aren't installed, so it installs lib +
 headers only (no config). `vio::vio` is aliased in-tree so consumers use one name
 either way. A downstream that `add_subdirectory`s vio (e.g. prism) should force
@@ -247,9 +253,14 @@ TLS rides libuv's **stream API** (`uv_read_start` / `uv_write` on the `uv_tcp_t`
 vio issues no raw `recv`/`send`, so libuv's backend (io_uring/IOCP) is invisible to the crypto
 layer. The pieces (all in `src/vio/`):
 
-- `ssl_backend.h` — compile-time backend seam (`VIO_SSL_BACKEND`); only bundled LibreSSL is wired.
-  Portable in-memory cert/key/CA loading (`BIO_new_mem_buf` + `PEM_read_bio_*`), feature-gated on
-  `LIBRESSL_VERSION_NUMBER` (never the fake `OPENSSL_VERSION_NUMBER = 0x20000000L`).
+- `ssl_backend.h` — compile-time backend seam (`VIO_SSL_BACKEND`); only bundled BoringSSL is
+  wired, and selecting another value is a configure error rather than a compile-for-one-link-to-
+  another mismatch. Portable in-memory cert/key/CA loading (`BIO_new_mem_buf` + `PEM_read_bio_*`),
+  feature-gated on the `VIO_SSL_BACKEND_*` macro plus the library's own identity macros (never the
+  raw `OPENSSL_VERSION_NUMBER`, which LibreSSL fakes as `0x20000000L`). On Windows it also undefs
+  `min`/`max` and wincrypt's X.509 name grabs before including any openssl header — BoringSSL does
+  not do that from the inside the way LibreSSL and OpenSSL do, **so every TU that touches openssl
+  must include `vio/ssl_backend.h` before it**.
 - `ssl_context.h` — `ssl_context_t`: a shared `SSL_CTX` built once from `ssl_config_t` (verify,
   ALPN, keylog, session cache). Server ALPN selection is hand-rolled (server preference, empty-list
   CVE-2024-5535 guard, `NOACK` on no overlap).
@@ -408,14 +419,14 @@ branch on the kind of close (defined in `ssl_engine.h`):
 - **Client session resumption** (`ssl_config_t.session_cache` → `ssl_session_cache_t`, app-owned,
   keyed by host): wired via `SSL_CTX_sess_set_new_cb` (fires when a ticket arrives) +
   `SSL_set_session` (before handshake). The peer host is stashed in SSL ex_data (`&engine.peer_name`)
-  to key the cache. `ssl_client_session_reused()` reports the result. **Caveat (root-caused, not a
-  vio bug):** the bundled **LibreSSL 4.1.0 TLS 1.3 *server* does not issue NewSessionTicket
-  messages** — a standalone LibreSSL probe over memory BIOs shows `num_tickets` defaults to 0 and
-  setting it to 2 (+ `SSL_SESS_CACHE_SERVER`) still produces no ticket bytes. So LibreSSL↔LibreSSL
-  TLS 1.3 resumption is impossible regardless of vio. The client-side resumption plumbing here is
-  correct: it is verified on TLS 1.2 (ticket in-handshake) and will resume over TLS 1.3 against any
-  server that issues tickets (OpenSSL/BoringSSL, or real-world servers). `SSL_CTX_set_num_tickets(2)`
-  is kept because it is correct for the backends that honor it.
+  to key the cache. `ssl_client_session_reused()` reports the result. **Caveat, now historical:**
+  under the old LibreSSL backend TLS 1.3 resumption could not work in either direction — its server
+  never issued NewSessionTicket (`num_tickets` defaults to 0, and setting it to 2 with
+  `SSL_SESS_CACHE_SERVER` still produced no ticket bytes) and its client never emitted
+  `pre_shared_key`, so only TLS 1.2 resumption (ticket in-handshake) was ever verified. BoringSSL
+  implements both sides, so the path is open — but it has **not been re-tested since the move**, so
+  treat TLS 1.3 resumption as unverified rather than working. `SSL_CTX_set_num_tickets(2)` is
+  correct on this backend.
 - **`ssl_*_writev` / `ssl_*_shutdown`**: vectored writes coalesce buffers into one TLS record and
   go through the same producer high-water throttle as `begin_write` (the coalesced plaintext is
   owned in the write slot, so it survives being parked for backpressure); half-close sends a
