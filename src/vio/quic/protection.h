@@ -75,6 +75,32 @@ inline constexpr cipher_suite_t tls_chacha20_poly1305_sha256{crypto::aead_t::cha
 // Section 5.2. Version specific by design: a future version gets a new salt so
 // a middlebox that only understands this one cannot read its Initial packets.
 inline constexpr std::array<std::uint8_t, 20> initial_salt_v1 = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a};
+// RFC 9369 section 3.1.
+inline constexpr std::array<std::uint8_t, 20> initial_salt_v2 = {0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9};
+
+[[nodiscard]] constexpr std::span<const std::uint8_t> initial_salt_for(std::uint32_t version)
+{
+  return version == quic_version_2 ? std::span<const std::uint8_t>(initial_salt_v2) : std::span<const std::uint8_t>(initial_salt_v1);
+}
+
+// RFC 9369 section 3.3: the labels change with the version so that keys derived
+// for one cannot be used with the other even where the secret is the same.
+struct key_labels_t
+{
+  const char *key;
+  const char *iv;
+  const char *header_protection;
+  const char *key_update;
+};
+
+[[nodiscard]] constexpr key_labels_t key_labels_for(std::uint32_t version)
+{
+  if (version == quic_version_2)
+  {
+    return key_labels_t{"quicv2 key", "quicv2 iv", "quicv2 hp", "quicv2 ku"};
+  }
+  return key_labels_t{"quic key", "quic iv", "quic hp", "quic ku"};
+}
 
 // Section 6.6. Overusing a key hands an attacker an advantage that grows with
 // the number of packets, so both directions are bounded: how many packets may
@@ -115,6 +141,9 @@ inline constexpr std::array<std::uint8_t, 20> initial_salt_v1 = {0x38, 0x76, 0x2
 // HKDF-Expand-Label over a constant secret.
 inline constexpr std::array<std::uint8_t, 16> retry_key_v1 = {0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e};
 inline constexpr std::array<std::uint8_t, 12> retry_nonce_v1 = {0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb};
+// RFC 9369 section 3.3.
+inline constexpr std::array<std::uint8_t, 16> retry_key_v2 = {0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92};
+inline constexpr std::array<std::uint8_t, 12> retry_nonce_v2 = {0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a};
 
 struct key_material_t
 {
@@ -131,22 +160,23 @@ struct initial_secrets_t
 
 // Section 5.1. The "quic iv" length is the AEAD nonce length for every suite
 // this version allows, so it is fixed here rather than plumbed.
-[[nodiscard]] inline std::expected<key_material_t, error_t> derive_key_material(cipher_suite_t suite, std::span<const std::uint8_t> secret)
+[[nodiscard]] inline std::expected<key_material_t, error_t> derive_key_material(cipher_suite_t suite, std::span<const std::uint8_t> secret, std::uint32_t version = quic_version_1)
 {
+  const auto labels = key_labels_for(version);
   key_material_t material;
   const std::size_t key_size = crypto::aead_key_size(suite.aead);
   material.key.resize(key_size);
   material.header_protection.resize(key_size);
 
-  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, "quic key", {}, material.key); !r.has_value())
+  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, labels.key, {}, material.key); !r.has_value())
   {
     return std::unexpected(r.error());
   }
-  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, "quic iv", {}, material.iv); !r.has_value())
+  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, labels.iv, {}, material.iv); !r.has_value())
   {
     return std::unexpected(r.error());
   }
-  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, "quic hp", {}, material.header_protection); !r.has_value())
+  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, labels.header_protection, {}, material.header_protection); !r.has_value())
   {
     return std::unexpected(r.error());
   }
@@ -154,10 +184,10 @@ struct initial_secrets_t
 }
 
 // Section 6.1: the secret for the next key phase.
-[[nodiscard]] inline std::expected<std::vector<std::uint8_t>, error_t> derive_next_secret(cipher_suite_t suite, std::span<const std::uint8_t> secret)
+[[nodiscard]] inline std::expected<std::vector<std::uint8_t>, error_t> derive_next_secret(cipher_suite_t suite, std::span<const std::uint8_t> secret, std::uint32_t version = quic_version_1)
 {
   std::vector<std::uint8_t> next(crypto::hash_size(suite.hash));
-  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, "quic ku", {}, next); !r.has_value())
+  if (auto r = crypto::hkdf_expand_label(suite.hash, secret, key_labels_for(version).key_update, {}, next); !r.has_value())
   {
     return std::unexpected(r.error());
   }
@@ -168,9 +198,9 @@ struct initial_secrets_t
 // client's first Initial packet, which is why anyone who sees that packet can
 // read the handshake -- Initial protection is about version-unaware
 // middleboxes, not confidentiality.
-[[nodiscard]] inline std::expected<initial_secrets_t, error_t> derive_initial_secrets(std::span<const std::uint8_t> client_destination_id)
+[[nodiscard]] inline std::expected<initial_secrets_t, error_t> derive_initial_secrets(std::span<const std::uint8_t> client_destination_id, std::uint32_t version = quic_version_1)
 {
-  auto initial = crypto::hkdf_extract(crypto::hash_t::sha256, initial_salt_v1, client_destination_id);
+  auto initial = crypto::hkdf_extract(crypto::hash_t::sha256, initial_salt_for(version), client_destination_id);
   if (!initial.has_value())
   {
     return std::unexpected(initial.error());
@@ -494,7 +524,7 @@ private:
 // Retry packet without its tag, prefixed by the connection ID the client put
 // in the Initial this answers. That prefix is what stops anyone who did not
 // see the Initial from forging a Retry.
-[[nodiscard]] inline std::expected<std::array<std::uint8_t, retry_integrity_tag_size>, error_t> retry_integrity_tag(std::span<const std::uint8_t> original_destination_id, std::span<const std::uint8_t> retry_without_tag)
+[[nodiscard]] inline std::expected<std::array<std::uint8_t, retry_integrity_tag_size>, error_t> retry_integrity_tag(std::span<const std::uint8_t> original_destination_id, std::span<const std::uint8_t> retry_without_tag, std::uint32_t version = quic_version_1)
 {
   if (original_destination_id.size() > max_connection_id_size)
   {
@@ -508,13 +538,13 @@ private:
   pseudo.insert(pseudo.end(), retry_without_tag.begin(), retry_without_tag.end());
 
   crypto::aead_key_t key;
-  if (auto r = key.init(crypto::aead_t::aes_128_gcm, retry_key_v1); !r.has_value())
+  if (auto r = key.init(crypto::aead_t::aes_128_gcm, version == quic_version_2 ? std::span<const std::uint8_t>(retry_key_v2) : std::span<const std::uint8_t>(retry_key_v1)); !r.has_value())
   {
     return std::unexpected(r.error());
   }
 
   std::array<std::uint8_t, retry_integrity_tag_size> tag = {};
-  auto sealed = key.seal(tag, retry_nonce_v1, {}, pseudo);
+  auto sealed = key.seal(tag, version == quic_version_2 ? retry_nonce_v2 : retry_nonce_v1, {}, pseudo);
   if (!sealed.has_value())
   {
     return std::unexpected(sealed.error());

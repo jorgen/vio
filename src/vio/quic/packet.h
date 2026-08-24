@@ -54,6 +54,10 @@
 namespace vio::quic
 {
 inline constexpr std::uint32_t quic_version_1 = 0x00000001;
+// RFC 9369. The same protocol as version 1 with different constants, published
+// so that version negotiation is exercised by something real and middleboxes
+// cannot assume version 1 is the only thing on the wire.
+inline constexpr std::uint32_t quic_version_2 = 0x6b3343cf;
 inline constexpr std::uint32_t quic_version_negotiation = 0x00000000;
 
 inline constexpr std::uint8_t header_form_long = 0x80;
@@ -120,23 +124,46 @@ enum class packet_kind_t : std::uint8_t
   return kind != packet_kind_t::one_rtt;
 }
 
-[[nodiscard]] constexpr std::uint8_t long_packet_type_bits(packet_kind_t kind)
+// RFC 9369 section 3.2: version 2 moves each type on by one, so that a reader
+// which learned version 1's numbering misreads version 2 rather than half
+// understanding it.
+[[nodiscard]] constexpr std::uint8_t long_packet_type_bits(packet_kind_t kind, std::uint32_t version = quic_version_1)
 {
+  const bool v2 = version == quic_version_2;
   switch (kind)
   {
   case packet_kind_t::initial:
-    return 0x00;
+    return v2 ? 0x10 : 0x00;
   case packet_kind_t::zero_rtt:
-    return 0x10;
+    return v2 ? 0x20 : 0x10;
   case packet_kind_t::handshake:
-    return 0x20;
+    return v2 ? 0x30 : 0x20;
   case packet_kind_t::retry:
-    return 0x30;
+    return v2 ? 0x00 : 0x30;
   case packet_kind_t::one_rtt:
   case packet_kind_t::version_negotiation:
     break;
   }
   return 0x00;
+}
+
+// The inverse of long_packet_type_bits. Every one of the four codes is a valid
+// packet kind in both versions, so this cannot fail.
+[[nodiscard]] constexpr packet_kind_t long_packet_kind(std::uint8_t type_bits, std::uint32_t version = quic_version_1)
+{
+  const bool v2 = version == quic_version_2;
+  switch (type_bits & long_packet_type_mask)
+  {
+  case 0x00:
+    return v2 ? packet_kind_t::retry : packet_kind_t::initial;
+  case 0x10:
+    return v2 ? packet_kind_t::initial : packet_kind_t::zero_rtt;
+  case 0x20:
+    return v2 ? packet_kind_t::zero_rtt : packet_kind_t::handshake;
+  default:
+    break;
+  }
+  return v2 ? packet_kind_t::handshake : packet_kind_t::retry;
 }
 
 // Reasons to drop a datagram, or the remainder of one. None of these is a
@@ -411,21 +438,7 @@ inline std::expected<packet_header_t, packet_discard_t> packet_reader_t::read_on
     return header;
   }
 
-  switch (first & long_packet_type_mask)
-  {
-  case 0x00:
-    header.kind = packet_kind_t::initial;
-    break;
-  case 0x10:
-    header.kind = packet_kind_t::zero_rtt;
-    break;
-  case 0x20:
-    header.kind = packet_kind_t::handshake;
-    break;
-  default:
-    header.kind = packet_kind_t::retry;
-    break;
-  }
+  header.kind = long_packet_kind(first, header.version);
 
   if (header.kind == packet_kind_t::retry)
   {

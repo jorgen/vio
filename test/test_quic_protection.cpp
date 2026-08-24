@@ -42,6 +42,53 @@ std::string hex(std::span<const std::uint8_t> data)
 
 TEST_SUITE("quic protection")
 {
+TEST_CASE("RFC 9369 A.1: version 2 derives its own Initial keys")
+{
+  // Same connection id as the version 1 vector above, which is the point: the
+  // salt and the labels are what differ, so a version 2 endpoint and a version
+  // 1 one never arrive at the same keys for the same handshake.
+  const auto connection_id = from_hex("8394c8f03e515708");
+  auto secrets = derive_initial_secrets(connection_id, quic_version_2);
+  REQUIRE(secrets.has_value());
+
+  auto client = derive_key_material(tls_aes_128_gcm_sha256, secrets->client, quic_version_2);
+  REQUIRE(client.has_value());
+  CHECK(hex(client->key) == "8b1a0bc121284290a29e0971b5cd045d");
+  CHECK(hex(client->iv) == "91f73e2351d8fa91660e909f");
+  CHECK(hex(client->header_protection) == "45b95e15235d6f45a6b19cbcb0294ba9");
+
+  auto server = derive_key_material(tls_aes_128_gcm_sha256, secrets->server, quic_version_2);
+  REQUIRE(server.has_value());
+  CHECK(hex(server->key) == "82db637861d55e1d011f19ea71d5d2a7");
+  CHECK(hex(server->iv) == "dd13c276499c0249d3310652");
+  CHECK(hex(server->header_protection) == "edf6d05c83121201b436e16877593c3a");
+
+  auto v1 = derive_initial_secrets(connection_id);
+  REQUIRE(v1.has_value());
+  CHECK(hex(v1->client) != hex(secrets->client));
+}
+
+TEST_CASE("RFC 9369 3.2: version 2 numbers the long header types differently")
+{
+  // Each type moves on by one, and retry wraps to zero.
+  CHECK(long_packet_type_bits(packet_kind_t::initial, quic_version_2) == 0x10);
+  CHECK(long_packet_type_bits(packet_kind_t::zero_rtt, quic_version_2) == 0x20);
+  CHECK(long_packet_type_bits(packet_kind_t::handshake, quic_version_2) == 0x30);
+  CHECK(long_packet_type_bits(packet_kind_t::retry, quic_version_2) == 0x00);
+
+  CHECK(long_packet_type_bits(packet_kind_t::initial) == 0x00);
+  CHECK(long_packet_type_bits(packet_kind_t::retry) == 0x30);
+
+  // The same four codes read back as the kind that wrote them, under either
+  // version, and never as each other's.
+  for (auto kind : {packet_kind_t::initial, packet_kind_t::zero_rtt, packet_kind_t::handshake, packet_kind_t::retry})
+  {
+    CHECK(long_packet_kind(long_packet_type_bits(kind, quic_version_1), quic_version_1) == kind);
+    CHECK(long_packet_kind(long_packet_type_bits(kind, quic_version_2), quic_version_2) == kind);
+    CHECK(long_packet_kind(long_packet_type_bits(kind, quic_version_2), quic_version_1) != kind);
+  }
+}
+
 TEST_CASE("RFC 9001 A.1: the Initial key schedule")
 {
   const auto connection_id = from_hex("8394c8f03e515708");
