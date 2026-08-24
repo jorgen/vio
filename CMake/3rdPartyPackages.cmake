@@ -4,8 +4,8 @@
 # fetch). The VIO_ prefix is derived from the project() name (PROJECT_NAME).
 #
 # Override a version without editing this file, e.g.:
-#   -DVIO_LIBRESSL_VERSION=4.0.0 -DVIO_LIBRESSL_URL=https://.../libressl-4.0.0.tar.gz -DVIO_LIBRESSL_SHA256=<hash>
-# or consume a pre-installed copy: -DVIO_USE_SYSTEM_LIBRESSL=ON
+#   -DVIO_BORINGSSL_URL=https://.../<commit>.tar.gz -DVIO_BORINGSSL_SHA256=<hash>
+# or consume a pre-installed copy: -DVIO_USE_SYSTEM_BORINGSSL=ON
 
 CmDepFetchPackage(cmakerc 952ff
     https://github.com/vector-of-bool/cmrc/archive/952ffddba731fc110bd50409e8d2b8a06abbd237.zip
@@ -21,9 +21,14 @@ if(VIO_BUILD_TESTS)
         SHA256=73381c7aa4dee704bd935609668cf41880ea7f19fa0504a200e13b74999c2d70)
 endif()
 
-CmDepFetchPackage(libressl 4.3.2
-    https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz
-    SHA256=edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5)
+# BoringSSL has no releases and no stable ABI, so it is pinned by commit like
+# any other source dependency and updated deliberately. Building it needs Go on
+# PATH, and on Windows NASM as well -- without an assembler its configure step
+# stops rather than quietly handing back a build with no AES-NI in it, which is
+# what LibreSSL did and why this is BoringSSL now.
+CmDepFetchPackage(boringssl 269525e
+    https://github.com/google/boringssl/archive/269525eb7fcf610b8f9985f3de08d658bbd83f84.tar.gz
+    SHA256=b9ae1852501d0d2e9c6b6047989fed9f0510087125c7113350116676436d54c8)
 
 CmDepFetchPackage(ada 3.2.4
     https://github.com/ada-url/ada/archive/refs/tags/v3.2.4.tar.gz

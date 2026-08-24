@@ -139,6 +139,14 @@ jobs:
           key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
           restore-keys: 3rdparty-${{ runner.os }}-
 
+      # BoringSSL assembles its x86-64 crypto with NASM, and stops rather than
+      # quietly building without AES-NI when no assembler is there. Go, which it
+      # also needs, is already on the runner image.
+      - name: Install NASM
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       # vcvars64.bat only affects the process it runs in, so configure, build
       # and test share one step. vswhere lives at a fixed path independent of
       # the installed VS version; %ProgramFiles(x86)% is read into a variable

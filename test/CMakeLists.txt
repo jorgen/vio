@@ -60,7 +60,7 @@ add_executable(vio_tests
     test_thread_pool.cpp
 )
 
-CmDepTargetLinkLibrary(vio_tests PRIVATE vio vio_objstore LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_tests PRIVATE vio vio_objstore BoringSSL::SSL BoringSSL::Crypto)
 
 if(VIO_USE_SYSTEM_DOCTEST)
     target_link_libraries(vio_tests PRIVATE doctest::doctest)
@@ -77,28 +77,28 @@ add_test(NAME vio_tests COMMAND vio_tests)
 # allocations, so it must not share a binary with anything else. Excluded from
 # the default build; configure and then "cmake --build . --target vio_bench".
 add_executable(vio_bench EXCLUDE_FROM_ALL bench_quic.cpp)
-CmDepTargetLinkLibrary(vio_bench PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_bench PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # A server for a foreign QUIC implementation to talk to. Needs a second
 # process, so it is not part of the suite.
 add_executable(vio_interop_server EXCLUDE_FROM_ALL interop_server.cpp)
-CmDepTargetLinkLibrary(vio_interop_server PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_interop_server PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_interop_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # A transfer with the network taken out of it: the one repeatable measurement
 # of what the protocol costs, and what a profiler should be pointed at.
 add_executable(vio_profile_quic EXCLUDE_FROM_ALL profile_quic.cpp)
-CmDepTargetLinkLibrary(vio_profile_quic PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_profile_quic PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_profile_quic PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # What the AEAD costs per packet, for comparing against another stack's crypto.
 add_executable(vio_crypto_bench EXCLUDE_FROM_ALL crypto_bench.cpp)
-CmDepTargetLinkLibrary(vio_crypto_bench PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_crypto_bench PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_crypto_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # The endpoint the QUIC Interop Runner drives, as both client and server. Its
 # whole interface is the environment, so it takes no arguments.
 add_executable(vio_interop_endpoint EXCLUDE_FROM_ALL interop_endpoint.cpp)
-CmDepTargetLinkLibrary(vio_interop_endpoint PRIVATE vio LibreSSL::TLS LibreSSL::SSL LibreSSL::Crypto)
+CmDepTargetLinkLibrary(vio_interop_endpoint PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_interop_endpoint PRIVATE ${CMAKE_SOURCE_DIR}/src)

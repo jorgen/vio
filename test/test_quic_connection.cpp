@@ -9,6 +9,8 @@
 #include <vio/quic/connection.h>
 #include <vio/quic/packet.h>
 
+#include <vio/ssl_backend.h>
+
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -64,10 +66,10 @@ certificate_t make_self_signed(const char *common_name)
   REQUIRE(X509_set_issuer_name(certificate, name) == 1);
 
   const std::string alt_name = std::string("DNS:") + common_name;
-  X509_EXTENSION *basic = X509V3_EXT_conf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
+  X509_EXTENSION *basic = X509V3_EXT_nconf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
   X509_add_ext(certificate, basic, -1);
   X509_EXTENSION_free(basic);
-  X509_EXTENSION *san = X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name, alt_name.c_str());
+  X509_EXTENSION *san = X509V3_EXT_nconf_nid(nullptr, nullptr, NID_subject_alt_name, alt_name.c_str());
   X509_add_ext(certificate, san, -1);
   X509_EXTENSION_free(san);
 

@@ -14,6 +14,8 @@
 #include <utility>
 
 #ifndef _WIN32
+#include <vio/ssl_backend.h>
+
 #include <openssl/x509v3.h> // IP-SAN construction for the ca_mem loopback cases (see below)
 #endif
 

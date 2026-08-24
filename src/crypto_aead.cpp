@@ -26,8 +26,14 @@
 #include <new>
 #include <utility>
 
+#include "vio/ssl_backend.h"
+
 #include <openssl/aes.h>
 #include <openssl/crypto.h>
+#if defined(VIO_SSL_BACKEND_BORINGSSL)
+#include <openssl/aead.h>
+#include <openssl/chacha.h>
+#endif
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
@@ -202,6 +208,14 @@ std::expected<void, error_t> aead_key_t::init(aead_t algorithm, std::span<const 
     return std::unexpected(crypto_error("AEAD key length does not match the algorithm"));
   }
 
+#if defined(VIO_SSL_BACKEND_BORINGSSL)
+  // BoringSSL keys the context in the constructor; there is no two-step form.
+  EVP_AEAD_CTX *ctx = EVP_AEAD_CTX_new(aead, key.data(), key.size(), aead_tag_size);
+  if (ctx == nullptr)
+  {
+    return std::unexpected(crypto_error("EVP_AEAD_CTX_new failed"));
+  }
+#else
   EVP_AEAD_CTX *ctx = EVP_AEAD_CTX_new();
   if (ctx == nullptr)
   {
@@ -212,6 +226,7 @@ std::expected<void, error_t> aead_key_t::init(aead_t algorithm, std::span<const 
     EVP_AEAD_CTX_free(ctx);
     return std::unexpected(crypto_error("EVP_AEAD_CTX_init failed"));
   }
+#endif
 
   if (_ctx != nullptr)
   {
@@ -287,12 +302,14 @@ std::expected<void, error_t> header_protection_key_t::init(aead_t algorithm, std
   if (algorithm == aead_t::chacha20_poly1305)
   {
     std::memcpy(impl->chacha_key.data(), key.data(), key.size());
+#if !defined(VIO_SSL_BACKEND_BORINGSSL)
     impl->chacha_ctx = EVP_CIPHER_CTX_new();
     if (impl->chacha_ctx == nullptr || EVP_EncryptInit_ex(impl->chacha_ctx, EVP_chacha20(), nullptr, impl->chacha_key.data(), nullptr) != 1)
     {
       delete impl;
       return std::unexpected(crypto_error("EVP_EncryptInit_ex failed"));
     }
+#endif
   }
   else if (AES_set_encrypt_key(key.data(), static_cast<int>(key.size() * 8), &impl->aes) != 0)
   {
@@ -324,10 +341,19 @@ std::expected<header_protection_mask_t, error_t> header_protection_key_t::mask(s
   }
 
   // RFC 9001 section 5.4.4: the sample is the 4-byte little-endian counter
-  // followed by the 12-byte nonce, which is exactly EVP_chacha20's 16-byte IV
-  // layout, and the mask is the keystream. Re-initialising with only the IV
-  // keeps the key schedule from the init above.
+  // followed by the 12-byte nonce, and the mask is the keystream they produce.
   const std::array<std::uint8_t, header_protection_mask_size> zeros = {};
+#if defined(VIO_SSL_BACKEND_BORINGSSL)
+  // No EVP_chacha20 here, so the counter and nonce go in as the separate
+  // arguments the primitive takes rather than packed into a 16-byte IV. There
+  // is no context to reuse, and none is needed: the key schedule is per call.
+  const auto counter = static_cast<std::uint32_t>(sample[0]) | (static_cast<std::uint32_t>(sample[1]) << 8) | (static_cast<std::uint32_t>(sample[2]) << 16) |
+                       (static_cast<std::uint32_t>(sample[3]) << 24);
+  CRYPTO_chacha_20(out.data(), zeros.data(), out.size(), impl->chacha_key.data(), sample.data() + 4, counter);
+  return out;
+#else
+  // The sample is exactly EVP_chacha20's 16-byte IV layout. Re-initialising
+  // with only the IV keeps the key schedule from the init above.
   int written = 0;
   if (EVP_EncryptInit_ex(impl->chacha_ctx, nullptr, nullptr, nullptr, sample.data()) != 1)
   {
@@ -338,5 +364,6 @@ std::expected<header_protection_mask_t, error_t> header_protection_key_t::mask(s
     return std::unexpected(crypto_error("EVP_EncryptUpdate failed"));
   }
   return out;
+#endif
 }
 } // namespace vio::crypto

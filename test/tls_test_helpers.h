@@ -4,6 +4,8 @@
 // (a CA + a leaf signed by it) and an ephemeral loopback TCP server. Uses only
 // the OpenSSL X509/PEM API, so it works against any wired SSL backend.
 
+#include <vio/ssl_backend.h>
+
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>

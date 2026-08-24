@@ -26,6 +26,8 @@
 
 #include "vio/crypto.h"
 
+#include "vio/ssl_backend.h"
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>

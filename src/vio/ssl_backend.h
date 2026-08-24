@@ -39,15 +39,38 @@ Copyright (c) 2025 Jørgen Lind
 // are drop-in behind this seam.
 // ---------------------------------------------------------------------------
 
+// <wincrypt.h> defines object-identifier constants whose names are also X.509
+// type names, so a translation unit that reached windows.h first cannot parse
+// these headers. LibreSSL and OpenSSL undef them from the inside; BoringSSL
+// does not, so it happens here -- the one place vio pulls the headers in. The
+// undefs are no-ops off Windows and on any TU that has not seen wincrypt.h.
+// vio wants the X.509 types, never the wincrypt constants; library.cpp uses
+// wincrypt through its Cert* functions only, which these do not touch.
+//
+// min/max go the same way: BoringSSL's C++ headers are reached through ssl.h
+// and call std::numeric_limits<>::max(), which the windows.h macro rewrites
+// into a syntax error. vio does not force NOMINMAX on its consumers (see the
+// note in operation/tcp.h), so the macros are dropped here instead.
+#if defined(_WIN32)
+#undef min
+#undef max
+#undef X509_NAME
+#undef X509_CERT_PAIR
+#undef X509_EXTENSIONS
+#undef PKCS7_ISSUER_AND_SERIAL
+#undef PKCS7_SIGNER_INFO
+#undef OCSP_REQUEST
+#undef OCSP_RESPONSE
+#endif
+
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
-// NB: intentionally NOT including <openssl/x509v3.h> -- on Windows it collides
-// with <wincrypt.h> macros that ssl.h/x509.h undef but x509v3.h does not, and we
-// need no symbols from it (X509_VERIFY_PARAM_* / X509_verify_cert_error_string
-// come from x509_vfy.h via ssl.h).
+// NB: intentionally NOT including <openssl/x509v3.h> -- it collides with the
+// same wincrypt.h names, and we need no symbols from it (X509_VERIFY_PARAM_* /
+// X509_verify_cert_error_string come from x509_vfy.h via ssl.h).
 
 #include <cstdint>
 #include <span>
@@ -111,6 +134,17 @@ inline X509 *get1_peer_cert(SSL *ssl)
 #endif
 }
 
+// The negotiated suite's two-byte IANA identifier. BoringSSL removed
+// SSL_CIPHER_get_value in favour of this spelling; the value is the same.
+inline uint16_t cipher_protocol_id(const SSL_CIPHER *cipher)
+{
+#if defined(VIO_SSL_BACKEND_BORINGSSL)
+  return SSL_CIPHER_get_protocol_id(cipher);
+#else
+  return SSL_CIPHER_get_value(cipher);
+#endif
+}
+
 // Named-group / curve list configuration.
 inline int set_groups_list(SSL_CTX *ctx, const char *groups)
 {
@@ -124,16 +158,15 @@ inline int set_groups_list(SSL_CTX *ctx, const char *groups)
 // TLS 1.3 cipher suite configuration (no-op where unsupported).
 inline int set_ciphersuites(SSL_CTX *ctx, const char *suites)
 {
-  if constexpr (has_tls13_ciphersuites)
-  {
-    return SSL_CTX_set_ciphersuites(ctx, suites);
-  }
-  else
-  {
-    (void)ctx;
-    (void)suites;
-    return 1;
-  }
+#if defined(VIO_SSL_BACKEND_BORINGSSL)
+  // Not an if constexpr: the discarded branch of one still has to name
+  // SSL_CTX_set_ciphersuites, and BoringSSL does not declare it at all.
+  (void)ctx;
+  (void)suites;
+  return 1;
+#else
+  return SSL_CTX_set_ciphersuites(ctx, suites);
+#endif
 }
 
 // ---- error extraction -----------------------------------------------------

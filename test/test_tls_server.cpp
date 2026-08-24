@@ -2,6 +2,8 @@
 
 #include <doctest/doctest.h>
 #include <numeric>
+#include <vio/ssl_backend.h>
+
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>

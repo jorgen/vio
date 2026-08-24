@@ -29,13 +29,14 @@
 #include <span>
 
 #ifdef _WIN32
-#include <openssl/bio.h>
-#include <openssl/err.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#include <string>
-#include <wincrypt.h>
 #include <windows.h>
+#include <wincrypt.h>
+
+// After wincrypt.h, so the seam can undo its name grabs before the X.509
+// headers it pulls in are parsed.
+#include "vio/ssl_backend.h"
+
+#include <string>
 #endif
 
 CMRC_DECLARE(vio); // NOLINT(modernize-type-traits)

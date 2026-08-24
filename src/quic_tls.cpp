@@ -22,6 +22,8 @@
 
 #include "vio/quic/tls.h"
 
+#include "vio/ssl_backend.h"
+
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -93,7 +95,7 @@ error_t tls_error(const char *what)
   {
     return std::nullopt;
   }
-  switch (SSL_CIPHER_get_value(cipher))
+  switch (ssl::cipher_protocol_id(cipher))
   {
   case 0x1301:
     return tls_aes_128_gcm_sha256;
@@ -355,6 +357,16 @@ const SSL_QUIC_METHOD *quic_method()
   // (set_encryption_secrets) and new (set_read_secret/set_write_secret) hooks
   // in one struct and warns that positional initialisation depends on their
   // order; it prefers the new pair when they are set, which is what this uses.
+#if defined(VIO_SSL_BACKEND_BORINGSSL)
+  // BoringSSL only ever had the new pair, and declares them first.
+  static const SSL_QUIC_METHOD method = {
+    .set_read_secret = on_set_read_secret,
+    .set_write_secret = on_set_write_secret,
+    .add_handshake_data = on_add_handshake_data,
+    .flush_flight = on_flush_flight,
+    .send_alert = on_send_alert,
+  };
+#else
   static const SSL_QUIC_METHOD method = {
     .set_encryption_secrets = nullptr,
     .add_handshake_data = on_add_handshake_data,
@@ -363,6 +375,7 @@ const SSL_QUIC_METHOD *quic_method()
     .set_read_secret = on_set_read_secret,
     .set_write_secret = on_set_write_secret,
   };
+#endif
   return &method;
 }
 

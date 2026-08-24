@@ -38,7 +38,10 @@ else()
         C_VISIBILITY_PRESET hidden
     )
 
-    if(NOT VIO_USE_SYSTEM_LIBRESSL)
+    # The default trust store is checked into the tree. LibreSSL shipped a curated
+    # cert.pem to refresh it from; BoringSSL ships none, so under that backend the
+    # checked-in copy is the only source and is updated deliberately, not on build.
+    if(VIO_SSL_BACKEND STREQUAL "libressl" AND NOT VIO_USE_SYSTEM_LIBRESSL)
         configure_file(${libressl_SOURCE_DIR}/cert.pem ${CMAKE_CURRENT_SOURCE_DIR}/default_certs/cert.pem COPYONLY)
     endif()
     cmrc_add_resource_library(vio_default_certs ALIAS vio::default_certs NAMESPACE vio default_certs/cert.pem)
@@ -63,8 +66,8 @@ else()
     # Dependencies are PUBLIC because vio's inline header code calls libuv/libressl directly.
     # Phase 2 (PIMPL) will allow switching to PRIVATE for full symbol hiding.
     # vio now speaks only the OpenSSL SSL_*/BIO API (the memory-BIO engine), so libtls
-    # (LibreSSL::TLS) is no longer linked -- only the SSL and Crypto libraries.
-    CmDepTargetLinkLibrary(vio PUBLIC LibreSSL::SSL LibreSSL::Crypto ada::ada)
+    # (libtls) never had a user here -- only the SSL and Crypto libraries.
+    CmDepTargetLinkLibrary(vio PUBLIC BoringSSL::SSL BoringSSL::Crypto ada::ada)
     if (WIN32)
         CmDepTargetLinkLibrary(vio PUBLIC crypt32 bcrypt)
     endif ()
@@ -188,6 +191,6 @@ if(VIO_INSTALL AND NOT EMSCRIPTEN)
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-        message(STATUS "vio: VIO_INSTALL is on but vio is built with bundled dependencies; installing library + headers only (no find_package config). Configure with VIO_USE_SYSTEM_LIBUV/LIBRESSL/ADA=ON for a relocatable package config.")
+        message(STATUS "vio: VIO_INSTALL is on but vio is built with bundled dependencies; installing library + headers only (no find_package config). Configure with VIO_USE_SYSTEM_LIBUV/BORINGSSL/ADA=ON for a relocatable package config.")
     endif()
 endif()

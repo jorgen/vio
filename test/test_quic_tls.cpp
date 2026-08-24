@@ -10,6 +10,8 @@
 #include <vio/quic/protection.h>
 #include <vio/quic/tls.h>
 
+#include <vio/ssl_backend.h>
+
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -69,11 +71,11 @@ certificate_t make_self_signed(const char *common_name)
   // Self-signed and used as its own trust anchor, so it has to look like a CA
   // and carry the name the client will check.
   const std::string alt_name = std::string("DNS:") + common_name;
-  X509_EXTENSION *basic = X509V3_EXT_conf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
+  X509_EXTENSION *basic = X509V3_EXT_nconf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
   REQUIRE(basic != nullptr);
   X509_add_ext(certificate, basic, -1);
   X509_EXTENSION_free(basic);
-  X509_EXTENSION *san = X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name, alt_name.c_str());
+  X509_EXTENSION *san = X509V3_EXT_nconf_nid(nullptr, nullptr, NID_subject_alt_name, alt_name.c_str());
   REQUIRE(san != nullptr);
   X509_add_ext(certificate, san, -1);
   X509_EXTENSION_free(san);
@@ -350,11 +352,15 @@ TEST_CASE("no shared ALPN is a fatal alert, not a silent fallback")
   server_config.certificate_chain_pem = identity.certificate_pem;
   server_config.private_key_pem = identity.private_key_pem;
   server_config.alpn = {"h3"};
+  // A QUIC session carries the transport parameters extension whatever else it
+  // is testing; without it the handshake is refused before ALPN is reached.
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
 
   tls_config_t client_config;
   client_config.role = tls_role_t::client;
   client_config.ca_certificates_pem = identity.certificate_pem;
   client_config.alpn = {"hq-interop"};
+  client_config.transport_parameters = {0x0a, 0x0b};
 
   auto server_context = tls_context_t::create(server_config);
   REQUIRE(server_context.has_value());
@@ -394,12 +400,14 @@ TEST_CASE("a client that cannot verify the server refuses the handshake")
   server_config.certificate_chain_pem = identity.certificate_pem;
   server_config.private_key_pem = identity.private_key_pem;
   server_config.alpn = {"h3"};
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
 
   tls_config_t client_config;
   client_config.role = tls_role_t::client;
   // Trusts a different self-signed certificate entirely.
   client_config.ca_certificates_pem = stranger.certificate_pem;
   client_config.alpn = {"h3"};
+  client_config.transport_parameters = {0x0a, 0x0b};
 
   auto server_context = tls_context_t::create(server_config);
   REQUIRE(server_context.has_value());

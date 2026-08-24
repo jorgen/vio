@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <vio/crypto_aead.h>
+#include <vio/ssl_backend.h>
 
 namespace
 {
@@ -91,7 +92,7 @@ int main(int argc, char **argv)
   const std::size_t payload = argc > 1 ? static_cast<std::size_t>(std::atoi(argv[1])) : 1200;
   const int iterations = argc > 2 ? std::atoi(argv[2]) : 400000;
 
-  std::printf("LibreSSL AEAD through vio, %zu byte payloads, %d iterations\n\n", payload, iterations);
+  std::printf("%s AEAD through vio, %zu byte payloads, %d iterations\n\n", OPENSSL_VERSION_TEXT, payload, iterations);
   std::printf("%-22s %14s %14s\n", "algorithm", "seal MB/s", "open MB/s");
 
   struct entry_t

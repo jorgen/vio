@@ -2,7 +2,7 @@
 
 **vio** is a lean C++23 async I/O library: [libuv](https://libuv.org) for the
 event loop, **C++20 coroutines** for the programming model, and
-[LibreSSL](https://www.libressl.org) for TLS. You write straight-line
+[BoringSSL](https://boringssl.googlesource.com/boringssl) for TLS. You write straight-line
 `co_await` code; vio drives it on a single-threaded event loop without callbacks
 or blocking.
 
@@ -48,8 +48,8 @@ REST service library), but stands alone as a general-purpose networking toolkit.
   rather than propagating).
 - **TCP, TLS, UDP, DNS, files, timers, a thread pool, and event pipes** — one
   uniform coroutine surface over libuv.
-- **TLS** via LibreSSL through a compile-time SSL-backend seam (OpenSSL/BoringSSL
-  reserved), with ALPN, SNI, OCSP stapling, and session resumption.
+- **TLS** via BoringSSL through a compile-time SSL-backend seam (LibreSSL and
+  OpenSSL selectable), with ALPN, SNI, OCSP stapling, and session resumption.
 - **Cancellation & timeouts** are first-class: pass a `cancellation_t*` to any
   cancellable op and cancel it from a watchdog coroutine.
 - **Backpressure-aware reads**: a queue reader, a **zero-copy `read_into`** that
@@ -260,14 +260,23 @@ unavailable on WASM — drive `event_loop_t` directly via `run_in_loop`.
 ## Dependencies
 
 Fetched at configure time via [cmake-dep](https://github.com/jorgen/cmake-dep):
-**libuv**, **LibreSSL**, **ada** (URL parsing), **doctest** (tests), and
+**libuv**, **BoringSSL**, **ada** (URL parsing), **doctest** (tests), and
 **cmakerc** (embedded default CA bundle). Each is togglable and overridable:
 
-- `VIO_USE_SYSTEM_{LIBUV,LIBRESSL,ADA,DOCTEST,CMAKERC}` — consume a pre-installed
+- `VIO_USE_SYSTEM_{LIBUV,BORINGSSL,ADA,DOCTEST,CMAKERC}` — consume a pre-installed
   copy via `find_package` instead of fetching.
 - `VIO_<DEP>_VERSION` / `VIO_<DEP>_URL` / `VIO_<DEP>_SHA256` — fetch a different
   version without editing the packages file, e.g.
-  `-DVIO_LIBRESSL_VERSION=4.0.0 -DVIO_LIBRESSL_URL=… -DVIO_LIBRESSL_SHA256=…`.
+  `-DVIO_BORINGSSL_URL=… -DVIO_BORINGSSL_SHA256=…`.
+
+Building BoringSSL needs **Go** on `PATH`, and on Windows **NASM** as well. Both
+are build-time only; neither ends up in the binary. Without an assembler
+BoringSSL's configure step stops rather than silently producing a build with no
+AES-NI in it, so a working Windows build is one that actually got the assembly.
+
+`VIO_SSL_BACKEND` selects the backend (`boringssl` by default, `libressl` or
+`openssl` against a system install). vio speaks the OpenSSL `SSL_*`/`BIO` API
+through `src/vio/ssl_backend.h`, which is the only place the three diverge.
 
 ## Consuming vio
 
@@ -284,7 +293,7 @@ target_link_libraries(my_app PRIVATE vio::vio)
 
 **Installed / `find_package`**: build vio with `VIO_INSTALL=ON` **and** against
 system deps (`-DVIO_USE_SYSTEM_LIBUV=ON …`) — in that configuration it installs a
-relocatable `find_package(vio)` config (`find_dependency`s libuv/LibreSSL/ada):
+relocatable `find_package(vio)` config (`find_dependency`s libuv/BoringSSL/ada):
 
 ```cmake
 find_package(vio CONFIG REQUIRED)

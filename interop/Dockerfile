@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         g++-14 \
         git \
+        golang-go \
         ninja-build \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
