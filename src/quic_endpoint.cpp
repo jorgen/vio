@@ -429,14 +429,14 @@ void send_retry(endpoint_impl_t &impl, const packet_header_t &header, const sock
   }
 
   std::array<std::uint8_t, max_datagram> out = {};
-  const std::size_t head = serialize_retry(out, quic_version_1, header.source_id, *source, *token);
+  const std::size_t head = serialize_retry(out, header.version, header.source_id, *source, *token);
   if (head == 0 || out.size() < head + retry_integrity_tag_size)
   {
     return;
   }
   // Section 5.8 of RFC 9001: the tag is what proves this came from someone who
   // saw the client's Initial, rather than anyone who can write a packet.
-  auto tag = retry_integrity_tag(header.destination_id.bytes(), std::span<const std::uint8_t>(out).first(head));
+  auto tag = retry_integrity_tag(header.destination_id.bytes(), std::span<const std::uint8_t>(out).first(head), header.version);
   if (!tag.has_value())
   {
     return;

@@ -370,9 +370,13 @@ private:
 class packet_protection_t
 {
 public:
-  [[nodiscard]] std::expected<void, error_t> init(cipher_suite_t suite, std::span<const std::uint8_t> secret)
+  // The version travels with the secret, because the labels the keys come from
+  // are version specific: a generation derived under one version and one
+  // derived under the other are different keys, and mixing them decrypts
+  // nothing.
+  [[nodiscard]] std::expected<void, error_t> init(cipher_suite_t suite, std::span<const std::uint8_t> secret, std::uint32_t version = quic_version_1)
   {
-    auto material = derive_key_material(suite, secret);
+    auto material = derive_key_material(suite, secret, version);
     if (!material.has_value())
     {
       return std::unexpected(material.error());
@@ -382,6 +386,7 @@ public:
       return std::unexpected(r.error());
     }
     _suite = suite;
+    _version = version;
     _iv = material->iv;
     _secret.assign(secret.begin(), secret.end());
     return {};
@@ -401,20 +406,20 @@ public:
   // the first generation, and keep it across every key update after that.
   [[nodiscard]] std::expected<key_material_t, error_t> material() const
   {
-    return derive_key_material(_suite, _secret);
+    return derive_key_material(_suite, _secret, _version);
   }
 
   // Section 6: the next key phase. Only the AEAD key and IV move; the caller
   // keeps using the header protection it already has.
   [[nodiscard]] std::expected<packet_protection_t, error_t> next_generation() const
   {
-    auto next = derive_next_secret(_suite, _secret);
+    auto next = derive_next_secret(_suite, _secret, _version);
     if (!next.has_value())
     {
       return std::unexpected(next.error());
     }
     packet_protection_t generation;
-    if (auto r = generation.init(_suite, *next); !r.has_value())
+    if (auto r = generation.init(_suite, *next, _version); !r.has_value())
     {
       return std::unexpected(r.error());
     }
@@ -486,6 +491,7 @@ public:
 
 private:
   cipher_suite_t _suite;
+  std::uint32_t _version = quic_version_1;
   std::vector<std::uint8_t> _secret;
   std::array<std::uint8_t, crypto::aead_nonce_size> _iv = {};
   crypto::aead_key_t _key;

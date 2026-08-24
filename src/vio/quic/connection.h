@@ -101,6 +101,9 @@ struct connection_close_t
 struct connection_config_t
 {
   tls_role_t role = tls_role_t::server;
+  // The version a client proposes in its first Initial. A server ignores this
+  // and adopts whatever the client asked for, provided the endpoint accepts it.
+  std::uint32_t version = quic_version_1;
   transport_parameters_t transport_parameters;
 
   // The connection ID this endpoint should answer to, instead of inventing one.

@@ -200,6 +200,41 @@ std::size_t total_bytes(const std::vector<std::vector<std::uint8_t>> &datagrams)
 
 TEST_SUITE("quic connection")
 {
+TEST_CASE("a version 2 client and server complete a handshake")
+{
+  // RFC 9369 is version 1 with a different Initial salt, different key labels
+  // and different long header type codes. A handshake that completes proves all
+  // three agree end to end: the wrong salt or the wrong labels would leave the
+  // Initial undecryptable, and the wrong type codes would have the server read
+  // a Handshake packet as something else.
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.version = quic_version_2;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  const auto exchange = run_handshake(*client, *server, at(0ns));
+  CAPTURE(exchange.rounds);
+
+  REQUIRE(client->handshake_complete());
+  REQUIRE(server->handshake_complete());
+  CHECK(client->state() == connection_state_t::connected);
+  CHECK(server->state() == connection_state_t::connected);
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+}
+
 TEST_CASE("a client and a server complete a handshake over byte arrays")
 {
   const auto identity = make_self_signed("localhost");

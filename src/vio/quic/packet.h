@@ -381,14 +381,17 @@ inline std::expected<packet_header_t, packet_discard_t> packet_reader_t::read_on
   const bool version_negotiation = header.version == quic_version_negotiation;
 
   // The version decides before anything else, because every rule below it is
-  // a version 1 rule -- the fixed bit is "not valid packets in this version",
-  // and the twenty byte ceiling on connection IDs is written as applying to a
-  // version 1 long header. A packet from a version this build does not speak
-  // has to come back as unsupported_version and nothing else, or a server
-  // cannot tell the difference between a packet to answer with Version
-  // Negotiation and one to drop on the floor. Its connection IDs, which may be
-  // longer than version 1 permits, are what parse_invariant_header is for.
-  if (!version_negotiation && header.version != quic_version_1)
+  // a rule of a particular version -- the fixed bit is "not valid packets in
+  // this version", and the twenty byte ceiling on connection IDs is written as
+  // applying to a version 1 long header. Version 2 keeps both rules and moves
+  // only the long header type codes (RFC 9369 section 3.2), which is why it
+  // parses here rather than needing a reader of its own. A packet from a
+  // version this build does not speak has to come back as unsupported_version
+  // and nothing else, or a server cannot tell the difference between a packet
+  // to answer with Version Negotiation and one to drop on the floor. Its
+  // connection IDs, which may be longer than either version permits, are what
+  // parse_invariant_header is for.
+  if (!version_negotiation && header.version != quic_version_1 && header.version != quic_version_2)
   {
     return std::unexpected(packet_discard_t::unsupported_version);
   }
@@ -587,7 +590,7 @@ public:
     }
 
     std::size_t position = 0;
-    _out[position] = static_cast<std::uint8_t>(header_form_long | header_fixed_bit | long_packet_type_bits(kind) | static_cast<std::uint8_t>(number_length - 1));
+    _out[position] = static_cast<std::uint8_t>(header_form_long | header_fixed_bit | long_packet_type_bits(kind, version) | static_cast<std::uint8_t>(number_length - 1));
     ++position;
     _out[position++] = static_cast<std::uint8_t>((version >> 24) & 0xff);
     _out[position++] = static_cast<std::uint8_t>((version >> 16) & 0xff);
@@ -793,7 +796,7 @@ private:
 
   std::size_t position = 0;
   // The four unused bits are the server's to pick; zero is as good as any.
-  out[position++] = header_form_long | header_fixed_bit | long_packet_type_bits(packet_kind_t::retry);
+  out[position++] = header_form_long | header_fixed_bit | long_packet_type_bits(packet_kind_t::retry, version);
   out[position++] = static_cast<std::uint8_t>((version >> 24) & 0xff);
   out[position++] = static_cast<std::uint8_t>((version >> 16) & 0xff);
   out[position++] = static_cast<std::uint8_t>((version >> 8) & 0xff);

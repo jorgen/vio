@@ -238,6 +238,12 @@ struct connection_impl_t
   std::optional<connection_close_t> close_reason;
   bool close_frame_pending = false;
 
+  // The version in use. A server adopts whatever its endpoint agreed to accept
+  // from the client's first Initial; everything version specific -- the Initial
+  // salt, the key labels, the long header type codes, the Retry tag -- follows
+  // from it rather than being assumed.
+  std::uint32_t version = quic_version_1;
+
   std::optional<transport_parameters_t> peer_parameters;
 
   loss_recovery_t recovery;
@@ -348,16 +354,16 @@ namespace
 {
 using detail::connection_impl_t;
 
-std::expected<void, error_t> install_keys(packet_space_t &space, const tls_secret_t &secret, bool read)
+std::expected<void, error_t> install_keys(packet_space_t &space, const tls_secret_t &secret, bool read, std::uint32_t version)
 {
-  auto material = derive_key_material(secret.suite, secret.secret);
+  auto material = derive_key_material(secret.suite, secret.secret, version);
   if (!material.has_value())
   {
     return std::unexpected(material.error());
   }
   auto &protection = read ? space.read : space.write;
   auto &header = read ? space.read_header : space.write_header;
-  if (auto r = protection.init(secret.suite, secret.secret); !r.has_value())
+  if (auto r = protection.init(secret.suite, secret.secret, version); !r.has_value())
   {
     return std::unexpected(r.error());
   }
@@ -397,7 +403,7 @@ std::expected<void, error_t> derive_next_generation(packet_space_t &space)
 
 std::expected<void, error_t> install_initial_keys(connection_impl_t &impl, const connection_id_t &destination)
 {
-  auto secrets = derive_initial_secrets(destination.bytes());
+  auto secrets = derive_initial_secrets(destination.bytes(), impl.version);
   if (!secrets.has_value())
   {
     return std::unexpected(secrets.error());
@@ -409,11 +415,11 @@ std::expected<void, error_t> install_initial_keys(connection_impl_t &impl, const
   auto &space = impl.spaces[0];
   const tls_secret_t write{.level = encryption_level_t::initial, .suite = tls_aes_128_gcm_sha256, .secret = write_secret};
   const tls_secret_t read{.level = encryption_level_t::initial, .suite = tls_aes_128_gcm_sha256, .secret = read_secret};
-  if (auto r = install_keys(space, write, false); !r.has_value())
+  if (auto r = install_keys(space, write, false, impl.version); !r.has_value())
   {
     return r;
   }
-  return install_keys(space, read, true);
+  return install_keys(space, read, true, impl.version);
 }
 
 void discard_space(connection_impl_t &impl, encryption_level_t level)
@@ -925,7 +931,7 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
   for (auto &secret : impl.tls.take_write_secrets())
   {
     auto &space = impl.spaces[space_index(secret.level)];
-    if (auto r = install_keys(space, secret, false); !r.has_value())
+    if (auto r = install_keys(space, secret, false, impl.version); !r.has_value())
     {
       return r;
     }
@@ -933,7 +939,7 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
   for (auto &secret : impl.tls.take_read_secrets())
   {
     auto &space = impl.spaces[space_index(secret.level)];
-    if (auto r = install_keys(space, secret, true); !r.has_value())
+    if (auto r = install_keys(space, secret, true, impl.version); !r.has_value())
     {
       return r;
     }
@@ -1682,6 +1688,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     // secret the Initial keys have, which is why Initial protection stops
     // off-path spoofing and nothing more.
     impl.original_destination_id = header.destination_id;
+    impl.version = header.version;
     if (auto r = install_initial_keys(impl, header.destination_id); !r.has_value())
     {
       return r;
@@ -1958,12 +1965,12 @@ std::expected<std::size_t, error_t> build_retry(connection_impl_t &impl, std::sp
     return std::unexpected(token.error());
   }
 
-  const std::size_t head = serialize_retry(out, quic_version_1, impl.peer_connection_id, impl.local_connection_id, *token);
+  const std::size_t head = serialize_retry(out, impl.version, impl.peer_connection_id, impl.local_connection_id, *token);
   if (head == 0 || out.size() < head + retry_integrity_tag_size)
   {
     return std::size_t{0};
   }
-  auto tag = retry_integrity_tag(impl.original_destination_id.bytes(), out.first(head));
+  auto tag = retry_integrity_tag(impl.original_destination_id.bytes(), out.first(head), impl.version);
   if (!tag.has_value())
   {
     return std::unexpected(tag.error());
@@ -2090,7 +2097,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     // Retry token wins when there is one.
     const auto carried = !impl.retry_token.empty() ? std::span<const std::uint8_t>(impl.retry_token) : std::span<const std::uint8_t>(impl.config.address_token);
     const auto token = *kind == packet_kind_t::initial ? carried : std::span<const std::uint8_t>{};
-    begun = builder.begin_long(*kind, quic_version_1, impl.peer_connection_id, impl.local_connection_id, token, packet_number, std::nullopt);
+    begun = builder.begin_long(*kind, impl.version, impl.peer_connection_id, impl.local_connection_id, token, packet_number, std::nullopt);
   }
   if (!begun)
   {
@@ -2768,6 +2775,7 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
     {
       return std::unexpected(error_t{.code = 1, .msg = "could not build the initial destination connection id"});
     }
+    impl->version = impl->config.version;
     impl->original_destination_id = *destination;
     impl->peer_connection_id = *destination;
     // Not a peer-issued ID yet -- the client invented it. Section 7.2 replaces

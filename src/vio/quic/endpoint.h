@@ -70,7 +70,7 @@ struct endpoint_config_t
 
   // Versions this endpoint speaks, offered in a Version Negotiation packet to
   // a client that asks for something else.
-  std::vector<std::uint32_t> supported_versions = {quic_version_1};
+  std::vector<std::uint32_t> supported_versions = {quic_version_1, quic_version_2};
 
   // Section 8.1.2. Present means every new client is sent a Retry before any
   // handshake work is done, which costs an address-spoofing attacker the
