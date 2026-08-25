@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -248,6 +249,32 @@ struct hystart_constants_t
   static constexpr std::uint32_t css_rounds = 5;
 };
 
+enum class congestion_algorithm_t : std::uint8_t
+{
+  // RFC 9002 appendix B: one datagram per round trip in congestion avoidance.
+  // Safe, and slow to take back a window a loss removed.
+  new_reno,
+  // RFC 9438. Growth is a cubic curve through the window the path last refused,
+  // so recovery is quick near it and cautious past it. What everything else
+  // ships by default.
+  cubic,
+};
+
+// RFC 9438 sections 4.6 and 5.1.
+struct cubic_constants_t
+{
+  // What a congestion event leaves the window at, as a fraction.
+  static constexpr double beta = 0.7;
+  // How hard the curve pushes past the previous maximum.
+  static constexpr double scale = 0.4;
+  // Section 4.3: the growth of a Reno flow, expressed for this beta, so that
+  // CUBIC is no slower than Reno would have been on a path where the cubic
+  // curve is the more cautious of the two.
+  static constexpr double alpha = 3.0 * (1.0 - beta) / (1.0 + beta);
+  // Section 4.2: a target more than half again the window is not believed.
+  static constexpr double target_ceiling = 1.5;
+};
+
 enum class hystart_phase_t : std::uint8_t
 {
   // Growing at the full slow start rate, watching the round trip time.
@@ -271,10 +298,16 @@ public:
     *this = congestion_control_t(datagram_size);
   }
 
-  explicit congestion_control_t(std::size_t max_datagram_size = 1200)
+  explicit congestion_control_t(std::size_t max_datagram_size = 1200, congestion_algorithm_t algorithm = congestion_algorithm_t::new_reno)
     : _max_datagram_size(max_datagram_size == 0 ? 1200 : max_datagram_size)
     , _window(initial_congestion_window(max_datagram_size == 0 ? 1200 : max_datagram_size))
+    , _algorithm(algorithm)
   {
+  }
+
+  [[nodiscard]] congestion_algorithm_t algorithm() const
+  {
+    return _algorithm;
   }
 
   [[nodiscard]] std::size_t window() const
@@ -410,7 +443,7 @@ public:
     return _recovery_started && sent_time <= _recovery_start;
   }
 
-  void on_packet_acked(const sent_packet_t &packet)
+  void on_packet_acked(const sent_packet_t &packet, tick_t now = tick_t{}, std::chrono::nanoseconds smoothed_rtt = std::chrono::nanoseconds::zero())
   {
     if (!packet.in_flight || in_recovery(packet.time_sent))
     {
@@ -423,6 +456,11 @@ public:
       _window += _hystart == hystart_phase_t::conservative ? packet.size / hystart_constants_t::css_growth_divisor : packet.size;
       return;
     }
+    if (_algorithm == congestion_algorithm_t::cubic)
+    {
+      grow_cubic(packet.size, now, smoothed_rtt);
+      return;
+    }
     // Congestion avoidance: about one datagram per round trip. The division is
     // integer, so a remainder is carried rather than discarded -- dropping it
     // would stall growth entirely once the window exceeds the datagram size
@@ -430,6 +468,70 @@ public:
     _avoidance_remainder += _max_datagram_size * packet.size;
     _window += _avoidance_remainder / _window;
     _avoidance_remainder %= _window;
+  }
+
+  // RFC 9438 section 4. The window follows a cubic curve whose inflection sits
+  // at the window the path last refused: growth is gentle as it approaches that
+  // point and firm once past it, which is what makes CUBIC both quick to
+  // recover what a loss took and cautious about asking for more than the path
+  // ever gave. Below the curve sits a floor -- what a Reno flow would have had
+  // by now -- so that on paths where the curve is the slower of the two,
+  // choosing CUBIC costs nothing.
+  void grow_cubic(std::size_t acknowledged, tick_t now, std::chrono::nanoseconds smoothed_rtt)
+  {
+    const auto mss = static_cast<double>(_max_datagram_size);
+    if (!_epoch_started)
+    {
+      // Section 4.2: the epoch begins when congestion avoidance does, and the
+      // curve is anchored to the window at that moment.
+      _epoch_started = true;
+      _epoch = now;
+      _cwnd_epoch = static_cast<double>(_window);
+      _w_est = _cwnd_epoch;
+      const auto w_max = (std::max)(_w_max, _cwnd_epoch);
+      // K is where the curve returns to the previous maximum. Already at or
+      // past it means there is nothing to climb back to.
+      _k = w_max <= _cwnd_epoch ? 0.0 : std::cbrt((w_max - _cwnd_epoch) / (cubic_constants_t::scale * mss));
+    }
+
+    const auto elapsed = std::chrono::duration<double>(now - _epoch).count();
+    const auto rtt = std::chrono::duration<double>(smoothed_rtt).count();
+    // Section 4.2: aim a round trip ahead, so the window is right when the
+    // packets it allows actually arrive.
+    const auto ahead = (std::max)(0.0, elapsed + rtt) - _k;
+    const auto w_max = (std::max)(_w_max, _cwnd_epoch);
+    double target = cubic_constants_t::scale * mss * ahead * ahead * ahead + w_max;
+
+    const auto window = static_cast<double>(_window);
+    if (target < window)
+    {
+      target = window;
+    }
+    else if (target > cubic_constants_t::target_ceiling * window)
+    {
+      target = cubic_constants_t::target_ceiling * window;
+    }
+
+    // Section 4.3: what a Reno flow would have reached over the same interval.
+    _w_est += cubic_constants_t::alpha * static_cast<double>(acknowledged) / window * mss;
+    if (_w_est > target)
+    {
+      target = _w_est;
+    }
+
+    if (target > window)
+    {
+      // Section 4.4: spread the distance to the target over a round trip
+      // rather than jumping to it.
+      const auto growth = (target - window) / window * static_cast<double>(acknowledged);
+      _cubic_remainder += growth;
+      if (_cubic_remainder >= 1.0)
+      {
+        const auto whole = static_cast<std::size_t>(_cubic_remainder);
+        _window += whole;
+        _cubic_remainder -= static_cast<double>(whole);
+      }
+    }
   }
 
   // Appendix B.6.
@@ -444,6 +546,20 @@ public:
     // Slow start is over for the ordinary reason, so there is nothing left for
     // HyStart++ to decide.
     _hystart = hystart_phase_t::finished;
+    if (_algorithm == congestion_algorithm_t::cubic)
+    {
+      const auto window = static_cast<double>(_window);
+      // Section 4.7, fast convergence: a flow that had to give up before it
+      // reached its previous maximum is meeting competition, and aims lower
+      // next time so the newcomer has room to find its share.
+      _w_max = _w_max != 0.0 && window < _w_max ? window * (1.0 + cubic_constants_t::beta) / 2.0 : window;
+      _slow_start_threshold = (std::max)(static_cast<std::size_t>(window * cubic_constants_t::beta), minimum_congestion_window(_max_datagram_size));
+      _window = _slow_start_threshold;
+      _epoch_started = false;
+      _cubic_remainder = 0.0;
+      _avoidance_remainder = 0;
+      return;
+    }
     _slow_start_threshold = (std::max)(_window / 2, minimum_congestion_window(_max_datagram_size));
     _window = _slow_start_threshold;
     _avoidance_remainder = 0;
@@ -532,6 +648,17 @@ private:
   bool _recovery_started = false;
 
   static constexpr std::chrono::nanoseconds unset_rtt = std::chrono::nanoseconds::max();
+  congestion_algorithm_t _algorithm = congestion_algorithm_t::new_reno;
+  // RFC 9438 state. Doubles because the curve is one; the window itself stays
+  // an integer count of bytes and only whole bytes are ever added to it.
+  double _w_max = 0.0;
+  double _cwnd_epoch = 0.0;
+  double _w_est = 0.0;
+  double _k = 0.0;
+  double _cubic_remainder = 0.0;
+  tick_t _epoch;
+  bool _epoch_started = false;
+
   hystart_phase_t _hystart = hystart_phase_t::slow_start;
   std::chrono::nanoseconds _last_round_min_rtt = unset_rtt;
   std::chrono::nanoseconds _current_round_min_rtt = unset_rtt;

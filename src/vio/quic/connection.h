@@ -47,6 +47,7 @@
 // and flow control, connection migration, Retry, and key update.
 
 #include "vio/error.h"
+#include "vio/quic/congestion_control.h"
 #include "vio/quic/connection_id.h"
 #include "vio/quic/ecn.h"
 #include "vio/quic/mtu.h"
@@ -127,6 +128,11 @@ struct connection_config_t
   // by the peer's max_udp_payload_size, which is a promise about what it will
   // read. Raise it past a 1500 byte link only where the whole path is known to
   // carry more: every size the path refuses costs probes to find out.
+  // Which controller runs congestion avoidance. NewReno is the conservative
+  // default RFC 9002 describes; CUBIC (RFC 9438) recovers a window a loss took
+  // far faster and is what the other implementations ship.
+  congestion_algorithm_t congestion_algorithm = congestion_algorithm_t::new_reno;
+
   std::size_t max_datagram_size = smallest_maximum_datagram_size;
   std::size_t datagram_size_ceiling = common_path_datagram_size;
 

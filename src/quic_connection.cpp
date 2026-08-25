@@ -204,7 +204,7 @@ struct connection_impl_t
   connection_impl_t(tls_session_t &&session, const connection_config_t &configuration)
     : tls(std::move(session))
     , config(configuration)
-    , congestion(configuration.max_datagram_size)
+    , congestion(configuration.max_datagram_size, configuration.congestion_algorithm)
     , streams(make_streams_config(configuration))
   {
   }
@@ -1342,7 +1342,7 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
         {
           impl.delivery.on_packet_acked(acked.delivery, acked.time_sent, acked.size, now, acked.packet_number);
         }
-        impl.congestion.on_packet_acked(acked);
+        impl.congestion.on_packet_acked(acked, now, impl.recovery.rtt().smoothed());
         if (space == pn_space_t::application)
         {
           impl.congestion.on_ack_round_progress(acked.packet_number);

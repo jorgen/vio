@@ -658,3 +658,178 @@ TEST_CASE("acknowledgements bunched by the path do not inflate the rate")
   CHECK(sample->rate < 2000000);
 }
 }
+
+TEST_SUITE("quic cubic")
+{
+using vio::quic::congestion_algorithm_t;
+using vio::quic::cubic_constants_t;
+
+// A controller that has grown a real window and then lost it -- which is the
+// situation the two algorithms actually differ in. Losing the *initial* window
+// tells you nothing: with nothing above it to climb back to, CUBIC's curve has
+// no work to do and the flow runs on its Reno-friendly floor, which is
+// deliberately slower than Reno.
+congestion_control_t after_losing_a_large_window(congestion_algorithm_t algorithm, vio::tick_t now, std::size_t target)
+{
+  congestion_control_t control(datagram, algorithm);
+  rtt_estimator_t rtt;
+  std::uint64_t number = 0;
+
+  // Slow start doubles per round trip until the window is worth losing.
+  while (control.window() < target)
+  {
+    const auto in_window = (std::max<std::size_t>)(1, control.window() / datagram);
+    for (std::size_t i = 0; i < in_window; ++i)
+    {
+      control.on_packet_sent(number);
+      control.on_packet_acked(packet(number, now), now, 20ms);
+      ++number;
+    }
+    now = now + std::chrono::nanoseconds(20ms);
+  }
+
+  control.on_packet_sent(number);
+  control.on_packets_lost({packet(number, now)}, now, rtt, 25ms, std::optional<vio::tick_t>(now));
+  return control;
+}
+
+TEST_CASE("a congestion event leaves CUBIC more window than NewReno")
+{
+  const auto now = at(0ns);
+  // Section 4.6: CUBIC keeps 0.7 of the window where NewReno keeps half.
+  congestion_control_t reno(datagram, congestion_algorithm_t::new_reno);
+  congestion_control_t cubic(datagram, congestion_algorithm_t::cubic);
+  rtt_estimator_t rtt;
+
+  const auto before = reno.window();
+  REQUIRE(cubic.window() == before);
+
+  reno.on_packet_sent(0);
+  cubic.on_packet_sent(0);
+  reno.on_packets_lost({packet(0, now)}, now, rtt, 25ms, std::optional<vio::tick_t>(now));
+  cubic.on_packets_lost({packet(0, now)}, now, rtt, 25ms, std::optional<vio::tick_t>(now));
+
+  CAPTURE(reno.window());
+  CAPTURE(cubic.window());
+  CHECK(cubic.window() > reno.window());
+  // And it is the fraction the RFC names, within the rounding to whole bytes.
+  const auto expected = static_cast<std::size_t>(static_cast<double>(before) * cubic_constants_t::beta);
+  CHECK(cubic.window() >= expected - datagram);
+  CHECK(cubic.window() <= expected + datagram);
+}
+
+TEST_CASE("CUBIC climbs back toward the window the path refused")
+{
+  auto now = at(0ns);
+  auto control = after_losing_a_large_window(congestion_algorithm_t::cubic, now, 150000);
+  const auto after_loss = control.window();
+
+  // A round trip of acknowledgements, repeated. The curve is anchored at the
+  // window the loss happened at, so growth accelerates as it returns there.
+  std::uint64_t number = 1;
+  for (int round = 0; round < 12; ++round)
+  {
+    for (int i = 0; i < 20; ++i)
+    {
+      control.on_packet_sent(number);
+      control.on_packet_acked(packet(number, now), now, 20ms);
+      ++number;
+    }
+    now = now + std::chrono::nanoseconds(20ms);
+  }
+
+  CAPTURE(after_loss);
+  CAPTURE(control.window());
+  CHECK(control.window() > after_loss);
+}
+
+// The point of choosing CUBIC, and the reason it exists: its growth is a
+// function of *time*, where Reno's is a function of round trips. On a short
+// path Reno's one datagram per round trip is already brisk and CUBIC is the
+// more cautious of the two -- deliberately, since it also gives up less on a
+// loss. It is on long paths, where a round trip is expensive and Reno crawls,
+// that the curve pulls away. That is the case worth testing, because it is the
+// case the algorithm was written for.
+//
+// A round here is a real round trip: the connection acknowledges a window's
+// worth and the clock moves on by one RTT. Acknowledging a fixed number of
+// packets per round instead would hand whichever algorithm grows per
+// acknowledgement an advantage that has nothing to do with either algorithm.
+std::size_t run_rounds(congestion_control_t &control, int rounds, std::chrono::nanoseconds rtt, vio::tick_t now)
+{
+  std::uint64_t number = 1;
+  for (int round = 0; round < rounds; ++round)
+  {
+    const auto in_window = (std::max<std::size_t>)(1, control.window() / datagram);
+    for (std::size_t i = 0; i < in_window; ++i)
+    {
+      control.on_packet_sent(number);
+      control.on_packet_acked(packet(number, now), now, rtt);
+      ++number;
+    }
+    now = now + rtt;
+  }
+  return control.window();
+}
+
+TEST_CASE("on a long path CUBIC takes back a lost window far faster than NewReno")
+{
+  const auto now = at(0ns);
+  auto reno = after_losing_a_large_window(congestion_algorithm_t::new_reno, now, 150000);
+  auto cubic = after_losing_a_large_window(congestion_algorithm_t::cubic, now, 150000);
+
+  // Fifteen seconds of a 200ms path: seventy-five round trips, which is not
+  // many, and exactly the point.
+  const auto reno_window = run_rounds(reno, 75, 200ms, now);
+  const auto cubic_window = run_rounds(cubic, 75, 200ms, now);
+
+  CAPTURE(reno_window);
+  CAPTURE(cubic_window);
+  CHECK(cubic_window > reno_window);
+}
+
+TEST_CASE("on a short path CUBIC is the more cautious of the two")
+{
+  const auto now = at(0ns);
+  auto reno = after_losing_a_large_window(congestion_algorithm_t::new_reno, now, 150000);
+  auto cubic = after_losing_a_large_window(congestion_algorithm_t::cubic, now, 150000);
+
+  // The same fifteen seconds over a 20ms path is 750 round trips, and Reno
+  // spends every one of them adding a datagram.
+  const auto reno_window = run_rounds(reno, 750, 20ms, now);
+  const auto cubic_window = run_rounds(cubic, 750, 20ms, now);
+
+  CAPTURE(reno_window);
+  CAPTURE(cubic_window);
+  CHECK(cubic_window < reno_window);
+}
+
+TEST_CASE("a flow that never reached its old maximum aims lower next time")
+{
+  // Section 4.7, fast convergence. Two congestion events, the second at a
+  // smaller window than the first: the target comes down rather than staying
+  // where a flow with the path to itself would have left it.
+  auto now = at(0ns);
+  congestion_control_t control(datagram, congestion_algorithm_t::cubic);
+  rtt_estimator_t rtt;
+
+  control.on_packet_sent(0);
+  control.on_packets_lost({packet(0, now)}, now, rtt, 25ms, std::optional<vio::tick_t>(now));
+  const auto first = control.window();
+
+  now = now + std::chrono::nanoseconds(1s);
+  control.on_packet_sent(1);
+  control.on_packets_lost({packet(1, now)}, now, rtt, 25ms, std::optional<vio::tick_t>(now));
+  const auto second = control.window();
+
+  CAPTURE(first);
+  CAPTURE(second);
+  CHECK(second < first);
+}
+
+TEST_CASE("NewReno is what a connection gets unless it asks otherwise")
+{
+  congestion_control_t control(datagram);
+  CHECK(control.algorithm() == congestion_algorithm_t::new_reno);
+}
+}
