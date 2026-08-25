@@ -36,6 +36,10 @@ namespace
 {
 using namespace std::chrono_literals;
 
+// A response goes out a chunk at a time. Big enough not to dribble, small
+// enough that building and copying one does not hold the event loop.
+constexpr std::size_t chunk_bytes = 256 * 1024;
+
 struct identity_t
 {
   std::vector<std::uint8_t> certificate_pem;
@@ -141,6 +145,7 @@ int main(int argc, char **argv)
   std::size_t bytes_read = 0;
   std::size_t answered = 0;
 
+
   loop.run_in_loop(
     [&]
     {
@@ -216,8 +221,18 @@ int main(int argc, char **argv)
         // sends "GET /<size>" and a newline, and the answer is that many bytes
         // followed by the end of the stream. It is barely a protocol, which is
         // the point -- it exercises the transport and nothing else.
+        // Lives in the coroutine frame, so the callback below may hold a
+        // reference to it for as long as the endpoint is running.
+        struct pending_response_t
+        {
+          connection_t *connection;
+          std::uint64_t stream;
+          std::size_t remaining;
+        };
+        std::vector<pending_response_t> pending;
+
         server->on_activity(
-          [&bytes_read, &answered](connection_t &connection)
+          [&bytes_read, &answered, &pending](connection_t &connection)
           {
             for (const auto id : connection.readable_streams())
             {
@@ -246,9 +261,36 @@ int main(int argc, char **argv)
                   wanted = static_cast<std::size_t>(parsed);
                 }
               }
-              const std::vector<std::uint8_t> body(wanted, 0x61);
-              (void)connection.write_stream(id, body, true);
+              // Queued rather than written: the loop above hands it over a
+              // chunk at a time. A whole response in one write_stream is a copy
+              // proportional to its size, on the event loop, which stalls every
+              // connection on this endpoint and lands in the measurement as if
+              // the transport were slow to start.
+              pending.push_back(pending_response_t{&connection, id, wanted});
               answered += wanted;
+            }
+
+            // After the request has been read, so the first chunk goes out
+            // with this wakeup rather than waiting for the next one -- which,
+            // with nothing yet in flight, is a round trip away.
+            for (auto item = pending.begin(); item != pending.end();)
+            {
+              if (item->connection != &connection)
+              {
+                ++item;
+                continue;
+              }
+              static const std::vector<std::uint8_t> filler(chunk_bytes, 0x61);
+              const auto piece = (std::min)(item->remaining, chunk_bytes);
+              const bool last = piece == item->remaining;
+              const auto taken = connection.write_stream(item->stream, std::span<const std::uint8_t>(filler).first(piece), last);
+              if (taken == 0)
+              {
+                ++item;
+                continue;
+              }
+              item->remaining -= taken;
+              item = item->remaining == 0 ? pending.erase(item) : item + 1;
             }
           });
 
