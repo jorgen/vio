@@ -549,7 +549,7 @@ TEST_CASE("a rate the sender limited does not become the path's peak")
   constexpr auto delay = 20ms;
   auto now = at(0ns);
 
-  estimator.set_app_limited(true);
+  estimator.set_app_limited();
   std::vector<delivery_rate_estimator_t::stamp_t> stamps;
   std::vector<vio::tick_t> sent_at;
   for (int i = 0; i < 20; ++i)

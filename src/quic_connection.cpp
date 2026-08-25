@@ -3198,7 +3198,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     // it is the application that is the limit here, not the path. A rate
     // measured across this says how fast the sender was fed, so it must not be
     // mistaken for how fast the path can carry.
-    impl.delivery.set_app_limited(true);
+    impl.delivery.set_app_limited();
     return std::size_t{0};
   }
 
@@ -3224,12 +3224,6 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   if (sending_probe)
   {
     impl.mtu.on_probe_sent(probe_packet_number, written, now, impl.recovery.rtt().smoothed());
-  }
-  // Once the window is what stops the next packet rather than the application,
-  // the path is being measured again.
-  if (impl.recovery.bytes_in_flight() + impl.config.max_datagram_size >= impl.congestion.window())
-  {
-    impl.delivery.set_app_limited(false);
   }
   impl.bytes_sent += written;
   if (paceable)

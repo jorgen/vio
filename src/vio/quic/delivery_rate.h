@@ -246,15 +246,13 @@ public:
     return _delivered;
   }
 
-  // Whether the sender is currently the limit rather than the path. Set when
-  // there is window to spare and nothing to put in it.
-  void set_app_limited(bool limited)
+  // The sender, rather than the path, is the limit: there was window to spare
+  // and nothing to put in it. The phase is not ended here but by the
+  // acknowledgement of something sent after it began, so that every packet sent
+  // while it held is marked -- a sample spanning the boundary would otherwise
+  // be read as a statement about the path.
+  void set_app_limited()
   {
-    if (!limited)
-    {
-      _app_limited = false;
-      return;
-    }
     _app_limited = true;
     _have_app_limited_end = _have_last_sent;
     _app_limited_end = _last_sent;
