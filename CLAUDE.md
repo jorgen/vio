@@ -198,6 +198,29 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   picoquic (`picoquicdemo -v 6b3343cf`), including ChaCha20 and HelloRetryRequest.
   Compatible version negotiation (RFC 9368) is not implemented.
 
+  **Path MTU discovery** (`mtu.h`, RFC 8899 as section 14.3 applies it): a
+  connection starts at the 1200 bytes every path must carry and probes upward
+  with a PING padded to the candidate size, in a datagram of its own. The first
+  probe asks for the ceiling outright -- most paths carry it, and a size arrived
+  at after slow start has ended has missed the part of the transfer it would
+  have helped; only once something is refused does it bisect. A probe is
+  disproved by a single loss while optimistic and by three once bisecting, and it
+  carries **its own deadline** (`probe_timeout`, RFC 8899 PROBE_TIMER) because a
+  path that silently swallows the size produces no acknowledgement *and* no loss
+  signal on an otherwise idle connection -- without it the search waits forever.
+  Probing waits for the handshake, for window the data was not going to use, and
+  for a path that is not already recovering; losing a probe never shrinks the
+  window (section 14.4). Repeated timeouts at a validated size retreat to the
+  floor. The ceiling is `connection_config_t::datagram_size_ceiling` (1452 by
+  default) bounded again by the peer's `max_udp_payload_size`.
+
+  Worth knowing before reaching for it as a performance lever: against picoquic
+  it reaches the same 1440 the peer does, but on a **byte**-rate-limited path it
+  is worth about 3% and no more -- the link charges bytes, the congestion window
+  is counted in bytes, and GSO has already amortised the per-datagram syscall.
+  It earns its place on conformance and on paths where the packet rate, rather
+  than the byte rate, is what runs out.
+
   `stream.h` and `streams.h` are sections 2 to 4: a stream is two independent
   halves that share an identifier, each with its own state machine and its own
   flow control limit, which is why `connection_t` asks

@@ -49,6 +49,7 @@
 #include "vio/error.h"
 #include "vio/quic/connection_id.h"
 #include "vio/quic/ecn.h"
+#include "vio/quic/mtu.h"
 #include "vio/quic/path.h"
 #include "vio/quic/qlog.h"
 #include "vio/quic/retry_token.h"
@@ -120,7 +121,14 @@ struct connection_config_t
 
   // The largest datagram this endpoint will send. Section 14 requires at least
   // 1200 for anything carrying an Initial.
-  std::size_t max_datagram_size = 1200;
+  // Where the path MTU search starts, and where it stops. Section 14 requires
+  // every path to carry the first, so it is also the size a connection retreats
+  // to if the path stops carrying what it grew to. The ceiling is bounded again
+  // by the peer's max_udp_payload_size, which is a promise about what it will
+  // read. Raise it past a 1500 byte link only where the whole path is known to
+  // carry more: every size the path refuses costs probes to find out.
+  std::size_t max_datagram_size = smallest_maximum_datagram_size;
+  std::size_t datagram_size_ceiling = common_path_datagram_size;
 
   std::chrono::nanoseconds max_ack_delay = std::chrono::milliseconds(25);
 
@@ -250,6 +258,10 @@ public:
   [[nodiscard]] connection_state_t state() const;
   [[nodiscard]] bool handshake_complete() const;
   [[nodiscard]] bool handshake_confirmed() const;
+
+  // The datagram size in use, which starts at what section 14 requires of every
+  // path and grows to whatever this one turns out to carry.
+  [[nodiscard]] std::size_t datagram_size() const;
 
   [[nodiscard]] const connection_id_t &local_connection_id() const;
   [[nodiscard]] const connection_id_t &peer_connection_id() const;

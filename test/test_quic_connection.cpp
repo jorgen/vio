@@ -187,6 +187,25 @@ exchange_t run_handshake(connection_t &client, connection_t &server, vio::tick_t
   return exchange;
 }
 
+// Everything one side has to send, handed to the other. run_handshake runs
+// until nothing moves; this is the single step, for tests that also need the
+// clock to advance between rounds.
+void pump(connection_t &from, connection_t &to, vio::tick_t now)
+{
+  for (;;)
+  {
+    std::vector<std::uint8_t> datagram(1500);
+    auto size = from.poll_send(datagram, now);
+    REQUIRE(size.has_value());
+    if (*size == 0)
+    {
+      break;
+    }
+    datagram.resize(*size);
+    REQUIRE(to.receive(datagram, now).has_value());
+  }
+}
+
 std::size_t total_bytes(const std::vector<std::vector<std::uint8_t>> &datagrams)
 {
   std::size_t sum = 0;
@@ -200,6 +219,113 @@ std::size_t total_bytes(const std::vector<std::vector<std::uint8_t>> &datagrams)
 
 TEST_SUITE("quic connection")
 {
+TEST_CASE("a connection grows its datagrams past the size every path must carry")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  // Nothing is known about the path yet, so both are at the floor.
+  CHECK(client->datagram_size() == smallest_maximum_datagram_size);
+
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  // The link here carries whatever is handed to it, so the search should walk
+  // up to the ceiling rather than stopping somewhere in the middle.
+  auto now = at(0ns);
+  for (int round = 0; round < 40 && client->datagram_size() < client_config.datagram_size_ceiling; ++round)
+  {
+    pump(*client, *server, now);
+    pump(*server, *client, now);
+    now = now + std::chrono::nanoseconds(5ms);
+  }
+
+  CHECK(client->datagram_size() > smallest_maximum_datagram_size);
+  CHECK(client->datagram_size() <= client_config.datagram_size_ceiling);
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+}
+
+TEST_CASE("a datagram size the path refuses is not adopted")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  // A path that carries 1300 bytes and no more, from the first packet: a link
+  // with a smaller MTU does not wait for the handshake to finish before
+  // dropping what will not fit.
+  constexpr std::size_t path_limit = 1300;
+  std::size_t refused = 0;
+  auto now = at(0ns);
+  for (int round = 0; round < 400; ++round)
+  {
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      if (*size > path_limit)
+      {
+        ++refused;
+        continue;
+      }
+      datagram.resize(*size);
+      REQUIRE(server->receive(datagram, now).has_value());
+    }
+    pump(*server, *client, now);
+
+    // Follow the connections' own timers rather than a fixed step: a probe the
+    // path swallowed is only discovered when loss detection says so, and that
+    // deadline is theirs to set.
+    auto deadline = client->next_timeout(now);
+    const auto other = server->next_timeout(now);
+    if (other.has_value() && (!deadline.has_value() || *other < *deadline))
+    {
+      deadline = other;
+    }
+    now = deadline.has_value() && *deadline > now ? *deadline : now + std::chrono::nanoseconds(1ms);
+  }
+
+  REQUIRE(client->handshake_complete());
+  // Something was too big to carry, which is the point of the exercise.
+  CHECK(refused > 0);
+  // It may adopt anything the path actually carried, and nothing above it.
+  CHECK(client->datagram_size() <= path_limit);
+  // And it did not give up and sit at the floor either.
+  CHECK(client->datagram_size() > smallest_maximum_datagram_size);
+  CHECK_FALSE(client->close_reason().has_value());
+}
+
 TEST_CASE("a version 2 client and server complete a handshake")
 {
   // RFC 9369 is version 1 with a different Initial salt, different key labels
@@ -233,6 +359,15 @@ TEST_CASE("a version 2 client and server complete a handshake")
   CHECK(server->state() == connection_state_t::connected);
   CHECK_FALSE(client->close_reason().has_value());
   CHECK_FALSE(server->close_reason().has_value());
+}
+
+// Path MTU discovery sends probes, which take packet numbers and change what
+// ends up in which datagram. A test about something else should not have that
+// moving underneath it: pinning the ceiling to the starting size leaves nothing
+// to search for. Discovery has its own tests.
+void pin_datagram_size(connection_config_t &config)
+{
+  config.datagram_size_ceiling = config.max_datagram_size;
 }
 
 TEST_CASE("a client and a server complete a handshake over byte arrays")
@@ -749,6 +884,8 @@ TEST_CASE("handshake packets acknowledge what came before them")
   connection_config_t client_config;
   client_config.role = tls_role_t::client;
   client_config.transport_parameters = sane_parameters();
+  pin_datagram_size(server_config);
+  pin_datagram_size(client_config);
 
   auto server = connection_t::create(contexts.server_context, server_config);
   REQUIRE(server.has_value());
@@ -1314,6 +1451,8 @@ TEST_CASE("streams survive a lossy link")
   connection_config_t client_config;
   client_config.role = tls_role_t::client;
   client_config.transport_parameters = sane_parameters();
+  pin_datagram_size(server_config);
+  pin_datagram_size(client_config);
 
   auto server = connection_t::create(contexts.server_context, server_config);
   REQUIRE(server.has_value());
@@ -1640,6 +1779,8 @@ TEST_CASE("a key update carries data across the phase change")
   connection_config_t client_config;
   client_config.role = tls_role_t::client;
   client_config.transport_parameters = sane_parameters();
+  pin_datagram_size(server_config);
+  pin_datagram_size(client_config);
 
   auto server = connection_t::create(contexts.server_context, server_config);
   REQUIRE(server.has_value());

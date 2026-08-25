@@ -397,6 +397,14 @@ public:
   // Appendix B.5: a packet sent before the recovery period began carries no
   // new information about the path, so acknowledging it must not grow the
   // window.
+  // Whether a recovery period is open at all, as opposed to whether a
+  // particular packet predates it. Something deciding whether to add optional
+  // traffic wants this one.
+  [[nodiscard]] bool recovering() const
+  {
+    return _recovery_started;
+  }
+
   [[nodiscard]] bool in_recovery(tick_t sent_time) const
   {
     return _recovery_started && sent_time <= _recovery_start;

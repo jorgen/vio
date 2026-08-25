@@ -244,6 +244,11 @@ struct connection_impl_t
   // from it rather than being assumed.
   std::uint32_t version = quic_version_1;
 
+  // Section 14.3. Every datagram this connection sends is bounded by what this
+  // has validated, which starts at the size every path must carry and grows by
+  // probing.
+  mtu_discovery_t mtu;
+
   std::optional<transport_parameters_t> peer_parameters;
 
   loss_recovery_t recovery;
@@ -480,6 +485,29 @@ inline constexpr std::chrono::nanoseconds new_token_lifetime = std::chrono::hour
     }
   }
   return false;
+}
+
+// Section 14.4: an MTU probe is the largest thing on the path by construction,
+// so losing one says something about the size and not about congestion. Loss
+// recovery has already taken it out of the bytes in flight; what must not
+// happen is the window shrinking for it.
+void report_loss(connection_impl_t &impl, pn_space_t space, const std::vector<sent_packet_t> &lost, tick_t now)
+{
+  std::vector<sent_packet_t> congested;
+  bool probe_lost = false;
+  for (const auto &packet : lost)
+  {
+    // Numbered per space, so only the space a probe was sent in can recognise
+    // one.
+    if (space == pn_space_t::application && impl.mtu.is_probe(packet.packet_number))
+    {
+      probe_lost = true;
+      impl.mtu.on_lost(packet.packet_number);
+      continue;
+    }
+    congested.push_back(packet);
+  }
+  impl.congestion.on_packets_lost(probe_lost ? congested : lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
 }
 
 // Whether anything waiting to go out is the kind of thing pacing exists to
@@ -984,6 +1012,7 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     }
 
     impl.peer_parameters = *parameters;
+    impl.mtu.limit(static_cast<std::size_t>(parameters->max_udp_payload_size));
     impl.streams.apply_peer_parameters(*parameters);
     // Section 10.3: the token covering the connection ID the peer chose during
     // the handshake. Only a server sends one.
@@ -1010,6 +1039,7 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     if (impl.config.role == tls_role_t::server)
     {
       impl.handshake_confirmed = true;
+      impl.mtu.enable();
     }
     if (impl.state == connection_state_t::handshaking)
     {
@@ -1293,6 +1323,10 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
         {
           application_space.phase_acknowledged = true;
         }
+        if (space == pn_space_t::application)
+        {
+          impl.mtu.on_acked(acked.packet_number);
+        }
         impl.congestion.on_packet_acked(acked);
         if (space == pn_space_t::application)
         {
@@ -1342,7 +1376,7 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       {
         impl.congestion.on_rtt_sample(impl.recovery.rtt().latest());
       }
-      impl.congestion.on_packets_lost(outcome.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
+      report_loss(impl, space, outcome.lost, now);
       repair_lost(impl, space, outcome.lost);
       break;
     }
@@ -1376,6 +1410,7 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
         return ack_eliciting;
       }
       impl.handshake_confirmed = true;
+      impl.mtu.enable();
       break;
 
     case frame_kind_t::stream:
@@ -2012,7 +2047,7 @@ void reap_and_grant(connection_impl_t &impl)
 // force_expand says the datagram owes that size for a reason decided before
 // this packet -- an Initial ahead of it -- as opposed to one this packet
 // discovers for itself by writing a PATH_CHALLENGE or PATH_RESPONSE.
-std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack, std::size_t expand_to = 0, bool force_expand = false)
+std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack, std::size_t expand_to = 0, bool force_expand = false, bool mtu_probe = false)
 {
   auto &space = impl.spaces[space_index(level)];
   if (space.discarded || !space.have_write)
@@ -2060,7 +2095,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   const bool want_ack = allow_empty_ack ? ack_owed : must_ack;
   const bool want_handshake_done = level == encryption_level_t::application && impl.config.role == tls_role_t::server && impl.handshake_complete && !impl.handshake_done_sent;
   const bool want_close = impl.close_frame_pending && space.have_write;
-  const bool want_probe = space.probes_pending > 0;
+  const bool want_probe = space.probes_pending > 0 || mtu_probe;
 
   bool want_path = false;
   if (level == encryption_level_t::application && !want_close)
@@ -2079,7 +2114,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   }
 
   // Only must_ack justifies a packet by itself; want_ack merely rides along.
-  if (!want_crypto && !must_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
+  if (!mtu_probe && !want_crypto && !must_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
   {
     return std::size_t{0};
   }
@@ -2557,7 +2592,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   // the AEAD sealed it are read back as ciphertext, and the peer discards the
   // packet instead of unpadding it. Only a long header, whose Length bounds the
   // packet, can be followed by filler.
-  if (expand_to > 0 && (force_expand || wrote_path_frame))
+  if (expand_to > 0 && (force_expand || mtu_probe || wrote_path_frame))
   {
     const std::size_t overhead = builder.header_length() + default_aead_expansion;
     if (expand_to > overhead)
@@ -2700,6 +2735,10 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
   {
     return std::unexpected(error_t{.code = 1, .msg = "max datagram size is below the 1200 bytes section 14 requires"});
   }
+  if (config.datagram_size_ceiling < config.max_datagram_size)
+  {
+    return std::unexpected(error_t{.code = 1, .msg = "datagram size ceiling is below the size to start from"});
+  }
 
   std::optional<connection_id_t> local = config.local_connection_id_override;
   if (!local.has_value())
@@ -2746,6 +2785,7 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
     impl->local_ids.install_initial(impl->local_connection_id, initial_token);
   }
   impl->ecn_sending = config.ecn;
+  impl->mtu.configure(config.max_datagram_size, config.datagram_size_ceiling);
 
   // Section 10.3: only a server may advertise this. A client's transport
   // parameters are not confidentiality protected, so publishing a token there
@@ -2987,10 +3027,11 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     if (expiry.loss_space.has_value())
     {
       qlog_lost(impl, expiry.lost, now);
-      impl.congestion.on_packets_lost(expiry.lost, now, impl.recovery.rtt(), impl.config.max_ack_delay, impl.recovery.first_rtt_sample());
+      report_loss(impl, *expiry.loss_space, expiry.lost, now);
       repair_lost(impl, *expiry.loss_space, expiry.lost);
       qlog_metrics(impl, now);
     }
+    impl.mtu.on_timeout();
     if (expiry.probe_space.has_value())
     {
       for (auto level : ordered_levels)
@@ -3034,7 +3075,7 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   // exempt for the same reason they are exempt from the window -- both exist
   // to get the connection unstuck.
   const bool paceable = impl.config.pacing && !probing && wants_paced_content(impl);
-  if (paceable && !impl.pacer.ready(now, impl.congestion.window(), impl.recovery.rtt().smoothed(), impl.config.max_datagram_size))
+  if (paceable && !impl.pacer.ready(now, impl.congestion.window(), impl.recovery.rtt().smoothed(), impl.mtu.datagram_size()))
   {
     return std::size_t{0};
   }
@@ -3056,7 +3097,28 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     return written;
   }
 
-  std::size_t budget = (std::min)(out.size(), impl.config.max_datagram_size);
+  // Section 14.3: a probe is a PING padded to the size being tested, in a
+  // datagram of its own. It is the only packet allowed past the size already
+  // validated, which is what makes it safe -- if the path refuses it, nothing
+  // that mattered was in it. It rides the ordinary path from here so that the
+  // accounting at the end of this function applies to it like any other
+  // datagram.
+  impl.mtu.expire(now);
+  auto &probe_space = impl.spaces[space_index(encryption_level_t::application)];
+  // A probe measures the path rather than using it, so it waits for room the
+  // data was not going to use: RFC 8899 section 3 asks that probing not come at
+  // the expense of what the connection is actually for. Without this a small or
+  // loss-reduced window spends itself on probes instead of on the data waiting
+  // behind them.
+  // ...and it waits for a path that is not already in trouble. RFC 8899
+  // section 5.3: probing while recovering both competes with the retransmission
+  // the connection actually needs and answers the wrong question, because a
+  // probe lost to congestion says nothing about the size.
+  const bool probe_has_room = impl.mtu.wants_probe() && !impl.congestion.recovering() && impl.recovery.bytes_in_flight() + impl.mtu.probe_size() <= impl.congestion.window();
+  const bool sending_probe = probe_has_room && !probing && !impl.close_frame_pending && probe_space.write.initialized() && impl.mtu.probe_size() <= out.size();
+  const std::uint64_t probe_packet_number = probe_space.next_packet_number;
+
+  std::size_t budget = (std::min)(out.size(), sending_probe ? impl.mtu.probe_size() : impl.mtu.datagram_size());
   if (impl.config.role == tls_role_t::server && !impl.address_validated)
   {
     // Section 8.1: three times what has arrived, and not a byte more.
@@ -3087,10 +3149,10 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     // How big this packet would have to be for the datagram to reach 1200.
     // The levels run in order, so by the time the 1-RTT packet is built,
     // carries_initial already says whether the datagram owes that size.
-    const std::size_t expand_to = written < minimum_initial_datagram ? minimum_initial_datagram - written : 0;
+    const std::size_t expand_to = sending_probe && level == encryption_level_t::application ? budget : (written < minimum_initial_datagram ? minimum_initial_datagram - written : 0);
     // An ACK on its own is worth a datagram only if nothing else is going out
     // in it; otherwise it rides along.
-    auto size = build_packet(impl, level, out.subspan(written, budget - written), now, true, expand_to, carries_initial);
+    auto size = build_packet(impl, level, out.subspan(written, budget - written), now, true, expand_to, carries_initial, sending_probe && level == encryption_level_t::application);
     if (!size.has_value())
     {
       return std::unexpected(size.error());
@@ -3131,6 +3193,10 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     written = minimum_initial_datagram;
   }
 
+  if (sending_probe)
+  {
+    impl.mtu.on_probe_sent(probe_packet_number, written, now, impl.recovery.rtt().smoothed());
+  }
   impl.bytes_sent += written;
   if (paceable)
   {
@@ -3181,6 +3247,9 @@ std::optional<tick_t> connection_t::next_timeout(tick_t now) const
     }
     consider(space.acks.ack_deadline(_impl->config.max_ack_delay));
   }
+  // A probe the path swallowed has to be given up on, and that is a deadline
+  // like any other.
+  consider(_impl->mtu.probe_deadline());
   // Whichever comes first: an acknowledgement this endpoint owes, or the loss
   // detection timer telling it something of its own has gone missing.
   consider(_impl->recovery.loss_detection_timer(now, recovery_context(*_impl)));
@@ -3191,7 +3260,7 @@ std::optional<tick_t> connection_t::next_timeout(tick_t now) const
     // Section 7.7: when the pacer is what is holding a packet, the caller has
     // to be told when to come back or the connection stalls until some other
     // timer happens to fire.
-    consider(_impl->pacer.next_departure(now, _impl->congestion.window(), _impl->recovery.rtt().smoothed(), _impl->config.max_datagram_size));
+    consider(_impl->pacer.next_departure(now, _impl->congestion.window(), _impl->recovery.rtt().smoothed(), _impl->mtu.datagram_size()));
   }
   return earliest;
 }
@@ -3284,6 +3353,11 @@ bool connection_t::initiate_key_update()
     return false;
   }
   return advance_key_phase(space, true).has_value();
+}
+
+std::size_t connection_t::datagram_size() const
+{
+  return _impl->mtu.datagram_size();
 }
 
 bool connection_t::key_phase() const
