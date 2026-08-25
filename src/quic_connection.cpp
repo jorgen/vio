@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <utility>
 
 namespace vio::quic
@@ -332,6 +333,11 @@ struct connection_impl_t
   // Section 8.1.3. A server issues one after the handshake; a client keeps
   // whatever arrives for the application to store.
   std::vector<std::uint8_t> new_token_pending;
+
+  // RFC 9221. Unreliable by construction: a queued datagram that does not fit
+  // the packet being built waits, and one that is lost is simply gone.
+  std::deque<std::vector<std::uint8_t>> datagrams_pending;
+  std::deque<std::vector<std::uint8_t>> datagrams_received;
   bool new_token_issued = false;
   std::vector<std::uint8_t> received_new_token;
   bool reset_by_peer = false;
@@ -1416,6 +1422,23 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
       break;
     }
 
+    case frame_kind_t::datagram:
+      // RFC 9221 section 3: receiving one when none was offered, or one larger
+      // than was offered, is a protocol violation rather than something to
+      // ignore -- the peer is using an extension this endpoint did not agree to.
+      if (impl.config.transport_parameters.max_datagram_frame_size == 0)
+      {
+        begin_close(impl, transport_error_protocol_violation, "DATAGRAM frame without max_datagram_frame_size", false, false);
+        return ack_eliciting;
+      }
+      if (frame.data.size() > impl.config.transport_parameters.max_datagram_frame_size)
+      {
+        begin_close(impl, transport_error_protocol_violation, "DATAGRAM frame larger than max_datagram_frame_size", false, false);
+        return ack_eliciting;
+      }
+      impl.datagrams_received.emplace_back(frame.data.begin(), frame.data.end());
+      return ack_eliciting;
+
     case frame_kind_t::connection_close:
       begin_close(impl, frame.error_code, std::string(reinterpret_cast<const char *>(frame.data.data()), frame.data.size()), frame.application_error, true);
       return ack_eliciting;
@@ -2121,7 +2144,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     // Section 8.2.2 forbids delaying a PATH_RESPONSE, so an owed echo is by
     // itself a reason to send.
     want_path = !impl.path_responses.empty() || impl.path.challenge_due(now, impl.recovery.rtt().pto_base() + impl.config.max_ack_delay);
-    want_path = want_path || !impl.new_ids_pending.empty() || !impl.remote_ids.pending_retires().empty() || !impl.new_token_pending.empty();
+    want_path = want_path || !impl.new_ids_pending.empty() || !impl.remote_ids.pending_retires().empty() || !impl.new_token_pending.empty() || !impl.datagrams_pending.empty();
   }
 
   bool want_streams = false;
@@ -2302,6 +2325,22 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
         record.push_back(sent_frame_t{.kind = frame_kind_t::new_token});
         impl.new_token_pending.clear();
       }
+    }
+
+    while (!impl.datagrams_pending.empty())
+    {
+      frame_t frame;
+      frame.kind = frame_kind_t::datagram;
+      frame.data = impl.datagrams_pending.front();
+      if (!frames.write(frame))
+      {
+        // No room in this packet. It keeps its place at the head of the queue
+        // rather than being dropped: the application asked for it to go, and
+        // the next packet is a better answer than never.
+        break;
+      }
+      record.push_back(sent_frame_t{.kind = frame_kind_t::datagram});
+      impl.datagrams_pending.pop_front();
     }
 
     for (auto it = impl.new_ids_pending.begin(); it != impl.new_ids_pending.end();)
@@ -3460,6 +3499,51 @@ std::size_t connection_t::write_stream(std::uint64_t id, std::span<const std::ui
   }
   _impl->streams.mark_sendable(*stream);
   return data.size();
+}
+
+std::size_t connection_t::max_datagram_payload() const
+{
+  if (!_impl->peer_parameters.has_value())
+  {
+    return 0;
+  }
+  const auto offered = _impl->peer_parameters->max_datagram_frame_size;
+  if (offered == 0)
+  {
+    return 0;
+  }
+  // The peer's limit counts the whole frame. The type byte and the length that
+  // precedes the payload come out of it, and the length is a varint sized
+  // against the payload -- eight bytes is the largest a varint gets, so
+  // reserving that is right whatever the payload turns out to be.
+  constexpr std::uint64_t frame_overhead = 1 + 8;
+  if (offered <= frame_overhead)
+  {
+    return 0;
+  }
+  return static_cast<std::size_t>(offered - frame_overhead);
+}
+
+bool connection_t::write_datagram(std::span<const std::uint8_t> data)
+{
+  const auto room = max_datagram_payload();
+  if (room == 0 || data.size() > room)
+  {
+    return false;
+  }
+  _impl->datagrams_pending.emplace_back(data.begin(), data.end());
+  return true;
+}
+
+std::optional<std::vector<std::uint8_t>> connection_t::read_datagram()
+{
+  if (_impl->datagrams_received.empty())
+  {
+    return std::nullopt;
+  }
+  auto front = std::move(_impl->datagrams_received.front());
+  _impl->datagrams_received.pop_front();
+  return front;
 }
 
 std::span<const std::uint8_t> connection_t::readable_stream(std::uint64_t id)

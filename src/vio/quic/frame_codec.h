@@ -365,6 +365,30 @@ inline std::expected<frame_t, frame_error_t> frame_reader_t::read_one()
     return frame;
   }
 
+  case frame_kind_t::datagram:
+  {
+    // RFC 9221 section 4: the low bit of the type is the LEN flag. Without it
+    // the payload runs to the end of the packet, so only the last frame in one
+    // may leave it out.
+    if ((type & 0x01) == 0)
+    {
+      frame.omit_length = true;
+      frame.data = remaining();
+      _position = _input.size();
+      return frame;
+    }
+    std::uint64_t length = 0;
+    if (!take_varint(length))
+    {
+      return truncated(type);
+    }
+    if (!take_length_prefixed(length, frame.data))
+    {
+      return truncated(type);
+    }
+    return frame;
+  }
+
   case frame_kind_t::new_token:
   {
     std::uint64_t length = 0;
@@ -561,6 +585,8 @@ inline std::expected<frame_t, frame_error_t> frame_reader_t::read_one()
     return 0x05;
   case frame_kind_t::crypto:
     return 0x06;
+  case frame_kind_t::datagram:
+    return frame.omit_length ? 0x30 : 0x31;
   case frame_kind_t::new_token:
     return 0x07;
   case frame_kind_t::stream:
@@ -640,6 +666,9 @@ inline std::expected<frame_t, frame_error_t> frame_reader_t::read_one()
   case frame_kind_t::crypto:
     return fits(frame.data.size()) && frame.offset <= varint_max - frame.data.size();
 
+  case frame_kind_t::datagram:
+    return frame.omit_length || fits(frame.data.size());
+
   case frame_kind_t::new_token:
     return !frame.data.empty() && fits(frame.data.size());
 
@@ -705,6 +734,9 @@ inline std::expected<frame_t, frame_error_t> frame_reader_t::read_one()
     break;
   case frame_kind_t::crypto:
     size += varint_size(frame.offset) + varint_size(frame.data.size()) + frame.data.size();
+    break;
+  case frame_kind_t::datagram:
+    size += frame.omit_length ? frame.data.size() : varint_size(frame.data.size()) + frame.data.size();
     break;
   case frame_kind_t::new_token:
     size += varint_size(frame.data.size()) + frame.data.size();
@@ -947,6 +979,11 @@ inline bool frame_writer_t::write_body(const frame_t &frame)
       return false;
     }
     return put_varint(frame.offset) && put_varint(frame.data.size()) && put_bytes(frame.data);
+
+  case frame_kind_t::datagram:
+    // Without the length there is nothing after this frame, so the payload is
+    // whatever is left of the packet.
+    return frame.omit_length ? put_bytes(frame.data) : put_varint(frame.data.size()) && put_bytes(frame.data);
 
   case frame_kind_t::new_token:
     if (frame.data.empty())

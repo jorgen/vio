@@ -70,6 +70,8 @@ enum class transport_parameter_id_t : std::uint64_t
   active_connection_id_limit = 0x0e,
   initial_source_connection_id = 0x0f,
   retry_source_connection_id = 0x10,
+  // RFC 9221.
+  max_datagram_frame_size = 0x20,
 };
 
 // Every one of these is spelled out in section 18.2 as what to assume when the
@@ -106,6 +108,12 @@ struct transport_parameters_t
   std::uint64_t active_connection_id_limit = default_active_connection_id_limit;
   std::optional<connection_id_t> initial_source_connection_id;
   std::optional<connection_id_t> retry_source_connection_id;
+
+  // RFC 9221 section 3. Zero, the default, means DATAGRAM frames are not
+  // supported and receiving one is a PROTOCOL_VIOLATION. Any other value is
+  // the largest frame this endpoint will accept, counted as the whole frame
+  // including its type and length.
+  std::uint64_t max_datagram_frame_size = 0;
 
   // preferred_address is not produced and is ignored when received: it only
   // matters for server-initiated migration, which this stack does not do.
@@ -193,6 +201,10 @@ enum class transport_parameter_error_t : std::uint8_t
   if (parameters.max_ack_delay != default_max_ack_delay_milliseconds)
   {
     put_integer(transport_parameter_id_t::max_ack_delay, parameters.max_ack_delay);
+  }
+  if (parameters.max_datagram_frame_size != 0)
+  {
+    put_integer(transport_parameter_id_t::max_datagram_frame_size, parameters.max_datagram_frame_size);
   }
   if (parameters.disable_active_migration)
   {
@@ -354,6 +366,12 @@ enum class transport_parameter_error_t : std::uint8_t
       break;
     case transport_parameter_id_t::max_ack_delay:
       if (!as_integer(parameters.max_ack_delay) || parameters.max_ack_delay >= max_ack_delay_limit)
+      {
+        return std::unexpected(transport_parameter_error_t::invalid_value);
+      }
+      break;
+    case transport_parameter_id_t::max_datagram_frame_size:
+      if (!as_integer(parameters.max_datagram_frame_size))
       {
         return std::unexpected(transport_parameter_error_t::invalid_value);
       }

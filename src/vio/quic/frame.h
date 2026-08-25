@@ -120,6 +120,9 @@ enum class frame_kind_t : std::uint8_t
   path_response,
   connection_close,
   handshake_done,
+  // RFC 9221. Not a section 19 frame: it exists only when both sides offered
+  // max_datagram_frame_size.
+  datagram,
 };
 
 struct frame_properties_t
@@ -201,6 +204,13 @@ struct frame_properties_t
     return make(k::connection_close, packet_in_all, false, true, false, false, p::discard);
   case 0x1d:
     return make(k::connection_close, packet_in_application, false, true, false, false, p::discard);
+  // RFC 9221 section 5: ack-eliciting and congestion controlled like anything
+  // else, and never retransmitted -- an unreliable datagram that came back
+  // later would not be the thing the application asked to send.
+  case 0x30:
+  case 0x31:
+    return make(k::datagram, packet_in_zero_rtt | packet_in_one_rtt, true, true, false, false, p::discard);
+
   case 0x1e:
     return make(k::handshake_done, packet_in_one_rtt, true, true, false, false, p::retransmit);
   default:

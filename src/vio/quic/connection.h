@@ -331,6 +331,20 @@ public:
 
   // Contiguous bytes ready to be read. The span is invalidated by
   // consume_stream and by receive.
+  // RFC 9221. Queues one unreliable datagram, refusing it if the peer offered
+  // no room for datagrams or the frame would exceed what it offered. Queued is
+  // all it promises: a datagram that is lost is not retransmitted, and one the
+  // connection closes on is never sent.
+  [[nodiscard]] bool write_datagram(std::span<const std::uint8_t> data);
+
+  // The largest payload write_datagram will take, given what the peer offered.
+  // Zero means the peer does not accept datagrams at all.
+  [[nodiscard]] std::size_t max_datagram_payload() const;
+
+  // The next datagram that arrived, or nothing. Received datagrams queue in
+  // order and are handed over one at a time.
+  [[nodiscard]] std::optional<std::vector<std::uint8_t>> read_datagram();
+
   [[nodiscard]] std::span<const std::uint8_t> readable_stream(std::uint64_t id);
   void consume_stream(std::uint64_t id, std::size_t bytes);
 

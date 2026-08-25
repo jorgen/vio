@@ -326,6 +326,148 @@ TEST_CASE("a datagram size the path refuses is not adopted")
   CHECK_FALSE(client->close_reason().has_value());
 }
 
+// RFC 9221. The extension is off unless both sides offer room for it, which is
+// what these first two check before anything is sent.
+TEST_CASE("datagrams are refused unless the peer offered room for them")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  // Neither offered, so neither will take one.
+  CHECK(client->max_datagram_payload() == 0);
+  const std::vector<std::uint8_t> payload = {'n', 'o'};
+  CHECK_FALSE(client->write_datagram(payload));
+}
+
+TEST_CASE("a datagram crosses to the peer when both offered room")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.max_datagram_frame_size = 1200;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.transport_parameters.max_datagram_frame_size = 1200;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  CHECK(client->max_datagram_payload() > 0);
+  CHECK(client->max_datagram_payload() < 1200);
+
+  const std::vector<std::uint8_t> payload = {'h', 'e', 'l', 'l', 'o'};
+  REQUIRE(client->write_datagram(payload));
+  pump(*client, *server, at(0ns));
+
+  auto arrived = server->read_datagram();
+  REQUIRE(arrived.has_value());
+  CHECK(*arrived == payload);
+  // Handed over once.
+  CHECK_FALSE(server->read_datagram().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+}
+
+TEST_CASE("a datagram larger than the peer offered is refused before it is sent")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.max_datagram_frame_size = 64;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.transport_parameters.max_datagram_frame_size = 64;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  const auto room = client->max_datagram_payload();
+  CHECK(room > 0);
+  CHECK(room < 64);
+
+  const std::vector<std::uint8_t> too_big(room + 1, 0x41);
+  CHECK_FALSE(client->write_datagram(too_big));
+  const std::vector<std::uint8_t> fits(room, 0x41);
+  CHECK(client->write_datagram(fits));
+}
+
+TEST_CASE("a datagram is not resent when it is lost")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.max_datagram_frame_size = 1200;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.transport_parameters.max_datagram_frame_size = 1200;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  const std::vector<std::uint8_t> payload = {'g', 'o', 'n', 'e'};
+  REQUIRE(client->write_datagram(payload));
+
+  // Sent, and dropped on the floor rather than delivered.
+  std::vector<std::uint8_t> datagram(1500);
+  auto size = client->poll_send(datagram, at(0ns));
+  REQUIRE(size.has_value());
+  REQUIRE(*size > 0);
+
+  // Section 5: not retransmitted. Whatever the connection does from here --
+  // acknowledgements, probes -- the payload is not among it.
+  auto now = at(0ns);
+  for (int round = 0; round < 30; ++round)
+  {
+    pump(*client, *server, now);
+    pump(*server, *client, now);
+    now = now + std::chrono::nanoseconds(50ms);
+  }
+  CHECK_FALSE(server->read_datagram().has_value());
+  CHECK_FALSE(client->close_reason().has_value());
+  CHECK_FALSE(server->close_reason().has_value());
+}
+
 TEST_CASE("a version 2 client and server complete a handshake")
 {
   // RFC 9369 is version 1 with a different Initial salt, different key labels
