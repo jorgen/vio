@@ -870,7 +870,22 @@ TEST_CASE("a close is delivered to the peer and reported on both sides")
   CHECK(server->close_reason()->application);
   CHECK(server->close_reason()->from_peer);
   CHECK(server->close_reason()->reason == "going away");
+
+  // Section 10.2 allows answering a close with one, and the peer is waiting for
+  // exactly that: without it it holds the connection open for three probe
+  // timeouts. So the server owes one frame before it is done.
+  CHECK(server->state() == connection_state_t::closing);
+  std::vector<std::uint8_t> answer(1500);
+  auto answered = server->poll_send(answer, at(0ns));
+  REQUIRE(answered.has_value());
+  CHECK(*answered > 0);
   CHECK(server->state() == connection_state_t::closed);
+
+  // And exactly one: a second close would be an exchange with no end.
+  std::vector<std::uint8_t> again(1500);
+  auto more = server->poll_send(again, at(0ns));
+  REQUIRE(more.has_value());
+  CHECK(*more == 0);
 }
 
 TEST_CASE("handshake packets acknowledge what came before them")

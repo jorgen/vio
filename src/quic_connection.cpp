@@ -907,16 +907,15 @@ void begin_close(connection_impl_t &impl, std::uint64_t error_code, std::string_
     return;
   }
   impl.close_reason = connection_close_t{.error_code = error_code, .application = application, .reason = std::string(reason), .from_peer = from_peer};
-  if (from_peer)
-  {
-    impl.state = connection_state_t::closed;
-    impl.close_frame_pending = false;
-  }
-  else
-  {
-    impl.state = connection_state_t::closing;
-    impl.close_frame_pending = true;
-  }
+  // Section 10.2 permits answering a CONNECTION_CLOSE with one, and declining
+  // to costs the peer real time: it stays in the closing state until three
+  // probe timeouts have passed, and a probe timeout carries max_ack_delay --
+  // 25ms by default, so most of a tenth of a second on every connection that
+  // ends. One frame ends it at once. The guard above runs this once per
+  // connection and the send path clears the flag after a single packet, so
+  // there is no exchange of closes.
+  impl.state = connection_state_t::closing;
+  impl.close_frame_pending = true;
 }
 
 // Hands TLS whatever the CRYPTO streams have made contiguous, runs the
