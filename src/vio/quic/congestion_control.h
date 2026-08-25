@@ -647,7 +647,10 @@ private:
   tick_t _recovery_start;
   bool _recovery_started = false;
 
-  static constexpr std::chrono::nanoseconds unset_rtt = std::chrono::nanoseconds::max();
+  // Parenthesised like every other max in this file: windows.h defines max as
+  // a macro, vio does not force NOMINMAX on its consumers, and the parentheses
+  // are what stop the macro from reaching the name.
+  static constexpr std::chrono::nanoseconds unset_rtt = (std::chrono::nanoseconds::max)();
   congestion_algorithm_t _algorithm = congestion_algorithm_t::new_reno;
   // RFC 9438 state. Doubles because the curve is one; the window itself stays
   // an integer count of bytes and only whole bytes are ever added to it.
