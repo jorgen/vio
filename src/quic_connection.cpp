@@ -2165,7 +2165,16 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   bool begun = false;
   if (*kind == packet_kind_t::one_rtt)
   {
-    begun = builder.begin_short(impl.peer_connection_id, space.key_phase, false, packet_number, std::nullopt);
+    // RFC 9287 section 3: only after the peer's parameters have been read, and
+    // unpredictably rather than always -- a bit that is reliably zero ossifies
+    // as readily as one that is reliably one.
+    bool clear_quic_bit = false;
+    if (impl.peer_parameters.has_value() && impl.peer_parameters->grease_quic_bit)
+    {
+      std::array<std::uint8_t, 1> coin = {};
+      clear_quic_bit = crypto::random_bytes(coin).has_value() && (coin[0] & 1) != 0;
+    }
+    begun = builder.begin_short(impl.peer_connection_id, space.key_phase, false, packet_number, std::nullopt, clear_quic_bit);
   }
   else
   {
@@ -2969,7 +2978,8 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
     }
   }
 
-  packet_reader_t reader(datagram, impl.local_connection_id.size());
+  // Having offered grease_quic_bit, this endpoint has to honour the promise.
+  packet_reader_t reader(datagram, impl.local_connection_id.size(), impl.config.transport_parameters.grease_quic_bit);
   while (auto next = reader.next())
   {
     if (!next->has_value())

@@ -72,6 +72,8 @@ enum class transport_parameter_id_t : std::uint64_t
   retry_source_connection_id = 0x10,
   // RFC 9221.
   max_datagram_frame_size = 0x20,
+  // RFC 9287.
+  grease_quic_bit = 0x2ab2,
 };
 
 // Every one of these is spelled out in section 18.2 as what to assume when the
@@ -114,6 +116,12 @@ struct transport_parameters_t
   // the largest frame this endpoint will accept, counted as the whole frame
   // including its type and length.
   std::uint64_t max_datagram_frame_size = 0;
+
+  // RFC 9287. Offering it promises to accept packets whose QUIC bit is clear;
+  // receiving it permits this endpoint to clear the bit on its own. Section 3
+  // forbids remembering a peer's offer across connections, so it is negotiated
+  // every time.
+  bool grease_quic_bit = false;
 
   // preferred_address is not produced and is ignored when received: it only
   // matters for server-initiated migration, which this stack does not do.
@@ -205,6 +213,11 @@ enum class transport_parameter_error_t : std::uint8_t
   if (parameters.max_datagram_frame_size != 0)
   {
     put_integer(transport_parameter_id_t::max_datagram_frame_size, parameters.max_datagram_frame_size);
+  }
+  if (parameters.grease_quic_bit)
+  {
+    // A flag, like disable_active_migration: present or not, never valued.
+    put_bytes(transport_parameter_id_t::grease_quic_bit, {});
   }
   if (parameters.disable_active_migration)
   {
@@ -382,6 +395,14 @@ enum class transport_parameter_error_t : std::uint8_t
         return std::unexpected(transport_parameter_error_t::invalid_value);
       }
       parameters.disable_active_migration = true;
+      break;
+    case transport_parameter_id_t::grease_quic_bit:
+      // Section 3: a value here at all is an error, not something to ignore.
+      if (!value.empty())
+      {
+        return std::unexpected(transport_parameter_error_t::invalid_value);
+      }
+      parameters.grease_quic_bit = true;
       break;
     case transport_parameter_id_t::active_connection_id_limit:
       if (!as_integer(parameters.active_connection_id_limit) || parameters.active_connection_id_limit < minimum_active_connection_id_limit)

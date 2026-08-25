@@ -292,9 +292,14 @@ struct packet_header_t
 class packet_reader_t
 {
 public:
-  packet_reader_t(std::span<const std::uint8_t> datagram, std::size_t local_connection_id_length)
+  // RFC 9287: an endpoint that offered grease_quic_bit has promised to accept
+  // packets with the QUIC bit clear, so the check below has to know whether the
+  // promise was made. Off by default -- section 17.2 makes a clear bit a
+  // discard for anyone who did not offer.
+  packet_reader_t(std::span<const std::uint8_t> datagram, std::size_t local_connection_id_length, bool accept_cleared_quic_bit = false)
     : _input(datagram)
     , _local_connection_id_length(local_connection_id_length)
+    , _accept_cleared_quic_bit(accept_cleared_quic_bit)
   {
   }
 
@@ -327,6 +332,7 @@ private:
 
   std::span<const std::uint8_t> _input;
   std::size_t _local_connection_id_length = 0;
+  bool _accept_cleared_quic_bit = false;
   std::size_t _position = 0;
   bool _done = false;
 };
@@ -340,7 +346,7 @@ inline std::expected<packet_header_t, packet_discard_t> packet_reader_t::read_on
 
   if ((first & header_form_long) == 0)
   {
-    if ((first & header_fixed_bit) == 0)
+    if ((first & header_fixed_bit) == 0 && !_accept_cleared_quic_bit)
     {
       return std::unexpected(packet_discard_t::fixed_bit_clear);
     }
@@ -395,7 +401,7 @@ inline std::expected<packet_header_t, packet_discard_t> packet_reader_t::read_on
   {
     return std::unexpected(packet_discard_t::unsupported_version);
   }
-  if (!version_negotiation && (first & header_fixed_bit) == 0)
+  if (!version_negotiation && (first & header_fixed_bit) == 0 && !_accept_cleared_quic_bit)
   {
     return std::unexpected(packet_discard_t::fixed_bit_clear);
   }
@@ -618,14 +624,17 @@ public:
     return finish_begin(position, packet_number, number_length);
   }
 
-  [[nodiscard]] bool begin_short(const connection_id_t &destination, bool key_phase, bool spin, std::uint64_t packet_number, std::optional<std::uint64_t> largest_acked)
+  // RFC 9287: the bit may be cleared once the peer has offered to accept it.
+  // Unpredictable rather than always clear, which is what greasing means -- a
+  // bit that is reliably zero is as ossifiable as one that is reliably one.
+  [[nodiscard]] bool begin_short(const connection_id_t &destination, bool key_phase, bool spin, std::uint64_t packet_number, std::optional<std::uint64_t> largest_acked, bool clear_quic_bit = false)
   {
     const std::size_t number_length = packet_number_size(packet_number, largest_acked);
     if (_out.size() < 1 + destination.size() + number_length)
     {
       return false;
     }
-    std::uint8_t first = static_cast<std::uint8_t>(header_fixed_bit | static_cast<std::uint8_t>(number_length - 1));
+    std::uint8_t first = static_cast<std::uint8_t>((clear_quic_bit ? 0 : header_fixed_bit) | static_cast<std::uint8_t>(number_length - 1));
     if (key_phase)
     {
       first |= short_key_phase_bit;

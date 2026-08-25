@@ -468,6 +468,113 @@ TEST_CASE("a datagram is not resent when it is lost")
   CHECK_FALSE(server->close_reason().has_value());
 }
 
+// RFC 9287. Offering the parameter is a promise to accept a cleared QUIC bit;
+// receiving it is permission to clear one. Both sides here do both.
+TEST_CASE("the QUIC bit is greased once both sides offer to accept it")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.grease_quic_bit = true;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.transport_parameters.grease_quic_bit = true;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+
+  // Enough short-header packets that an unpredictable bit is overwhelmingly
+  // likely to have been clear on some and set on others.
+  int cleared = 0;
+  int set = 0;
+  auto now = at(0ns);
+  for (int round = 0; round < 40; ++round)
+  {
+    const std::vector<std::uint8_t> chunk(200, static_cast<std::uint8_t>(round));
+    (void)client->write_stream(*id, chunk, false);
+    for (;;)
+    {
+      std::vector<std::uint8_t> datagram(1500);
+      auto size = client->poll_send(datagram, now);
+      REQUIRE(size.has_value());
+      if (*size == 0)
+      {
+        break;
+      }
+      datagram.resize(*size);
+      // Short header: the form bit is clear.
+      if ((datagram[0] & 0x80) == 0)
+      {
+        ((datagram[0] & 0x40) == 0 ? cleared : set)++;
+      }
+      REQUIRE(server->receive(datagram, now).has_value());
+    }
+    pump(*server, *client, now);
+    now = now + std::chrono::nanoseconds(1ms);
+  }
+
+  CAPTURE(cleared);
+  CAPTURE(set);
+  CHECK(cleared > 0);
+  CHECK(set > 0);
+  // And the peer accepted every one of them, having promised to.
+  CHECK_FALSE(server->close_reason().has_value());
+  CHECK_FALSE(client->close_reason().has_value());
+}
+
+TEST_CASE("a cleared QUIC bit is refused by a peer that did not offer to accept it")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  // The server does not offer, so it must keep discarding cleared-bit packets.
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, at(0ns));
+  REQUIRE(client->handshake_complete());
+
+  auto id = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(id.has_value());
+  const std::vector<std::uint8_t> chunk(64, 0x5a);
+  CHECK(client->write_stream(*id, chunk, true) == chunk.size());
+
+  std::vector<std::uint8_t> datagram(1500);
+  auto size = client->poll_send(datagram, at(0ns));
+  REQUIRE(size.has_value());
+  REQUIRE(*size > 0);
+  datagram.resize(*size);
+  REQUIRE((datagram[0] & 0x80) == 0);
+  // The client did not grease, because the server never offered.
+  CHECK((datagram[0] & 0x40) != 0);
+
+  // Clearing it by hand is what a middlebox or a broken peer would do, and the
+  // server drops the packet rather than reading it.
+  datagram[0] = static_cast<std::uint8_t>(datagram[0] & ~0x40);
+  REQUIRE(server->receive(datagram, at(0ns)).has_value());
+  CHECK(server->readable_stream(*id).empty());
+}
+
 TEST_CASE("a version 2 client and server complete a handshake")
 {
   // RFC 9369 is version 1 with a different Initial salt, different key labels
