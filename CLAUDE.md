@@ -198,6 +198,39 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   picoquic (`picoquicdemo -v 6b3343cf`), including ChaCha20 and HelloRetryRequest.
   Compatible version negotiation (RFC 9368) is not implemented.
 
+  **Extensions.** Three beyond RFC 9000 itself:
+
+  - **DATAGRAM (RFC 9221)** — `max_datagram_frame_size` plus frame types
+    0x30/0x31, reached through `write_datagram` / `read_datagram` /
+    `max_datagram_payload`. The rule that makes it the extension it is: a lost
+    DATAGRAM is *not* retransmitted, so its loss policy is `discard`. Sending is
+    refused rather than truncated when the peer offered no room or too little,
+    and the peer's limit counts the whole frame, so `max_datagram_payload` does
+    that arithmetic once rather than leaving it to callers.
+  - **grease_quic_bit (RFC 9287)** — offering the parameter promises to accept a
+    cleared QUIC bit (`packet_reader_t` takes a flag for that promise);
+    receiving it permits clearing one on short headers, which vio does
+    *unpredictably* per packet, because a bit that is reliably zero ossifies as
+    readily as one that is reliably one.
+  - **CUBIC (RFC 9438)** — a mode on `congestion_control_t`, not a second
+    controller, because it differs from NewReno in exactly two places: the
+    growth curve in congestion avoidance and the 0.7 (not 0.5) decrease.
+    `connection_config_t::congestion_algorithm` selects it; **NewReno remains the
+    default**. Measured: identical on a lossless path (they only diverge after a
+    congestion event); on a lossy long path (4 MB, 200ms, 0.5% loss, nine runs)
+    CUBIC's median is 3.0 Mbps against NewReno's 1.25; on a *short* path CUBIC is
+    deliberately the more cautious, since its growth is a function of time where
+    Reno's is a function of round trips and there are many of those in a second.
+
+  Not implemented, and why: **ACK_FREQUENCY** is still a draft whose codepoints
+  have moved between versions, and measurement showed vio already receives
+  *fewer* acknowledgements than picoquic (one per 30 packets against one per 20),
+  so it would buy control rather than throughput. **0-RTT** needs anti-replay --
+  single-use tickets or a strike register -- and a partial implementation of a
+  security property is worse than none. **HTTP/3 and QPACK** belong in prism, per
+  the architecture. Timestamps and multipath are niche; no two of picoquic,
+  msquic and quiche agree on having all of them either.
+
   **Path MTU discovery** (`mtu.h`, RFC 8899 as section 14.3 applies it): a
   connection starts at the 1200 bytes every path must carry and probes upward
   with a PING padded to the candidate size, in a datagram of its own. The first
