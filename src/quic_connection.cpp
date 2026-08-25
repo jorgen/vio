@@ -249,6 +249,12 @@ struct connection_impl_t
   // probing.
   mtu_discovery_t mtu;
 
+  // How fast the path is delivering, measured rather than inferred from the
+  // window. Section 14.3's probing and section 7's window both benefit from
+  // being told where the operating point is instead of searching for it.
+  delivery_rate_estimator_t delivery;
+  std::uint64_t last_delivery_rate = 0;
+
   std::optional<transport_parameters_t> peer_parameters;
 
   loss_recovery_t recovery;
@@ -1327,6 +1333,10 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
         {
           impl.mtu.on_acked(acked.packet_number);
         }
+        if (acked.in_flight)
+        {
+          impl.delivery.on_packet_acked(acked.delivery, acked.time_sent, acked.size, now, acked.packet_number);
+        }
         impl.congestion.on_packet_acked(acked);
         if (space == pn_space_t::application)
         {
@@ -1356,6 +1366,15 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
           }
         }
       }
+      // One rate for the whole batch, not one per packet: the interval a rate
+      // is measured over spans the acknowledgements, so it is only complete
+      // once they have all been counted. A sample shorter than a round trip is
+      // refused inside -- it would be measuring a burst arriving, not a path.
+      if (auto rate = impl.delivery.take(impl.recovery.rtt().minimum()); rate.has_value())
+      {
+        impl.last_delivery_rate = rate->rate;
+      }
+
       // Section 13.4.2.1, and section 7 of RFC 9002: a rise in the
       // congestion-experienced count is a router saying it is close to
       // dropping, and is treated exactly as loss would be -- except that
@@ -2716,6 +2735,10 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     impl.congestion.on_packet_sent(packet_number);
   }
   sent.frames = std::move(record);
+  if (sent.in_flight)
+  {
+    sent.delivery = impl.delivery.on_packet_sent(now, impl.recovery.bytes_in_flight() == 0, packet_number);
+  }
   impl.recovery.on_packet_sent(to_pn_space(level), std::move(sent));
   return *length;
 }
@@ -3171,6 +3194,11 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
 
   if (!carries_anything)
   {
+    // Past the window and past the pacer, and still nothing to put in a packet:
+    // it is the application that is the limit here, not the path. A rate
+    // measured across this says how fast the sender was fed, so it must not be
+    // mistaken for how fast the path can carry.
+    impl.delivery.set_app_limited(true);
     return std::size_t{0};
   }
 
@@ -3196,6 +3224,12 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   if (sending_probe)
   {
     impl.mtu.on_probe_sent(probe_packet_number, written, now, impl.recovery.rtt().smoothed());
+  }
+  // Once the window is what stops the next packet rather than the application,
+  // the path is being measured again.
+  if (impl.recovery.bytes_in_flight() + impl.config.max_datagram_size >= impl.congestion.window())
+  {
+    impl.delivery.set_app_limited(false);
   }
   impl.bytes_sent += written;
   if (paceable)
@@ -3358,6 +3392,16 @@ bool connection_t::initiate_key_update()
 std::size_t connection_t::datagram_size() const
 {
   return _impl->mtu.datagram_size();
+}
+
+std::uint64_t connection_t::delivery_rate() const
+{
+  return _impl->last_delivery_rate;
+}
+
+std::uint64_t connection_t::peak_delivery_rate() const
+{
+  return _impl->delivery.peak();
 }
 
 bool connection_t::key_phase() const

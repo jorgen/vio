@@ -42,6 +42,7 @@
 //
 // Time enters as a parameter. Nothing here reads a clock.
 
+#include "vio/quic/delivery_rate.h"
 #include "vio/quic/ecn.h"
 #include "vio/quic/frame_codec.h"
 #include "vio/tick.h"
@@ -215,6 +216,9 @@ struct sent_packet_t
   // against the codepoints this endpoint applied, so each packet has to
   // remember what it went out marked as.
   ecn_codepoint_t ecn = ecn_codepoint_t::not_ect;
+  // What delivery looked like when this went out, so that acknowledging it can
+  // say how much moved in the interval since.
+  delivery_rate_estimator_t::stamp_t delivery;
   std::vector<sent_frame_t> frames;
 };
 

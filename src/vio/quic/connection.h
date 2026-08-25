@@ -263,6 +263,11 @@ public:
   // path and grows to whatever this one turns out to carry.
   [[nodiscard]] std::size_t datagram_size() const;
 
+  // What the path has been measured delivering, in bytes per second: the most
+  // recent sample, and the fastest seen. Nothing steers on these yet.
+  [[nodiscard]] std::uint64_t delivery_rate() const;
+  [[nodiscard]] std::uint64_t peak_delivery_rate() const;
+
   [[nodiscard]] const connection_id_t &local_connection_id() const;
   [[nodiscard]] const connection_id_t &peer_connection_id() const;
 

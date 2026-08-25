@@ -489,3 +489,172 @@ TEST_CASE("a loss ends the question")
   CHECK(control.hystart_phase() == hystart_phase_t::finished);
 }
 }
+
+TEST_SUITE("quic delivery rate")
+{
+using vio::quic::delivery_rate_estimator_t;
+
+// The estimator driven by hand, against a path whose rate is known because the
+// test chose it: packets sent back to back and acknowledged as the path
+// delivers them, one round trip later.
+TEST_CASE("a steady path reports the rate it is delivering at")
+{
+  delivery_rate_estimator_t estimator;
+  constexpr std::size_t packet = 1200;
+  constexpr auto delay = 20ms;
+  // 1200 bytes every 40 microseconds is 30 MB/s.
+  constexpr auto spacing = 40us;
+
+  std::vector<delivery_rate_estimator_t::stamp_t> stamps;
+  std::vector<vio::tick_t> sent_at;
+  auto now = at(0ns);
+  for (int i = 0; i < 500; ++i)
+  {
+    stamps.push_back(estimator.on_packet_sent(now, i == 0, static_cast<std::uint64_t>(i)));
+    sent_at.push_back(now);
+    now = now + std::chrono::nanoseconds(spacing);
+  }
+
+  auto ack_time = at(0ns) + std::chrono::nanoseconds(delay);
+  for (std::size_t i = 0; i < stamps.size(); ++i)
+  {
+    estimator.on_packet_acked(stamps[i], sent_at[i], packet, ack_time, i);
+    ack_time = ack_time + std::chrono::nanoseconds(spacing);
+  }
+
+  auto sample = estimator.take(delay);
+  REQUIRE(sample.has_value());
+  CHECK_FALSE(sample->app_limited);
+  CAPTURE(sample->rate);
+  CHECK(sample->rate > 28000000);
+  CHECK(sample->rate < 32000000);
+  CHECK(estimator.peak() == sample->rate);
+}
+
+TEST_CASE("a sample shorter than a round trip is refused")
+{
+  delivery_rate_estimator_t estimator;
+  auto now = at(0ns);
+  const auto stamp = estimator.on_packet_sent(now, true, 0);
+  // This measures one burst arriving, not what the path carries; reporting it
+  // would be an enormous invented rate.
+  estimator.on_packet_acked(stamp, now, 1200, now + std::chrono::nanoseconds(1us), 0);
+  CHECK_FALSE(estimator.take(20ms).has_value());
+  CHECK(estimator.peak() == 0);
+}
+
+TEST_CASE("a rate the sender limited does not become the path's peak")
+{
+  delivery_rate_estimator_t estimator;
+  constexpr auto delay = 20ms;
+  auto now = at(0ns);
+
+  estimator.set_app_limited(true);
+  std::vector<delivery_rate_estimator_t::stamp_t> stamps;
+  std::vector<vio::tick_t> sent_at;
+  for (int i = 0; i < 20; ++i)
+  {
+    stamps.push_back(estimator.on_packet_sent(now, i == 0, static_cast<std::uint64_t>(i)));
+    sent_at.push_back(now);
+    now = now + std::chrono::nanoseconds(2ms);
+  }
+  auto ack_time = at(0ns) + std::chrono::nanoseconds(delay);
+  for (std::size_t i = 0; i < stamps.size(); ++i)
+  {
+    estimator.on_packet_acked(stamps[i], sent_at[i], 1200, ack_time, i);
+    ack_time = ack_time + std::chrono::nanoseconds(2ms);
+  }
+
+  auto sample = estimator.take(delay);
+  REQUIRE(sample.has_value());
+  CHECK(sample->app_limited);
+  CHECK(sample->rate > 0);
+  // Reported, but never believed as a statement about the path.
+  CHECK(estimator.peak() == 0);
+}
+
+// The point of a windowed maximum rather than an all-time one: a path that
+// slows down has to be believed. An estimate that only ever grows would hold
+// the connection to a rate the path stopped carrying.
+TEST_CASE("a path that slows down is eventually believed")
+{
+  delivery_rate_estimator_t estimator;
+  constexpr auto delay = 20ms;
+  std::uint64_t packet_number = 0;
+
+  // Drive one round of traffic at a chosen spacing and read the filter back.
+  const auto run_round = [&](std::chrono::nanoseconds spacing, vio::tick_t start)
+  {
+    std::vector<delivery_rate_estimator_t::stamp_t> stamps;
+    std::vector<vio::tick_t> sent_at;
+    auto now = start;
+    const auto first = packet_number;
+    for (int i = 0; i < 60; ++i)
+    {
+      stamps.push_back(estimator.on_packet_sent(now, false, packet_number++));
+      sent_at.push_back(now);
+      now = now + spacing;
+    }
+    auto ack_time = start + std::chrono::nanoseconds(delay);
+    for (std::size_t i = 0; i < stamps.size(); ++i)
+    {
+      estimator.on_packet_acked(stamps[i], sent_at[i], 1200, ack_time, first + i);
+      ack_time = ack_time + spacing;
+    }
+    (void)estimator.take(delay);
+    return now;
+  };
+
+  // Fast to begin with. The rate a single round can show is bounded by the
+  // propagation delay it is measured across, so this is well under the 30 MB/s
+  // the spacing alone would suggest -- what matters here is that it is the
+  // larger of the two rates, and that the filter lets go of it.
+  auto now = at(0ns);
+  now = run_round(std::chrono::nanoseconds(40us), now);
+  const auto fast = estimator.peak();
+  CHECK(fast > 3000000);
+
+  // Then the path drops to a fifth of that and stays there. The filter holds
+  // the old maximum for its window and then lets it go.
+  for (int round = 0; round < 14; ++round)
+  {
+    now = run_round(std::chrono::nanoseconds(200us), now + std::chrono::nanoseconds(delay));
+  }
+
+  CAPTURE(fast);
+  CAPTURE(estimator.peak());
+  CHECK(estimator.peak() < fast);
+  CHECK(estimator.peak() > 1500000);
+  CHECK(estimator.peak() < 3000000);
+}
+
+// The interval is the larger of how long the acknowledgements took to come back
+// and how long the packets took to go out. Without that, a path that holds
+// acknowledgements and releases them together reads back as infinitely fast.
+TEST_CASE("acknowledgements bunched by the path do not inflate the rate")
+{
+  delivery_rate_estimator_t estimator;
+  constexpr auto delay = 20ms;
+  auto now = at(0ns);
+
+  std::vector<delivery_rate_estimator_t::stamp_t> stamps;
+  std::vector<vio::tick_t> sent_at;
+  // One packet a millisecond left this sender: about 1.2 MB/s.
+  for (int i = 0; i < 40; ++i)
+  {
+    stamps.push_back(estimator.on_packet_sent(now, i == 0, static_cast<std::uint64_t>(i)));
+    sent_at.push_back(now);
+    now = now + std::chrono::nanoseconds(1ms);
+  }
+  const auto ack_time = at(0ns) + std::chrono::nanoseconds(delay + 40ms);
+  for (std::size_t i = 0; i < stamps.size(); ++i)
+  {
+    estimator.on_packet_acked(stamps[i], sent_at[i], 1200, ack_time, i);
+  }
+
+  auto sample = estimator.take(delay);
+  REQUIRE(sample.has_value());
+  CAPTURE(sample->rate);
+  CHECK(sample->rate < 2000000);
+}
+}
