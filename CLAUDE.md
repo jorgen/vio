@@ -229,6 +229,32 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   the architecture. Timestamps and multipath are niche; no two of picoquic,
   msquic and quiche agree on having all of them either.
 
+  **Denial-of-service hardening.** Three defects found in the August 2026
+  security review, each of which cost one packet to trigger:
+
+  - **A Version Negotiation packet is never answered** (`quic_endpoint.cpp`).
+    Its version field is zero, which no endpoint supports, so replying produced
+    a packet that was itself a trigger -- section 6.1 forbids it, and two
+    endpoints pointed at each other never stopped. A Version Negotiation is also
+    withheld from any datagram below 1200 bytes, for the amplification reason
+    section 14.1 gives about Initials.
+  - **`connection_config_t::handshake_timeout`** (default 10 s, `0` disables).
+    The idle timeout of section 10.1 is negotiated, so it does not exist until
+    the peer's transport parameters arrive -- which means a handshake that never
+    got that far was never reaped at all, and one spoofed Initial bought a
+    connection plus a TLS session for the life of the process. The deadline is
+    stamped on the first datagram and reported through `next_timeout`.
+  - **`active_connection_id_limit` is clamped** to
+    `maximum_active_connection_id_limit` (8) on decode. Section 18.2 gives it a
+    floor and no ceiling, but `replenish_connection_ids` loops against it with a
+    CSPRNG draw and an HMAC per iteration, so an unbounded value was an
+    unbounded loop that froze every connection on the endpoint. Clamped rather
+    than refused: the parameter is a promise about what the peer will remember,
+    and meeting it partially is legal where rejecting the handshake is rude.
+
+  Regression tests for all three are in `test_quic_endpoint.cpp` and
+  `test_quic_connection.cpp`; each was confirmed to fail with its fix reverted.
+
   **Session resumption and 0-RTT** (RFC 9001 section 4.6, RFC 8446 section 8).
   Two separate knobs on `tls_config_t`, because they are two features:
   `session_resumption` issues and offers tickets, which shortens a handshake and
