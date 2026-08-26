@@ -147,11 +147,18 @@ struct tls_config_t
   // transport's business, not this layer's.
   std::vector<std::uint8_t> transport_parameters;
 
+  // Issue tickets on a server, keep and offer them on a client. Resumption
+  // alone shortens a handshake -- no certificate, no signature -- and carries
+  // none of 0-RTT's replay exposure, so it is worth having on its own. Off by
+  // default because a ticket is a credential, and one nobody uses is one
+  // nobody guards.
+  bool session_resumption = false;
+
   // RFC 9001 section 4.6. On a server this permits accepting 0-RTT; on a client
-  // it permits offering it. Off by default, because 0-RTT is the one part of
-  // QUIC where the transport hands the application data it cannot promise is
-  // fresh, and that is a decision for the application to make rather than to
-  // inherit.
+  // it permits offering it. Implies session_resumption, since 0-RTT rides on a
+  // ticket. Off by default, because 0-RTT is the one part of QUIC where the
+  // transport hands the application data it cannot promise is fresh, and that
+  // is a decision for the application to make rather than to inherit.
   bool early_data = false;
 
   // Where a server records the ClientHellos it has seen, so that a replayed one

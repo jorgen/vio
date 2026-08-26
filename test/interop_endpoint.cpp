@@ -57,7 +57,7 @@ std::string environment(const char *name, std::string fallback = {})
 // address, which this one has none to give.
 bool supported(std::string_view, std::string_view testcase)
 {
-  static constexpr std::string_view known[] = {"handshake", "transfer", "multiconnect", "retry", "keyupdate", "ecn"};
+  static constexpr std::string_view known[] = {"handshake", "transfer", "multiconnect", "retry", "keyupdate", "ecn", "resumption", "zerortt"};
   return std::find(std::begin(known), std::end(known), testcase) != std::end(known);
 }
 
@@ -362,7 +362,7 @@ void collect(client_state_t &state, connection_t &connection)
 
 // One connection carrying every request in the batch. multiconnect calls this
 // once per request instead, which is the whole of that test.
-task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector<request_t> &batch, const std::string &directory, bool key_update)
+task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector<request_t> &batch, const std::string &directory, bool key_update, std::vector<std::uint8_t> *ticket = nullptr, bool early_data = false)
 {
   if (batch.empty())
   {
@@ -417,7 +417,7 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
 
   client.on_activity([&state](connection_t &connection) { collect(state, connection); });
 
-  auto connected = client.connect(target, batch.front().host);
+  auto connected = client.connect(target, batch.front().host, ticket != nullptr ? std::span<const std::uint8_t>(*ticket) : std::span<const std::uint8_t>{});
   if (!connected.has_value())
   {
     std::printf("could not start a connection to %s\n", batch.front().host.c_str());
@@ -446,7 +446,8 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
     // A request per stream, opened as the peer's limit allows rather than all
     // at once: the multiplexing test asks for thousands of files, and the
     // credit for them arrives in MAX_STREAMS as earlier ones finish.
-    if (connection->handshake_complete())
+    const bool resuming = ticket != nullptr && !ticket->empty();
+    if (connection->handshake_complete() || resuming)
     {
       while (opened < batch.size())
       {
@@ -470,6 +471,38 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
   }
 
   bool ok = state.finished() && !state.failed;
+  if (ticket != nullptr && !ticket->empty())
+  {
+    // Resuming is not the same as 0-RTT: a ticket can be accepted while the
+    // early data on it is refused, and only the second is what this tests.
+    if (auto *connection = client.connection(handle); connection != nullptr)
+    {
+      const bool early = connection->early_data_accepted();
+      std::printf("resumed, early data %s\n", early ? "accepted" : "refused");
+      // Only the zerortt case fails for want of it; resumption is content to
+      // have resumed, and offers no early data to be refused.
+      ok = ok && (early || !early_data);
+    }
+  }
+  // TLS 1.3 sends the ticket after the handshake, and often after the transfer
+  // this connection existed for, so it is worth waiting a moment for.
+  if (ticket != nullptr && ticket->empty())
+  {
+    for (int elapsed = 0; elapsed < 200 && ticket->empty(); ++elapsed)
+    {
+      connection_t *connection = client.connection(handle);
+      if (connection == nullptr)
+      {
+        break;
+      }
+      *ticket = connection->resumption_ticket();
+      if (!ticket->empty())
+      {
+        break;
+      }
+      co_await sleep(loop, 10ms);
+    }
+  }
   if (auto *connection = client.connection(handle); connection != nullptr)
   {
     connection->close(0, "done", true);
@@ -506,6 +539,8 @@ task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
   // stops checking rather than misreport a transport result. vio's own default
   // is unchanged and still verifies.
   tls.verify_peer = false;
+  tls.session_resumption = testcase == "resumption" || testcase == "zerortt";
+  tls.early_data = testcase == "zerortt";
   auto context = tls_context_t::create(tls);
   if (!context.has_value())
   {
@@ -516,6 +551,25 @@ task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
   const auto directory = environment("DOWNLOADS", "/downloads");
   const bool key_update = testcase == "keyupdate";
   bool ok = true;
+
+  if (testcase == "zerortt" || testcase == "resumption")
+  {
+    // The runner's shape for both: one connection to be issued a ticket, then a
+    // second that spends it. What is being tested is the second one, so the
+    // first fetches nothing beyond what it takes to get a ticket. The two
+    // differ only in what the second is required to achieve -- resumption asks
+    // that the handshake be shorter, zerortt that data ride in the first
+    // flight -- which is why early data is configured per test case above.
+    std::vector<std::uint8_t> ticket;
+    ok = co_await fetch(loop, *context, {requests.front()}, directory, false, &ticket);
+    if (!ok || ticket.empty())
+    {
+      std::printf("no session ticket to resume with\n");
+      co_return 1;
+    }
+    ok = co_await fetch(loop, *context, requests, directory, false, &ticket, testcase == "zerortt");
+    co_return ok ? 0 : 1;
+  }
 
   if (testcase == "multiconnect")
   {

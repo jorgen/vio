@@ -533,6 +533,56 @@ TEST_CASE("a context refuses configurations it cannot honour")
 // at all: the same first flight can be delivered to two servers, which is
 // precisely what an attacker who captured it would do.
 
+TEST_CASE("resumption without early data")
+{
+  const auto identity = make_self_signed("localhost");
+
+  tls_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.certificate_chain_pem = identity.certificate_pem;
+  server_config.private_key_pem = identity.private_key_pem;
+  server_config.alpn = {"h3"};
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
+  server_config.session_resumption = true;
+
+  tls_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.ca_certificates_pem = identity.certificate_pem;
+  client_config.alpn = {"h3"};
+  client_config.transport_parameters = {0x0a, 0x0b};
+  client_config.session_resumption = true;
+
+  auto server_context = tls_context_t::create(server_config);
+  REQUIRE(server_context.has_value());
+  auto client_context = tls_context_t::create(client_config);
+  REQUIRE(client_context.has_value());
+  // Resumption needs no register: without early data there is nothing to
+  // replay, which is the whole reason it is worth having separately.
+  CHECK(server_config.anti_replay == nullptr);
+
+  auto server = tls_session_t::create(*server_context);
+  REQUIRE(server.has_value());
+  auto client = tls_session_t::create(*client_context, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server);
+  REQUIRE(client->handshake_complete());
+
+  const auto ticket = client->resumption_ticket();
+  REQUIRE_FALSE(ticket.empty());
+
+  auto resumed = tls_session_t::create(*client_context, "localhost", ticket);
+  REQUIRE(resumed.has_value());
+  auto second = tls_session_t::create(*server_context);
+  REQUIRE(second.has_value());
+  run_handshake(*resumed, *second);
+  CHECK(resumed->handshake_complete());
+  CHECK(second->handshake_complete());
+  // Resumed, but nothing was offered early, so nothing was accepted early.
+  CHECK_FALSE(resumed->early_data_accepted());
+  CHECK_FALSE(resumed->in_early_data());
+  CHECK_FALSE(resumed->alert().has_value());
+}
+
 TEST_CASE("early data")
 {
   const auto identity = make_self_signed("localhost");

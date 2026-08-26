@@ -647,10 +647,10 @@ std::expected<tls_context_t, error_t> tls_context_t::create(const tls_config_t &
     return std::unexpected(tls_error("SSL_CTX_set_quic_method failed"));
   }
 
-  // Resumption exists only where early data does. A connection that will never
-  // offer 0-RTT has nothing to gain from a ticket and every reason not to mint
-  // one: a ticket is a credential, and one nobody uses is one nobody guards.
-  if (config.early_data)
+  // A ticket is a credential, and one nobody uses is one nobody guards -- so
+  // tickets exist only where something asked for them. Early data implies it,
+  // because 0-RTT rides on resumption.
+  if (config.session_resumption || config.early_data)
   {
     SSL_CTX_set_session_cache_mode(impl->ctx, config.role == tls_role_t::client ? SSL_SESS_CACHE_CLIENT : SSL_SESS_CACHE_SERVER);
     if (config.role == tls_role_t::client)
