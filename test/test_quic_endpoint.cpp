@@ -831,3 +831,120 @@ TEST_CASE("a Version Negotiation packet is never answered with another one")
   CHECK(replies_to_small_datagram == 0);
   CHECK(replies_to_real_unknown_version == 1);
 }
+
+// VIO-14. flush_entry hands control to the application, and endpoint.h invites
+// it to call back in from there. Both connect() and flush() mutate the
+// connection vector -- one reallocates it, the other erases from it -- while
+// the walk that called the handler was iterating it by reference.
+
+TEST_CASE("an application may dial and flush from inside its connection handler")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  int announced = 0;
+  bool survived = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, int &announced, bool &survived) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.connection.transport_parameters = sane_parameters();
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        client_config.connection.transport_parameters = sane_parameters();
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+
+        // The handler dials again and flushes, from inside the walk that is
+        // announcing it. Both are documented uses.
+        endpoint_t *client_ptr = &*client;
+        const sockaddr *target_ptr = reinterpret_cast<const sockaddr *>(&*target);
+        client->on_connection(
+          [client_ptr, target_ptr, &announced](connection_t &)
+          {
+            ++announced;
+            if (announced == 1)
+            {
+              // Enough dials to grow the vector past its capacity while the
+              // walk that called this handler is still holding a cursor into
+              // it. One is not enough -- the vector may already have room.
+              for (int i = 0; i < 16; ++i)
+              {
+                (void)client_ptr->connect(target_ptr, "localhost");
+              }
+            }
+            (void)client_ptr->flush();
+          });
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto server_run = [](endpoint_t &e, cancellation_t &c) -> detached_task_t { co_await e.run(&c); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &e, cancellation_t &c) -> detached_task_t { co_await e.run(&c); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        // Several, so the walk that announces the first still has entries left
+        // to step to when the handler reallocates the vector under it.
+        for (int i = 0; i < 4; ++i)
+        {
+          auto dialled = client->connect(target_ptr, "localhost");
+          REQUIRE(dialled.has_value());
+        }
+
+        for (int i = 0; i < 200 && announced < 4; ++i)
+        {
+          co_await sleep(loop, 5ms);
+        }
+        // Reaching here at all is the assertion: before the fix the walk's
+        // cursor dangled the moment the handler dialled.
+        survived = announced >= 2;
+
+        server_cancel.cancel();
+        client_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        server.reset();
+        client.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, announced, survived);
+    });
+
+  event_loop.run();
+  CHECK(survived);
+}
+

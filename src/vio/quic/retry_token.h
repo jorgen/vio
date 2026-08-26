@@ -63,6 +63,11 @@ namespace vio::quic
 inline constexpr std::size_t retry_token_key_size = 32;
 inline constexpr std::chrono::nanoseconds default_retry_token_lifetime = std::chrono::seconds(10);
 
+// Section 8.1.3: a token from a NEW_TOKEN frame is meant to be kept and
+// presented on a later connection, so it lives far longer than the Retry token
+// that only has to survive one round trip.
+inline constexpr std::chrono::nanoseconds new_token_lifetime = std::chrono::hours(24);
+
 // Section 8.1.3 and 8.1.4 both hand a client an opaque token, and a server must
 // not confuse them. A Retry token is used immediately and carries the
 // connection ID the client first chose, which the handshake then requires the

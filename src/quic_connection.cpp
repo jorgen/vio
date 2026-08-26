@@ -524,7 +524,6 @@ void discard_space(connection_impl_t &impl, encryption_level_t level)
 //   observer of both paths can trivially link them.
 // Section 8.1.3: a token meant for a later connection is worth little if it
 // expires in the seconds a Retry token lives for.
-inline constexpr std::chrono::nanoseconds new_token_lifetime = std::chrono::hours(24);
 
 // Section 8.2.4: three times the larger of the current PTO and a PTO computed
 // from the initial RTT, because a new path may be slower than the one in use

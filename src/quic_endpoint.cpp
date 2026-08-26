@@ -140,6 +140,13 @@ struct endpoint_impl_t
   const tls_context_t &context;
   endpoint_config_t config;
   udp_t udp;
+  // flush_entry hands control to the application, which endpoint.h invites to
+  // call connect() or flush() from there. Both mutate `connections` -- one by
+  // push_back, which reallocates, the other by reap, which erases -- so the
+  // walks below iterate by index and reaping is deferred until the outermost
+  // one has finished. Without this the iteration cursor is left dangling into
+  // freed storage and the next step writes through it.
+  int walking = 0;
 
   std::vector<std::unique_ptr<connection_entry_t>> connections;
   std::unordered_map<connection_id_t, connection_entry_t *> by_id;
@@ -392,6 +399,40 @@ void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> d
     return std::nullopt;
   }
   return header;
+}
+
+// Whether this Initial's token proves the address, cheaply and without building
+// anything. Both kinds are accepted: a Retry token, bound to the full address,
+// and a NEW_TOKEN token from an earlier connection, bound to the address without
+// its port. The endpoint has to ask this itself -- branching on whether a token
+// is merely *present* means one junk byte skips the stateless Retry entirely and
+// buys a connection, a TLS session and three key schedules, which is exactly the
+// cost the Retry exists to avoid.
+[[nodiscard]] bool token_proves_address(const endpoint_impl_t &impl, const packet_header_t &header, const sockaddr *address, tick_t now)
+{
+  if (header.token.empty())
+  {
+    return false;
+  }
+  const auto full = address_bytes(address);
+  if (!full.empty())
+  {
+    auto retry = impl.config.retry_key->validate(header.token, full, now);
+    if (retry.has_value() && retry->kind == address_token_kind_t::retry)
+    {
+      return true;
+    }
+  }
+  const auto host = host_address_bytes(address);
+  if (!host.empty())
+  {
+    auto reused = impl.config.retry_key->validate(header.token, host, now, new_token_lifetime);
+    if (reused.has_value() && reused->kind == address_token_kind_t::new_token)
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Section 8.1.2, done the way the section intends: without building anything.
@@ -647,6 +688,13 @@ void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
 
 void reap(endpoint_impl_t &impl, tick_t now)
 {
+  if (impl.walking > 0)
+  {
+    // A nested call, from an application callback inside a walk. Erasing now
+    // would dangle the walk's cursor; the walk reaps as soon as it unwinds, so
+    // nothing is lost by declining here.
+    return;
+  }
   for (auto it = impl.connections.begin(); it != impl.connections.end();)
   {
     auto &entry = **it;
@@ -756,10 +804,12 @@ std::expected<void, error_t> endpoint_t::flush()
 {
   auto &impl = *_impl;
   const auto now = loop_now(impl.loop);
-  for (auto &entry : impl.connections)
+  ++impl.walking;
+  for (std::size_t index = 0; index < impl.connections.size(); ++index)
   {
-    flush_entry(impl, *entry, now);
+    flush_entry(impl, *impl.connections[index], now);
   }
+  --impl.walking;
   reap(impl, now);
   return {};
 }
@@ -815,10 +865,12 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
         break;
       }
       const auto now = loop_now(state.loop);
-      for (auto &entry : state.connections)
+      ++state.walking;
+      for (std::size_t index = 0; index < state.connections.size(); ++index)
       {
-        flush_entry(state, *entry, now);
+        flush_entry(state, *state.connections[index], now);
       }
+      --state.walking;
       reap(state, now);
     }
     state.running = false;
@@ -899,7 +951,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
         continue;
       }
 
-      if (impl.config.retry_key != nullptr && initial->token.empty())
+      if (impl.config.retry_key != nullptr && !token_proves_address(impl, *initial, sender, now))
       {
         // Section 8.1.2: nothing has proved this address is real, so it is
         // answered without building anything. Whatever comes back carries the
