@@ -710,7 +710,7 @@ void endpoint_t::on_activity(connection_active_t handler)
   _impl->on_activity = std::move(handler);
 }
 
-std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name)
+std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket)
 {
   auto &impl = *_impl;
   ensure_socket(impl, address != nullptr ? address->sa_family : AF_INET);
@@ -720,6 +720,10 @@ std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *
   config.peer_address = address_bytes(address);
   config.peer_host_address = host_address_bytes(address);
   config.ecn = impl.config.ecn ? ecn_codepoint_t::ect0 : ecn_codepoint_t::not_ect;
+  if (!resumption_ticket.empty())
+  {
+    config.resumption_ticket.assign(resumption_ticket.begin(), resumption_ticket.end());
+  }
 
   auto created = connection_t::create(impl.context, config, server_name);
   if (!created.has_value())

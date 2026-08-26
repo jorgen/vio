@@ -8,6 +8,7 @@
 #include <vio/event_loop.h>
 #include <vio/operation/sleep.h>
 #include <vio/operation/tcp.h>
+#include <vio/quic/anti_replay.h>
 #include <vio/quic/endpoint.h>
 #include <vio/task.h>
 
@@ -555,4 +556,149 @@ TEST_CASE("a handle stops naming a connection the endpoint has collected")
   CHECK(named_before);
   CHECK_FALSE(named_after);
 }
+}
+
+
+TEST_CASE("a resumed connection carries a request in its first flight, over a real socket")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool resumed = false;
+  bool early_accepted = false;
+  std::string received;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &resumed, bool &early_accepted, std::string &received) -> task_t<void>
+      {
+        anti_replay_t strikes;
+
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        server_tls.early_data = true;
+        server_tls.anti_replay = &strikes;
+
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+        client_tls.early_data = true;
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.connection.transport_parameters = sane_parameters();
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        connection_t *accepted = nullptr;
+        server->on_connection([&accepted](connection_t &connection) { accepted = &connection; });
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        client_config.connection.transport_parameters = sane_parameters();
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+
+        // A first connection, purely to be issued a ticket. The ticket arrives
+        // after the handshake reports complete, so this waits past that.
+        std::vector<std::uint8_t> ticket;
+        {
+          auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+          REQUIRE(dialled.has_value());
+          for (int i = 0; i < 200; ++i)
+          {
+            auto *connection = client->connection(*dialled);
+            if (connection == nullptr)
+            {
+              break;
+            }
+            ticket = connection->resumption_ticket();
+            if (!ticket.empty())
+            {
+              connection->close(0, "done");
+              break;
+            }
+            co_await sleep(loop, 5ms);
+          }
+        }
+        REQUIRE_FALSE(ticket.empty());
+        (void)client->flush();
+        co_await sleep(loop, 20ms);
+        accepted = nullptr;
+
+        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost", ticket);
+        REQUIRE(dialled.has_value());
+        connection_t *connection = client->connection(*dialled);
+        REQUIRE(connection != nullptr);
+
+        // Written before the handshake has been given any chance to run. On a
+        // connection that was not resuming there would be no key for it.
+        REQUIRE_FALSE(connection->handshake_complete());
+        const std::string message = "0-RTT over a real socket";
+        auto stream = connection->open_stream(stream_direction_t::bidirectional);
+        REQUIRE(stream.has_value());
+        const std::vector<std::uint8_t> payload(message.begin(), message.end());
+        REQUIRE(connection->write_stream(*stream, payload, true) == payload.size());
+        (void)client->flush();
+
+        for (int i = 0; i < 200; ++i)
+        {
+          if (accepted != nullptr)
+          {
+            auto readable = accepted->readable_stream(*stream);
+            if (readable.size() >= message.size())
+            {
+              received.assign(reinterpret_cast<const char *>(readable.data()), readable.size());
+              break;
+            }
+          }
+          co_await sleep(loop, 5ms);
+        }
+        resumed = connection->handshake_complete();
+        early_accepted = connection->early_data_accepted() && accepted != nullptr && accepted->early_data_accepted();
+
+        server_cancel.cancel();
+        client_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        server.reset();
+        client.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, resumed, early_accepted, received);
+    });
+
+  event_loop.run();
+  CHECK(resumed);
+  CHECK(received == "0-RTT over a real socket");
+  CHECK(early_accepted);
 }

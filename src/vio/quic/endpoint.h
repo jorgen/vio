@@ -45,6 +45,8 @@
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/operation/udp.h"
+#include <span>
+
 #include "vio/quic/connection.h"
 #include "vio/task.h"
 #include "vio/tick.h"
@@ -216,7 +218,11 @@ public:
 
   // Dials. The returned pointer is owned by the endpoint and stays valid until
   // the connection closes and is reaped.
-  [[nodiscard]] std::expected<connection_handle_t, error_t> connect(const sockaddr *address, std::string_view server_name);
+  //
+  // A ticket kept from an earlier connection to this peer resumes, which lets
+  // the first flight carry application data. It is per-dial rather than part of
+  // the config because a ticket is about one peer and an endpoint dials many.
+  [[nodiscard]] std::expected<connection_handle_t, error_t> connect(const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket = {});
 
   // The connection that handle names, or nullptr once the endpoint has
   // collected it. Ask each time it is needed rather than keeping what this
