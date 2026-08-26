@@ -387,9 +387,10 @@ public:
     return charge_connection(consumed);
   }
 
-  [[nodiscard]] streams_error_t receive_reset_stream(std::uint64_t id, std::uint64_t error_code, std::uint64_t final_size)
+  [[nodiscard]] streams_error_t receive_reset_stream(std::uint64_t id, std::uint64_t error_code, std::uint64_t final_size, std::uint64_t &credit_released)
   {
     (void)error_code;
+    credit_released = 0;
     auto *stream = ensure_remote(id);
     if (stream == nullptr)
     {
@@ -399,12 +400,14 @@ public:
     {
       return streams_error_t::stream_state;
     }
+    const auto before = stream->receive.read_offset();
     std::uint64_t consumed = 0;
     const auto error = stream->receive.receive_reset(final_size, consumed);
     if (error != stream_error_t::none)
     {
       return from_stream_error(error);
     }
+    credit_released = stream->receive.read_offset() - before;
     return charge_connection(consumed);
   }
 
@@ -498,6 +501,17 @@ public:
       return;
     }
     limit += additional;
+
+    // A credit is only sound if the index it paid for is permanently spent, and
+    // nothing stops a peer reopening an index it already finished -- section 3.2
+    // makes a frame for a lower index legitimate, so refusing one is not an
+    // option. What bounds it is the ceiling: however many streams have come and
+    // gone, the limit can never exceed what was advertised plus the count of
+    // distinct indices the peer has ever opened. Reusing one buys nothing.
+    const auto opened = direction == stream_direction_t::bidirectional ? _remote_bidi_opened : _remote_uni_opened;
+    const auto initial = direction == stream_direction_t::bidirectional ? _config.initial_max_streams_bidi : _config.initial_max_streams_uni;
+    const auto ceiling = opened > max_stream_count - initial ? max_stream_count : initial + opened;
+    limit = (std::min)(limit, ceiling);
   }
 
   struct reaped_t

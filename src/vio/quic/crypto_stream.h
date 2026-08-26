@@ -58,6 +58,13 @@ namespace vio::quic
 // slack, which is generous without being a lever.
 inline constexpr std::size_t default_crypto_buffer_limit = 64 * 1024;
 
+// The byte budget above says nothing about what holding those bytes costs. One
+// byte at every other offset stays inside it and still buys a map node and a
+// separate heap block per byte -- about a hundred times the accounted figure,
+// and reachable before the handshake, where Initial keys come from a connection
+// id anyone can read. So the runs are counted as well as the bytes.
+inline constexpr std::size_t max_crypto_chunks = 64;
+
 enum class crypto_insert_t : std::uint8_t
 {
   ok,
@@ -130,6 +137,12 @@ public:
     if (merged_start == start && merged_end == end && first == last)
     {
       if (_buffered + incoming.size() > _buffer_limit)
+      {
+        return crypto_insert_t::buffer_exceeded;
+      }
+      // The only path that adds a run without removing one, so the only place
+      // the count can grow.
+      if (_chunks.size() >= max_crypto_chunks)
       {
         return crypto_insert_t::buffer_exceeded;
       }

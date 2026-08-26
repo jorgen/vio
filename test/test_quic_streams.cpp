@@ -496,7 +496,8 @@ TEST_CASE("a reset charges the connection for bytes that never arrived")
 
   CHECK(streams.receive_stream_frame(1, 0, as_bytes("hello"), false) == streams_error_t::none);
   CHECK(streams.data_received() == 5);
-  CHECK(streams.receive_reset_stream(1, 3, 40) == streams_error_t::none);
+  std::uint64_t released = 0;
+  CHECK(streams.receive_reset_stream(1, 3, 40, released) == streams_error_t::none);
   // Section 4.5 again: both endpoints must agree on the credit consumed.
   CHECK(streams.data_received() == 40);
 }
@@ -622,3 +623,159 @@ TEST_CASE("the connection send window is what the peer allowed minus what has go
   }
 }
 }
+
+// VIO-08. Flow control bounds the highest offset a peer reaches, not the number
+// of runs held to get there, and the two are very different numbers.
+
+TEST_CASE("a receive half bounds the number of runs it will hold, not just the bytes")
+{
+  receive_stream_t receive;
+  receive.set_max_data(1000000);
+
+  // One byte at every other offset: every arrival is its own run, none of them
+  // merge, and none of them can ever be read because offset 0 stays missing.
+  std::uint64_t consumed = 0;
+  std::size_t accepted = 0;
+  stream_error_t last = stream_error_t::none;
+  for (std::uint64_t offset = 1; offset < 4096; offset += 2)
+  {
+    const std::vector<std::uint8_t> byte = {0x61};
+    last = receive.receive(offset, byte, false, consumed);
+    if (last != stream_error_t::none)
+    {
+      break;
+    }
+    ++accepted;
+  }
+  CHECK(last == stream_error_t::flow_control);
+  CHECK(accepted <= max_receive_chunks);
+  // And the byte budget was nowhere near spent, which is the point: the cap
+  // that mattered was never the one flow control was enforcing.
+  CHECK(consumed < 100000);
+}
+
+// VIO-10. A stream can finish with nothing left to take, and the terminal check
+// used to sit below the early return those streams hit.
+
+TEST_CASE("a receive half finishes even when nothing is left to take")
+{
+  SUBCASE("an empty frame carrying FIN")
+  {
+    receive_stream_t receive;
+    receive.set_max_data(100);
+    std::uint64_t consumed = 0;
+    REQUIRE(receive.receive(0, {}, true, consumed) == stream_error_t::none);
+    receive.consume(0);
+    CHECK(receive.finished());
+    CHECK(receive.state() == receive_state_t::data_read);
+  }
+
+  SUBCASE("a reset with nothing behind it")
+  {
+    receive_stream_t receive;
+    receive.set_max_data(100);
+    std::uint64_t consumed = 0;
+    REQUIRE(receive.receive_reset(0, consumed) == stream_error_t::none);
+    receive.consume(0);
+    CHECK(receive.finished());
+    CHECK(receive.state() == receive_state_t::reset_read);
+  }
+
+  SUBCASE("data drained before the FIN arrived")
+  {
+    receive_stream_t receive;
+    receive.set_max_data(100);
+    std::uint64_t consumed = 0;
+    REQUIRE(receive.receive(0, as_bytes("abc"), false, consumed) == stream_error_t::none);
+    receive.consume(3);
+    CHECK_FALSE(receive.finished());
+    REQUIRE(receive.receive(3, {}, true, consumed) == stream_error_t::none);
+    receive.consume(0);
+    CHECK(receive.finished());
+  }
+}
+
+// VIO-12. Section 4.5 charges the final size against connection flow control.
+// The bytes are then never delivered, so the credit has to come back.
+
+TEST_CASE("a reset returns the connection credit it consumed")
+{
+  streams_t streams(client_config(1000, 500, 10));
+  std::uint64_t released = 0;
+  REQUIRE(streams.receive_reset_stream(1, 0, 400, released) == streams_error_t::none);
+  CHECK(streams.data_received() == 400);
+  // Nothing will ever be read from it, so all four hundred are releasable.
+  CHECK(released == 400);
+}
+
+// VIO-11. A credit is only sound if the index it paid for is permanently spent,
+// and section 3.2 makes a frame for an already-used lower index legitimate.
+
+TEST_CASE("finishing and reusing one stream index cannot inflate the stream limit")
+{
+  streams_t streams(client_config(1000000, 500, 10));
+  const auto initial_uni = streams.local_max_streams(stream_direction_t::unidirectional);
+
+  // Unidirectional, so the receive half finishing is the whole stream
+  // finishing -- a bidirectional one would wait on a send half nothing here
+  // ever uses, and would never be reaped at all.
+  for (int round = 0; round < 50; ++round)
+  {
+    (void)streams.receive_stream_frame(3, 0, as_bytes("x"), true);
+    auto *stream = streams.find(3);
+    if (stream != nullptr && stream->has_receive)
+    {
+      stream->receive.consume(1);
+    }
+    // What the connection does with the result: a reaped stream returns its
+    // credit by raising the limit.
+    const auto reaped = streams.reap_finished(stream_initiator_t::server);
+    if (reaped.unidirectional > 0)
+    {
+      streams.grant_streams(stream_direction_t::unidirectional, reaped.unidirectional);
+    }
+  }
+
+  // Only one index was ever opened, so at most one credit can be owed for it.
+  CHECK(streams.local_max_streams(stream_direction_t::unidirectional) <= initial_uni + 1);
+}
+
+// VIO-13. A range queued for retransmission whose bytes were then acknowledged
+// and retired has nothing behind it, and an empty STREAM frame makes no
+// progress -- so it used to go out again for ever, at congestion-window rate.
+
+TEST_CASE("a retransmit range whose bytes were acknowledged does not loop")
+{
+  send_stream_t send;
+  send.set_max_data(10000);
+
+  const auto payload = as_bytes("0123456789");
+  CHECK(send.write(payload, false));
+
+  auto first = send.next_chunk(1000, 10000);
+  REQUIRE(first.has_value());
+  REQUIRE(first->data.size() == payload.size());
+  send.on_chunk_sent(*first);
+
+  // Declared lost, so it is queued to go again...
+  send.on_range_lost(0, payload.size());
+  REQUIRE(send.has_pending());
+
+  // ...and then acknowledged after all, which retires the bytes behind it.
+  send.on_range_acknowledged(0, payload.size());
+
+  // Whatever comes next must not be an empty frame at offset zero, and the
+  // queue must drain rather than reoffering the same range for ever.
+  for (int i = 0; i < 8; ++i)
+  {
+    auto chunk = send.next_chunk(1000, 10000);
+    if (!chunk.has_value())
+    {
+      break;
+    }
+    CHECK_FALSE(chunk->data.empty());
+    send.on_chunk_sent(*chunk);
+  }
+  CHECK_FALSE(send.has_pending());
+}
+

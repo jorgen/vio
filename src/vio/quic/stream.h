@@ -57,6 +57,12 @@ inline constexpr std::uint64_t stream_initiator_mask = 0x01;
 inline constexpr std::uint64_t stream_direction_mask = 0x02;
 inline constexpr std::uint64_t max_stream_id = varint_max;
 
+// How many discontiguous runs a receive half will hold. Flow control bounds the
+// bytes; this bounds the bookkeeping, which is the larger number when a peer
+// sends one byte at every other offset. Sixty-four is far more reordering than
+// any real path produces and still a fixed, small cost.
+inline constexpr std::size_t max_receive_chunks = 64;
+
 enum class stream_initiator_t : std::uint8_t
 {
   client,
@@ -235,7 +241,10 @@ public:
       _state = receive_state_t::size_known;
     }
 
-    insert(offset, data);
+    if (!insert(offset, data))
+    {
+      return stream_error_t::flow_control;
+    }
 
     if (_final_size.has_value() && _state != receive_state_t::data_read && contiguous_end() >= *_final_size)
     {
@@ -272,6 +281,12 @@ public:
     }
     _final_size = final_size;
     _chunks.clear();
+    // Section 4.5 charges the final size against connection flow control, and
+    // that is right -- but these bytes are now never going to be delivered to
+    // anyone, so the receiver has to release the credit for them. Advancing the
+    // read offset is what says so: there is nothing left between here and the
+    // final size, and the connection reads the difference back out.
+    _read_offset = final_size;
     if (_state != receive_state_t::reset_read)
     {
       _state = receive_state_t::reset_received;
@@ -292,6 +307,12 @@ public:
 
   void consume(std::size_t bytes)
   {
+    // Settled first, and unconditionally. A stream that ended with nothing left
+    // to take -- an empty frame carrying FIN, a reset, or a read that happened
+    // to take the last byte before the FIN arrived -- reaches the early return
+    // below, and with the terminal check only after it those streams never
+    // finished, were never reaped, and never returned their MAX_STREAMS credit.
+    settle();
     auto it = _chunks.find(_read_offset);
     if (it == _chunks.end() || bytes == 0)
     {
@@ -309,7 +330,19 @@ public:
       _chunks.erase(it);
       _chunks.emplace(_read_offset, std::move(rest));
     }
-    if (_final_size.has_value() && _read_offset >= *_final_size)
+    settle();
+  }
+
+  // The one place a receive half becomes terminal, so that every path that can
+  // finish one goes through it.
+  void settle()
+  {
+    if (_state == receive_state_t::reset_received)
+    {
+      _state = receive_state_t::reset_read;
+      return;
+    }
+    if (_state != receive_state_t::data_read && _final_size.has_value() && _read_offset >= *_final_size)
     {
       _state = receive_state_t::data_read;
     }
@@ -337,11 +370,16 @@ private:
 
   // The same merge-on-insert as the CRYPTO stream: a peer may repackage the
   // same bytes across different frame boundaries on every retransmission.
-  void insert(std::uint64_t offset, std::span<const std::uint8_t> data)
+  // Flow control bounds the highest offset reached, which is not the same as
+  // bounding what is held: one byte at every other offset stays inside any
+  // window and still costs a map node plus its own heap block per byte, which
+  // is fifty to a hundred times the advertised budget in real memory. So the
+  // fragments are counted as well as the bytes.
+  [[nodiscard]] bool insert(std::uint64_t offset, std::span<const std::uint8_t> data)
   {
     if (data.empty())
     {
-      return;
+      return true;
     }
     std::uint64_t start = offset;
     std::size_t skip = 0;
@@ -350,7 +388,7 @@ private:
       const std::uint64_t behind = _read_offset - start;
       if (behind >= data.size())
       {
-        return;
+        return true;
       }
       skip = static_cast<std::size_t>(behind);
       start = _read_offset;
@@ -401,7 +439,7 @@ private:
         }
         next = _chunks.erase(next);
       }
-      return;
+      return true;
     }
 
     auto first = _chunks.upper_bound(start);
@@ -425,8 +463,15 @@ private:
 
     if (merged_start == start && merged_end == end && first == last)
     {
+      // A fragment that merges with nothing is a new node. This is the only
+      // path that grows the map without also removing from it, so it is the
+      // only place the count has to be defended.
+      if (_chunks.size() >= max_receive_chunks)
+      {
+        return false;
+      }
       _chunks.emplace(start, std::move(incoming));
-      return;
+      return true;
     }
 
     std::vector<std::uint8_t> merged(static_cast<std::size_t>(merged_end - merged_start));
@@ -437,6 +482,7 @@ private:
     }
     _chunks.erase(first, last);
     _chunks.emplace(merged_start, std::move(merged));
+    return true;
   }
 
   std::map<std::uint64_t, std::vector<std::uint8_t>> _chunks;
@@ -538,6 +584,27 @@ public:
       return std::nullopt;
     }
 
+    // A queued range whose bytes have since been acknowledged and retired has
+    // nothing left behind it: window() returns empty, the frame goes out with no
+    // data, and nothing about the queue advances -- so it goes out again, for
+    // ever, at congestion-window rate, and if the FIN rides along it lands at
+    // the wrong offset and the peer is obliged to close. Dropping them here is
+    // what on_range_acknowledged cannot do, since it never prunes the queue.
+    while (!_retransmit.empty() && _retransmit.front().offset < _base)
+    {
+      const auto &stale = _retransmit.front();
+      const std::uint64_t stale_end = stale.offset + stale.length;
+      if (stale_end <= _base)
+      {
+        _retransmit.erase(_retransmit.begin());
+        continue;
+      }
+      // Partly retired: keep only the part that still has bytes behind it.
+      auto trimmed = range_t{.offset = _base, .length = stale_end - _base};
+      _retransmit.front() = trimmed;
+      break;
+    }
+
     if (!_retransmit.empty())
     {
       const auto &range = _retransmit.front();
@@ -549,6 +616,13 @@ public:
       chunk_t chunk;
       chunk.offset = range.offset;
       chunk.data = window(range.offset, amount);
+      if (chunk.data.empty())
+      {
+        // Nothing behind it after all. Refusing beats emitting an empty frame
+        // that makes no progress and is therefore repeated indefinitely.
+        _retransmit.erase(_retransmit.begin());
+        return std::nullopt;
+      }
       // The FIN rides only with the range that actually reaches the end.
       chunk.fin = _fin && range.offset + amount == queued();
       chunk.retransmit = true;

@@ -838,6 +838,26 @@ void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, 
   return impl.started + impl.config.handshake_timeout;
 }
 
+// Section 4.1: the peer may send more once these bytes are out of the way,
+// whether the application read them or a reset made them undeliverable.
+// Updating per byte would spend a frame per read, so the window is extended
+// once it is half consumed -- early enough that the peer never stalls.
+void release_connection_credit(connection_impl_t &impl, std::uint64_t bytes)
+{
+  if (bytes == 0)
+  {
+    return;
+  }
+  impl.consumed_since_max_data += bytes;
+  const auto window = impl.streams.local_max_data() - impl.streams.data_received();
+  if (impl.consumed_since_max_data * 2 >= window + impl.consumed_since_max_data)
+  {
+    impl.streams.set_local_max_data(impl.streams.local_max_data() + impl.consumed_since_max_data);
+    impl.consumed_since_max_data = 0;
+    impl.max_data_pending = true;
+  }
+}
+
 [[nodiscard]] recovery_context_t recovery_context(const connection_impl_t &impl)
 {
   recovery_context_t context;
@@ -1555,12 +1575,14 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
 
     case frame_kind_t::reset_stream:
     {
-      const auto error = impl.streams.receive_reset_stream(frame.stream_id, frame.error_code, frame.final_size);
+      std::uint64_t released = 0;
+      const auto error = impl.streams.receive_reset_stream(frame.stream_id, frame.error_code, frame.final_size, released);
       if (error != streams_error_t::none)
       {
         begin_close(impl, streams_error_code(error), "stream reset error", false, false);
         return ack_eliciting;
       }
+      release_connection_credit(impl, released);
       break;
     }
 
@@ -3850,14 +3872,7 @@ void connection_t::consume_stream(std::uint64_t id, std::size_t bytes)
       _impl->streams.mark_sendable(*stream);
     }
 
-    _impl->consumed_since_max_data += taken;
-    const auto connection_window = _impl->streams.local_max_data() - _impl->streams.data_received();
-    if (_impl->consumed_since_max_data * 2 >= connection_window + _impl->consumed_since_max_data)
-    {
-      _impl->streams.set_local_max_data(_impl->streams.local_max_data() + _impl->consumed_since_max_data);
-      _impl->consumed_since_max_data = 0;
-      _impl->max_data_pending = true;
-    }
+    release_connection_credit(*_impl, taken);
   }
 
   // Returning stream credit is the same idea as returning data credit: once
