@@ -181,7 +181,6 @@ struct tls_context_impl_t
   // findable from the SSL object.
   anti_replay_t *anti_replay = nullptr;
   bool early_data = false;
-  std::vector<std::uint8_t> resumption_ticket;
 
   ~tls_context_impl_t()
   {
@@ -623,7 +622,6 @@ std::expected<tls_context_t, error_t> tls_context_t::create(const tls_config_t &
   }
   impl->early_data = config.early_data;
   impl->anti_replay = config.anti_replay;
-  impl->resumption_ticket = config.resumption_ticket;
   if (SSL_CTX_set_ex_data(impl->ctx, context_index(), impl.get()) != 1)
   {
     return std::unexpected(tls_error("SSL_CTX_set_ex_data failed"));
@@ -747,7 +745,7 @@ tls_session_t::~tls_session_t() = default;
 tls_session_t::tls_session_t(tls_session_t &&) noexcept = default;
 tls_session_t &tls_session_t::operator=(tls_session_t &&) noexcept = default;
 
-std::expected<tls_session_t, error_t> tls_session_t::create(const tls_context_t &context, std::string_view server_name)
+std::expected<tls_session_t, error_t> tls_session_t::create(const tls_context_t &context, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket)
 {
   if (context._impl == nullptr || context._impl->ctx == nullptr)
   {
@@ -790,9 +788,9 @@ std::expected<tls_session_t, error_t> tls_session_t::create(const tls_context_t 
       return std::unexpected(tls_error("SSL_set_quic_early_data_context failed"));
     }
   }
-  if (context._impl->role == tls_role_t::client && !context._impl->resumption_ticket.empty())
+  if (context._impl->role == tls_role_t::client && !resumption_ticket.empty())
   {
-    SSL_SESSION *session = SSL_SESSION_from_bytes(context._impl->resumption_ticket.data(), context._impl->resumption_ticket.size(), context._impl->ctx);
+    SSL_SESSION *session = SSL_SESSION_from_bytes(resumption_ticket.data(), resumption_ticket.size(), context._impl->ctx);
     if (session == nullptr)
     {
       // A ticket that will not parse is one that cannot be used, and a full

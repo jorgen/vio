@@ -20,6 +20,7 @@
   THE SOFTWARE.
 */
 
+#include <cstdio>
 #include "vio/quic/connection.h"
 
 #include "vio/crypto.h"
@@ -82,6 +83,9 @@ constexpr std::size_t space_count = 3;
   case packet_kind_t::one_rtt:
     return encryption_level_t::application;
   case packet_kind_t::zero_rtt:
+    // Section 4.1.1: 0-RTT is numbered in the application space and shares its
+    // state -- only the keys differ, which is what the level says.
+    return encryption_level_t::early_data;
   case packet_kind_t::retry:
   case packet_kind_t::version_negotiation:
     break;
@@ -264,6 +268,10 @@ struct connection_impl_t
   std::uint64_t last_delivery_rate = 0;
 
   std::optional<transport_parameters_t> peer_parameters;
+  // Section 4.6.1: the limits a resuming client sends 0-RTT under, kept only
+  // until the handshake delivers the real ones.
+  std::optional<transport_parameters_t> remembered_parameters;
+  bool early_data_repaired = false;
 
   loss_recovery_t recovery;
   congestion_control_t congestion;
@@ -995,6 +1003,17 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     const auto alert = impl.tls.alert();
     begin_close(impl, alert.has_value() ? crypto_error_code(*alert) : crypto_error_code(0x50), advanced.error().msg, false, false);
     return {};
+  }
+
+  // Section 4.6.2. The server resumed but would not read the early data, so
+  // everything sent under those keys has to go out again under 1-RTT ones.
+  // Doing it here rather than waiting for loss detection is the difference
+  // between a retransmit and a timeout.
+  if (impl.config.role == tls_role_t::client && impl.tls.early_data_rejected() && !impl.early_data_repaired)
+  {
+    impl.early_data_repaired = true;
+    const auto rejected = impl.recovery.take_early_data_packets();
+    repair_lost(impl, pn_space_t::application, rejected);
   }
 
   for (auto &secret : impl.tls.take_write_secrets())
@@ -1885,7 +1904,11 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     }
   }
 
-  if (space.discarded || !space.have_read)
+  // A 0-RTT packet arrives before any 1-RTT read key exists -- that is the
+  // whole point of it -- so the application space's read key is the wrong
+  // thing to ask about. Its own key is what decides.
+  const bool zero_rtt = header.kind == packet_kind_t::zero_rtt;
+  if (space.discarded || (zero_rtt ? !space.have_early : !space.have_read))
   {
     return {};
   }
@@ -1897,11 +1920,6 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   // application space's numbering. Without early keys it cannot be read at all,
   // which is the ordinary case for a server that did not accept 0-RTT and for
   // every client.
-  const bool zero_rtt = header.kind == packet_kind_t::zero_rtt;
-  if (zero_rtt && !space.have_early)
-  {
-    return {};
-  }
   auto &header_protection = zero_rtt ? space.early_header : space.read_header;
   auto &payload_protection = zero_rtt ? space.early : space.read;
 
@@ -2786,6 +2804,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   sent.in_flight = sent.ack_eliciting;
   sent.size = *length;
   sent.ecn = impl.ecn_sending;
+  sent.early_data = use_early;
   if (impl.qlog != nullptr)
   {
     impl.qlog->begin_event(now, "transport", "packet_sent");
@@ -2844,6 +2863,86 @@ connection_t::~connection_t() = default;
 connection_t::connection_t(connection_t &&) noexcept = default;
 connection_t &connection_t::operator=(connection_t &&) noexcept = default;
 
+namespace
+{
+// The ticket a caller keeps is one opaque thing, but two are needed to resume:
+// the TLS session, and the transport parameters the server gave last time. A
+// length-prefixed pair, with a version byte so a stored ticket from an older
+// build is recognised and discarded rather than misread.
+constexpr std::uint8_t resumption_ticket_version = 1;
+
+void append_chunk(std::vector<std::uint8_t> &out, std::span<const std::uint8_t> chunk)
+{
+  const auto size = static_cast<std::uint32_t>(chunk.size());
+  out.push_back(static_cast<std::uint8_t>(size >> 24));
+  out.push_back(static_cast<std::uint8_t>(size >> 16));
+  out.push_back(static_cast<std::uint8_t>(size >> 8));
+  out.push_back(static_cast<std::uint8_t>(size));
+  out.insert(out.end(), chunk.begin(), chunk.end());
+}
+
+bool take_chunk(std::span<const std::uint8_t> &input, std::span<const std::uint8_t> &chunk)
+{
+  if (input.size() < 4)
+  {
+    return false;
+  }
+  const auto size = static_cast<std::size_t>(input[0]) << 24 | static_cast<std::size_t>(input[1]) << 16 | static_cast<std::size_t>(input[2]) << 8 | static_cast<std::size_t>(input[3]);
+  input = input.subspan(4);
+  if (input.size() < size)
+  {
+    return false;
+  }
+  chunk = input.first(size);
+  input = input.subspan(size);
+  return true;
+}
+
+struct resumption_t
+{
+  std::span<const std::uint8_t> session;
+  transport_parameters_t parameters;
+};
+
+// Anything malformed is simply not a ticket: a full handshake is always
+// available, so there is no reason to fail a connection over one.
+std::optional<resumption_t> parse_resumption_ticket(std::span<const std::uint8_t> ticket)
+{
+  if (ticket.empty() || ticket[0] != resumption_ticket_version)
+  {
+    return std::nullopt;
+  }
+  ticket = ticket.subspan(1);
+  std::span<const std::uint8_t> parameters;
+  std::span<const std::uint8_t> session;
+  if (!take_chunk(ticket, parameters) || !take_chunk(ticket, session) || !ticket.empty())
+  {
+    return std::nullopt;
+  }
+  auto decoded = decode_transport_parameters(parameters);
+  if (!decoded.has_value())
+  {
+    return std::nullopt;
+  }
+  return resumption_t{.session = session, .parameters = *decoded};
+}
+
+// Section 4.6.1. These are the parameters a client must not carry over: they
+// describe the connection that issued the ticket rather than limits the server
+// is willing to keep to, and acting on a remembered one would mean acting on
+// the wrong connection's identity. The server's new values replace them.
+transport_parameters_t remembered_limits(transport_parameters_t parameters)
+{
+  parameters.ack_delay_exponent = default_ack_delay_exponent_parameter;
+  parameters.max_ack_delay = default_max_ack_delay_milliseconds;
+  parameters.initial_source_connection_id.reset();
+  parameters.original_destination_connection_id.reset();
+  parameters.retry_source_connection_id.reset();
+  parameters.stateless_reset_token.reset();
+  return parameters;
+}
+} // namespace
+
 std::expected<connection_t, error_t> connection_t::create(const tls_context_t &context, const connection_config_t &config, std::string_view server_name)
 {
   if (config.local_connection_id_length > max_connection_id_size)
@@ -2878,13 +2977,24 @@ std::expected<connection_t, error_t> connection_t::create(const tls_context_t &c
     return std::unexpected(error_t{.code = 1, .msg = "could not build a local connection id"});
   }
 
-  auto session = tls_session_t::create(context, server_name);
+  // A server never resumes: it is handed a ticket, it does not present one.
+  const auto resumption = config.role == tls_role_t::client ? parse_resumption_ticket(config.resumption_ticket) : std::nullopt;
+
+  auto session = tls_session_t::create(context, server_name, resumption.has_value() ? resumption->session : std::span<const std::uint8_t>{});
   if (!session.has_value())
   {
     return std::unexpected(session.error());
   }
 
   auto impl = std::make_unique<detail::connection_impl_t>(std::move(*session), config);
+  if (resumption.has_value())
+  {
+    // What lets a stream be opened and written before the server has said
+    // anything. Superseded by the real parameters at handshake completion --
+    // which is also what happens if the server refuses the early data.
+    impl->remembered_parameters = remembered_limits(resumption->parameters);
+    impl->streams.apply_peer_parameters(*impl->remembered_parameters);
+  }
   impl->local_connection_id = *local;
   // Section 5.1.1: the ID carried in the long header during the handshake is
   // sequence 0. Its stateless reset token goes out in the transport
@@ -3403,6 +3513,30 @@ bool connection_t::handshake_complete() const
 bool connection_t::handshake_confirmed() const
 {
   return _impl->handshake_confirmed;
+}
+
+std::vector<std::uint8_t> connection_t::resumption_ticket() const
+{
+  auto session = _impl->tls.resumption_ticket();
+  if (session.empty() || !_impl->peer_parameters.has_value())
+  {
+    return {};
+  }
+  std::vector<std::uint8_t> out;
+  out.push_back(resumption_ticket_version);
+  append_chunk(out, encode_transport_parameters(*_impl->peer_parameters));
+  append_chunk(out, session);
+  return out;
+}
+
+bool connection_t::early_data_accepted() const
+{
+  return _impl->tls.early_data_accepted();
+}
+
+bool connection_t::early_data_rejected() const
+{
+  return _impl->tls.early_data_rejected();
 }
 
 bool connection_t::address_validated_by_retry() const

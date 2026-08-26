@@ -108,6 +108,17 @@ struct connection_config_t
   std::uint32_t version = quic_version_1;
   transport_parameters_t transport_parameters;
 
+  // A ticket from an earlier connection to this peer, as handed back by
+  // resumption_ticket(). Offering one resumes, and a resumed connection can put
+  // application data in its very first flight.
+  //
+  // It carries the server's transport parameters as well as the TLS session,
+  // because section 4.6.1 requires a client sending 0-RTT to keep inside the
+  // limits the server gave last time -- there is nothing else to go on before
+  // the server has spoken. Those remembered limits are replaced by the real
+  // ones the moment the handshake delivers them.
+  std::vector<std::uint8_t> resumption_ticket;
+
   // The connection ID this endpoint should answer to, instead of inventing one.
   // A server that answered an earlier Initial with a Retry has already told the
   // client which id to use, and the handshake requires that exact value to come
@@ -264,6 +275,22 @@ public:
   [[nodiscard]] connection_state_t state() const;
   [[nodiscard]] bool handshake_complete() const;
   [[nodiscard]] bool handshake_confirmed() const;
+
+  // A ticket for resuming this connection later, once the handshake is done
+  // and the server has issued one. Empty until then, and on a server always.
+  // Keeping it is what makes the next connection to this peer able to send
+  // 0-RTT; where it is kept is the caller's decision, so it comes out as bytes.
+  [[nodiscard]] std::vector<std::uint8_t> resumption_ticket() const;
+
+  // Whether the data this connection sent before the handshake finished was
+  // taken. Meaningful on a client that offered a ticket.
+  [[nodiscard]] bool early_data_accepted() const;
+
+  // The server resumed but refused the early data, so nothing sent at 0-RTT
+  // arrived. Stream state written early has been rewound and will go out again
+  // under 1-RTT keys, which is section 4.6.2's requirement; this reports that
+  // it happened rather than asking the caller to do anything about it.
+  [[nodiscard]] bool early_data_rejected() const;
 
   // The datagram size in use, which starts at what section 14 requires of every
   // path and grows to whatever this one turns out to carry.

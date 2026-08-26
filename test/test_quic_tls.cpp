@@ -585,11 +585,7 @@ TEST_CASE("early data")
   SUBCASE("a ticket resumes, and early data is accepted")
   {
     REQUIRE_FALSE(ticket.empty());
-    client_config.resumption_ticket = ticket;
-    auto resuming_context = tls_context_t::create(client_config);
-    REQUIRE(resuming_context.has_value());
-
-    auto client = tls_session_t::create(*resuming_context, "localhost");
+    auto client = tls_session_t::create(*first_client_context, "localhost", ticket);
     REQUIRE(client.has_value());
     auto server = tls_session_t::create(*server_context);
     REQUIRE(server.has_value());
@@ -621,11 +617,7 @@ TEST_CASE("early data")
   SUBCASE("a replayed first flight is refused early data")
   {
     REQUIRE_FALSE(ticket.empty());
-    client_config.resumption_ticket = ticket;
-    auto resuming_context = tls_context_t::create(client_config);
-    REQUIRE(resuming_context.has_value());
-
-    auto client = tls_session_t::create(*resuming_context, "localhost");
+    auto client = tls_session_t::create(*first_client_context, "localhost", ticket);
     REQUIRE(client.has_value());
     REQUIRE(client->advance().has_value());
 
@@ -666,10 +658,7 @@ TEST_CASE("early data")
     auto crowded_context = tls_context_t::create(crowded);
     REQUIRE(crowded_context.has_value());
 
-    client_config.resumption_ticket = ticket;
-    auto resuming_context = tls_context_t::create(client_config);
-    REQUIRE(resuming_context.has_value());
-    auto client = tls_session_t::create(*resuming_context, "localhost");
+    auto client = tls_session_t::create(*first_client_context, "localhost", ticket);
     REQUIRE(client.has_value());
     auto server = tls_session_t::create(*crowded_context);
     REQUIRE(server.has_value());
@@ -698,6 +687,20 @@ TEST_CASE("early data")
     tls_config_t offering = client_config;
     offering.anti_replay = nullptr;
     CHECK(tls_context_t::create(offering).has_value());
+  }
+
+  SUBCASE("a ticket that will not parse falls back to a full handshake")
+  {
+    const std::vector<std::uint8_t> nonsense(64, 0x5a);
+    auto client = tls_session_t::create(*first_client_context, "localhost", nonsense);
+    REQUIRE(client.has_value());
+    auto server = tls_session_t::create(*server_context);
+    REQUIRE(server.has_value());
+    run_handshake(*client, *server);
+    CHECK(client->handshake_complete());
+    CHECK(server->handshake_complete());
+    CHECK_FALSE(client->early_data_accepted());
+    CHECK_FALSE(client->alert().has_value());
   }
 }
 

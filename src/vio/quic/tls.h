@@ -162,13 +162,7 @@ struct tls_config_t
   // because a replay arriving on a second connection is the case it exists for.
   anti_replay_t *anti_replay = nullptr;
 
-  // A ticket kept from an earlier connection to this server, as handed back by
-  // tls_session_t::resumption_ticket. Offering one is what makes a handshake a
-  // resumption, and 0-RTT rides on resumption. Serialized bytes rather than a
-  // live object because where a ticket is kept -- memory, disk, a shared cache
-  // -- is the application's decision, and because a ticket outliving the
-  // process is the case that makes 0-RTT worth having.
-  std::vector<std::uint8_t> resumption_ticket;
+
 
   // Where to append the TLS secrets, in the NSS key log format every capture
   // tool reads. This is what makes a packet capture of a QUIC connection
@@ -219,7 +213,13 @@ public:
   tls_session_t &operator=(const tls_session_t &) = delete;
 
   // server_name is the SNI a client sends, and is ignored for a server.
-  [[nodiscard]] static std::expected<tls_session_t, error_t> create(const tls_context_t &context, std::string_view server_name = {});
+  // A ticket kept from an earlier connection to this peer, as handed back by
+  // resumption_ticket(), makes this handshake a resumption -- and 0-RTT rides
+  // on resumption. It belongs here rather than on the context because a ticket
+  // is about one peer and a context is shared across all of them. Serialized
+  // bytes because where a ticket is kept is the application's decision, and
+  // because a ticket outliving the process is the case worth having.
+  [[nodiscard]] static std::expected<tls_session_t, error_t> create(const tls_context_t &context, std::string_view server_name = {}, std::span<const std::uint8_t> resumption_ticket = {});
 
   // Sets the quic_transport_parameters extension. Must be called before the
   // handshake produces its first flight. A server needs this separately from

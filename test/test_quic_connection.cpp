@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -6,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <doctest/doctest.h>
+#include <vio/quic/anti_replay.h>
 #include <vio/quic/connection.h>
 #include <vio/quic/packet.h>
 
@@ -2986,4 +2988,215 @@ TEST_CASE("a token from one connection saves a round trip on the next")
     CHECK(client->address_validated_by_retry());
   }
 }
+
+// 0-RTT at the transport layer: a client that kept a ticket writes a stream
+// before it has heard a word from the server, and those bytes ride in a 0-RTT
+// packet in the client's first flight.
+
+namespace
+{
+bool contains_packet_kind(std::span<const std::uint8_t> datagram, packet_kind_t wanted)
+{
+  packet_reader_t reader(datagram, 0);
+  while (auto next = reader.next())
+  {
+    if (!next->has_value())
+    {
+      return false;
+    }
+    if (next->value().kind == wanted)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A first connection whose only purpose is to obtain a ticket.
+std::vector<std::uint8_t> obtain_ticket(const tls_context_t &server_context, const tls_context_t &client_context, vio::tick_t now)
+{
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+  run_handshake(*client, *server, now);
+  REQUIRE(client->handshake_complete());
+  return client->resumption_ticket();
+}
+} // namespace
+
+TEST_CASE("a resumed connection sends application data in its first flight")
+{
+  const auto identity = make_self_signed("localhost");
+  anti_replay_t strikes;
+
+  tls_config_t server_tls;
+  server_tls.role = tls_role_t::server;
+  server_tls.certificate_chain_pem = identity.certificate_pem;
+  server_tls.private_key_pem = identity.private_key_pem;
+  server_tls.alpn = {"h3"};
+  server_tls.early_data = true;
+  server_tls.anti_replay = &strikes;
+
+  tls_config_t client_tls;
+  client_tls.role = tls_role_t::client;
+  client_tls.ca_certificates_pem = identity.certificate_pem;
+  client_tls.alpn = {"h3"};
+  client_tls.early_data = true;
+
+  auto server_context = tls_context_t::create(server_tls);
+  REQUIRE(server_context.has_value());
+  auto first_client_context = tls_context_t::create(client_tls);
+  REQUIRE(first_client_context.has_value());
+
+  const auto now = vio::tick_t{};
+  const auto ticket = obtain_ticket(*server_context, *first_client_context, now);
+  REQUIRE_FALSE(ticket.empty());
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.resumption_ticket = ticket;
+
+  auto server = connection_t::create(*server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(*first_client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  // Written before a single byte has arrived from the server. On a full
+  // handshake there would be no key to write it under.
+  const std::vector<std::uint8_t> early = {'G', 'E', 'T', ' ', '/', 'e', 'a', 'r', 'l', 'y'};
+  const auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+  CHECK(client->write_stream(*stream, early, true) == early.size());
+
+  // Everything the client has to say before it has heard anything back. This
+  // is the first flight, and whether the data is in it is the whole question.
+  std::vector<std::vector<std::uint8_t>> first_flight;
+  for (;;)
+  {
+    std::vector<std::uint8_t> datagram(1500);
+    auto size = client->poll_send(datagram, now);
+    REQUIRE(size.has_value());
+    if (*size == 0)
+    {
+      break;
+    }
+    datagram.resize(*size);
+    first_flight.push_back(std::move(datagram));
+  }
+  for (auto &datagram : first_flight)
+  {
+    REQUIRE(server->receive(datagram, now).has_value());
+  }
+
+  run_handshake(*client, *server, now);
+  CHECK(client->handshake_complete());
+  CHECK(server->handshake_complete());
+  CHECK(client->early_data_accepted());
+  CHECK(server->early_data_accepted());
+  CHECK_FALSE(client->early_data_rejected());
+
+  SUBCASE("the data arrived, and whole")
+  {
+    const auto readable = server->readable_streams();
+    REQUIRE(readable.size() == 1);
+    CHECK(readable[0] == *stream);
+    const auto bytes = server->readable_stream(*stream);
+    CHECK(std::vector<std::uint8_t>(bytes.begin(), bytes.end()) == early);
+    CHECK(server->stream_receive_finished(*stream));
+  }
+
+  SUBCASE("it really did travel in the first flight")
+  {
+    REQUIRE_FALSE(first_flight.empty());
+    // Sent before the server had said a word, which is what separates 0-RTT
+    // from data merely held back until 1-RTT keys existed.
+    const auto early_packet = std::any_of(first_flight.begin(), first_flight.end(), [](const auto &datagram) { return contains_packet_kind(datagram, packet_kind_t::zero_rtt); });
+    CHECK(early_packet);
+  }
+}
+
+TEST_CASE("a refused ticket still delivers the data the client sent early")
+{
+  const auto identity = make_self_signed("localhost");
+  anti_replay_t strikes;
+
+  tls_config_t server_tls;
+  server_tls.role = tls_role_t::server;
+  server_tls.certificate_chain_pem = identity.certificate_pem;
+  server_tls.private_key_pem = identity.private_key_pem;
+  server_tls.alpn = {"h3"};
+  server_tls.early_data = true;
+  server_tls.anti_replay = &strikes;
+
+  tls_config_t client_tls;
+  client_tls.role = tls_role_t::client;
+  client_tls.ca_certificates_pem = identity.certificate_pem;
+  client_tls.alpn = {"h3"};
+  client_tls.early_data = true;
+
+  auto server_context = tls_context_t::create(server_tls);
+  REQUIRE(server_context.has_value());
+  auto first_client_context = tls_context_t::create(client_tls);
+  REQUIRE(first_client_context.has_value());
+
+  const auto now = vio::tick_t{};
+  const auto ticket = obtain_ticket(*server_context, *first_client_context, now);
+  REQUIRE_FALSE(ticket.empty());
+
+  // A register with no room refuses every identifier, which is the server-side
+  // decision a client has to survive without losing what it wrote.
+  anti_replay_t full(anti_replay_t::default_window, 1);
+  const std::uint8_t occupant[] = {0xab};
+  REQUIRE(full.accept(occupant, vio::tick_t{}));
+  tls_config_t refusing = server_tls;
+  refusing.anti_replay = &full;
+  auto refusing_context = tls_context_t::create(refusing);
+  REQUIRE(refusing_context.has_value());
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.resumption_ticket = ticket;
+
+  auto server = connection_t::create(*refusing_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(*first_client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  const std::vector<std::uint8_t> early = {'G', 'E', 'T', ' ', '/', 'e', 'a', 'r', 'l', 'y'};
+  const auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+  CHECK(client->write_stream(*stream, early, true) == early.size());
+
+  run_handshake(*client, *server, now);
+  CHECK(client->handshake_complete());
+  CHECK(server->handshake_complete());
+  CHECK(client->early_data_rejected());
+  CHECK_FALSE(client->early_data_accepted());
+  CHECK_FALSE(server->early_data_accepted());
+
+  // Section 4.6.2: what was sent at 0-RTT has to go out again under 1-RTT
+  // keys. The caller wrote it once and never hears that any of this happened.
+  const auto readable = server->readable_streams();
+  REQUIRE(readable.size() == 1);
+  const auto bytes = server->readable_stream(*stream);
+  CHECK(std::vector<std::uint8_t>(bytes.begin(), bytes.end()) == early);
+  CHECK(server->stream_receive_finished(*stream));
+}
+
 }

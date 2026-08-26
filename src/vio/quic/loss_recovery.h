@@ -219,6 +219,10 @@ struct sent_packet_t
   // What delivery looked like when this went out, so that acknowledging it can
   // say how much moved in the interval since.
   delivery_rate_estimator_t::stamp_t delivery;
+  // Sent under 0-RTT keys. It shares the application space with everything
+  // else, so nothing else distinguishes it -- and a server that refuses early
+  // data leaves exactly these packets undecryptable and unacknowledged.
+  bool early_data = false;
   std::vector<sent_frame_t> frames;
 };
 
@@ -614,6 +618,37 @@ public:
 
   // Appendix A.11: the packets go, the RTT estimate stays. It described the
   // path, and the path has not changed.
+  // RFC 9001 section 4.6.2. A server that refused early data never read those
+  // packets, so waiting for them to be declared lost is waiting for a timeout
+  // to confirm something already known. They are taken out of flight and handed
+  // back for their frames to be repaired, which sends the same data again under
+  // 1-RTT keys -- and the application never learns that any of it happened.
+  [[nodiscard]] std::vector<sent_packet_t> take_early_data_packets()
+  {
+    auto &state = _spaces[pn_space_to_index(pn_space_t::application)];
+    std::vector<sent_packet_t> taken;
+    for (std::size_t index = 0; index < state.sent.slots(); ++index)
+    {
+      if (!state.sent.live(index) || !state.sent.at(index).early_data)
+      {
+        continue;
+      }
+      const auto &packet = state.sent.at(index);
+      if (packet.in_flight)
+      {
+        _bytes_in_flight -= (std::min)(_bytes_in_flight, packet.size);
+      }
+      if (packet.ack_eliciting)
+      {
+        --_ack_eliciting_in_flight;
+      }
+      taken.push_back(std::move(state.sent.at(index)));
+      state.sent.remove(index);
+    }
+    state.sent.compact();
+    return taken;
+  }
+
   void discard_space(pn_space_t space)
   {
     auto &state = _spaces[pn_space_to_index(space)];
