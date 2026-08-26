@@ -409,6 +409,21 @@ std::expected<void, error_t> install_early_keys(packet_space_t &space, const tls
   return {};
 }
 
+// Section 4.9.3. A client is done with them once it has 1-RTT write keys, a
+// server once the handshake completes -- which is when the client's Finished
+// has been read. Keeping them past that leaves a window in which a captured
+// 0-RTT packet is still readable, and there is nothing left to read with them.
+void discard_early_keys(packet_space_t &space)
+{
+  if (!space.have_early)
+  {
+    return;
+  }
+  space.early = packet_protection_t{};
+  space.early_header = header_protection_t{};
+  space.have_early = false;
+}
+
 std::expected<void, error_t> install_keys(packet_space_t &space, const tls_secret_t &secret, bool read, std::uint32_t version)
 {
   auto material = derive_key_material(secret.suite, secret.secret, version);
@@ -1035,9 +1050,14 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
     }
   }
 
+  auto &application = impl.spaces[space_index(encryption_level_t::application)];
+  if (impl.config.role == tls_role_t::client ? application.have_write : impl.tls.handshake_complete())
+  {
+    discard_early_keys(application);
+  }
+
   // Only the application space ever updates keys; Initial and Handshake are
   // discarded long before it could matter.
-  auto &application = impl.spaces[space_index(encryption_level_t::application)];
   if (auto r = derive_next_generation(application); !r.has_value())
   {
     return r;

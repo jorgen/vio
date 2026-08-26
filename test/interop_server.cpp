@@ -21,6 +21,7 @@
 #include <vio/event_loop.h>
 #include <vio/operation/sleep.h>
 #include <vio/operation/tcp.h>
+#include <vio/quic/anti_replay.h>
 #include <vio/quic/endpoint.h>
 #include <vio/quic/retry_token.h>
 #include <vio/task.h>
@@ -151,11 +152,18 @@ int main(int argc, char **argv)
     {
       return [](event_loop_t &event_loop, const identity_t &pem, int listen_port, const char *protocol, int lifetime, bool retry, const char *qlog_dir, int &handshakes, std::size_t &bytes_read, std::size_t &answered) -> task_t<void>
       {
+        // One register for the whole endpoint, which is what it has to be: a
+        // replay is the same ClientHello arriving on a second connection, so a
+        // per-connection register would never see one.
+        anti_replay_t strikes;
+
         tls_config_t tls;
         tls.role = tls_role_t::server;
         tls.certificate_chain_pem = pem.certificate_pem;
         tls.private_key_pem = pem.private_key_pem;
         tls.alpn = {protocol};
+        tls.early_data = true;
+        tls.anti_replay = &strikes;
 
         auto context = tls_context_t::create(tls);
         if (!context.has_value())
