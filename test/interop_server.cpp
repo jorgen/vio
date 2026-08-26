@@ -181,6 +181,10 @@ int main(int argc, char **argv)
         {
           config.connection.pacing = false;
         }
+        if (const char *cc = std::getenv("VIO_CC"); cc != nullptr && std::strcmp(cc, "cubic") == 0)
+        {
+          config.connection.congestion_algorithm = congestion_algorithm_t::cubic;
+        }
         if (qlog_dir != nullptr)
         {
           config.qlog_directory = qlog_dir;
