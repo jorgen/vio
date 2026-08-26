@@ -386,6 +386,42 @@ TEST_CASE("the peer's ack delay is scaled by its exponent")
   CHECK(recovery.rtt().variation() == std::chrono::nanoseconds(57500us));
 }
 
+TEST_CASE("an enormous peer ack delay cannot invert the RTT estimate")
+{
+  loss_recovery_t recovery;
+  recovery_context_t context;
+  // The default exponent, which a peer gets simply by not sending one.
+  context.ack_delay_exponent = 3;
+  context.handshake_confirmed = false;
+  context.max_ack_delay = 25ms;
+
+  recovery.on_packet_sent(pn_space_t::application, packet(0, at(0ns)));
+  recovery.on_packet_sent(pn_space_t::application, packet(1, at(0ns)));
+
+  ack_builder_t first(0, 0);
+  auto seed = recovery.on_ack_received(pn_space_t::application, first.build(), at(300us), context);
+  REQUIRE(seed.rtt_updated);
+  const auto honest_pto = recovery.rtt().pto_base();
+  REQUIRE(honest_pto > std::chrono::nanoseconds::zero());
+
+  // A varint the peer is free to send. Scaled by the exponent it also chose,
+  // then converted to nanoseconds, this used to wrap the signed 64-bit
+  // representation and come out negative.
+  ack_builder_t hostile(1, 0, std::uint64_t{1} << 53);
+  auto outcome = recovery.on_ack_received(pn_space_t::application, hostile.build(), at(600us), context);
+  REQUIRE(outcome.acknowledged_unsent == false);
+
+  // Whatever the estimator made of that, none of it may be negative: a
+  // negative PTO leaves the loss timer permanently due, and the sender then
+  // ignores both the congestion window and the pacer.
+  CHECK(recovery.rtt().smoothed() >= std::chrono::nanoseconds::zero());
+  CHECK(recovery.rtt().variation() >= std::chrono::nanoseconds::zero());
+  CHECK(recovery.rtt().pto_base() > std::chrono::nanoseconds::zero());
+  // And the estimate stays in the region a real path could produce rather than
+  // being dragged out to centuries.
+  CHECK(recovery.rtt().smoothed() < std::chrono::seconds(1));
+}
+
 TEST_CASE("the PTO backs off and resets")
 {
   loss_recovery_t recovery;

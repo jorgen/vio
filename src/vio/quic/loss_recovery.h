@@ -70,6 +70,12 @@ inline constexpr std::int64_t loss_time_threshold_denominator = 8;
 // Section 6.1.2 and 6.2.1: the floor under both the loss delay and the PTO.
 inline constexpr std::chrono::nanoseconds loss_granularity = std::chrono::milliseconds(1);
 
+// The largest acknowledgement delay worth believing. A peer chooses both the
+// delay and the exponent scaling it, so the product on the wire is bounded by
+// nothing; about seventy minutes is already far past any value that describes a
+// real path, and it leaves room for the conversion to nanoseconds.
+inline constexpr std::uint64_t ack_delay_ceiling_microseconds = std::uint64_t{1} << 32;
+
 // Section 6.2.2: what to assume before there is a sample.
 inline constexpr std::chrono::nanoseconds initial_rtt = std::chrono::milliseconds(333);
 
@@ -139,7 +145,9 @@ public:
     // adjustment below is judged plausible against.
     _minimum = (std::min)(_minimum, latest);
 
-    auto delay = ack_delay;
+    // Defensive: every caller now clamps, but a negative delay here would make
+    // the adjustment below add rather than subtract.
+    auto delay = (std::max)(ack_delay, std::chrono::nanoseconds::zero());
     if (handshake_confirmed)
     {
       // Before confirmation the peer has not yet promised a max_ack_delay, so
@@ -496,8 +504,20 @@ public:
         {
           continue;
         }
-        const std::uint64_t scale = context.ack_delay_exponent >= 63 ? 0 : ack.ack_delay << context.ack_delay_exponent;
-        const auto delay = std::chrono::microseconds(static_cast<std::int64_t>((std::min<std::uint64_t>)(scale, (std::numeric_limits<std::int64_t>::max)())));
+        // Taking this at face value overflows twice: the shift itself, and then
+        // the microsecond-to-nanosecond conversion at the call below, which
+        // multiplies by a thousand in a signed 64-bit type and wraps negative.
+        // A negative delay makes the RTT estimate enormous, which makes the PTO
+        // negative, which leaves the loss timer permanently due -- an unpaced
+        // send loop that ignores the congestion window. So the clamp happens
+        // here, in the unit it is expressed in, before either can happen.
+        std::uint64_t scale = 0;
+        if (context.ack_delay_exponent < 63)
+        {
+          const std::uint64_t headroom = ack_delay_ceiling_microseconds >> context.ack_delay_exponent;
+          scale = ack.ack_delay > headroom ? ack_delay_ceiling_microseconds : (ack.ack_delay << context.ack_delay_exponent);
+        }
+        const auto delay = std::chrono::microseconds(static_cast<std::int64_t>(scale));
         // Section 5.3: the application space is the only one whose ACK delay
         // is bounded by max_ack_delay, and only after confirmation.
         _rtt.on_rtt_sample(now - packet.time_sent, delay, context.handshake_confirmed && space == pn_space_t::application, context.max_ack_delay);
