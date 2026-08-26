@@ -225,11 +225,59 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   Not implemented, and why: **ACK_FREQUENCY** is still a draft whose codepoints
   have moved between versions, and measurement showed vio already receives
   *fewer* acknowledgements than picoquic (one per 30 packets against one per 20),
-  so it would buy control rather than throughput. **0-RTT** needs anti-replay --
-  single-use tickets or a strike register -- and a partial implementation of a
-  security property is worse than none. **HTTP/3 and QPACK** belong in prism, per
+  so it would buy control rather than throughput. **HTTP/3 and QPACK** belong in prism, per
   the architecture. Timestamps and multipath are niche; no two of picoquic,
   msquic and quiche agree on having all of them either.
+
+  **Session resumption and 0-RTT** (RFC 9001 section 4.6, RFC 8446 section 8).
+  Two separate knobs on `tls_config_t`, because they are two features:
+  `session_resumption` issues and offers tickets, which shortens a handshake and
+  carries no replay exposure; `early_data` additionally permits 0-RTT, and
+  implies the first.
+
+  A **server with early data on must be given an `anti_replay_t`** or
+  `tls_context_t::create` fails -- refusing to build the context beats building
+  one that silently never grants 0-RTT. `anti_replay.h` is the RFC 8446 section
+  8.2 strike register: it records a digest of each ClientHello random inside a
+  window, and it is deliberately **fail-closed and bounded** -- a repeat, or a
+  full register, is refused rather than evicting something still inside its
+  window. Refusing costs a round trip; forgetting costs the guarantee. It is
+  consulted only for ClientHellos that actually offer early data, so ordinary
+  full handshakes cannot exhaust the capacity that protects the ones that do.
+  One register per endpoint, not per connection -- a replay is by definition a
+  second connection.
+
+  The **ticket a caller keeps is one opaque blob** carrying both the TLS session
+  and the server's transport parameters, because section 4.6.1 requires a
+  resuming client to stay inside the limits from last time and there is nothing
+  else to go on before the server has spoken -- without them a 0-RTT client
+  cannot even open a stream. The forbidden-to-remember parameters (connection
+  IDs, `max_ack_delay`, `ack_delay_exponent`, the reset token) are scrubbed on
+  the way in and replaced by the real ones at handshake completion. Read it with
+  `connection_t::resumption_ticket()`, spend it with
+  `endpoint_t::connect(address, name, ticket)` -- per dial, since a ticket is
+  about one peer and an endpoint dials many. A ticket that will not parse is a
+  full handshake, never a failure to connect.
+
+  Three transport details that each cost a debugging session: `level_for` maps
+  0-RTT to `early_data` (it shares the application packet-number space, only the
+  keys differ); the receive gate asks for the **early** key, never the 1-RTT read
+  key, which by definition does not exist yet; and `SSL_do_handshake` returning 1
+  while `SSL_in_early_data` is **not** completion -- treating it as such sends the
+  next call into post-handshake processing, which fails. On rejection the client
+  calls `SSL_reset_early_data_reject` and vio **repairs the 0-RTT packets at
+  once** (`take_early_data_packets` + `repair_lost`) rather than waiting for loss
+  detection, so section 4.6.2's resend costs a retransmit and not a timeout; the
+  application never learns it happened. Keys are discarded per section 4.9.3 --
+  client when 1-RTT write keys arrive, server at handshake completion.
+
+  Verified against **picoquic in both directions**: picoquic client to vio server
+  reports "Zero RTT data is accepted" (including through a Retry), and vio's
+  client resumes into picoquic's server with early data accepted --
+  `TESTCASE=zerortt` in `interop_endpoint.cpp`. One asymmetry worth knowing:
+  picoquic's *server* mints no NewSessionTicket unless the client enabled early
+  data, so the `resumption` case does not complete against it; vio to vio it does,
+  which is what the in-process tests cover.
 
   **Path MTU discovery** (`mtu.h`, RFC 8899 as section 14.3 applies it): a
   connection starts at the 1200 bytes every path must carry and probes upward
