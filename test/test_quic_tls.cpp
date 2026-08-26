@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 #include <doctest/doctest.h>
+#include <vio/quic/anti_replay.h>
 #include <vio/quic/frame_codec.h>
 #include <vio/quic/protection.h>
 #include <vio/quic/tls.h>
@@ -140,6 +141,30 @@ const tls_secret_t *find(const std::vector<tls_secret_t> &secrets, encryption_le
     }
   }
   return nullptr;
+}
+
+// Runs both sides to completion and then a few rounds further. The extra
+// rounds are not slack: TLS 1.3 sends its NewSessionTicket after the handshake
+// reports done, so a loop that stops at completion never carries the ticket.
+void run_handshake(tls_session_t &client, tls_session_t &server)
+{
+  bool settled = false;
+  for (int rounds = 0; rounds < 24; ++rounds)
+  {
+    REQUIRE(client.advance().has_value());
+    const bool client_moved = pump(client, server);
+    REQUIRE(server.advance().has_value());
+    const bool server_moved = pump(server, client);
+
+    if (client.handshake_complete() && server.handshake_complete() && !client_moved && !server_moved)
+    {
+      if (settled)
+      {
+        return;
+      }
+      settled = true;
+    }
+  }
 }
 
 std::string hex(std::span<const std::uint8_t> data)
@@ -502,4 +527,178 @@ TEST_CASE("a context refuses configurations it cannot honour")
     CHECK_FALSE(tls_context_t::create(config).has_value());
   }
 }
+
+// 0-RTT, and the property that makes it safe to have. The two sessions are
+// wired to each other by hand as above, which is what makes a replay testable
+// at all: the same first flight can be delivered to two servers, which is
+// precisely what an attacker who captured it would do.
+
+TEST_CASE("early data")
+{
+  const auto identity = make_self_signed("localhost");
+  const std::vector<std::uint8_t> server_parameters = {0x01, 0x02, 0x03, 0x04};
+
+  anti_replay_t strikes;
+
+  tls_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.certificate_chain_pem = identity.certificate_pem;
+  server_config.private_key_pem = identity.private_key_pem;
+  server_config.alpn = {"h3"};
+  server_config.transport_parameters = server_parameters;
+  server_config.early_data = true;
+  server_config.anti_replay = &strikes;
+
+  tls_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.ca_certificates_pem = identity.certificate_pem;
+  client_config.alpn = {"h3"};
+  client_config.transport_parameters = {0x0a, 0x0b};
+  client_config.early_data = true;
+
+  auto server_context = tls_context_t::create(server_config);
+  REQUIRE(server_context.has_value());
+  auto first_client_context = tls_context_t::create(client_config);
+  REQUIRE(first_client_context.has_value());
+
+  // The first connection cannot resume anything; what it is for is the ticket.
+  auto first_server = tls_session_t::create(*server_context);
+  REQUIRE(first_server.has_value());
+  auto first_client = tls_session_t::create(*first_client_context, "localhost");
+  REQUIRE(first_client.has_value());
+  run_handshake(*first_client, *first_server);
+  REQUIRE(first_client->handshake_complete());
+  REQUIRE(first_server->handshake_complete());
+
+  const auto ticket = first_client->resumption_ticket();
+
+  SUBCASE("a completed handshake hands back a ticket")
+  {
+    CHECK_FALSE(ticket.empty());
+    // Only the client gets one: the server issued it.
+    CHECK(first_server->resumption_ticket().empty());
+    // And the first connection was a full handshake, so nothing was early.
+    CHECK_FALSE(first_client->early_data_accepted());
+    CHECK_FALSE(first_server->early_data_accepted());
+  }
+
+  SUBCASE("a ticket resumes, and early data is accepted")
+  {
+    REQUIRE_FALSE(ticket.empty());
+    client_config.resumption_ticket = ticket;
+    auto resuming_context = tls_context_t::create(client_config);
+    REQUIRE(resuming_context.has_value());
+
+    auto client = tls_session_t::create(*resuming_context, "localhost");
+    REQUIRE(client.has_value());
+    auto server = tls_session_t::create(*server_context);
+    REQUIRE(server.has_value());
+
+    // The point of 0-RTT: a write key before the peer has said anything.
+    REQUIRE(client->advance().has_value());
+    const auto early_writes = client->take_write_secrets();
+    const auto *early = find(early_writes, encryption_level_t::early_data);
+    REQUIRE(early != nullptr);
+    CHECK(client->in_early_data());
+
+    run_handshake(*client, *server);
+    CHECK(client->handshake_complete());
+    CHECK(server->handshake_complete());
+    CHECK_FALSE(client->alert().has_value());
+    CHECK_FALSE(server->alert().has_value());
+
+    CHECK(client->early_data_accepted());
+    CHECK(server->early_data_accepted());
+    CHECK_FALSE(client->early_data_rejected());
+
+    // And the key the client wrote early with is the one the server reads with.
+    auto server_reads = server->take_read_secrets();
+    const auto *server_early = find(server_reads, encryption_level_t::early_data);
+    REQUIRE(server_early != nullptr);
+    CHECK(hex(server_early->secret) == hex(early->secret));
+  }
+
+  SUBCASE("a replayed first flight is refused early data")
+  {
+    REQUIRE_FALSE(ticket.empty());
+    client_config.resumption_ticket = ticket;
+    auto resuming_context = tls_context_t::create(client_config);
+    REQUIRE(resuming_context.has_value());
+
+    auto client = tls_session_t::create(*resuming_context, "localhost");
+    REQUIRE(client.has_value());
+    REQUIRE(client->advance().has_value());
+
+    // Exactly what an attacker gets by watching the wire: the bytes, twice.
+    const auto pending = client->pending_handshake_data(encryption_level_t::initial);
+    const std::vector<std::uint8_t> flight(pending.begin(), pending.end());
+    REQUIRE_FALSE(flight.empty());
+
+    const auto deliver = [&](tls_session_t &server)
+    {
+      REQUIRE(server.provide_handshake_data(encryption_level_t::initial, flight).has_value());
+      REQUIRE(server.advance().has_value());
+      return server.in_early_data() || server.early_data_accepted();
+    };
+
+    auto honest = tls_session_t::create(*server_context);
+    REQUIRE(honest.has_value());
+    auto replayed = tls_session_t::create(*server_context);
+    REQUIRE(replayed.has_value());
+
+    // The register is what separates them; the two ClientHellos are identical.
+    CHECK(deliver(*honest));
+    CHECK_FALSE(deliver(*replayed));
+    // The replay is still a handshake, just not an early one -- refusing early
+    // data costs the client a round trip and nothing else.
+    CHECK_FALSE(replayed->alert().has_value());
+  }
+
+  SUBCASE("early data is refused when the register is full")
+  {
+    REQUIRE_FALSE(ticket.empty());
+    anti_replay_t full(anti_replay_t::default_window, 1);
+    const std::uint8_t occupant[] = {0xff, 0xee};
+    REQUIRE(full.accept(occupant, vio::tick_t{}));
+
+    tls_config_t crowded = server_config;
+    crowded.anti_replay = &full;
+    auto crowded_context = tls_context_t::create(crowded);
+    REQUIRE(crowded_context.has_value());
+
+    client_config.resumption_ticket = ticket;
+    auto resuming_context = tls_context_t::create(client_config);
+    REQUIRE(resuming_context.has_value());
+    auto client = tls_session_t::create(*resuming_context, "localhost");
+    REQUIRE(client.has_value());
+    auto server = tls_session_t::create(*crowded_context);
+    REQUIRE(server.has_value());
+
+    run_handshake(*client, *server);
+    CHECK(client->handshake_complete());
+    CHECK(server->handshake_complete());
+    // Fails closed: no room to vouch for it, so it does not get early data.
+    CHECK_FALSE(server->early_data_accepted());
+    CHECK_FALSE(client->early_data_accepted());
+    // The client is told, because what it wrote early is now its to write
+    // again -- and the connection is otherwise fine.
+    CHECK(client->early_data_rejected());
+    CHECK_FALSE(client->alert().has_value());
+  }
+
+  SUBCASE("a server without a register refuses to enable early data at all")
+  {
+    tls_config_t unguarded = server_config;
+    unguarded.anti_replay = nullptr;
+    CHECK_FALSE(tls_context_t::create(unguarded).has_value());
+  }
+
+  SUBCASE("a client needs no register to offer early data")
+  {
+    tls_config_t offering = client_config;
+    offering.anti_replay = nullptr;
+    CHECK(tls_context_t::create(offering).has_value());
+  }
+}
+
 }

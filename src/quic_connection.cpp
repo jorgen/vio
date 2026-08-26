@@ -167,6 +167,13 @@ struct packet_space_t
   packet_protection_t write;
   header_protection_t read_header;
   header_protection_t write_header;
+  // RFC 9001 section 4.6: 0-RTT shares the application packet number space but
+  // not its keys, and the direction is one way -- a client only writes at this
+  // level and a server only reads. Kept beside the 1-RTT keys rather than in a
+  // space of their own because the packet numbers are the same sequence.
+  packet_protection_t early;
+  header_protection_t early_header;
+  bool have_early = false;
   // RFC 9001 section 6.3: the next generation is derived when the current one
   // is installed rather than when a key update is detected. Deriving it on
   // demand would make the time taken to process a packet depend on the Key
@@ -370,6 +377,29 @@ struct connection_impl_t
 namespace
 {
 using detail::connection_impl_t;
+
+// RFC 9001 section 4.6: the 0-RTT keys sit beside the application space's own
+// rather than in it. One direction only -- a client writes at this level and a
+// server reads at it -- so a single slot serves, and which side it belongs to
+// is decided by which of the two TLS handed over.
+std::expected<void, error_t> install_early_keys(packet_space_t &space, const tls_secret_t &secret, std::uint32_t version)
+{
+  auto material = derive_key_material(secret.suite, secret.secret, version);
+  if (!material.has_value())
+  {
+    return std::unexpected(material.error());
+  }
+  if (auto r = space.early.init(secret.suite, secret.secret, version); !r.has_value())
+  {
+    return std::unexpected(r.error());
+  }
+  if (auto r = space.early_header.init(secret.suite, material->header_protection); !r.has_value())
+  {
+    return std::unexpected(r.error());
+  }
+  space.have_early = true;
+  return {};
+}
 
 std::expected<void, error_t> install_keys(packet_space_t &space, const tls_secret_t &secret, bool read, std::uint32_t version)
 {
@@ -970,17 +1000,19 @@ std::expected<void, error_t> drive_tls(connection_impl_t &impl)
   for (auto &secret : impl.tls.take_write_secrets())
   {
     auto &space = impl.spaces[space_index(secret.level)];
-    if (auto r = install_keys(space, secret, false, impl.version); !r.has_value())
+    const auto installed = secret.level == encryption_level_t::early_data ? install_early_keys(space, secret, impl.version) : install_keys(space, secret, false, impl.version);
+    if (!installed.has_value())
     {
-      return r;
+      return installed;
     }
   }
   for (auto &secret : impl.tls.take_read_secrets())
   {
     auto &space = impl.spaces[space_index(secret.level)];
-    if (auto r = install_keys(space, secret, true, impl.version); !r.has_value())
+    const auto installed = secret.level == encryption_level_t::early_data ? install_early_keys(space, secret, impl.version) : install_keys(space, secret, true, impl.version);
+    if (!installed.has_value())
     {
-      return r;
+      return installed;
     }
   }
 
@@ -1745,12 +1777,6 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   {
     return receive_version_negotiation(impl, header);
   }
-  if (header.kind == packet_kind_t::zero_rtt)
-  {
-    // 0-RTT is refused by construction, and dropped rather than an error.
-    return {};
-  }
-
   auto level = level_for(header.kind);
   if (!level.has_value())
   {
@@ -1867,7 +1893,19 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   // The two halves are split here rather than using unprotect_packet, because
   // which key generation applies is only knowable once the header is unmasked,
   // and the Key Phase bit that says so is itself under header protection.
-  auto unmasked = space.read_header.remove(packet, header.packet_number_offset);
+  // RFC 9001 section 4.6: a 0-RTT packet is protected with its own keys, in the
+  // application space's numbering. Without early keys it cannot be read at all,
+  // which is the ordinary case for a server that did not accept 0-RTT and for
+  // every client.
+  const bool zero_rtt = header.kind == packet_kind_t::zero_rtt;
+  if (zero_rtt && !space.have_early)
+  {
+    return {};
+  }
+  auto &header_protection = zero_rtt ? space.early_header : space.read_header;
+  auto &payload_protection = zero_rtt ? space.early : space.read;
+
+  auto unmasked = header_protection.remove(packet, header.packet_number_offset);
   if (!unmasked.has_value())
   {
     if (is_connection_error(unmasked.error()))
@@ -1878,6 +1916,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   }
 
   const bool phase_changed = header.kind == packet_kind_t::one_rtt && unmasked->key_phase != space.key_phase;
+  (void)zero_rtt;
   bool peer_updated = false;
 
   // Decryption is in place, and an AEAD that rejects a tag is under no
@@ -1896,7 +1935,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     std::copy(ciphertext.begin(), ciphertext.end(), packet.begin() + static_cast<std::ptrdiff_t>(payload_offset));
   };
 
-  auto opened = space.read.decrypt(packet, header.packet_number_offset, *unmasked, space.acks.largest_received());
+  auto opened = payload_protection.decrypt(packet, header.packet_number_offset, *unmasked, space.acks.largest_received());
   if (phase_changed && !opened.has_value())
   {
     // A differing Key Phase bit means one of two things, and which one is not
@@ -1928,7 +1967,7 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
     // attempt, and enough of them across the connection means the key can no
     // longer be trusted to reject the next one.
     ++impl.packets_failed_authentication;
-    if (impl.packets_failed_authentication > aead_integrity_limit(space.read.suite().aead))
+    if (impl.packets_failed_authentication > aead_integrity_limit(payload_protection.suite().aead))
     {
       begin_close(impl, transport_error_aead_limit_reached, "AEAD integrity limit reached", false, false);
     }
@@ -2091,11 +2130,16 @@ void reap_and_grant(connection_impl_t &impl)
 std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack, std::size_t expand_to = 0, bool force_expand = false, bool mtu_probe = false)
 {
   auto &space = impl.spaces[space_index(level)];
-  if (space.discarded || !space.have_write)
+  // RFC 9001 section 4.6: before the handshake finishes a client may send
+  // application data under the 0-RTT keys, numbered in the application space
+  // it will go on using. The moment 1-RTT write keys exist this stops being
+  // true, which is what ends 0-RTT without anything having to notice.
+  const bool use_early = level == encryption_level_t::application && !space.have_write && space.have_early && impl.config.role == tls_role_t::client;
+  if (space.discarded || (!space.have_write && !use_early))
   {
     return std::size_t{0};
   }
-  auto kind = packet_kind_for(level);
+  auto kind = use_early ? std::optional<packet_kind_t>(packet_kind_t::zero_rtt) : packet_kind_for(level);
   if (!kind.has_value())
   {
     return std::size_t{0};
@@ -2114,7 +2158,10 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     impl.tls.consume_handshake_data(level, produced.size());
   }
 
-  const bool want_crypto = space.crypto_send.has_pending();
+  // Section 17.2.3 and the frame table in frame.h: a 0-RTT packet carries
+  // neither CRYPTO nor ACK. The handshake does not run at this level and there
+  // is nothing yet to acknowledge at it.
+  const bool want_crypto = space.crypto_send.has_pending() && !use_early;
   // Section 13.2.1 draws a line the previous reading of this missed. An
   // endpoint MUST acknowledge ack-eliciting Initial and Handshake packets
   // *immediately*, but 1-RTT packets only within its advertised
@@ -2132,7 +2179,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   // small and the packet is going anyway.
   const bool handshake_space = level == encryption_level_t::initial || level == encryption_level_t::handshake;
   const bool ack_owed = space.acks.has_received() && space.acks.ack_pending();
-  const bool must_ack = ack_owed && (handshake_space || space.acks.should_send_ack(now, impl.config.max_ack_delay));
+  const bool must_ack = ack_owed && !use_early && (handshake_space || space.acks.should_send_ack(now, impl.config.max_ack_delay));
   const bool want_ack = allow_empty_ack ? ack_owed : must_ack;
   const bool want_handshake_done = level == encryption_level_t::application && impl.config.role == tls_role_t::server && impl.handshake_complete && !impl.handshake_done_sent;
   const bool want_close = impl.close_frame_pending && space.have_write;
@@ -2682,13 +2729,15 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   // Section 6.6: a key that has protected too many packets must not protect
   // another. The connection ends rather than continuing on a key that is no
   // longer doing its job.
-  if (space.packets_encrypted >= aead_confidentiality_limit(space.write.suite().aead))
+  auto &send_protection = use_early ? space.early : space.write;
+  auto &send_header_protection = use_early ? space.early_header : space.write_header;
+  if (space.packets_encrypted >= aead_confidentiality_limit(send_protection.suite().aead))
   {
     begin_close(impl, transport_error_aead_limit_reached, "AEAD confidentiality limit reached", false, false);
     return std::size_t{0};
   }
 
-  auto length = protect_packet(space.write, space.write_header, out, *layout, packet_number);
+  auto length = protect_packet(send_protection, send_header_protection, out, *layout, packet_number);
   if (!length.has_value())
   {
     return std::unexpected(length.error());

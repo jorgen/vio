@@ -114,6 +114,15 @@ int session_index()
   static const int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
   return index;
 }
+
+// The certificate-selection callback is handed only the ClientHello, and what
+// it needs -- the strike register -- belongs to the context. This is how it
+// gets from one to the other.
+int context_index()
+{
+  static const int index = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+  return index;
+}
 } // namespace
 
 namespace detail
@@ -135,7 +144,12 @@ struct tls_session_impl_t
   bool complete = false;
   // Set when TLS tried to open the early data level. Nothing installs those
   // keys, so the session is finished either way; this only says why.
-  bool early_data_refused = false;
+  // Set when this endpoint offered or accepted early data and TLS turned it
+  // down -- a stale ticket, a changed configuration, a replayed ClientHello.
+  // Not an error: the connection continues at 1-RTT, which is what the client
+  // must be prepared for whenever it offers.
+  bool early_data_rejected = false;
+  std::vector<std::uint8_t> resumption_ticket;
   // The 32 bytes a key log line is indexed by. LibreSSL's accessor reports
   // zeroes on the QUIC path, so it is read out of the ClientHello, where it
   // sits at a fixed offset: type, three length bytes, two version bytes, then
@@ -161,6 +175,13 @@ struct tls_context_impl_t
   // Held for the lifetime of the context: the ALPN callback is handed a
   // pointer to this, and SSL_CTX_set_alpn_protos wants the wire encoding.
   std::vector<std::uint8_t> alpn_wire;
+  // RFC 9001 section 9.2. Shared across the connections of one endpoint,
+  // because a replay arriving on a *second* connection is the case it exists
+  // for. Reached from a BoringSSL callback, which is why the context has to be
+  // findable from the SSL object.
+  anti_replay_t *anti_replay = nullptr;
+  bool early_data = false;
+  std::vector<std::uint8_t> resumption_ticket;
 
   ~tls_context_impl_t()
   {
@@ -177,6 +198,11 @@ namespace
 detail::tls_session_impl_t *session_of(SSL *ssl)
 {
   return static_cast<detail::tls_session_impl_t *>(SSL_get_ex_data(ssl, session_index()));
+}
+
+detail::tls_context_impl_t *context_of(SSL *ssl)
+{
+  return static_cast<detail::tls_context_impl_t *>(SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), context_index()));
 }
 
 // The NSS key log format names one process-wide file, which is what the
@@ -276,14 +302,6 @@ int on_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level, const SSL_CI
   {
     return 0;
   }
-  if (*mapped == encryption_level_t::early_data)
-  {
-    // The 0-RTT seam, cut. Failing here is deliberate: accepting the secret
-    // and dropping it would leave TLS believing a level is usable that this
-    // transport will never protect a packet at.
-    session->early_data_refused = true;
-    return 0;
-  }
   log_quic_secret(*session, *mapped, false, secret, secret_len);
   session->read_secrets.push_back(tls_secret_t{.level = *mapped, .suite = *suite, .secret = std::vector<std::uint8_t>(secret, secret + secret_len)});
   return 1;
@@ -302,14 +320,67 @@ int on_set_write_secret(SSL *ssl, enum ssl_encryption_level_t level, const SSL_C
   {
     return 0;
   }
-  if (*mapped == encryption_level_t::early_data)
-  {
-    session->early_data_refused = true;
-    return 0;
-  }
   log_quic_secret(*session, *mapped, true, secret, secret_len);
   session->write_secrets.push_back(tls_secret_t{.level = *mapped, .suite = *suite, .secret = std::vector<std::uint8_t>(secret, secret + secret_len)});
   return 1;
+}
+
+// RFC 8446 section 8.2, reached from BoringSSL before it decides whether to
+// resume. Recording the ClientHello here is what makes a replay recognisable:
+// the random is thirty-two bytes the client chose, so a captured handshake
+// replayed at the server carries the same one.
+//
+// Turning early data off for this connection is all that is needed to refuse:
+// section 8 of RFC 8446 wants the handshake to continue, and BoringSSL still
+// resumes -- the client simply pays the round trip it was trying to avoid.
+// Called on a client when the server's NewSessionTicket arrives. Serialized
+// immediately rather than held: the session outlives nothing in particular, and
+// bytes are what the application can store.
+int on_new_session(SSL *ssl, SSL_SESSION *session)
+{
+  auto *impl = session_of(ssl);
+  if (impl == nullptr || session == nullptr)
+  {
+    return 0;
+  }
+  std::uint8_t *out = nullptr;
+  std::size_t out_len = 0;
+  if (SSL_SESSION_to_bytes(session, &out, &out_len) != 1)
+  {
+    return 0;
+  }
+  impl->resumption_ticket.assign(out, out + out_len);
+  OPENSSL_free(out);
+  // Zero: BoringSSL keeps ownership of the session, which is what it does when
+  // the callback does not take a reference.
+  return 0;
+}
+
+enum ssl_select_cert_result_t on_select_certificate(const SSL_CLIENT_HELLO *hello)
+{
+  auto *context = context_of(hello->ssl);
+  if (context == nullptr || !context->early_data)
+  {
+    return ssl_select_cert_success;
+  }
+  // Only a ClientHello that actually offers early data is worth a slot. The
+  // register is a fixed size and refuses when full, so recording handshakes
+  // that were never going to replay anything is a way to spend the capacity
+  // that protects the ones that are -- on a server whose traffic is mostly
+  // full handshakes, that is every slot.
+  const std::uint8_t *extension = nullptr;
+  std::size_t extension_len = 0;
+  if (SSL_early_callback_ctx_extension_get(hello, TLSEXT_TYPE_early_data, &extension, &extension_len) == 0)
+  {
+    return ssl_select_cert_success;
+  }
+  const auto fresh = context->anti_replay != nullptr && hello->random != nullptr &&
+                     context->anti_replay->accept(std::span<const std::uint8_t>(hello->random, hello->random_len), tick_t::from_nanoseconds(std::chrono::steady_clock::now().time_since_epoch()));
+  if (!fresh)
+  {
+    SSL_set_early_data_enabled(hello->ssl, 0);
+  }
+  return ssl_select_cert_success;
 }
 
 int on_add_handshake_data(SSL *ssl, enum ssl_encryption_level_t level, const uint8_t *data, size_t len)
@@ -550,15 +621,53 @@ std::expected<tls_context_t, error_t> tls_context_t::create(const tls_config_t &
   {
     return std::unexpected(tls_error("could not pin TLS 1.3"));
   }
+  impl->early_data = config.early_data;
+  impl->anti_replay = config.anti_replay;
+  impl->resumption_ticket = config.resumption_ticket;
+  if (SSL_CTX_set_ex_data(impl->ctx, context_index(), impl.get()) != 1)
+  {
+    return std::unexpected(tls_error("SSL_CTX_set_ex_data failed"));
+  }
+  if (config.early_data)
+  {
+    // A server with nowhere to record ClientHellos cannot tell a replay from a
+    // first attempt, and RFC 9001 section 9.2 requires that it can. Refusing to
+    // build the context is better than building one that quietly never grants
+    // 0-RTT, because the second looks like it works.
+    if (config.role == tls_role_t::server && config.anti_replay == nullptr)
+    {
+      return std::unexpected(error_t{.code = 1, .msg = "early data needs an anti-replay register on a server"});
+    }
+    SSL_CTX_set_early_data_enabled(impl->ctx, 1);
+    if (config.role == tls_role_t::server)
+    {
+      SSL_CTX_set_select_certificate_cb(impl->ctx, on_select_certificate);
+    }
+  }
   if (SSL_CTX_set_quic_method(impl->ctx, quic_method()) != 1)
   {
     return std::unexpected(tls_error("SSL_CTX_set_quic_method failed"));
   }
 
-  // Nothing here resumes, and 0-RTT rides on resumption. Turning tickets off
-  // is the outermost of the cuts that keep early data unreachable.
-  SSL_CTX_set_options(impl->ctx, SSL_OP_NO_TICKET);
-  SSL_CTX_set_session_cache_mode(impl->ctx, SSL_SESS_CACHE_OFF);
+  // Resumption exists only where early data does. A connection that will never
+  // offer 0-RTT has nothing to gain from a ticket and every reason not to mint
+  // one: a ticket is a credential, and one nobody uses is one nobody guards.
+  if (config.early_data)
+  {
+    SSL_CTX_set_session_cache_mode(impl->ctx, config.role == tls_role_t::client ? SSL_SESS_CACHE_CLIENT : SSL_SESS_CACHE_SERVER);
+    if (config.role == tls_role_t::client)
+    {
+      // BoringSSL hands the ticket over here, once, when it arrives -- which on
+      // TLS 1.3 is after the handshake, so nothing can be assumed about it at
+      // the point the handshake reports success.
+      SSL_CTX_sess_set_new_cb(impl->ctx, on_new_session);
+    }
+  }
+  else
+  {
+    SSL_CTX_set_options(impl->ctx, SSL_OP_NO_TICKET);
+    SSL_CTX_set_session_cache_mode(impl->ctx, SSL_SESS_CACHE_OFF);
+  }
 
   if (!config.key_log_path.empty())
   {
@@ -663,6 +772,43 @@ std::expected<tls_session_t, error_t> tls_session_t::create(const tls_context_t 
     return std::unexpected(tls_error("SSL_set_quic_transport_params failed"));
   }
 
+  if (context._impl->early_data && context._impl->role == tls_role_t::server)
+  {
+    // BoringSSL compares this byte for byte against the value from the
+    // connection that minted the ticket, and rejects early data if it moved.
+    // The transport parameters belong in it because a client that resumes has
+    // remembered the old ones and will act on them; the ALPN belongs in it
+    // because 0-RTT data is only meaningful to the protocol it was sent for.
+    std::vector<std::uint8_t> early_context = context._impl->transport_parameters;
+    early_context.insert(early_context.end(), context._impl->alpn_wire.begin(), context._impl->alpn_wire.end());
+    if (early_context.empty())
+    {
+      early_context.push_back(0);
+    }
+    if (SSL_set_quic_early_data_context(impl->ssl, early_context.data(), early_context.size()) != 1)
+    {
+      return std::unexpected(tls_error("SSL_set_quic_early_data_context failed"));
+    }
+  }
+  if (context._impl->role == tls_role_t::client && !context._impl->resumption_ticket.empty())
+  {
+    SSL_SESSION *session = SSL_SESSION_from_bytes(context._impl->resumption_ticket.data(), context._impl->resumption_ticket.size(), context._impl->ctx);
+    if (session == nullptr)
+    {
+      // A ticket that will not parse is one that cannot be used, and a full
+      // handshake is the honest answer -- not a failure to connect.
+      ERR_clear_error();
+    }
+    else
+    {
+      const bool offered = SSL_set_session(impl->ssl, session) == 1;
+      SSL_SESSION_free(session);
+      if (offered && context._impl->early_data)
+      {
+        SSL_set_early_data_enabled(impl->ssl, 1);
+      }
+    }
+  }
   if (context._impl->role == tls_role_t::server)
   {
     SSL_set_accept_state(impl->ssl);
@@ -790,6 +936,19 @@ std::expected<bool, error_t> tls_session_t::advance()
     }
 
     const int rc = SSL_do_handshake(_impl->ssl);
+    if (rc == 1 && SSL_in_early_data(_impl->ssl) != 0)
+    {
+      // Success here does not mean the handshake finished. With early data the
+      // handshake stops at the point where 0-RTT keys exist -- so that a client
+      // can write and a server can read before the peer has been heard from --
+      // and finishes on a later call. Treating it as complete is what makes the
+      // next call fall into post-handshake processing and fail.
+      if (has_feedable_data(*_impl))
+      {
+        continue;
+      }
+      return false;
+    }
     if (rc == 1)
     {
       _impl->complete = true;
@@ -811,6 +970,19 @@ std::expected<bool, error_t> tls_session_t::advance()
     }
 
     const int err = SSL_get_error(_impl->ssl, rc);
+    if (err == SSL_ERROR_EARLY_DATA_REJECTED)
+    {
+      // The server took the resumption but not the early data. Everything
+      // written at 0-RTT has to be considered unsent -- the server did not
+      // decrypt it and never will -- so the handshake is rewound to the point
+      // before it and continues as an ordinary one. What was sent early is the
+      // caller's to send again, which is why this is reported rather than
+      // handled here.
+      ERR_clear_error();
+      SSL_reset_early_data_reject(_impl->ssl);
+      _impl->early_data_rejected = true;
+      continue;
+    }
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
     {
       ERR_clear_error();
@@ -822,11 +994,6 @@ std::expected<bool, error_t> tls_session_t::advance()
         continue;
       }
       return false;
-    }
-    if (_impl->early_data_refused)
-    {
-      ERR_clear_error();
-      return std::unexpected(error_t{.code = 1, .msg = "TLS negotiated early data, which this build does not support"});
     }
     if (_impl->alert.has_value())
     {
@@ -916,6 +1083,26 @@ std::vector<tls_secret_t> tls_session_t::take_write_secrets()
     return {};
   }
   return std::exchange(_impl->write_secrets, {});
+}
+
+std::vector<std::uint8_t> tls_session_t::resumption_ticket() const
+{
+  return _impl == nullptr ? std::vector<std::uint8_t>{} : _impl->resumption_ticket;
+}
+
+bool tls_session_t::early_data_accepted() const
+{
+  return _impl != nullptr && _impl->ssl != nullptr && SSL_early_data_accepted(_impl->ssl) != 0;
+}
+
+bool tls_session_t::early_data_rejected() const
+{
+  return _impl != nullptr && _impl->early_data_rejected;
+}
+
+bool tls_session_t::in_early_data() const
+{
+  return _impl != nullptr && _impl->ssl != nullptr && SSL_in_early_data(_impl->ssl) != 0;
 }
 
 bool tls_session_t::handshake_complete() const

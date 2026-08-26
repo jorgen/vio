@@ -48,6 +48,8 @@
 // installed, so a session that somehow negotiated early data fails closed
 // instead of sending packets it cannot protect.
 
+#include <vio/quic/anti_replay.h>
+
 #include "vio/error.h"
 #include "vio/quic/packet.h"
 #include "vio/quic/protection.h"
@@ -145,6 +147,29 @@ struct tls_config_t
   // transport's business, not this layer's.
   std::vector<std::uint8_t> transport_parameters;
 
+  // RFC 9001 section 4.6. On a server this permits accepting 0-RTT; on a client
+  // it permits offering it. Off by default, because 0-RTT is the one part of
+  // QUIC where the transport hands the application data it cannot promise is
+  // fresh, and that is a decision for the application to make rather than to
+  // inherit.
+  bool early_data = false;
+
+  // Where a server records the ClientHellos it has seen, so that a replayed one
+  // is answered with a full handshake instead. A server that enables early data
+  // without one gets no 0-RTT: RFC 9001 section 9.2 requires the protection,
+  // and the safe reading of a missing register is that nothing can be vouched
+  // for. Not owned; it is shared across the connections of one endpoint,
+  // because a replay arriving on a second connection is the case it exists for.
+  anti_replay_t *anti_replay = nullptr;
+
+  // A ticket kept from an earlier connection to this server, as handed back by
+  // tls_session_t::resumption_ticket. Offering one is what makes a handshake a
+  // resumption, and 0-RTT rides on resumption. Serialized bytes rather than a
+  // live object because where a ticket is kept -- memory, disk, a shared cache
+  // -- is the application's decision, and because a ticket outliving the
+  // process is the case that makes 0-RTT worth having.
+  std::vector<std::uint8_t> resumption_ticket;
+
   // Where to append the TLS secrets, in the NSS key log format every capture
   // tool reads. This is what makes a packet capture of a QUIC connection
   // legible at all. Setting it hands the keys to anyone who can read the file,
@@ -222,6 +247,27 @@ public:
   [[nodiscard]] std::vector<tls_secret_t> take_write_secrets();
 
   [[nodiscard]] bool handshake_complete() const;
+
+  // RFC 9001 section 4.6. On a client, whether the 0-RTT it offered was taken;
+  // on a server, whether the 0-RTT it received was accepted. False covers both
+  // "never offered" and "offered and turned down", which the caller
+  // distinguishes by knowing whether it asked.
+  [[nodiscard]] bool early_data_accepted() const;
+
+  // Whether TLS is still processing early data, which on a server is the window
+  // in which received 0-RTT is being handed over.
+  [[nodiscard]] bool in_early_data() const;
+
+  // The server resumed but refused the early data. Whatever was written at
+  // 0-RTT did not arrive and has to be written again once the handshake
+  // completes; nothing else about the connection is affected.
+  [[nodiscard]] bool early_data_rejected() const;
+
+  // A ticket for resuming this connection later, once the server has issued
+  // one. Empty until then, and on a server always: only a client resumes.
+  // Section 4.6.1 -- the ticket carries the transport parameters and the
+  // application protocol with it, so what comes back is enough on its own.
+  [[nodiscard]] std::vector<std::uint8_t> resumption_ticket() const;
 
   // A fatal TLS alert, if one was raised. RFC 9000 section 20.1 maps this onto
   // a CONNECTION_CLOSE with error code 0x0100 + the alert.

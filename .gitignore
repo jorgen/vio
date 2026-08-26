@@ -5,3 +5,8 @@ cmake-build-*
 build*/
 cmake-build-*/
 test_write_then_read_*
+
+.cache/
+.vs/
+*.bak
+*.obj
