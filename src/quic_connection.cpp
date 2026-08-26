@@ -1944,7 +1944,17 @@ std::expected<void, error_t> receive_packet(connection_impl_t &impl, const packe
   // A 0-RTT packet arrives before any 1-RTT read key exists -- that is the
   // whole point of it -- so the application space's read key is the wrong
   // thing to ask about. Its own key is what decides.
+  //
+  // Only a server, though. There is one early-key slot and it holds whichever
+  // direction this endpoint has: on a client that is its own *write* key, so
+  // without the role test a client would open a copy of its own 0-RTT packet
+  // reflected back at it, authenticate it against its own key, and act on the
+  // frames inside -- before it has even verified the server's certificate.
   const bool zero_rtt = header.kind == packet_kind_t::zero_rtt;
+  if (zero_rtt && impl.config.role != tls_role_t::server)
+  {
+    return {};
+  }
   if (space.discarded || (zero_rtt ? !space.have_early : !space.have_read))
   {
     return {};

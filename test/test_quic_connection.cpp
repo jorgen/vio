@@ -3127,6 +3127,78 @@ TEST_CASE("a resumed connection sends application data in its first flight")
   }
 }
 
+TEST_CASE("a client refuses its own 0-RTT packet reflected back at it")
+{
+  const auto identity = make_self_signed("localhost");
+  anti_replay_t strikes;
+
+  tls_config_t server_tls;
+  server_tls.role = tls_role_t::server;
+  server_tls.certificate_chain_pem = identity.certificate_pem;
+  server_tls.private_key_pem = identity.private_key_pem;
+  server_tls.alpn = {"h3"};
+  server_tls.early_data = true;
+  server_tls.anti_replay = &strikes;
+
+  tls_config_t client_tls;
+  client_tls.role = tls_role_t::client;
+  client_tls.ca_certificates_pem = identity.certificate_pem;
+  client_tls.alpn = {"h3"};
+  client_tls.early_data = true;
+
+  auto server_context = tls_context_t::create(server_tls);
+  REQUIRE(server_context.has_value());
+  auto client_context = tls_context_t::create(client_tls);
+  REQUIRE(client_context.has_value());
+
+  const auto now = vio::tick_t{};
+  const auto ticket = obtain_ticket(*server_context, *client_context, now);
+  REQUIRE_FALSE(ticket.empty());
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.resumption_ticket = ticket;
+
+  auto client = connection_t::create(*client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  const std::vector<std::uint8_t> early = {'G', 'E', 'T', ' ', '/', 'x'};
+  const auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+  REQUIRE(client->write_stream(*stream, early, true) == early.size());
+
+  // Everything the client says before it hears anything back. The 0-RTT packet
+  // is in here, protected with the client's own early write key -- which is the
+  // only early key it has, and the one the receive path would reach for.
+  std::vector<std::uint8_t> reflected;
+  for (;;)
+  {
+    std::vector<std::uint8_t> datagram(1500);
+    auto size = client->poll_send(datagram, now);
+    REQUIRE(size.has_value());
+    if (*size == 0)
+    {
+      break;
+    }
+    datagram.resize(*size);
+    if (reflected.empty() && contains_packet_kind(datagram, packet_kind_t::zero_rtt))
+    {
+      reflected = datagram;
+    }
+  }
+  REQUIRE_FALSE(reflected.empty());
+  REQUIRE_FALSE(client->handshake_complete());
+
+  // Anyone watching the wire can do this. Nothing secret is involved.
+  const auto readable_before = client->readable_streams().size();
+  REQUIRE(client->receive(reflected, now).has_value());
+  CHECK(client->readable_streams().size() == readable_before);
+  CHECK(client->readable_stream(*stream).empty());
+  CHECK_FALSE(client->stream_receive_finished(*stream));
+  CHECK(client->state() != connection_state_t::closed);
+}
+
 TEST_CASE("a refused ticket still delivers the data the client sent early")
 {
   const auto identity = make_self_signed("localhost");

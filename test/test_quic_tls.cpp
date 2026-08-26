@@ -588,7 +588,10 @@ TEST_CASE("early data")
   const auto identity = make_self_signed("localhost");
   const std::vector<std::uint8_t> server_parameters = {0x01, 0x02, 0x03, 0x04};
 
-  anti_replay_t strikes;
+  // Small on purpose: the full-register case has to be reachable, and it has to
+  // be reachable on the same context that minted the ticket.
+  constexpr std::size_t register_capacity = 8;
+  anti_replay_t strikes(anti_replay_t::default_window, register_capacity);
 
   tls_config_t server_config;
   server_config.role = tls_role_t::server;
@@ -699,18 +702,26 @@ TEST_CASE("early data")
   SUBCASE("early data is refused when the register is full")
   {
     REQUIRE_FALSE(ticket.empty());
-    anti_replay_t full(anti_replay_t::default_window, 1);
-    const std::uint8_t occupant[] = {0xff, 0xee};
-    REQUIRE(full.accept(occupant, vio::tick_t{}));
-
-    tls_config_t crowded = server_config;
-    crowded.anti_replay = &full;
-    auto crowded_context = tls_context_t::create(crowded);
-    REQUIRE(crowded_context.has_value());
+    // Filled through the register the live context already holds. Building a
+    // second context would rotate the ticket keys, and then early data would be
+    // refused because resumption failed rather than because the register was
+    // full -- which is what this subcase asserted before.
+    // Stamped from the same clock the TLS callback uses. A tick_t{} here would
+    // look ancient next to a steady_clock reading and be swept out by expire()
+    // before the handshake ever consulted the register -- which is precisely
+    // how the previous version of this subcase managed to pass for free.
+    const auto stamped = vio::tick_t::from_nanoseconds(std::chrono::steady_clock::now().time_since_epoch());
+    for (std::size_t i = 0; strikes.size() < register_capacity && i < register_capacity * 4; ++i)
+    {
+      std::uint8_t filler[32] = {};
+      filler[0] = static_cast<std::uint8_t>(i + 1);
+      (void)strikes.accept(filler, stamped);
+    }
+    REQUIRE(strikes.size() == register_capacity);
 
     auto client = tls_session_t::create(*first_client_context, "localhost", ticket);
     REQUIRE(client.has_value());
-    auto server = tls_session_t::create(*crowded_context);
+    auto server = tls_session_t::create(*server_context);
     REQUIRE(server.has_value());
 
     run_handshake(*client, *server);
@@ -737,6 +748,21 @@ TEST_CASE("early data")
     tls_config_t offering = client_config;
     offering.anti_replay = nullptr;
     CHECK(tls_context_t::create(offering).has_value());
+  }
+
+  SUBCASE("the ticket cannot outlive the window that would recognise its replay")
+  {
+    REQUIRE_FALSE(ticket.empty());
+    SSL_CTX *bare = SSL_CTX_new(TLS_method());
+    REQUIRE(bare != nullptr);
+    SSL_SESSION *parsed = SSL_SESSION_from_bytes(ticket.data(), ticket.size(), bare);
+    REQUIRE(parsed != nullptr);
+    const auto lifetime = std::chrono::seconds(SSL_SESSION_get_timeout(parsed));
+    SSL_SESSION_free(parsed);
+    SSL_CTX_free(bare);
+    // BoringSSL's own default here is two days. Anything longer than the
+    // register's window is a ticket whose replay nobody would recognise.
+    CHECK(lifetime <= std::chrono::duration_cast<std::chrono::seconds>(strikes.window()));
   }
 
   SUBCASE("a ticket that will not parse falls back to a full handshake")

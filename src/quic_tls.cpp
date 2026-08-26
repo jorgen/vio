@@ -373,6 +373,15 @@ enum ssl_select_cert_result_t on_select_certificate(const SSL_CLIENT_HELLO *hell
   {
     return ssl_select_cert_success;
   }
+  // And a ticket to resume with. This callback runs before the PSK is decrypted,
+  // so offering early data costs an attacker nothing -- a ClientHello with the
+  // extension and no ticket at all would otherwise spend a slot. Since the
+  // register is deliberately fail-closed, letting that happen turns the safety
+  // property into a switch for turning 0-RTT off for everyone.
+  if (SSL_early_callback_ctx_extension_get(hello, TLSEXT_TYPE_pre_shared_key, &extension, &extension_len) == 0)
+  {
+    return ssl_select_cert_success;
+  }
   const auto fresh = context->anti_replay != nullptr && hello->random != nullptr &&
                      context->anti_replay->accept(std::span<const std::uint8_t>(hello->random, hello->random_len), tick_t::from_nanoseconds(std::chrono::steady_clock::now().time_since_epoch()));
   if (!fresh)
@@ -640,6 +649,13 @@ std::expected<tls_context_t, error_t> tls_context_t::create(const tls_config_t &
     if (config.role == tls_role_t::server)
     {
       SSL_CTX_set_select_certificate_cb(impl->ctx, on_select_certificate);
+      // The register remembers a ClientHello for its window; a ticket that can
+      // outlive that window is one whose replay nobody would recognise. So the
+      // ticket lifetime is set from the window rather than left at BoringSSL's
+      // default of two days, which is 288 times longer and would have made the
+      // register decorative for anything older than ten minutes.
+      const auto window = std::chrono::duration_cast<std::chrono::seconds>(config.anti_replay->window()).count();
+      SSL_CTX_set_session_psk_dhe_timeout(impl->ctx, static_cast<std::uint32_t>(window > 0 ? window : 1));
     }
   }
   if (SSL_CTX_set_quic_method(impl->ctx, quic_method()) != 1)

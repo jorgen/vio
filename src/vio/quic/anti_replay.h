@@ -14,6 +14,7 @@ Anti-replay for 0-RTT, after RFC 8446 section 8.2 (ClientHello recording).
 #include <span>
 #include <unordered_map>
 
+#include <vio/crypto.h>
 #include <vio/tick.h>
 
 namespace vio::quic
@@ -50,12 +51,16 @@ public:
   // thousand; this leaves room and is a few tens of megabytes.
   static constexpr std::size_t default_capacity = 1U << 20;
 
-  anti_replay_t() = default;
+  anti_replay_t()
+  {
+    seed();
+  }
 
   anti_replay_t(std::chrono::nanoseconds window, std::size_t capacity)
     : _window(window)
     , _capacity(capacity)
   {
+    seed();
   }
 
   [[nodiscard]] std::chrono::nanoseconds window() const
@@ -110,12 +115,15 @@ private:
   // randomness; collisions are a false "seen", which costs a round trip, and
   // never a false "fresh", which would cost the guarantee -- because a
   // collision can only ever add entries the register treats as present.
-  [[nodiscard]] static std::uint64_t digest(std::span<const std::uint8_t> identifier)
+  [[nodiscard]] std::uint64_t digest(std::span<const std::uint8_t> identifier) const
   {
-    // FNV-1a. Not a security hash and does not need to be: the input is not
-    // chosen to collide with anything, and a collision is safe in the direction
-    // that matters.
-    std::uint64_t hash = 1469598103934665603ULL;
+    // FNV-1a over a per-register secret and then the identifier. The identifier
+    // is a ClientHello random, which the client chooses freely, so an unkeyed
+    // hash here is a table an attacker can precompute collisions against once
+    // and reuse against every deployment for as long as the code exists. The
+    // key costs nothing and removes the offline half of that attack: without it
+    // there is no fixed function to solve against.
+    std::uint64_t hash = _key;
     for (const auto byte : identifier)
     {
       hash ^= byte;
@@ -141,6 +149,21 @@ private:
     }
   }
 
+  void seed()
+  {
+    std::uint8_t bytes[sizeof(std::uint64_t)] = {};
+    if (crypto::random_bytes(bytes).has_value())
+    {
+      for (const auto byte : bytes)
+      {
+        _key = (_key << 8) | byte;
+      }
+    }
+  }
+
+  // Drawn once per register. Zero would still work -- it is only the FNV basis
+  // -- but then every register in every process would agree again.
+  std::uint64_t _key = 1469598103934665603ULL;
   std::chrono::nanoseconds _window = default_window;
   std::size_t _capacity = default_capacity;
   std::unordered_map<std::uint64_t, tick_t> _seen;
