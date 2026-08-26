@@ -90,6 +90,15 @@ inline constexpr std::uint64_t max_ack_delay_limit = std::uint64_t{1} << 14;
 inline constexpr std::uint64_t minimum_max_udp_payload_size = 1200;
 inline constexpr std::uint64_t minimum_active_connection_id_limit = 2;
 
+// Section 18.2 gives this parameter a floor and no ceiling, because the peer is
+// only promising what it is willing to remember. But the promise is what this
+// endpoint loops against when it issues IDs, so an unbounded value is an
+// unbounded loop with a random draw and an HMAC in it. Honouring more than a
+// handful buys nothing -- the IDs exist so a connection can migrate without
+// being linkable, and a few spare is all that takes -- so a larger request is
+// quietly met with what is worth issuing rather than refused.
+inline constexpr std::uint64_t maximum_active_connection_id_limit = 8;
+
 struct transport_parameters_t
 {
   // Server only: the Destination Connection ID from the client's first
@@ -409,6 +418,7 @@ enum class transport_parameter_error_t : std::uint8_t
       {
         return std::unexpected(transport_parameter_error_t::invalid_value);
       }
+      parameters.active_connection_id_limit = (std::min)(parameters.active_connection_id_limit, maximum_active_connection_id_limit);
       break;
     case transport_parameter_id_t::initial_source_connection_id:
       if (!as_connection_id(parameters.initial_source_connection_id))

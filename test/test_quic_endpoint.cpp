@@ -8,6 +8,7 @@
 #include <vio/event_loop.h>
 #include <vio/operation/sleep.h>
 #include <vio/operation/tcp.h>
+#include <vio/operation/udp_datagram.h>
 #include <vio/quic/anti_replay.h>
 #include <vio/quic/endpoint.h>
 #include <vio/task.h>
@@ -701,4 +702,132 @@ TEST_CASE("a resumed connection carries a request in its first flight, over a re
   CHECK(resumed);
   CHECK(received == "0-RTT over a real socket");
   CHECK(early_accepted);
+}
+
+// VIO-01. A Version Negotiation packet carries version zero, which no endpoint
+// supports -- so answering one produced a reply that was itself a trigger.
+// Section 6.1 forbids it, and two endpoints pointed at each other never stopped.
+
+TEST_CASE("a Version Negotiation packet is never answered with another one")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  int replies_to_version_negotiation = 0;
+  int replies_to_small_datagram = 0;
+  int replies_to_real_unknown_version = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, int &to_vn, int &to_small, int &to_real) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        auto server_context = tls_context_t::create(server_tls);
+        REQUIRE(server_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.connection.transport_parameters = sane_parameters();
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        cancellation_t server_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        (void)server_run;
+
+        // A plain socket, so the bytes on the wire are exactly what this test
+        // says they are rather than whatever a connection would have built.
+        auto probe_created = udp_create(loop);
+        REQUIRE(probe_created.has_value());
+        std::optional<udp_t> probe(std::move(*probe_created));
+        auto probe_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(probe_address.has_value());
+        REQUIRE(udp_bind(*probe, reinterpret_cast<const sockaddr *>(&*probe_address)).has_value());
+        auto reader_created = udp_create_reader(*probe);
+        REQUIRE(reader_created.has_value());
+        std::optional<udp_reader_t> reader(std::move(*reader_created));
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+
+        int received = 0;
+        auto pump = [](decltype(*reader) &r, int &count) -> detached_task_t
+        {
+          for (;;)
+          {
+            auto datagram = co_await r;
+            if (!datagram.has_value())
+            {
+              break;
+            }
+            ++count;
+          }
+        }(*reader, received);
+        (void)pump;
+
+        const auto probe_with = [&](std::vector<std::uint8_t> bytes) -> task_t<int>
+        {
+          received = 0;
+          (void)udp_try_send(*probe, bytes, reinterpret_cast<const sockaddr *>(&*target));
+          for (int i = 0; i < 20 && received == 0; ++i)
+          {
+            co_await sleep(loop, 5ms);
+          }
+          co_return int{received};
+        };
+
+        // Long header, version 0x00000000, both connection ids empty: a
+        // Version Negotiation packet, and the shape of the whole attack.
+        std::vector<std::uint8_t> version_negotiation = {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        to_vn = co_await probe_with(version_negotiation);
+
+        // An unsupported version in a datagram too small to have been a real
+        // connection attempt: also unanswered, so it cannot be an amplifier.
+        std::vector<std::uint8_t> small_unknown = {0xC0, 0x0A, 0x0A, 0x0A, 0x0A, 0x00, 0x00};
+        to_small = co_await probe_with(small_unknown);
+
+        // And the case that must still work: a full-sized datagram naming a
+        // version this endpoint does not speak earns a Version Negotiation.
+        std::vector<std::uint8_t> real_unknown(1200, 0x00);
+        real_unknown[0] = 0xC0;
+        real_unknown[1] = 0x0A;
+        real_unknown[2] = 0x0A;
+        real_unknown[3] = 0x0A;
+        real_unknown[4] = 0x0A;
+        to_real = co_await probe_with(real_unknown);
+
+        // The pump parks on the reader, so it has to be woken before anything
+        // it refers to is destroyed -- reader first, then the socket, and only
+        // then the loop.
+        reader->cancel();
+        co_await sleep(loop, 20ms);
+        reader.reset();
+        probe.reset();
+
+        server_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        server.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, replies_to_version_negotiation, replies_to_small_datagram, replies_to_real_unknown_version);
+    });
+
+  event_loop.run();
+  CHECK(replies_to_version_negotiation == 0);
+  CHECK(replies_to_small_datagram == 0);
+  CHECK(replies_to_real_unknown_version == 1);
 }

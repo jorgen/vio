@@ -3199,4 +3199,110 @@ TEST_CASE("a refused ticket still delivers the data the client sent early")
   CHECK(server->stream_receive_finished(*stream));
 }
 
+
+// VIO-02. A handshake that never finishes negotiates no idle timeout, so before
+// this fix nothing reaped it: one spoofed Initial bought a connection that
+// lived as long as the process did.
+
+TEST_CASE("a handshake that never completes is abandoned")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+
+  // What an attacker sends: enough to build a connection, never enough to
+  // finish one. It does not have to decrypt -- the clock starts either way.
+  std::vector<std::uint8_t> junk(1200, 0x00);
+  junk[0] = 0xC0;
+  REQUIRE(server->receive(junk, at(0ms)).has_value());
+
+  std::vector<std::uint8_t> out(1500);
+  SUBCASE("it survives right up to the deadline")
+  {
+    auto size = server->poll_send(out, at(9s));
+    REQUIRE(size.has_value());
+    CHECK(server->state() != connection_state_t::closed);
+  }
+
+  SUBCASE("and is closed once past it")
+  {
+    auto size = server->poll_send(out, at(11s));
+    REQUIRE(size.has_value());
+    // Nothing is sent: there is no one there to tell, which is the whole point.
+    CHECK(*size == 0);
+    CHECK(server->state() == connection_state_t::closed);
+  }
+
+  SUBCASE("the deadline is reported so a caller can arm a timer for it")
+  {
+    const auto deadline = server->next_timeout(at(0ms));
+    REQUIRE(deadline.has_value());
+    CHECK(*deadline <= at(10s));
+  }
+}
+
+TEST_CASE("a completed handshake is not abandoned by the handshake timeout")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ms));
+  REQUIRE(server->handshake_complete());
+
+  // Well past the handshake deadline of ten seconds, and well inside the idle
+  // timeout of thirty that this handshake negotiated. The fix must not shorten
+  // a live connection's life to the handshake budget.
+  std::vector<std::uint8_t> out(1500);
+  auto size = server->poll_send(out, at(25s));
+  REQUIRE(size.has_value());
+  CHECK(server->state() != connection_state_t::closed);
+}
+
+// VIO-03. active_connection_id_limit is a promise about what the peer will
+// remember, and it was being used directly as a loop bound.
+
+TEST_CASE("a peer cannot drive connection id issuance with a huge limit")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  // Section 18.2 puts no ceiling on this, so nothing stops a peer asking for
+  // every connection id there is. Before the clamp this never returned.
+  client_config.transport_parameters.active_connection_id_limit = (std::uint64_t{1} << 62) - 1;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  run_handshake(*client, *server, at(0ms));
+  REQUIRE(server->handshake_complete());
+  CHECK(server->issued_connection_ids().size() <= maximum_active_connection_id_limit);
+}
+
 }

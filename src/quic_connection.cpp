@@ -375,6 +375,10 @@ struct connection_impl_t
   std::chrono::nanoseconds idle_timeout{};
   tick_t last_activity;
   bool activity_seen = false;
+  // When this connection was first driven, which is the only clock reading it
+  // has before a handshake gives it a negotiated one.
+  tick_t started;
+  bool started_seen = false;
   // Section 10.1 also restarts the timer on sending an ack-eliciting packet,
   // but only the first since the last one received -- otherwise an endpoint
   // that keeps talking to a peer that has vanished would never time out.
@@ -821,6 +825,19 @@ void migrate_to(connection_impl_t &impl, std::span<const std::uint8_t> address, 
   return impl.last_activity + period;
 }
 
+// The deadline by which the handshake has to be finished. Unlike the idle
+// timeout this is known from the first datagram, which is the point: a
+// connection that never completes a handshake never negotiates an idle timeout
+// and would otherwise never be reaped at all.
+[[nodiscard]] std::optional<tick_t> handshake_deadline(const connection_impl_t &impl)
+{
+  if (impl.handshake_complete || !impl.started_seen || impl.config.handshake_timeout == std::chrono::nanoseconds::zero())
+  {
+    return std::nullopt;
+  }
+  return impl.started + impl.config.handshake_timeout;
+}
+
 [[nodiscard]] recovery_context_t recovery_context(const connection_impl_t &impl)
 {
   recovery_context_t context;
@@ -1165,7 +1182,7 @@ std::expected<void, error_t> replenish_connection_ids(connection_impl_t &impl)
   {
     return {};
   }
-  const auto limit = impl.peer_parameters->active_connection_id_limit;
+  const auto limit = (std::min)(impl.peer_parameters->active_connection_id_limit, maximum_active_connection_id_limit);
   while (impl.local_ids.can_issue(limit))
   {
     std::array<std::uint8_t, max_connection_id_size> bytes = {};
@@ -3108,6 +3125,11 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
   {
     return {};
   }
+  if (!impl.started_seen)
+  {
+    impl.started_seen = true;
+    impl.started = now;
+  }
   impl.bytes_received += datagram.size();
   // Section 10.1: the timer restarts on a packet received and processed. The
   // datagram has not been authenticated yet, so this is refined below to only
@@ -3243,6 +3265,11 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
 std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8_t> out, tick_t now)
 {
   auto &impl = *_impl;
+  if (!impl.started_seen)
+  {
+    impl.started_seen = true;
+    impl.started = now;
+  }
   // Section 8.2.4: an attempt that has run out of time is abandoned before
   // anything else decides what to send.
   impl.path.on_timeout(now);
@@ -3253,6 +3280,14 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   if (auto r = issue_new_token(impl, now); !r.has_value())
   {
     return std::unexpected(r.error());
+  }
+  if (auto deadline = handshake_deadline(impl); deadline.has_value() && now >= *deadline)
+  {
+    // Nothing is sent. A handshake this old has either been abandoned or was
+    // never real, and in both cases there is no one to tell.
+    impl.state = connection_state_t::closed;
+    impl.close_frame_pending = false;
+    return std::size_t{0};
   }
   if (auto deadline = idle_deadline(impl); deadline.has_value() && now >= *deadline)
   {
@@ -3509,6 +3544,7 @@ std::optional<tick_t> connection_t::next_timeout(tick_t now) const
   // detection timer telling it something of its own has gone missing.
   consider(_impl->recovery.loss_detection_timer(now, recovery_context(*_impl)));
   consider(idle_deadline(*_impl));
+  consider(handshake_deadline(*_impl));
   consider(_impl->path.deadline());
   if (_impl->config.pacing && wants_paced_content(*_impl))
   {

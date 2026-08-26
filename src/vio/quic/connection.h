@@ -149,6 +149,15 @@ struct connection_config_t
 
   std::chrono::nanoseconds max_ack_delay = std::chrono::milliseconds(25);
 
+  // How long a connection may stay unfinished before it is abandoned. The idle
+  // timeout of section 10.1 cannot cover this: it is negotiated, so it does not
+  // exist until the peer's transport parameters have arrived, and a handshake
+  // that never gets that far would otherwise be held forever. A server reached
+  // over the open internet needs this, because an Initial costs an attacker one
+  // spoofed datagram and costs the server a connection, a TLS session and three
+  // key schedules. Zero disables it.
+  std::chrono::nanoseconds handshake_timeout = std::chrono::seconds(10);
+
   // Section 13.4. The codepoint this connection's datagrams go out marked
   // with, recorded on each sent packet so the peer's reported counts can be
   // checked against it. Leave it at not_ect unless whatever owns the socket

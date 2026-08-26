@@ -874,7 +874,19 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
       {
         // Section 6.1, and only for a long header: a short header carries no
         // version, so there is nothing to negotiate about.
-        send_version_negotiation(impl, *invariant, sender);
+        //
+        // Two things this must not do. A Version Negotiation packet carries
+        // version zero, which is a version no endpoint supports, so answering
+        // one produces a reply that is itself a trigger -- section 6.1 forbids
+        // it outright, and without the test two endpoints pointed at each other
+        // never stop. And a datagram too small to have been a real connection
+        // attempt gets no answer at all, for the reason section 14.1 gives
+        // about Initials: a reply larger than what arrived is an amplifier
+        // pointed at whoever the source address really belongs to.
+        if (invariant->version != quic_version_negotiation && bytes.size() >= smallest_maximum_datagram_size)
+        {
+          send_version_negotiation(impl, *invariant, sender);
+        }
         continue;
       }
       // Only an Initial starts a connection. Anything else addressed to a
