@@ -252,14 +252,52 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
     than refused: the parameter is a promise about what the peer will remember,
     and meeting it partially is legal where rejecting the handshake is rude.
 
-  Regression tests for all three are in `test_quic_endpoint.cpp` and
-  `test_quic_connection.cpp`; each was confirmed to fail with its fix reverted.
+  Thirteen further **high** findings from the same review are also fixed: the
+  peer's `ack_delay` is clamped before it can invert the RTT estimate (the value
+  and its exponent are both the peer's, and the product overflowed twice); the
+  address token is validated *before* a connection is built, since branching on
+  a token's presence let one junk byte skip the stateless Retry; both stream and
+  CRYPTO reassembly now cap **fragments** as well as bytes, because flow control
+  bounds the highest offset reached and never the number of runs held to get
+  there; four stream state-machine defects (a half that finished with nothing
+  left to take never became terminal and so was never reaped, a reset charged
+  connection credit it never released, a reaped index could be reopened and
+  re-credited, and a retransmit range over acknowledged bytes emitted empty
+  STREAM frames for ever); and the 0-RTT set below.
+
+  Regression tests live beside the code they cover, and **each was confirmed to
+  fail with its fix reverted** -- which is the only thing that makes a regression
+  test worth having. Two were wrong on the first attempt and are worth knowing
+  about: a client only holds early keys until 1-RTT arrives, so a reflection test
+  run after the handshake proves nothing, and a `tick_t{}` timestamp looks
+  ancient beside the `steady_clock` reading the TLS callback uses, so a register
+  filled with one is swept empty before the test reaches its assertion.
+
+  The remaining medium and low findings are catalogued in `SECURITY_BACKLOG.md`,
+  with the evidence strength each was recorded at -- the review was
+  machine-assisted and one of its claims was checked and found false, so
+  "relayed" there means verify before fixing.
 
   **Session resumption and 0-RTT** (RFC 9001 section 4.6, RFC 8446 section 8).
   Two separate knobs on `tls_config_t`, because they are two features:
   `session_resumption` issues and offers tickets, which shortens a handshake and
   carries no replay exposure; `early_data` additionally permits 0-RTT, and
   implies the first.
+
+  **Hardened in the August 2026 review.** The ticket lifetime is now set from
+  the register's window (`SSL_CTX_set_session_psk_dhe_timeout`) rather than left
+  at BoringSSL's two-day default, which was 288 times longer than the window
+  that would recognise a replay -- the invariant this section used to assert was
+  not implemented. The receive path now checks the role before reaching for the
+  early key: there is one early-key slot and on a client it holds that client's
+  own *write* key, so a reflected copy of its own 0-RTT packet authenticated and
+  its frames were acted on, before the server's certificate had been verified.
+  The register's digest is keyed per instance, since the identifier is a
+  ClientHello random the client chooses freely and an unkeyed hash is a table an
+  attacker precomputes once. And a ClientHello must now carry a ticket as well
+  as the extension before it can spend a slot -- offering early data costs
+  nothing, and because the register is deliberately fail-closed, filling it was a
+  way to switch 0-RTT off for everyone.
 
   A **server with early data on must be given an `anti_replay_t`** or
   `tls_context_t::create` fails -- refusing to build the context beats building
