@@ -4,6 +4,7 @@
 #include <ostream>
 #include <vector>
 #include <doctest/doctest.h>
+#include <vio/quic/anti_replay.h>
 #include <vio/quic/congestion_control.h>
 
 // RFC 9002 section 7, NewReno. The window is the only number here, so the
@@ -831,5 +832,94 @@ TEST_CASE("NewReno is what a connection gets unless it asks otherwise")
 {
   congestion_control_t control(datagram);
   CHECK(control.algorithm() == congestion_algorithm_t::new_reno);
+}
+}
+
+TEST_SUITE("quic anti replay")
+{
+using vio::quic::anti_replay_t;
+
+std::vector<std::uint8_t> identifier(std::uint8_t seed)
+{
+  std::vector<std::uint8_t> out(32, seed);
+  out[0] = seed;
+  out[31] = static_cast<std::uint8_t>(seed * 7 + 1);
+  return out;
+}
+
+TEST_CASE("a ClientHello seen once is refused the second time")
+{
+  anti_replay_t replay;
+  const auto hello = identifier(1);
+  CHECK(replay.accept(hello, at(0ns)));
+  CHECK_FALSE(replay.accept(hello, at(0ns)));
+  // Still refused later in the window.
+  CHECK_FALSE(replay.accept(hello, at(1min)));
+}
+
+TEST_CASE("different ClientHellos are each accepted once")
+{
+  anti_replay_t replay;
+  for (int i = 1; i < 50; ++i)
+  {
+    CHECK(replay.accept(identifier(static_cast<std::uint8_t>(i)), at(0ns)));
+  }
+  CHECK(replay.size() == 49);
+  for (int i = 1; i < 50; ++i)
+  {
+    CHECK_FALSE(replay.accept(identifier(static_cast<std::uint8_t>(i)), at(0ns)));
+  }
+}
+
+TEST_CASE("an entry is forgotten once its window has passed")
+{
+  anti_replay_t replay(std::chrono::minutes(10), 1024);
+  const auto hello = identifier(2);
+  CHECK(replay.accept(hello, at(0ns)));
+  CHECK_FALSE(replay.accept(hello, at(std::chrono::minutes(9))));
+  // Past the window the register has no memory of it, which is exactly why a
+  // ticket may not be allowed to live longer than the window.
+  CHECK(replay.accept(hello, at(std::chrono::minutes(11))));
+}
+
+// The property that matters most: when it cannot vouch for an identifier it
+// says no. A register that forgot under pressure would hand an attacker the
+// replay it exists to prevent.
+TEST_CASE("a full register refuses rather than forgetting")
+{
+  anti_replay_t replay(std::chrono::minutes(10), 8);
+  for (int i = 1; i <= 8; ++i)
+  {
+    CHECK(replay.accept(identifier(static_cast<std::uint8_t>(i)), at(0ns)));
+  }
+  CHECK(replay.size() == 8);
+  // Full. A fresh identifier is refused rather than evicting one still inside
+  // its window.
+  CHECK_FALSE(replay.accept(identifier(9), at(0ns)));
+  // And the ones it holds are still recognised.
+  CHECK_FALSE(replay.accept(identifier(1), at(0ns)));
+  // Once the window passes there is room again.
+  CHECK(replay.accept(identifier(9), at(std::chrono::minutes(11))));
+}
+
+TEST_CASE("an empty identifier is never accepted")
+{
+  anti_replay_t replay;
+  CHECK_FALSE(replay.accept({}, at(0ns)));
+}
+
+// Replaying in a loop must not keep the entry alive past the original's window,
+// or an attacker could hold a slot open indefinitely.
+TEST_CASE("a repeat does not extend what the register remembers")
+{
+  anti_replay_t replay(std::chrono::minutes(10), 1024);
+  const auto hello = identifier(3);
+  CHECK(replay.accept(hello, at(0ns)));
+  for (int minute = 1; minute < 10; ++minute)
+  {
+    CHECK_FALSE(replay.accept(hello, at(std::chrono::minutes(minute))));
+  }
+  // Ten minutes after the *first* sighting, not the last.
+  CHECK(replay.accept(hello, at(std::chrono::minutes(11))));
 }
 }
