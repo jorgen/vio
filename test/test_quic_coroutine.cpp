@@ -296,3 +296,146 @@ TEST_CASE("a milestone that names nothing resolves rather than hanging")
   CHECK(failed);
 }
 }
+
+// The per-call operation, still with no endpoint under it. What matters here is
+// that an operation and the coroutine awaiting it can let go of each other in
+// either order, because both orders really happen: an accept resolves the
+// instant a connection is already queued, and a dial can be abandoned while
+// still in flight.
+
+namespace
+{
+// Awaits an operation and records what came back. The connection handle is kept
+// so a test can check the operation's result really reached the caller.
+vio::detached_task_t await_operation(vio::quic_connection_awaitable_t awaitable, bool &woke, bool &failed, int &code)
+{
+  auto outcome = co_await std::move(awaitable);
+  woke = true;
+  failed = !outcome.has_value();
+  code = outcome.has_value() ? 0 : outcome.error().code;
+}
+} // namespace
+
+TEST_SUITE("quic coroutine operation")
+{
+TEST_CASE("an operation resolved before anyone awaits it does not suspend")
+{
+  using namespace vio;
+
+  // Settled with a failure, which is the shape of a dial refused before it
+  // ever went out.
+  auto *op = detail::quic_op_create(nullptr);
+  detail::quic_op_finish(*op, error_t{.code = vio_quic_handshake_failed, .msg = "no"});
+
+  bool woke = false;
+  bool failed = false;
+  int code = 0;
+  await_operation(quic_connection_awaitable_t{op}, woke, failed, code);
+  CHECK(woke);
+  CHECK(failed);
+
+  // The endpoint's hold is still outstanding; dropping it frees the operation.
+  detail::quic_op_dispatch(op);
+}
+
+TEST_CASE("an operation resolved while a coroutine is parked resumes it")
+{
+  using namespace vio;
+
+  auto *op = detail::quic_op_create(nullptr);
+  bool woke = false;
+  bool failed = false;
+  int code = 0;
+  await_operation(quic_connection_awaitable_t{op}, woke, failed, code);
+  CHECK_FALSE(woke);
+
+  detail::quic_op_finish(*op, error_t{.code = vio_quic_idle_timeout, .msg = "idle"});
+  CHECK_FALSE(woke);
+
+  // Settling records; the beat resumes. Nothing is woken until something
+  // dispatches, because whatever settled it was standing inside the read loop.
+  detail::quic_op_dispatch(op);
+  CHECK(woke);
+  CHECK(failed);
+  CHECK(code == vio_quic_idle_timeout);
+}
+
+// The first of the two orders that a boolean pair cannot express: abandoned
+// while still in flight, and resolved afterwards. The operation has to survive
+// the abandonment, because the endpoint still has it, and it must not resume
+// the frame that has gone.
+TEST_CASE("an operation abandoned before it resolves is not resumed")
+{
+  using namespace vio;
+
+  auto *op = detail::quic_op_create(nullptr);
+  {
+    // Destroyed without ever being awaited, which is what an abandoned frame
+    // amounts to from the operation's side.
+    quic_connection_awaitable_t awaitable{op};
+    awaitable.await_suspend(std::noop_coroutine());
+    CHECK(op->continuation);
+  }
+  // The awaitable let go of its hold and, on the way, of the continuation.
+  CHECK_FALSE(op->continuation);
+
+  // The endpoint resolving it now touches nothing that has gone.
+  detail::quic_op_finish(*op, error_t{.code = vio_quic_endpoint_closed, .msg = "released"});
+  detail::quic_op_dispatch(op);
+}
+
+// The other order: resolved first, then abandoned. Here the endpoint lets go
+// first and the awaitable is last, so the awaitable is what frees it.
+TEST_CASE("an operation abandoned after it resolves is freed by whoever is last")
+{
+  using namespace vio;
+
+  auto *op = detail::quic_op_create(nullptr);
+  detail::quic_op_finish(*op, error_t{.code = vio_quic_connection_closed, .msg = "closed"});
+  // Nothing parked, so this resumes nothing and only drops the endpoint's hold.
+  detail::quic_op_dispatch(op);
+
+  // One hold left. Destroying the awaitable is what frees it, and under a
+  // sanitiser a double free or a leak would show up here.
+  {
+    quic_connection_awaitable_t awaitable{op};
+    CHECK(awaitable.await_ready());
+  }
+}
+
+TEST_CASE("the first outcome is the one reported")
+{
+  using namespace vio;
+
+  auto *op = detail::quic_op_create(nullptr);
+  detail::quic_op_finish(*op, error_t{.code = vio_quic_handshake_failed, .msg = "first"});
+  // More than one thing notices an ending, and a dial that failed for one
+  // reason must not be reclassified by a later pass over it.
+  detail::quic_op_finish(*op, error_t{.code = vio_quic_idle_timeout, .msg = "second"});
+  CHECK(op->failure.code == vio_quic_handshake_failed);
+
+  bool woke = false;
+  bool failed = false;
+  int code = 0;
+  await_operation(quic_connection_awaitable_t{op}, woke, failed, code);
+  CHECK(code == vio_quic_handshake_failed);
+  detail::quic_op_dispatch(op);
+}
+
+TEST_CASE("a moved-from awaitable holds nothing")
+{
+  using namespace vio;
+
+  // Every factory returns one of these by value, so the move has to leave the
+  // source inert: two awaitables releasing the same operation is a double free,
+  // and it would happen on the ordinary path rather than an exotic one.
+  auto *op = detail::quic_op_create(nullptr);
+  detail::quic_op_finish(*op, error_t{.code = vio_quic_busy, .msg = "busy"});
+  {
+    quic_connection_awaitable_t first{op};
+    quic_connection_awaitable_t second{std::move(first)};
+    CHECK(second.await_ready());
+  }
+  detail::quic_op_dispatch(op);
+}
+}

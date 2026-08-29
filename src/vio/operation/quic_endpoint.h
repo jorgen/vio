@@ -70,6 +70,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <uv.h>
@@ -298,16 +299,100 @@ struct quic_op_t
 {
   quic_endpoint_state_t *endpoint = nullptr;
   std::coroutine_handle<> continuation;
-  ref_ptr_t<quic_connection_state_t> result;
+  // Explicitly null: ref_ptr_t default-constructs by allocating, and can only
+  // do so for a type that is itself default constructible -- which
+  // quic_connection_state_t deliberately is not, since a connection state with
+  // no endpoint and no transport behind it is not a thing that should exist.
+  ref_ptr_t<quic_connection_state_t> result = ref_ptr_t<quic_connection_state_t>::null();
   error_t failure;
   bool resolved = false;
   bool failed = false;
   // The two-hold protocol: the awaitable holds one and the endpoint holds the
-  // other, and the last to let go frees it. Without it an operation resolved
-  // after its awaitable was abandoned has nobody left to delete it.
+  // other, and whichever lets go last frees it.
+  //
+  // A count rather than the completed/detached pair udp_send_op_t uses, because
+  // that pair relies on the second owner being a libuv callback that runs
+  // exactly once. Here either owner may let go first -- an operation can be
+  // resolved and then abandoned, or abandoned and then resolved -- and a
+  // boolean cannot say which of those has already happened.
   int holds = 0;
   registration_t cancel_registration;
 };
+
+// Allocated per call rather than kept as a slot on the endpoint, which is what
+// lets two coroutines accept at once without one overwriting the other's
+// continuation. Two holds from the start: the awaitable about to be returned,
+// and whoever is going to resolve it.
+[[nodiscard]] inline quic_op_t *quic_op_create(quic_endpoint_state_t *endpoint)
+{
+  auto *op = new quic_op_t();
+  op->endpoint = endpoint;
+  op->holds = 2;
+  return op;
+}
+
+inline void quic_op_release(quic_op_t *op)
+{
+  if (op == nullptr)
+  {
+    return;
+  }
+  --op->holds;
+  if (op->holds <= 0)
+  {
+    delete op;
+  }
+}
+
+// Records an outcome. The first one wins: a dial that failed for one reason
+// must not be reclassified by a later pass, and more than one thing notices an
+// ending.
+//
+// Nothing here resumes anything. Resumption happens on the beat and nowhere
+// else, because whatever calls this is standing inside the transport's read
+// loop -- and a coroutine resumed from there may drop the last endpoint
+// reference and destroy the very storage being walked.
+inline void quic_op_finish(quic_op_t &op, ref_ptr_t<quic_connection_state_t> connection)
+{
+  if (op.resolved)
+  {
+    return;
+  }
+  op.result = std::move(connection);
+  op.resolved = true;
+}
+
+inline void quic_op_finish(quic_op_t &op, error_t failure)
+{
+  if (op.resolved)
+  {
+    return;
+  }
+  op.failure = std::move(failure);
+  op.failed = true;
+  op.resolved = true;
+}
+
+// The endpoint letting go: resumes whatever is parked, then drops its hold.
+//
+// Nothing may touch the operation after the resume. The resumed coroutine runs
+// to its next suspension, and on the way it destroys the awaitable that was
+// holding this -- so by the time control comes back, the only remaining hold is
+// the one this function is about to drop, and quite possibly neither.
+inline void quic_op_dispatch(quic_op_t *op)
+{
+  if (op == nullptr)
+  {
+    return;
+  }
+  const auto continuation = op->continuation;
+  op->continuation = {};
+  if (continuation)
+  {
+    continuation.resume();
+  }
+  quic_op_release(op);
+}
 
 // Links a waiter into a slot. Nothing checks for a double link: a waiter node
 // lives in exactly one awaitable and an awaitable suspends at most once.
@@ -609,5 +694,86 @@ public:
 
 private:
   ref_ptr_t<detail::quic_milestone_state_t> _state;
+};
+
+// One accept or one dial. Unlike a milestone this is consumed: it resolves
+// once, to the coroutine that asked, and a second call is a second operation.
+//
+// It borrows its endpoint through the operation rather than holding one, which
+// is the rule the whole layer turns on -- an awaitable that kept the endpoint
+// alive would prevent the release that is supposed to resolve it, and the loop
+// would never close.
+//
+// The outcome lives in the operation, which both the endpoint and this share.
+// That is deliberate and is what makes the two orders equivalent: an operation
+// resolved before anyone awaited it and one resolved while a coroutine was
+// parked are read from the same place, so there is no second path to get
+// wrong. An outcome kept in the awaitable would be invisible to the first case
+// and would silently report whatever it was initialised to.
+class quic_connection_awaitable_t
+{
+public:
+  explicit quic_connection_awaitable_t(detail::quic_op_t *op)
+    : _op(op)
+  {
+  }
+
+  quic_connection_awaitable_t(const quic_connection_awaitable_t &) = delete;
+  quic_connection_awaitable_t &operator=(const quic_connection_awaitable_t &) = delete;
+
+  quic_connection_awaitable_t(quic_connection_awaitable_t &&other) noexcept
+    : _op(std::exchange(other._op, nullptr))
+  {
+  }
+
+  quic_connection_awaitable_t &operator=(quic_connection_awaitable_t &&other) noexcept
+  {
+    if (this != &other)
+    {
+      detail::quic_op_release(_op);
+      _op = std::exchange(other._op, nullptr);
+    }
+    return *this;
+  }
+
+  ~quic_connection_awaitable_t()
+  {
+    if (_op == nullptr)
+    {
+      return;
+    }
+    // Clearing the continuation is the load-bearing half. This destructor runs
+    // on the ordinary path, where it is redundant, and also when the frame it
+    // was parked in is destroyed -- and there a continuation left behind is a
+    // handle the endpoint would later resume into storage that has gone.
+    _op->continuation = {};
+    detail::quic_op_release(_op);
+  }
+
+  [[nodiscard]] bool await_ready() const noexcept
+  {
+    return _op == nullptr || _op->resolved;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    _op->continuation = continuation;
+  }
+
+  [[nodiscard]] std::expected<quic_connection_t, error_t> await_resume() noexcept
+  {
+    if (_op == nullptr)
+    {
+      return std::unexpected(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
+    }
+    if (_op->failed)
+    {
+      return std::unexpected(_op->failure);
+    }
+    return quic_connection_t{_op->result};
+  }
+
+private:
+  detail::quic_op_t *_op = nullptr;
 };
 } // namespace vio
