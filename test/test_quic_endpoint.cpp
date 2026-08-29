@@ -1076,3 +1076,122 @@ TEST_CASE("a datagram that cannot draw a stateless reset does not spend one")
   // can actually use it.
   CHECK(replies_to_short_header == 1);
 }
+
+// VIO-14 again, on the other walk. run() dispatches on_activity and then
+// flushes, both over a vector of raw pointers into entries the connection
+// vector owns, and endpoint.h invites the handler to call flush() from there.
+// flush() reaps and reaping erases, but neither of those two loops was marked
+// as a walk -- so a handler that flushed could free the very entries the flush
+// loop was about to write through. flush() and the timer were already marked;
+// these two were not.
+
+TEST_CASE("a connection is not reaped while the endpoint is walking it")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  std::size_t count_before = 0;
+  std::size_t count_after = 0;
+  bool observed = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &before, std::size_t &after, bool &seen) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        // Zero, so an entry that reaches the closed state during this batch is
+        // collectable before the batch has finished being walked. That is the
+        // race, compressed into one turn of the loop.
+        server_config.draining_period = std::chrono::milliseconds{0};
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
+
+        // Everything here is what endpoint.h invites an application to do from
+        // a handler. The flush sends the close, which puts the connection into
+        // the closed state and latches its draining deadline -- and with that
+        // deadline at zero, the reap at the end of that same flush is the one
+        // that would collect the connection the outer walk is still holding a
+        // pointer to.
+        server->on_activity(
+          [&server, &before, &after, &seen](connection_t &connection)
+          {
+            // A close queued before there are keys to send it under never
+            // reaches the wire, so the connection would never become closed
+            // and never become collectable.
+            if (seen || !connection.handshake_complete())
+            {
+              return;
+            }
+            seen = true;
+            before = server->connection_count();
+            connection.close(0, "from the handler", true);
+            (void)server->flush();
+            after = server->connection_count();
+          });
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        REQUIRE(dialled.has_value());
+
+        for (int i = 0; i < 400 && !seen; ++i)
+        {
+          co_await sleep(loop, 5ms);
+        }
+
+        client_cancel.cancel();
+        server_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        client.reset();
+        server.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, count_before, count_after, observed);
+    });
+
+  event_loop.run();
+  REQUIRE(observed);
+  CHECK(count_before == 1);
+  // Still there. A reap that ran here would have collected it, and the walk
+  // outside would then have flushed freed storage.
+  CHECK(count_after == 1);
+}

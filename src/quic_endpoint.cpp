@@ -1015,6 +1015,13 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     }
     }
 
+    // Both walks below hold raw pointers into entries the connection vector
+    // owns, and the handler is invited to call back in -- flush() reaps, and
+    // reaping erases. Marking the walk is what defers that until the pointers
+    // are no longer needed; without it a handler that flushes frees the
+    // entries this loop is about to write through.
+    ++impl.walking;
+
     // Before the flush, so anything the application writes in response goes
     // out with the reply rather than waiting for the next wakeup.
     if (impl.on_activity)
@@ -1030,6 +1037,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     {
       flush_entry(impl, *entry, now);
     }
+    --impl.walking;
     reap(impl, now);
   }
 
