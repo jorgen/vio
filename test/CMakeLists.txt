@@ -29,6 +29,7 @@ add_executable(vio_tests
     test_quic_congestion.cpp
     test_quic_qlog.cpp
     test_quic_streams.cpp
+    test_quic_coroutine.cpp
     test_http_client.cpp
     test_http_cache.cpp
     test_file.cpp

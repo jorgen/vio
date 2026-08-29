@@ -3775,6 +3775,7 @@ connection_path_stats_t connection_t::path_stats() const
   out.bytes_in_flight = _impl->recovery.bytes_in_flight();
   out.congestion_window = _impl->congestion.window();
   out.slow_start_threshold = _impl->congestion.slow_start_threshold();
+  out.in_slow_start = _impl->congestion.in_slow_start();
   return out;
 }
 

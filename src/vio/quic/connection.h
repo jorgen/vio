@@ -130,6 +130,11 @@ struct connection_path_stats_t
   std::size_t bytes_in_flight = 0;
   std::size_t congestion_window = 0;
   std::size_t slow_start_threshold = 0;
+  // Whether the window is still doubling. Worth reporting separately because
+  // the same window means different things either side of it: in slow start it
+  // is a floor being probed upward, and afterwards it is an estimate being
+  // defended.
+  bool in_slow_start = false;
 };
 
 struct connection_close_t
