@@ -8,6 +8,7 @@
 #include <vector>
 #include <doctest/doctest.h>
 #include <vio/crypto.h>
+#include <vio/quic/connection.h>
 #include <vio/quic/transport_parameters.h>
 
 // RFC 9000 section 18. The interesting part is not the round trip -- it is
@@ -66,6 +67,50 @@ TEST_CASE("defaults are not written to the wire")
 {
   const transport_parameters_t parameters;
   CHECK(encode_transport_parameters(parameters).empty());
+}
+
+// The struct's own initialisers are the absent-parameter values above, which
+// grant nothing. What an endpoint actually advertises comes from a separate
+// function, and a connection built without configuration uses it -- otherwise
+// the handshake completes and the connection can carry no bytes at all, which
+// is a failure with no error attached to it anywhere.
+TEST_CASE("a connection configured with nothing still has credit")
+{
+  const connection_config_t config;
+  const auto &parameters = config.transport_parameters;
+
+  CHECK(parameters.initial_max_data > 0);
+  CHECK(parameters.initial_max_stream_data_bidi_local > 0);
+  CHECK(parameters.initial_max_stream_data_bidi_remote > 0);
+  CHECK(parameters.initial_max_stream_data_uni > 0);
+  CHECK(parameters.initial_max_streams_bidi > 0);
+  CHECK(parameters.initial_max_streams_uni > 0);
+  CHECK(parameters.max_idle_timeout > 0);
+
+  // A lone stream is bounded by its own window as well as the connection's, so
+  // a per-stream limit far below the connection limit would cap a single
+  // transfer whatever credit the connection had.
+  CHECK(parameters.initial_max_stream_data_bidi_remote * 8 >= parameters.initial_max_data);
+  CHECK(parameters.initial_max_stream_data_bidi_remote <= parameters.initial_max_data);
+}
+
+// Two extensions stay off. Enabling DATAGRAM commits an endpoint to a receive
+// queue that only an application reading datagrams ever drains, and clearing
+// the QUIC bit changes what vio's traffic looks like on the wire; neither is a
+// decision a default should make on an application's behalf.
+TEST_CASE("the defaults enable no extension")
+{
+  const auto parameters = default_transport_parameters();
+  CHECK(parameters.max_datagram_frame_size == 0);
+  CHECK_FALSE(parameters.grease_quic_bit);
+
+  const auto encoded = encode_transport_parameters(parameters);
+  const auto decoded = decode_transport_parameters(encoded);
+  REQUIRE(decoded.has_value());
+  CHECK(decoded->max_datagram_frame_size == 0);
+  CHECK_FALSE(decoded->grease_quic_bit);
+  CHECK(decoded->initial_max_data == parameters.initial_max_data);
+  CHECK(decoded->initial_max_streams_bidi == parameters.initial_max_streams_bidi);
 }
 
 TEST_CASE("a full set round trips")

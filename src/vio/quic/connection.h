@@ -106,7 +106,17 @@ struct connection_config_t
   // The version a client proposes in its first Initial. A server ignores this
   // and adopts whatever the client asked for, provided the endpoint accepts it.
   std::uint32_t version = quic_version_1;
-  transport_parameters_t transport_parameters;
+
+  // What this endpoint advertises. Initialised to a working set rather than to
+  // the struct's own initialisers, which are section 18.2's absent-parameter
+  // values and grant no credit at all -- a connection built from those
+  // completes its handshake and can then carry nothing, with no error raised
+  // anywhere to say why.
+  //
+  // To change one value, start from what is here rather than from a bare
+  // struct: transport_parameters_t{.initial_max_data = x} names one field and
+  // silently zeroes the other eight.
+  transport_parameters_t transport_parameters = default_transport_parameters();
 
   // A ticket from an earlier connection to this peer, as handed back by
   // resumption_ticket(). Offering one resumes, and a resumed connection can put

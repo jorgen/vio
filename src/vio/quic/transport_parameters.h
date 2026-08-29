@@ -136,6 +136,83 @@ struct transport_parameters_t
   // matters for server-initiated migration, which this stack does not do.
 };
 
+// What this endpoint advertises when the application says nothing.
+//
+// These are deliberately NOT the struct's own default member initialisers, and
+// the distinction is load-bearing rather than stylistic. decode_transport
+// _parameters below default-constructs a transport_parameters_t and then
+// overwrites only the ids that actually arrived, so those initialisers are
+// section 18.2's "the peer did not send this" values -- and for every credit
+// field that value is zero, because a peer that says nothing has granted
+// nothing. Raise one of them there and a silent peer decodes as having granted
+// credit it never gave; this endpoint then sends past a limit that does not
+// exist and is closed with FLOW_CONTROL_ERROR. A resuming 0-RTT client makes
+// the same mistake a round trip earlier, from the stored ticket.
+//
+// So the policy lives here, in a function, and reaches the wire through
+// connection_config_t::transport_parameters. Note that a caller who wants to
+// change one value must start from this rather than from a bare struct:
+// transport_parameters_t{.initial_max_data = x} is not a partial override, it
+// is a full reset to zero credit for everything it does not name.
+[[nodiscard]] inline transport_parameters_t default_transport_parameters()
+{
+  transport_parameters_t out;
+
+  // Zero, the absent-parameter value, means a peer that vanishes is kept for
+  // the life of the process. Thirty seconds is what every hand-written
+  // parameter block in this repository already says.
+  out.max_idle_timeout = 30000;
+
+  // Unread bytes this endpoint promises to hold across the whole connection,
+  // and the real bound on receive memory: nothing above the transport keeps a
+  // second copy, so bytes sit in reassembly until the application takes them
+  // and taking them is what returns the credit.
+  //
+  // It is also the throughput ceiling on a long path, because there is no
+  // receive window auto-tuning here to grow past it -- eight megabytes over a
+  // 100 ms round trip is about 670 Mbit/s, where a megabyte would have been 84.
+  out.initial_max_data = 8ull * 1024 * 1024;
+
+  // A quarter of the connection window each, so that four streams can be
+  // individually full before the connection limit binds and one slow reader
+  // cannot starve the rest. They are overcommitted within initial_max_data
+  // rather than added to it, so this ratio costs no memory -- the connection
+  // window is what bounds the total.
+  //
+  // The per-stream window caps a single transfer just as the connection window
+  // does, which is why it has to rise with it: a lone stream against a 256 KiB
+  // window is about 21 Mbit/s on that same 100 ms path however much credit the
+  // connection has.
+  out.initial_max_stream_data_bidi_local = 2ull * 1024 * 1024;
+  out.initial_max_stream_data_bidi_remote = 2ull * 1024 * 1024;
+  // Non-zero for the same reason as the pair above, and because the zero
+  // default has already caught this repository twice: two of its QUIC test
+  // files leave this at zero and so cannot use unidirectional streams at all,
+  // with nothing anywhere reporting why.
+  out.initial_max_stream_data_uni = 2ull * 1024 * 1024;
+
+  // How many streams the peer may have open at once, not how many it may open.
+  // An index costs nothing until a frame arrives for it, and MAX_STREAMS
+  // returns the credit as the application finishes with each one.
+  out.initial_max_streams_bidi = 100;
+  out.initial_max_streams_uni = 100;
+
+  // Section 5.1. Spare connection IDs are what let a peer migrate without being
+  // linkable across the move. Four rather than the section 18.2 floor of two
+  // because every consumer in this repository picked four, and rather than the
+  // eight the decoder clamps to because each one the peer issues costs it a
+  // draw from the CSPRNG and an HMAC.
+  out.active_connection_id_limit = 4;
+
+  // max_datagram_frame_size and grease_quic_bit are left at their absent
+  // values on purpose. Every other number here bounds a queue the transport
+  // drains by itself; the datagram queue is drained only by an application
+  // that reads it, so enabling the extension by default would hand every
+  // endpoint a buffer that a program not using datagrams never empties. The
+  // QUIC bit is an operational decision rather than a flow control one.
+  return out;
+}
+
 enum class transport_parameter_error_t : std::uint8_t
 {
   truncated,
@@ -327,8 +404,7 @@ enum class transport_parameter_error_t : std::uint8_t
         return std::unexpected(transport_parameter_error_t::invalid_value);
       }
       break;
-    case transport_parameter_id_t::stateless_reset_token:
-    {
+    case transport_parameter_id_t::stateless_reset_token: {
       if (value.size() != stateless_reset_token_size)
       {
         return std::unexpected(transport_parameter_error_t::invalid_value);
