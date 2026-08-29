@@ -10,7 +10,11 @@ A design proposal. Progress against the eight-step build order at the bottom:
 - **Step 3 (endpoint hardening) — partly done.** `flush(connection_t&)`, `on_connection_gone`
   and the `walking` bracket landed. The deadline-driven timer and the IPv4-pinning fix were
   both tried and reverted with measurements; see the section at the end.
-- **Steps 4 to 8 — not started.**
+- **Step 4 (the coroutine endpoint) — done**, built through the twelve-step order at the
+  bottom of this file. `src/vio/operation/quic_endpoint.h` and `test/test_quic_coroutine.cpp`;
+  53 test cases. Streams, writes and datagrams (steps 5 to 7 of the *feature* list, not the
+  build order) are still to come, and nothing in the header names a stream yet.
+- **Steps 5 to 8 — not started.**
 
 Landed alongside these, outside the build order: peer-to-peer endpoints (two TLS contexts),
 mutual TLS, and six verified bug fixes.
@@ -5266,9 +5270,53 @@ BUILD ORDER:
 11. 11. Cancellation on both operations, and the cancelled dial's close. Its own three cases: pre-cancelled never touches the transport; cancelled while suspended resolves with `vio_cancelled` and the peer sees a CONNECTION_CLOSE; a cancelled accept leaves the queue intact for the next accept.
 12. 12. Run the whole file under `cmake --preset asan` and under `msvc-asan`, because tests 3, 4, 5, 11 and 14 are memory-safety assertions and pass vacuously without a sanitiser. Then run the existing `test_quic_endpoint.cpp` unchanged — nothing in this step touches the transport except one constant, so a regression there means the constant was not the only change.
 
+ALL TWELVE ARE DONE. What the plan got wrong, in the order it was found:
+
+- **Step 6's port-only bind was written after all**, and without the six-line transport
+  addition the open question below said it needed. `endpoint_t::bind(const sockaddr *)` is
+  enough: the coroutine layer tries `[::]` and falls back to `0.0.0.0`, which is
+  `udp_bind_dual_stack`'s rule applied rather than reused. It comes with a trap the
+  transport has too and nobody had written down — a socket bound dual-stack cannot send to
+  a bare IPv4 literal, so a *peer-to-peer* endpoint bound this way must dial IPv6 or
+  IPv4-mapped addresses. That is a comment on `quic_endpoint_bind`, and it cost a hung test
+  to find.
+- **`shutdown_active` was not enough to stop accepting.** It is cleared the moment the last
+  goodbye is acknowledged, so an accept loop written the obvious way would take a new
+  connection on the way out. There is a second flag, `shutdown_requested`, set once and
+  never cleared, and it is what both the accept factory and the arrival hook test.
+- **A shutdown's peers end *cleanly*.** The plan's test expected
+  `vio_quic_connection_closed`; a shutdown says NO_ERROR, and a zero code from either side
+  is a clean ending by this layer's own classification. What tells it apart from a
+  connection that simply finished is the close reason, which names the peer.
+- **The role sort's client branch is not reachable by the peer-to-peer test.** Alice's own
+  dial is kept out of her accept queue by the *registry*, because `quic_endpoint_connect`
+  enters it before the hook can fire. Only a connection dialled straight through
+  `quic_endpoint_native()` reaches the role check, and reverting the check leaves the
+  peer-to-peer test passing. There is now a test that dials through the transport, and it
+  does fail when the check is removed.
+- **The cancellation registration must be dropped when the operation resolves, not when it
+  resumes.** This is the one real defect, and the sanitiser found it. An operation resolved
+  at call time waits on `ready_ops` for the next beat; deregistering there let a caller
+  resolve, run on, and destroy a request-scoped `cancellation_t` that the beat then wrote
+  through. Release says nothing, the MSVC debug iterators call it an erase outside the
+  range. `quic_op_finish` now resets it, which is safe from inside a cancel callback because
+  `cancellation_t::cancel` moves its list out before running any of it.
+- **Two tests raced and one hung**, both because the plan treated a client's dial resolving
+  as saying something about when the *server* ran its arrival hook. It does not: they are
+  independent endpoints. Those tests wait.
+- **The beat's flush pass is not falsifiable by any test here**, and the plan half said so.
+  The endpoint's 2 ms ticker flushes everything anyway, so removing the per-connection flush
+  changes latency and not correctness. It is written because it is the only form that scales
+  once streams arrive, and that claim is still untested.
+
+`endpoint_t::connect` validates neither the address nor its family — a garbage `sockaddr`
+produces a connection that dials into nowhere and ends on the handshake timeout, and a null
+one dereferences. That is the transport's call and was left alone; the coroutine layer
+promises only that whatever the transport does refuse comes back on the awaitable.
+
 OPEN QUESTIONS:
 - Whether `quic_endpoint_shutdown` should also stop the driver. It does not: resolving the milestone leaves the endpoint reading a socket with no connections on it, which is right for one that will dial again and pointless for one about to be dropped. Keeping it tied to the release means the beat, the reader's poll and the socket stay armed between the shutdown resolving and the handle going out of scope. Settle it when there is a program that shuts down and then keeps going.
-- The port-only bind, `quic_endpoint_bind(endpoint, std::uint16_t)`, is left out. It needs `endpoint_t::bind(std::uint16_t)` forwarding to `udp_bind_dual_stack` (udp.h:632), because the `udp_t` is private to `endpoint_impl_t` — six lines of transport addition that step 4's stated scope does not cover. Without it a caller who just wants a port has to pick a family, and picking IPv4 is how an endpoint ends up unable to reach an IPv6 peer. Worth doing in step 5 rather than never.
+- ~~The port-only bind, `quic_endpoint_bind(endpoint, std::uint16_t)`, is left out.~~ **Settled: it was written, in the coroutine layer, with no transport change.** See the note above the open questions. It needs `endpoint_t::bind(std::uint16_t)` forwarding to `udp_bind_dual_stack` (udp.h:632), because the `udp_t` is private to `endpoint_impl_t` — six lines of transport addition that step 4's stated scope does not cover. Without it a caller who just wants a port has to pick a family, and picking IPv4 is how an endpoint ends up unable to reach an IPv6 peer. Worth doing in step 5 rather than never.
 - `quic_connection_resumption_ticket` and `quic_connection_new_token` are not here. Both are `std::vector<std::uint8_t>` copies that would have to be latched at the ending to survive the reap, and nothing in step 4 or 5 spends one — step 7 is where 0-RTT lands and where the latching cost is justified.
 - `quic_connection_stats_t::open_streams` is absent rather than present-and-zero. `connection_t` has no stream-count accessor; step 5 adds the field along with the registry that can answer it, which is source-compatible.
 - The `closed_locally` gap: a close issued through `quic_connection_native()->close(0, …)` is reported as `vio_quic_idle_timeout`. Fixing it properly means a `connection_end_t how` on `connection_close_t`, set at the five sites in quic_connection.cpp that build one. That is the right fix and it is a step-2-shaped change to a public struct; whether it is worth making late is a call for whoever owns the transport, and if it is made, `quic_classify_ending` collapses to a switch and `closed_locally` goes away.
