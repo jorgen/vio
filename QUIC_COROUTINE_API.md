@@ -3692,3 +3692,70 @@ The coroutine layer must own its own `uv_prepare_t`, registered through the ref 
 listener is posted through `_run_in_loop` (`event_loop_impl.h:171`), an event pipe that
 `event_loop_t::stop()` closes before draining -- so a listener destroyed during shutdown may
 never be removed, and the loop would then call `about_to_block()` on freed storage.
+
+
+---
+
+# Step 4: two corrections to this document, verified against the source
+
+The step 4 specification work produced three independent designs and three adversarial reviews.
+Every design came back "needs-work", and two findings are not opinions about those designs --
+they are defects in the sketches **in this document**, confirmed by reading the source. They are
+recorded here because anyone implementing step 4 from the headers above will otherwise build
+them.
+
+## 1. An awaitable must not hold a strong reference to the endpoint state
+
+The header sketch gives `quic_future_t` a `ref_ptr_t<Owner> handle`, and declares
+`quic_accept_future_t = quic_future_t<quic_endpoint_state_t, quic_accept_slot_t>`. Built that
+way it deadlocks, by construction:
+
+1. A coroutine suspends on `co_await quic_endpoint_accept(endpoint)`. The awaitable's
+   `ref_ptr_t` copy increments the endpoint state's count (`ref_counted_wrapper.h:63-70`).
+2. The application drops its last `quic_endpoint_t` -- which is the intended shutdown gesture.
+3. `dec()` finds the count is 1 rather than 0, so it never runs the destroy callbacks
+   (`ref_counted_impl.h:31-46`).
+4. Teardown therefore never runs, so the parked accept is never resolved, so the coroutine never
+   resumes, so the reference is never released.
+5. The beat and UDP handles stay open, `uv_loop_close` fails, and `~event_loop_t` prints every
+   open handle and asserts -- the exact failure mode CLAUDE.md warns about.
+
+The waiter holds the thing whose destruction would release the waiter.
+
+This idiom is copied from `tcp_future_t`, where it is correct: there, the handle is the
+operation's owner and dropping it mid-await is not a shutdown path. QUIC differs precisely
+because *releasing the endpoint is how an application shuts down*, and that gesture is supposed
+to resolve every parked awaitable.
+
+So an awaitable holds a **borrowed** pointer and registers itself in an intrusive waiter list on
+the state, so that teardown can walk the list and resolve every waiter; each waiter unlinks
+itself when destroyed, so an abandoned `task_t` leaves nothing dangling. Note the ordering trap
+that follows: if a derived awaitable holds a `ref_ptr_t` member and the base holds the waiter
+node, the member is destroyed **before** the base unlinks, so the state may already be freed when
+`unlink()` writes through it.
+
+## 2. The beat should be a check handle, not a prepare handle
+
+Verified in `3rdparty/libuv-v1.51.0/src/unix/core.c`, `uv_run`'s iteration is:
+
+    uv__run_pending -> uv__run_idle -> uv__run_prepare -> uv__io_poll
+      -> uv__run_pending -> uv__run_check -> uv__run_closing_handles
+      -> uv__update_time -> uv__run_timers
+
+A QUIC connection's work almost always originates in a datagram, and datagrams arrive in
+`uv__io_poll`. A **check** handle runs immediately after poll, in the same iteration, so a
+coroutine woken by an arriving datagram writes its reply in the same turn. A **prepare** handle
+already ran before that poll, so the same work waits for the next iteration -- one extra trip
+through `epoll_wait` per exchange, which on a request/response workload is a round trip of
+latency added to every exchange.
+
+This document's thesis says `uv_prepare_t`; that was chosen for its *ownership* (a handle
+registered through the ref count, rather than
+`event_loop_t::add_about_to_block_listener`, whose removal is posted through a pipe that
+`stop()` closes first -- still the right call). The phase was not the point being made, and
+section "Backpressure" already notes in passing that prepare costs a turn. Take the ownership
+argument and use `uv_check_t`.
+
+The one case prepare wins is work created by a timer, since timers run at the end of an
+iteration and a prepare handle sees them before the next poll rather than after it. That is the
+minority case here, and the 2 ms ticker already forces a turn.
