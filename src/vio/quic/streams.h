@@ -538,21 +538,27 @@ public:
     for (auto it = _streams.begin(); it != _streams.end();)
     {
       const auto id = it->first;
-      if (stream_initiator(id) != remote_initiator)
+      const auto &stream = it->second;
+      const bool receive_done = !stream.has_receive || stream.receive.state() == receive_state_t::data_read || stream.receive.state() == receive_state_t::reset_read;
+      const bool send_done = !stream.has_send || stream.send.state() == send_state_t::data_received || stream.send.state() == send_state_t::reset_sent;
+      if (!receive_done || !send_done)
       {
         ++it;
         continue;
       }
-      const auto &stream = it->second;
-      const bool receive_done = !stream.has_receive || stream.receive.state() == receive_state_t::data_read || stream.receive.state() == receive_state_t::reset_read;
-      const bool send_done = !stream.has_send || stream.send.state() == send_state_t::data_received || stream.send.state() == send_state_t::reset_sent;
-      if (receive_done && send_done)
+      // Only a peer-initiated stream returns credit. MAX_STREAMS says how many
+      // more the PEER may open, so a stream this endpoint opened has none to
+      // give back, and counting it would hand the peer credit for streams it
+      // never used.
+      if (stream_initiator(id) == remote_initiator)
       {
         (stream_direction(id) == stream_direction_t::bidirectional ? reaped.bidirectional : reaped.unidirectional) += 1;
-        it = _streams.erase(it);
-        continue;
       }
-      ++it;
+      // But both kinds are erased. A locally opened stream that has finished
+      // is as dead as a remote one, and ids are never reused on either side,
+      // so keeping it only grows a map node per stream for the life of the
+      // connection -- which on a long-lived one that opens many is unbounded.
+      it = _streams.erase(it);
     }
     return reaped;
   }

@@ -779,3 +779,50 @@ TEST_CASE("a retransmit range whose bytes were acknowledged does not loop")
   CHECK_FALSE(send.has_pending());
 }
 
+// Reaping used to skip anything this endpoint opened, so a connection that
+// opened and finished streams kept a map node for each one until it closed.
+// Ids are never reused on either side, so there is nothing to be gained by
+// remembering a finished one -- and on a long-lived connection that opens many
+// the growth has no bound.
+TEST_CASE("a finished stream is reaped whichever side opened it")
+{
+  streams_t streams(client_config());
+  // Enough credit that the count below is bounded by the test rather than by
+  // the peer's stream limit.
+  streams.apply_peer_parameters(peer_parameters(100000, 500, 64));
+
+  constexpr int count = 32;
+  std::vector<std::uint64_t> opened;
+  for (int i = 0; i < count; ++i)
+  {
+    auto id = streams.open(stream_direction_t::unidirectional);
+    REQUIRE(id.has_value());
+    opened.push_back(*id);
+  }
+  CHECK(streams.all().size() == count);
+
+  // Finish each one: the bytes are written, put on the wire, and acknowledged,
+  // which is what takes the sending half terminal.
+  for (const auto id : opened)
+  {
+    auto *stream = streams.find(id);
+    REQUIRE(stream != nullptr);
+    REQUIRE(stream->send.write(as_bytes("done"), true));
+    stream->send.set_max_data(64);
+    auto chunk = stream->send.next_chunk(64, 64);
+    REQUIRE(chunk.has_value());
+    const auto length = chunk->data.size();
+    stream->send.on_chunk_sent(*chunk);
+    stream->send.on_range_acknowledged(chunk->offset, length);
+    CHECK(stream->send.state() == send_state_t::data_received);
+  }
+
+  // Nothing is credited back: MAX_STREAMS says how many the PEER may open, and
+  // these were not its.
+  const auto reaped = streams.reap_finished(stream_initiator_t::server);
+  CHECK(reaped.unidirectional == 0);
+  CHECK(reaped.bidirectional == 0);
+
+  // But they are gone, which is the point.
+  CHECK(streams.all().empty());
+}
