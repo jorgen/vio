@@ -488,7 +488,35 @@ public:
   // Ascending by id. The connection does not hold streams in that order, so
   // this sorts; it is a caller-facing convenience rather than anything the
   // send path uses.
+  //
+  // Note what it is: streams with unread bytes right now. That is a level, and
+  // a level cannot answer "what happened" -- a stream that carried only a
+  // zero-length FIN never appears here, nor does one reset before anything was
+  // read, nor one whose bytes have all been consumed. The take_* accessors
+  // below answer that question instead.
   [[nodiscard]] std::vector<std::uint64_t> readable_streams();
+
+  // Everything that has happened since the last call, drained by reading it.
+  //
+  // These exist for anything that has to be woken rather than polled: each
+  // reports an edge once, so nothing is missed by asking at the wrong moment,
+  // and each is emptied by the call. A duplicate id is possible and harmless
+  // -- the second look finds nothing to do -- but a missed one is not, which
+  // is why they are recorded where the change happens rather than inferred.
+  //
+  // opened covers both sides; use stream_initiator() on the id to tell a
+  // stream the peer opened from one this endpoint did.
+  [[nodiscard]] std::vector<std::uint64_t> take_opened_streams();
+  // Streams with more to read, or whose receiving half has just ended --
+  // including by a reset, and including a FIN that carried no bytes.
+  [[nodiscard]] std::vector<std::uint64_t> take_data_arrived();
+  // Streams whose sending half may now move: a limit really rose, an
+  // acknowledgement freed room, or the peer ended it with STOP_SENDING. A
+  // duplicate MAX_DATA does not appear here, because nothing changed.
+  [[nodiscard]] std::vector<std::uint64_t> take_send_unblocked();
+  // Whether the peer raised how many streams this endpoint may open, which is
+  // what open_stream returning nothing is waiting for.
+  [[nodiscard]] bool take_stream_credit_opened();
 
   // The two halves finish independently -- that is the whole point of
   // modelling them separately -- so a caller that wants to know whether it can

@@ -3669,4 +3669,127 @@ TEST_CASE("the path reports what it has measured")
   CHECK(stats.congestion_window >= stats.bytes_in_flight);
 }
 
+// The three shapes a level cannot express, each of which is a request a server
+// would silently lose if readable_streams() were the only way to notice a
+// stream: one that carries a zero-length FIN, one reset before anything was
+// read, and one whose bytes have all been consumed before anyone looked.
+TEST_CASE("a stream the peer opened is reported even when it carries nothing")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(client.has_value());
+  REQUIRE(server.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+
+  // Whatever the handshake itself opened is not what this is about.
+  (void)server->take_opened_streams();
+  (void)server->take_data_arrived();
+
+  SUBCASE("a stream whose only content is an empty FIN")
+  {
+    auto stream = client->open_stream(stream_direction_t::bidirectional);
+    REQUIRE(stream.has_value());
+    CHECK(client->write_stream(*stream, {}, true) == 0);
+    run_handshake(*client, *server, at(1ms));
+
+    // Nothing to read, ever, so the level never shows it.
+    CHECK(server->readable_streams().empty());
+
+    const auto opened = server->take_opened_streams();
+    CHECK(std::find(opened.begin(), opened.end(), *stream) != opened.end());
+    // And the end of it is an event in its own right, which is what says the
+    // request is complete.
+    const auto arrived = server->take_data_arrived();
+    CHECK(std::find(arrived.begin(), arrived.end(), *stream) != arrived.end());
+    CHECK(server->stream_receive_finished(*stream));
+  }
+
+  SUBCASE("a stream reset before anything was read")
+  {
+    auto stream = client->open_stream(stream_direction_t::bidirectional);
+    REQUIRE(stream.has_value());
+    client->reset_stream(*stream, 7);
+    run_handshake(*client, *server, at(1ms));
+
+    CHECK(server->readable_streams().empty());
+    const auto arrived = server->take_data_arrived();
+    CHECK(std::find(arrived.begin(), arrived.end(), *stream) != arrived.end());
+    CHECK(server->stream_receive_reset(*stream));
+  }
+
+  SUBCASE("an edge is drained by reading it")
+  {
+    auto stream = client->open_stream(stream_direction_t::bidirectional);
+    REQUIRE(stream.has_value());
+    CHECK(client->write_stream(*stream, {}, true) == 0);
+    run_handshake(*client, *server, at(1ms));
+
+    CHECK_FALSE(server->take_opened_streams().empty());
+    // Once, not for ever: an edge that stayed set would wake its reader on
+    // every pass with nothing to do.
+    CHECK(server->take_opened_streams().empty());
+  }
+}
+
+// A writer parks against what the peer has acknowledged, so the edges that
+// release it have to include the acknowledgement itself -- a peer with room to
+// spare has no reason to send a MAX_DATA, and a writer waiting for one would
+// wait for ever.
+TEST_CASE("a sender is told when its stream can move again")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  auto parameters = sane_parameters();
+  parameters.initial_max_stream_data_bidi_local = 4096;
+  parameters.initial_max_stream_data_bidi_remote = 4096;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = parameters;
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = parameters;
+
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(client.has_value());
+  REQUIRE(server.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+
+  auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+  const std::vector<std::uint8_t> body(64 * 1024, 0xab);
+  CHECK(client->write_stream(*stream, body, false) == body.size());
+  (void)client->take_send_unblocked();
+
+  run_handshake(*client, *server, at(1ms));
+
+  // Some of it left and was acknowledged, which is the edge.
+  const auto unblocked = client->take_send_unblocked();
+  CHECK(std::find(unblocked.begin(), unblocked.end(), *stream) != unblocked.end());
+
+  SUBCASE("and STOP_SENDING releases a writer that can never make progress")
+  {
+    (void)client->take_send_unblocked();
+    server->stop_sending(*stream, 3);
+    run_handshake(*client, *server, at(2ms));
+
+    // After this nothing on the stream is ever acknowledged again, so being
+    // told it is over is the only thing that can release a parked writer.
+    const auto stopped = client->take_send_unblocked();
+    CHECK(std::find(stopped.begin(), stopped.end(), *stream) != stopped.end());
+  }
+}
+
 }

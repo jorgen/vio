@@ -1463,6 +1463,11 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
           if (auto *stream = impl.streams.find(sent.stream_id); stream != nullptr && stream->has_send)
           {
             stream->send.on_range_acknowledged(sent.offset, sent.length);
+            // The commonest thing that frees room on a healthy connection.
+            // The send marks a writer parks against are measured from what has
+            // been acknowledged, so without this a parked writer waits for a
+            // MAX_DATA that a peer with room to spare has no reason to send.
+            impl.streams.note_send_unblocked(sent.stream_id);
             // Section 4.6: this is the other way a stream finishes, and the
             // one nothing else notices. A stream the application has already
             // read to the end is still live until the peer acknowledges what
@@ -3953,6 +3958,26 @@ void connection_t::consume_stream(std::uint64_t id, std::size_t bytes)
   // nothing left to take. The scan itself waits until the next packet is
   // built.
   _impl->reap_wanted = true;
+}
+
+std::vector<std::uint64_t> connection_t::take_opened_streams()
+{
+  return _impl->streams.take_opened();
+}
+
+std::vector<std::uint64_t> connection_t::take_data_arrived()
+{
+  return _impl->streams.take_data_arrived();
+}
+
+std::vector<std::uint64_t> connection_t::take_send_unblocked()
+{
+  return _impl->streams.take_send_unblocked();
+}
+
+bool connection_t::take_stream_credit_opened()
+{
+  return _impl->streams.take_stream_credit_opened();
 }
 
 std::vector<std::uint64_t> connection_t::readable_streams()

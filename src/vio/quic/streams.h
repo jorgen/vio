@@ -49,6 +49,7 @@
 #include <map>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace vio::quic
@@ -211,7 +212,23 @@ public:
 
   void set_peer_max_data(std::uint64_t value)
   {
-    _peer_max_data = (std::max)(_peer_max_data, value);
+    // A rise in the shared window can unblock any stream that had data to
+    // send, so it is reported against the connection by waking every stream
+    // that is currently holding some. The alternative -- a separate
+    // connection-level edge -- would make a caller ask two questions where one
+    // will do.
+    if (value <= _peer_max_data)
+    {
+      return;
+    }
+    _peer_max_data = value;
+    for (auto &entry : _streams)
+    {
+      if (entry.second.has_send && entry.second.send.queued() > entry.second.send.sent_offset())
+      {
+        _send_unblocked.push_back(entry.first);
+      }
+    }
   }
 
   void set_local_max_data(std::uint64_t value)
@@ -222,7 +239,14 @@ public:
   void set_peer_max_streams(stream_direction_t direction, std::uint64_t value)
   {
     auto &target = direction == stream_direction_t::bidirectional ? _peer_max_streams_bidi : _peer_max_streams_uni;
-    target = (std::max)(target, value);
+    // A rise, not an arrival. MAX_STREAMS is a clamp, so a duplicate or a
+    // reordered frame carrying an older value changes nothing and must not
+    // wake anyone waiting to open a stream.
+    if (value > target)
+    {
+      target = value;
+      _stream_credit_opened = true;
+    }
   }
 
   [[nodiscard]] std::uint64_t peer_max_streams(stream_direction_t direction) const
@@ -234,6 +258,56 @@ public:
   {
     auto it = _streams.find(id);
     return it == _streams.end() ? nullptr : &it->second;
+  }
+
+  // What has happened since the last time anyone asked, as opposed to what is
+  // true now.
+  //
+  // readable_streams() and the accessors beside it are levels: they answer
+  // "does this stream have bytes waiting", which is the wrong question for
+  // anything that has to be woken. A stream that carried a zero-length FIN
+  // never has bytes, one that was reset before a read has had its reassembly
+  // cleared, and one whose bytes have been consumed looks identical to one
+  // that never had any -- so a caller watching the level misses all three. An
+  // edge is recorded once, drained once, and cannot be missed by looking at
+  // the wrong moment.
+  //
+  // Ids are appended without checking for duplicates, because the check costs
+  // more than the duplicate: a caller that is woken twice for one stream finds
+  // nothing to do the second time, which is cheap and correct.
+  [[nodiscard]] std::vector<std::uint64_t> take_opened()
+  {
+    return std::exchange(_opened, {});
+  }
+
+  [[nodiscard]] std::vector<std::uint64_t> take_data_arrived()
+  {
+    return std::exchange(_data_arrived, {});
+  }
+
+  // Streams whose sending half may now be able to move. Recorded only when a
+  // limit really rose or a send half really went terminal, never on a
+  // duplicate MAX_DATA -- both setters are max() clamps, so an arrival is not
+  // the same as a change, and waking a parked writer that still cannot write
+  // is how a wakeup loop starts.
+  [[nodiscard]] std::vector<std::uint64_t> take_send_unblocked()
+  {
+    return std::exchange(_send_unblocked, {});
+  }
+
+  // Whether the peer raised how many streams this endpoint may open. Not a
+  // list, because the answer is about the connection rather than any stream.
+  [[nodiscard]] bool take_stream_credit_opened()
+  {
+    return std::exchange(_stream_credit_opened, false);
+  }
+
+  // Recorded from the acknowledgement path, which lives in the connection
+  // rather than here and is the commonest thing that frees room on a healthy
+  // connection.
+  void note_send_unblocked(std::uint64_t id)
+  {
+    _send_unblocked.push_back(id);
   }
 
   // Streams that may have something to send. Building a packet walks this
@@ -356,6 +430,10 @@ public:
     }
     const auto id = make_stream_id(_config.local_initiator, direction, next);
     ++next;
+    // Recorded for both sides, because a caller watching for new streams
+    // should not have to know which of them it opened itself -- and the
+    // connection layer filters by initiator where it matters.
+    _opened.push_back(id);
     auto &stream = _streams[id];
     stream.id = id;
     stream.has_send = true;
@@ -383,11 +461,22 @@ public:
       return streams_error_t::stream_state;
     }
 
+    const auto readable_before = stream->receive.readable().size();
+    const auto finished_before = stream->receive.state() == receive_state_t::data_received || stream->receive.state() == receive_state_t::data_read;
     std::uint64_t consumed = 0;
     const auto error = stream->receive.receive(offset, data, fin, consumed);
     if (error != stream_error_t::none)
     {
       return from_stream_error(error);
+    }
+    // Either more to read, or the end settled. The second is the case a level
+    // cannot express: a FIN carrying no bytes changes nothing about what is
+    // readable and is still the most important thing that can happen to a
+    // stream, because it is what says the request is complete.
+    const auto finished_now = stream->receive.state() == receive_state_t::data_received || stream->receive.state() == receive_state_t::data_read;
+    if (stream->receive.readable().size() > readable_before || (finished_now && !finished_before))
+    {
+      _data_arrived.push_back(id);
     }
     return charge_connection(consumed);
   }
@@ -415,6 +504,10 @@ public:
       return from_stream_error(error);
     }
     credit_released = stream->receive.read_offset() - before;
+    // A reset ends the receiving half as surely as a FIN, and leaves nothing
+    // readable behind it -- so without this a reader parked on the stream
+    // would wait for bytes that are never coming.
+    _data_arrived.push_back(id);
     return charge_connection(consumed);
   }
 
@@ -438,6 +531,11 @@ public:
       stream->reset_pending = true;
       mark_sendable(*stream);
     }
+    // Its own edge, and not an optional one: after the reset above nothing on
+    // this stream is ever acknowledged again, so a writer parked waiting for
+    // room would wait for ever. Being told the stream is over is the only
+    // thing that can release it.
+    _send_unblocked.push_back(id);
     return streams_error_t::none;
   }
 
@@ -452,7 +550,12 @@ public:
     {
       return streams_error_t::stream_state;
     }
+    const auto before = stream->send.max_data();
     stream->send.set_max_data(value);
+    if (stream->send.max_data() > before)
+    {
+      _send_unblocked.push_back(id);
+    }
     return streams_error_t::none;
   }
 
@@ -644,8 +747,18 @@ private:
       stream.has_send = true;
       stream.send = send_stream_t(peer_initial_stream_limit(id));
     }
+    // The one moment a peer-opened stream becomes real. Nothing else marks it:
+    // it may carry no bytes at all, so no level ever shows it.
+    _opened.push_back(id);
     return &stream;
   }
+
+  // Edges, drained by take_*. See the comment on take_opened above for why
+  // these exist alongside the level accessors rather than instead of them.
+  std::vector<std::uint64_t> _opened;
+  std::vector<std::uint64_t> _data_arrived;
+  std::vector<std::uint64_t> _send_unblocked;
+  bool _stream_credit_opened = false;
 
   streams_config_t _config;
   // Keyed by stream id, and nothing reads it in order: the send path works
