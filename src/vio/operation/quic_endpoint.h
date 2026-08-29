@@ -440,22 +440,38 @@ inline void quic_milestone_unlink(quic_waiter_t &node)
   node.continuation = {};
 }
 
-// Marks a milestone reached and wakes everything waiting on it. The first call
-// wins: a connection that closes for one reason does not get reclassified by a
-// later one, and a milestone reached twice is a bug in the caller rather than
-// something to paper over here.
+// Marks a milestone reached. The first call wins: a connection that ended for
+// one reason does not get reclassified by a later one, and more than one thing
+// notices an ending.
 //
-// The drain takes one waiter at a time and re-reads the head each pass, rather
-// than walking a snapshot. Resuming a coroutine can do anything, including
-// destroying another coroutine that is waiting on this same milestone -- a
-// supervisor tearing down a peer -- so the node that was going to be next may
-// not exist by the time we get to it. Re-reading is what makes that safe.
+// It deliberately wakes nobody. Whatever calls this is standing inside the
+// transport's read loop or its flush, and a coroutine resumed from there may
+// drop the last endpoint reference -- destroying the endpoint, the driver's
+// frame and the very vector being walked, several calls further down the same
+// stack. Latching here and draining on the beat is what keeps that impossible
+// rather than merely unlikely.
 inline void quic_milestone_reach(quic_milestone_state_t &slot, std::expected<void, error_t> result)
+{
+  if (slot.reached)
+  {
+    return;
+  }
+  slot.reached = true;
+  slot.result = std::move(result);
+}
+
+// Wakes everything waiting on a milestone that has been reached. Called from
+// the beat and nowhere else.
+//
+// One waiter at a time, re-reading the head each pass rather than walking a
+// snapshot: resuming a coroutine can do anything, including destroying another
+// coroutine waiting on this same milestone, so the node that was going to be
+// next may not exist by the time we reach it.
+inline void quic_milestone_drain(quic_milestone_state_t &slot)
 {
   if (!slot.reached)
   {
-    slot.reached = true;
-    slot.result = std::move(result);
+    return;
   }
   while (slot.waiters != nullptr)
   {
@@ -776,4 +792,404 @@ public:
 private:
   detail::quic_op_t *_op = nullptr;
 };
+
+namespace detail
+{
+// -----------------------------------------------------------------------------
+// The beat
+// -----------------------------------------------------------------------------
+//
+// Why a prepare handle rather than a check handle. libuv's iteration is
+//
+//   pending -> idle -> PREPARE -> poll (blocks) -> pending -> CHECK
+//     -> closing handles -> update time -> TIMERS
+//
+// verified in 3rdparty/libuv-v1.51.0/src/unix/core.c. Read it with the wake
+// sources marked. A coroutine made runnable by an arriving datagram becomes so
+// during poll, and nothing blocks between the check that follows and the
+// prepare that opens the next iteration -- so on that path the two phases are
+// worth the same and the beat costs no round trip either way.
+//
+// Timers decide it. They run at the end of the iteration, after check, and the
+// endpoint's own ticker fires there -- and it is that tick which flushes every
+// connection, latches an idle timeout and fires the gone hook. So a connection
+// ending with no traffic on it becomes runnable in the timer phase and nowhere
+// else, and prepare is the next callback phase with nothing blocking in
+// between, where check is reached only after another poll.
+//
+// An idle handle is disqualified outright: uv__backend_timeout returns zero
+// while any idle handle is active, so an always-started one turns the loop into
+// a spin. Neither prepare nor check appears in that function, which is what
+// makes arming this permanently and paying one predicate per turn safer than
+// arming it conditionally -- and step 3 of this work found that making a
+// periodic mechanism in this endpoint conditional produced both a spin and a
+// stall.
+constexpr int quic_beat_max_passes = 4;
+
+[[nodiscard]] inline bool quic_beat_has_work(const quic_endpoint_state_t &self)
+{
+  return !self.ready_ops.empty() || !self.pending.empty() || !self.dirty.empty() || self.flush_all;
+}
+
+inline void quic_mark_pending(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_state_t> state)
+{
+  if (state->queued)
+  {
+    return;
+  }
+  state->queued = true;
+  self.pending.push_back(std::move(state));
+}
+
+inline void quic_mark_dirty(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_state_t> state)
+{
+  if (state->dirty)
+  {
+    return;
+  }
+  state->dirty = true;
+  self.dirty.push_back(std::move(state));
+}
+
+inline void quic_drain_connection(ref_ptr_t<quic_connection_state_t> &state)
+{
+  state->queued = false;
+  if (state->ready.ref_counted() != nullptr)
+  {
+    quic_milestone_drain(state->ready.data());
+  }
+  if (state->closed.ref_counted() != nullptr)
+  {
+    quic_milestone_drain(state->closed.data());
+  }
+}
+
+// Resumes everything that has become runnable.
+//
+// Every list is taken out of the state before anything is resumed, so a resumed
+// coroutine may dial, close a connection, or drop the last handle to one
+// without invalidating the walk. The connection entries are held by reference
+// rather than by pointer, so an entry the draining latch has already erased
+// from the registry is still alive when the beat reaches it.
+inline void quic_beat_resume(quic_endpoint_state_t &self)
+{
+  auto ops = std::exchange(self.ready_ops, {});
+  for (auto *op : ops)
+  {
+    op->endpoint = nullptr;
+    // Reset before anything is resumed: the resuming coroutine owns the token
+    // and may destroy it.
+    op->cancel_registration.reset();
+    quic_op_dispatch(op);
+  }
+
+  auto pending = std::exchange(self.pending, {});
+  for (auto &state : pending)
+  {
+    quic_drain_connection(state);
+  }
+}
+
+// Pushes whatever the resumed coroutines wrote onto the socket, in the same
+// turn rather than the next one.
+inline void quic_beat_flush(quic_endpoint_state_t &self)
+{
+  if (!self.transport.has_value())
+  {
+    return;
+  }
+  if (std::exchange(self.flush_all, false))
+  {
+    (void)self.transport->flush();
+  }
+  auto dirty = std::exchange(self.dirty, {});
+  for (auto &state : dirty)
+  {
+    state->dirty = false;
+    if (state->transport == nullptr)
+    {
+      continue; // a tombstone has nothing left to send
+    }
+    (void)self.transport->flush(*state->transport);
+  }
+}
+
+inline void quic_beat_cb(uv_prepare_t *handle)
+{
+  // Borrowed, and deliberately not null-checked: libuv fires no callback for a
+  // handle after uv_close, which is the guarantee the borrow rests on. A null
+  // test would not even be the right one, because the reference count
+  // overwrites this field with its own pointer before closing.
+  auto *self = static_cast<quic_endpoint_state_t *>(handle->data);
+  if (self->closing)
+  {
+    return;
+  }
+  // Bounded: resuming a coroutine can make more work, and an application that
+  // always makes more would otherwise starve the loop's I/O inside one
+  // callback. Whatever is left waits for the next turn, which the endpoint's
+  // own ticker guarantees arrives.
+  for (int pass = 0; pass < quic_beat_max_passes && quic_beat_has_work(*self); ++pass)
+  {
+    quic_beat_resume(*self);
+    quic_beat_flush(*self);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// The hooks
+// -----------------------------------------------------------------------------
+//
+// All three fire from inside the transport's flush, which is the one place
+// nothing may be resumed. They record and mark; the beat does the rest.
+
+// Fires once per connection, from the transport's flush, when the handshake
+// has completed -- for connections this endpoint dialled as well as ones that
+// arrived, which is why the role has to be read here rather than assumed.
+//
+// Registration only, at this step. The sort between a waiting dial and the
+// accept queue arrives with the operations that need it.
+inline void quic_hook_connection(quic_endpoint_state_t &self, vio::quic::connection_t &connection)
+{
+  if (self.closing)
+  {
+    return;
+  }
+  auto found = self.by_connection.find(&connection);
+  if (found == self.by_connection.end())
+  {
+    auto state = ref_ptr_t<quic_connection_state_t>(&self, &connection, connection.role());
+    found = self.by_connection.emplace(&connection, std::move(state)).first;
+  }
+  auto state = found->second;
+  state->handshake_reached = true;
+  state->alpn = std::string(connection.selected_alpn());
+  if (state->ready.ref_counted() != nullptr)
+  {
+    quic_milestone_reach(state->ready.data(), {});
+  }
+  quic_mark_pending(self, state);
+}
+
+inline void quic_hook_activity(quic_endpoint_state_t &self, vio::quic::connection_t &connection)
+{
+  const auto found = self.by_connection.find(&connection);
+  if (found == self.by_connection.end())
+  {
+    return;
+  }
+  quic_mark_pending(self, found->second);
+}
+
+// The tombstone point. Everything an application can still ask after a
+// connection has ended is latched here, because the reap a draining period
+// later frees the connection_t with no notification at all.
+inline void quic_sever(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_state_t> state, const std::expected<void, error_t> &ending)
+{
+  if (state->severed)
+  {
+    return;
+  }
+  state->severed = true;
+  if (state->transport != nullptr)
+  {
+    state->close_reason = state->transport->close_reason();
+    state->stats = quic_read_stats(*state->transport);
+    if (state->alpn.empty())
+    {
+      state->alpn = std::string(state->transport->selected_alpn());
+    }
+  }
+  // Nulled here rather than at the reap, which nothing tells us about: a
+  // pointer kept past this point is one nothing will ever say to drop, and the
+  // next connection_t may be allocated at the same address.
+  state->transport = nullptr;
+
+  if (state->ready.ref_counted() != nullptr)
+  {
+    quic_milestone_reach(state->ready.data(), ending);
+  }
+  if (state->closed.ref_counted() != nullptr)
+  {
+    quic_milestone_reach(state->closed.data(), ending);
+  }
+  if (state->pending_dial != nullptr)
+  {
+    auto *op = std::exchange(state->pending_dial, nullptr);
+    if (ending.has_value())
+    {
+      quic_op_finish(*op, state);
+    }
+    else
+    {
+      quic_op_finish(*op, ending.error());
+    }
+    self.ready_ops.push_back(op);
+  }
+  quic_mark_pending(self, state);
+}
+
+inline void quic_hook_gone(quic_endpoint_state_t &self, vio::quic::connection_t &connection)
+{
+  const auto found = self.by_connection.find(&connection);
+  if (found == self.by_connection.end())
+  {
+    return; // arrived and ended before anything registered it
+  }
+  auto state = found->second;
+  // Erased while the pointer still names this connection.
+  self.by_connection.erase(found);
+
+  const int code = quic_classify_ending(connection.close_reason(), state->handshake_reached, state->closed_locally, connection.reset_by_peer(), connection.version_negotiation_failed());
+  std::expected<void, error_t> ending;
+  if (code != 0)
+  {
+    const auto reason = connection.close_reason();
+    ending = std::unexpected(error_t{.code = code, .msg = reason.has_value() && !reason->reason.empty() ? reason->reason : std::string("the connection ended")});
+  }
+  quic_sever(self, state, ending);
+
+  if (self.shutdown_active && self.shutdown_outstanding > 0)
+  {
+    --self.shutdown_outstanding;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Teardown
+// -----------------------------------------------------------------------------
+//
+// What releasing the last handle does, and the reason nothing else in this
+// layer holds a strong reference to the endpoint: this has to be reachable, and
+// an awaitable or a connection that kept the endpoint alive would stop it.
+inline void quic_teardown(quic_endpoint_state_t &self)
+{
+  // First, before anything is resumed. Every entry point tests this rather than
+  // whether the transport is still there, because the transport outlives most
+  // of what follows -- and a coroutine resumed to be told the endpoint is going
+  // away could otherwise dial and park on something nothing will ever resolve.
+  self.closing = true;
+
+  // The driver's frame holds a reference to the transport and owns the datagram
+  // reader. Cancelling finishes both synchronously: cancellation_t runs its
+  // callbacks inline, the reader's cancel delivers inline, and a cancelled
+  // sleep resumes inline -- so by the time this returns, run() has unwound.
+  self.driver_stop.cancel();
+  self.driver.reset();
+
+  const error_t released{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"};
+
+  auto registry = std::exchange(self.by_connection, {});
+  for (auto &entry : registry)
+  {
+    entry.second->endpoint = nullptr;
+    quic_sever(self, entry.second, std::unexpected(released));
+  }
+  self.accept_queue.clear();
+
+  auto live = std::exchange(self.live_ops, {});
+  for (auto *op : live)
+  {
+    quic_op_finish(*op, released);
+    self.ready_ops.push_back(op);
+  }
+
+  if (self.shutdown.ref_counted() != nullptr)
+  {
+    quic_milestone_reach(self.shutdown.data(), std::unexpected(released));
+  }
+
+  // Everything is latched; now resume. The transport is still alive here, so a
+  // resumed coroutine reading a tombstone finds what it latched, and nothing it
+  // can call will start new work because closing is already set.
+  auto ops = std::exchange(self.ready_ops, {});
+  for (auto *op : ops)
+  {
+    op->endpoint = nullptr;
+    op->cancel_registration.reset();
+    quic_op_dispatch(op);
+  }
+  auto pending = std::exchange(self.pending, {});
+  for (auto &state : pending)
+  {
+    quic_drain_connection(state);
+  }
+  if (self.shutdown.ref_counted() != nullptr)
+  {
+    quic_milestone_drain(self.shutdown.data());
+  }
+
+  self.dirty.clear();
+  self.transport.reset();
+}
+} // namespace detail
+
+// -----------------------------------------------------------------------------
+// Creating an endpoint
+// -----------------------------------------------------------------------------
+
+// The context decides what the endpoint is for: one built for a server answers,
+// one built for a client dials. It must outlive the endpoint, which borrows it.
+//
+// Nothing is bound and nothing is read yet. libuv makes a UDP socket lazily and
+// whoever touches it first fixes its address family, so an endpoint that
+// started reading before it knew where it was going would be pinned to IPv4 --
+// which is why binding and dialling are the only things that create it.
+[[nodiscard]] inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t &context, const quic_config_t &config = {});
+
+// The same, for an endpoint that both answers and dials on one port. Either may
+// be null, which is how a dial-only or an answer-only endpoint is expressed.
+[[nodiscard]] inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t *server_context, const vio::quic::tls_context_t *client_context, const quic_config_t &config = {});
+
+namespace detail
+{
+[[nodiscard]] inline std::expected<quic_endpoint_t, error_t> quic_endpoint_build(event_loop_t &loop, std::expected<vio::quic::endpoint_t, error_t> transport, const quic_config_t &config)
+{
+  if (!transport.has_value())
+  {
+    return std::unexpected(transport.error());
+  }
+
+  quic_endpoint_t endpoint{ref_ptr_t<quic_endpoint_state_t>(loop, std::move(*transport), config)};
+  auto *self = &endpoint.handle.data();
+  self->rc = endpoint.handle.ref_counted();
+
+  if (const int started = uv_prepare_init(loop.loop(), &self->beat); started < 0)
+  {
+    return std::unexpected(error_t{.code = started, .msg = uv_strerror(started)});
+  }
+  // Registered with the reference count so that the close is issued once, when
+  // the count reaches zero, on the same terms as the socket. The data pointer
+  // is borrowed and not a parked reference, for the reason timer_impl.h gives:
+  // a reference held in a registered handle keeps the count above zero forever
+  // and the close is never issued at all.
+  endpoint.handle.register_handle(&self->beat);
+  self->beat.data = self;
+  (void)uv_prepare_start(&self->beat, quic_beat_cb);
+  // Unreferenced, so that an endpoint nobody is using does not by itself keep
+  // the loop alive. An endpoint created and never bound has no descriptor --
+  // libuv makes the socket lazily -- so without this the beat would be the only
+  // active handle and run() would never return.
+  uv_unref(reinterpret_cast<uv_handle_t *>(&self->beat));
+
+  self->transport->on_connection([self](vio::quic::connection_t &connection) { quic_hook_connection(*self, connection); });
+  self->transport->on_activity([self](vio::quic::connection_t &connection) { quic_hook_activity(*self, connection); });
+  self->transport->on_connection_gone([self](vio::quic::connection_t &connection) { quic_hook_gone(*self, connection); });
+
+  endpoint.handle.on_destroy([self]() { quic_teardown(*self); });
+  return endpoint;
+}
+} // namespace detail
+
+inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t &context, const quic_config_t &config)
+{
+  auto transport = vio::quic::endpoint_t::create(loop, context, config.transport);
+  return detail::quic_endpoint_build(loop, std::move(transport), config);
+}
+
+inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t *server_context, const vio::quic::tls_context_t *client_context, const quic_config_t &config)
+{
+  auto transport = vio::quic::endpoint_t::create(loop, server_context, client_context, config.transport);
+  return detail::quic_endpoint_build(loop, std::move(transport), config);
+}
 } // namespace vio

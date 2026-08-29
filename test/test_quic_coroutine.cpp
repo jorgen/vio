@@ -1,8 +1,12 @@
+#include <chrono>
 #include <coroutine>
 #include <optional>
 #include <doctest/doctest.h>
 
 #include <vio/operation/quic_endpoint.h>
+#include <vio/operation/sleep.h>
+
+#include "quic_identity.h"
 
 // The coroutine QUIC API, built up in the order its pieces can be tested.
 //
@@ -181,6 +185,10 @@ TEST_CASE("a waiter is resumed when the milestone is reached")
   CHECK_FALSE(woke);
 
   detail::quic_milestone_reach(slot.data(), std::unexpected(error_t{.code = vio_quic_idle_timeout, .msg = "idle"}));
+  // Latched but nobody woken: whatever reached it was standing in the read
+  // loop, and resuming there is the one thing this layer never does.
+  CHECK_FALSE(woke);
+  detail::quic_milestone_drain(slot.data());
   CHECK(woke);
   CHECK(failed);
 }
@@ -198,6 +206,7 @@ TEST_CASE("every waiter is resumed, and the first reason is the one kept")
   await_milestone(quic_milestone_t{slot}, second_woke, second_failed);
 
   detail::quic_milestone_reach(slot.data(), std::unexpected(error_t{.code = vio_quic_connection_closed, .msg = "peer closed"}));
+  detail::quic_milestone_drain(slot.data());
   CHECK(first_woke);
   CHECK(second_woke);
   CHECK(first_failed);
@@ -207,6 +216,7 @@ TEST_CASE("every waiter is resumed, and the first reason is the one kept")
   // must not be reclassified by a later pass over it, and the second call has
   // to be harmless because more than one thing notices an ending.
   detail::quic_milestone_reach(slot.data(), {});
+  detail::quic_milestone_drain(slot.data());
   CHECK(slot->reached);
   CHECK_FALSE(slot->result.has_value());
   CHECK(slot->result.error().code == vio_quic_connection_closed);
@@ -245,6 +255,7 @@ TEST_CASE("an awaitable destroyed while linked takes itself out of the list")
 
   // So reaching it now walks an empty list rather than freed storage.
   detail::quic_milestone_reach(slot.data(), {});
+  detail::quic_milestone_drain(slot.data());
   CHECK(slot->reached);
 }
 
@@ -437,5 +448,320 @@ TEST_CASE("a moved-from awaitable holds nothing")
     CHECK(second.await_ready());
   }
   detail::quic_op_dispatch(op);
+}
+}
+
+TEST_SUITE("quic coroutine endpoint")
+{
+namespace
+{
+std::expected<vio::quic::tls_context_t, vio::error_t> make_server_context(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return vio::quic::tls_context_t::create(config);
+}
+
+std::expected<vio::quic::tls_context_t, vio::error_t> make_client_context(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return vio::quic::tls_context_t::create(config);
+}
+} // namespace
+
+TEST_CASE("an endpoint that is never bound does not keep the loop running")
+{
+  using namespace vio;
+
+  // The case uv_unref exists for, and the one that is easy to get wrong in a
+  // way no assertion catches: libuv makes the UDP socket lazily, so an endpoint
+  // created and never bound owns no descriptor at all. Its beat is therefore
+  // the only active handle on the loop, and a referenced prepare handle is
+  // enough on its own to make uv_run block for ever -- stop() closes vio's
+  // internal handles and nothing else.
+  //
+  // So this test hanging *is* the failure. There is no assertion that can
+  // report it, which is why it is worth writing down rather than assuming.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = make_server_context(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  bool created = false;
+  {
+    auto endpoint = quic_endpoint_create(event_loop, *context);
+    REQUIRE(endpoint.has_value());
+    created = endpoint->handle.ref_counted() != nullptr;
+    event_loop.stop();
+    // Returning at all is the assertion. With the beat referenced, uv_run has
+    // an active handle and blocks here for ever.
+    event_loop.run();
+  } // and only now is the endpoint released, which requests the closes
+  // A second run drains them. Every other test in this file releases its
+  // endpoint before the loop stops, which is the shape an application should
+  // use; this one cannot, because what it is testing is that run() returns
+  // while the endpoint is still alive.
+  event_loop.run();
+  CHECK(created);
+}
+
+TEST_CASE("an endpoint released while the loop can still run leaves nothing open")
+{
+  using namespace vio;
+
+  // The other half of the same rule, from the handle-lifetime section of
+  // CLAUDE.md: a vio handle must be released while the loop can still run, or
+  // its uv_close is requested and never drained, uv_loop_close fails with EBUSY
+  // and the event loop destructor aborts on its assert.
+  //
+  // Here the endpoint is dropped inside the task, so the close is issued during
+  // the run() that is still in progress. If the beat were not registered with
+  // the reference count, this would be the assertion that fires.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = make_server_context(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  bool released = false;
+
+  std::optional<task_t<void>> task;
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &was_released) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, tls);
+            REQUIRE(endpoint.has_value());
+            was_released = true;
+          } // the last handle goes here, and with it the socket and the beat
+          co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, released));
+    });
+  event_loop.run();
+  CHECK(released);
+}
+
+TEST_CASE("an endpoint can be built to answer, to dial, or to do both")
+{
+  using namespace vio;
+
+  // A tls_context_t picks TLS_server_method or TLS_client_method at creation
+  // and gates tickets and early data on that, so no single one can both answer
+  // and dial. Which slots are filled is what decides whether a dial or an
+  // arriving Initial is refused, which makes the two-context overload the whole
+  // of peer-to-peer support at this layer.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = make_server_context(identity);
+  const auto client_context = make_client_context(identity);
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  {
+    auto answering = quic_endpoint_create(event_loop, &*server_context, nullptr);
+    auto dialling = quic_endpoint_create(event_loop, nullptr, &*client_context);
+    auto both = quic_endpoint_create(event_loop, &*server_context, &*client_context);
+    CHECK(answering.has_value());
+    CHECK(dialling.has_value());
+    CHECK(both.has_value());
+
+    // The single-context form puts it in the slot its role names, so it is the
+    // two-context form with one side left empty rather than a third thing.
+    auto shorthand = quic_endpoint_create(event_loop, *server_context);
+    CHECK(shorthand.has_value());
+
+    event_loop.stop();
+    event_loop.run();
+  }
+  event_loop.run(); // drains the closes the four releases above requested
+}
+
+TEST_CASE("a permanently armed beat still lets the loop sleep")
+{
+  using namespace vio;
+
+  // The beat is armed for the life of the endpoint and costs one predicate per
+  // loop turn. That is deliberate: an idle handle is disqualified outright,
+  // because uv__backend_timeout returns zero while one is active and the loop
+  // stops sleeping altogether. Neither prepare nor check appears in that
+  // function, which is what makes arming this permanently cheaper to reason
+  // about than arming it conditionally -- and step 3 of this work found that
+  // making a periodic mechanism in this endpoint conditional produced both a
+  // spin and a stall.
+  //
+  // What is checked here is that a timer still ends the sleep with the beat
+  // running, which is the observable half of that claim.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = make_server_context(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool slept = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &did_sleep) -> task_t<void>
+        {
+          auto endpoint = quic_endpoint_create(loop, tls);
+          REQUIRE(endpoint.has_value());
+          co_await sleep(loop, std::chrono::milliseconds(20));
+          did_sleep = true;
+          loop.stop();
+        }(event_loop, *context, slept));
+    });
+  event_loop.run();
+  CHECK(slept);
+}
+
+TEST_CASE("marking records and draining resumes, and they are separable")
+{
+  using namespace vio;
+
+  // The invariant the whole layer rests on: the hooks fire from inside the
+  // transport's read loop, where a resumed coroutine could drop the last
+  // endpoint reference and destroy the vector being walked. So they mark, and
+  // the beat resumes.
+  //
+  // Driven here by hand rather than over a socket, because the point is that
+  // marking and resuming are separable at all -- a connection marked pending
+  // stays parked until something drains it.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = make_server_context(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  {
+    auto endpoint = quic_endpoint_create(event_loop, *context);
+    REQUIRE(endpoint.has_value());
+    auto &state = endpoint->handle.data();
+
+    auto connection = ref_ptr_t<detail::quic_connection_state_t>(&state, nullptr, vio::quic::tls_role_t::server);
+    connection->ready = ref_ptr_t<detail::quic_milestone_state_t>();
+
+    detail::quic_milestone_reach(connection->ready.data(), {});
+    detail::quic_mark_pending(state, connection);
+    CHECK(state.pending.size() == 1);
+    CHECK(connection->queued);
+
+    // Marked twice is queued once: the read loop can touch one connection
+    // several times in a turn, and a list with duplicates would drain the same
+    // milestone repeatedly.
+    detail::quic_mark_pending(state, connection);
+    CHECK(state.pending.size() == 1);
+
+    quic_milestone_t ready{connection->ready};
+    CHECK(ready.reached());
+
+    // Draining is what the beat does, and it clears the flag so the next turn
+    // can mark again.
+    detail::quic_beat_resume(state);
+    CHECK(state.pending.empty());
+    CHECK_FALSE(connection->queued);
+
+    event_loop.stop();
+    event_loop.run();
+  }
+  event_loop.run();
+}
+
+TEST_CASE("teardown latches a connection before its transport goes away")
+{
+  using namespace vio;
+
+  // What makes holding a quic_connection_t past the ending safe. The endpoint
+  // frees the connection_t on its own schedule with no notification, so
+  // everything an application can still ask has to be copied out at the sever
+  // and the pointer nulled there -- a pointer kept past that point is one
+  // nothing will ever say to drop, and the next connection_t may land at the
+  // same address.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = make_server_context(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  quic_connection_t survivor;
+  {
+    auto endpoint = quic_endpoint_create(event_loop, *context);
+    REQUIRE(endpoint.has_value());
+    auto &state = endpoint->handle.data();
+
+    auto connection = ref_ptr_t<detail::quic_connection_state_t>(&state, nullptr, vio::quic::tls_role_t::server);
+    connection->closed = ref_ptr_t<detail::quic_milestone_state_t>();
+    connection->alpn = "test";
+    state.by_connection.emplace(reinterpret_cast<const vio::quic::connection_t *>(0x1), connection);
+    survivor.handle = connection;
+
+    event_loop.stop();
+    event_loop.run();
+  } // the endpoint goes here, and teardown severs everything it still holds
+  event_loop.run();
+
+  REQUIRE(survivor.handle.ref_counted() != nullptr);
+  CHECK(survivor.handle->severed);
+  CHECK(survivor.handle->transport == nullptr);
+  CHECK(survivor.handle->endpoint == nullptr);
+  CHECK(survivor.handle->alpn == "test");
+
+  quic_milestone_t closed{survivor.handle->closed};
+  REQUIRE(closed.reached());
+  CHECK_FALSE(survivor.handle->closed->result.has_value());
+  CHECK(survivor.handle->closed->result.error().code == vio_quic_endpoint_closed);
+}
+
+TEST_CASE("teardown resolves an operation nobody would otherwise resume")
+{
+  using namespace vio;
+
+  // A coroutine parked on an accept when the last endpoint handle goes is a
+  // leaked frame, and if that frame holds a handle it is also an event loop
+  // that never returns. Teardown finishes every live operation with
+  // vio_quic_endpoint_closed and then resumes them -- latch first, resume
+  // second, because a resumed coroutine may destroy the awaitable holding the
+  // operation being walked.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = make_server_context(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  {
+    auto endpoint = quic_endpoint_create(event_loop, *context);
+    REQUIRE(endpoint.has_value());
+    auto &state = endpoint->handle.data();
+
+    auto *op = detail::quic_op_create(&state);
+    state.live_ops.push_back(op);
+
+    // Two holds: the awaitable standing in for a suspended coroutine, and the
+    // endpoint that is going to resolve it.
+    CHECK(op->holds == 2);
+
+    event_loop.stop();
+    event_loop.run();
+
+    // The endpoint is still alive here, so nothing has torn down yet.
+    CHECK_FALSE(op->resolved);
+
+    {
+      quic_connection_awaitable_t parked{op};
+      auto released = std::move(*endpoint);
+    } // both go here: the endpoint tears down, then the awaitable releases
+
+    // Which means the operation was finished, resumed (there was no
+    // continuation) and freed by whichever owner was last. Reading it here
+    // would be a use-after-free; that it is freed at all is what ASan checks.
+  }
+  event_loop.run();
 }
 }
