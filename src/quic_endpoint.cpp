@@ -352,10 +352,16 @@ constexpr std::size_t stateless_resets_per_second = 64;
 
 void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address, tick_t now)
 {
-  if (impl.config.stateless_reset_key == nullptr || !allow_stateless_reset(impl, now))
+  if (impl.config.stateless_reset_key == nullptr)
   {
     return;
   }
+  // Everything that decides whether a reset is possible at all comes before
+  // the allowance is spent. A long header names its own connection ID length,
+  // so it never needs a reset and never gets one -- but charging the allowance
+  // first meant every one of them burned one of the sixty-four this endpoint
+  // has each second, and a flood drained the budget that exists to protect the
+  // short-header packets a reset can actually answer.
   const auto invariant = parse_invariant_header(datagram);
   if (!invariant.has_value() || invariant->long_header)
   {
@@ -372,6 +378,11 @@ void send_stateless_reset(endpoint_impl_t &impl, std::span<const std::uint8_t> d
     return;
   }
 
+  // Spent here, where the next thing done is the HMAC it exists to ration.
+  if (!allow_stateless_reset(impl, now))
+  {
+    return;
+  }
   const auto token = impl.config.stateless_reset_key->token_for(*id);
   std::array<std::uint8_t, max_datagram> out = {};
   auto size = build_stateless_reset(out, token, datagram.size());

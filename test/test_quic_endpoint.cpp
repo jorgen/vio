@@ -948,3 +948,131 @@ TEST_CASE("an application may dial and flush from inside its connection handler"
   CHECK(survived);
 }
 
+// The allowance that rations stateless resets was spent before the check that
+// decides whether a reset is possible at all, so every long-header datagram --
+// none of which can ever draw one -- still burned an allowance. Sixty-four of
+// them, one second's worth, left a genuine short-header packet unanswered.
+
+TEST_CASE("a datagram that cannot draw a stateless reset does not spend one")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  int replies_to_long_headers = 0;
+  int replies_to_short_header = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, int &to_long, int &to_short) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        auto server_context = tls_context_t::create(server_tls);
+        REQUIRE(server_context.has_value());
+
+        auto reset_key = stateless_reset_key_t::create();
+        REQUIRE(reset_key.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        server_config.stateless_reset_key = &*reset_key;
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        cancellation_t server_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        (void)server_run;
+
+        auto probe_created = udp_create(loop);
+        REQUIRE(probe_created.has_value());
+        std::optional<udp_t> probe(std::move(*probe_created));
+        auto probe_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(probe_address.has_value());
+        REQUIRE(udp_bind(*probe, reinterpret_cast<const sockaddr *>(&*probe_address)).has_value());
+        auto reader_created = udp_create_reader(*probe);
+        REQUIRE(reader_created.has_value());
+        std::optional<udp_reader_t> reader(std::move(*reader_created));
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+
+        int received = 0;
+        auto pump = [](decltype(*reader) &r, int &count) -> detached_task_t
+        {
+          for (;;)
+          {
+            auto datagram = co_await r;
+            if (!datagram.has_value())
+            {
+              break;
+            }
+            ++count;
+          }
+        }(*reader, received);
+        (void)pump;
+
+        // A Handshake packet for a connection ID this endpoint never issued: a
+        // long header, a version it does speak, and not an Initial, so it
+        // reaches the stateless reset path and is refused there.
+        std::vector<std::uint8_t> handshake_shaped = {0xE0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x00};
+
+        // More than the sixty-four allowed per second, sent back to back so
+        // they all land inside one refill window.
+        constexpr int long_header_count = 70;
+        for (int i = 0; i < long_header_count; ++i)
+        {
+          handshake_shaped[6] = static_cast<std::uint8_t>(i);
+          (void)udp_try_send(*probe, handshake_shaped, reinterpret_cast<const sockaddr *>(&*target));
+        }
+        co_await sleep(loop, 50ms);
+        to_long = received;
+
+        // And the packet that should get one: a short header naming a
+        // connection this endpoint has never heard of.
+        received = 0;
+        std::vector<std::uint8_t> short_header(100, 0x00);
+        short_header[0] = 0x40;
+        for (std::size_t i = 1; i <= 8; ++i)
+        {
+          short_header[i] = static_cast<std::uint8_t>(0xA0 + i);
+        }
+        (void)udp_try_send(*probe, short_header, reinterpret_cast<const sockaddr *>(&*target));
+        for (int i = 0; i < 20 && received == 0; ++i)
+        {
+          co_await sleep(loop, 5ms);
+        }
+        to_short = received;
+
+        reader->cancel();
+        co_await sleep(loop, 20ms);
+        reader.reset();
+        probe.reset();
+
+        server_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        server.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, replies_to_long_headers, replies_to_short_header);
+    });
+
+  event_loop.run();
+  // None of the long headers is answerable, so none is answered.
+  CHECK(replies_to_long_headers == 0);
+  // The allowance they used to consume is still there for the one packet that
+  // can actually use it.
+  CHECK(replies_to_short_header == 1);
+}
