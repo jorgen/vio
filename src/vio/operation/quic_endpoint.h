@@ -316,6 +316,11 @@ struct quic_op_t
   // resolved and then abandoned, or abandoned and then resolved -- and a
   // boolean cannot say which of those has already happened.
   int holds = 0;
+  // Which of the two operations this is. The accept queue is drained by finding
+  // the oldest unresolved accepting op in live_ops, so a dial parked on the
+  // same list must be distinguishable from one -- handing a dialling coroutine
+  // an inbound connection would be silent and wrong.
+  bool accepting = false;
   registration_t cancel_registration;
 };
 
@@ -591,6 +596,12 @@ struct quic_endpoint_state_t
   reference_counted_t *rc = nullptr;
   uv_prepare_t beat = {};
 
+  // Which context slots were filled at create, which is the whole of what makes
+  // a dial or an answer legal. Recorded here because endpoint_t does not
+  // publish it and there is no setter, so it cannot change after this.
+  bool can_accept = false;
+  bool can_dial = false;
+
   bool driver_started = false;
   // Set as the very first act of teardown, before anything is resumed. Every
   // entry point tests this rather than whether the transport is still there,
@@ -829,6 +840,12 @@ namespace detail
 // every caller is standing inside the transport's flush.
 inline void quic_op_ready(quic_endpoint_state_t &self, quic_op_t *op);
 
+// Keeps the queue and the waiter list from ever both being non-empty. One
+// function rather than a push here and a pop there, because two places that
+// each half-implement the pairing is how a connection ends up queued behind a
+// coroutine that was already waiting for it.
+inline void quic_accept_pump(quic_endpoint_state_t &self);
+
 constexpr int quic_beat_max_passes = 4;
 
 [[nodiscard]] inline bool quic_beat_has_work(const quic_endpoint_state_t &self)
@@ -963,8 +980,28 @@ inline void quic_hook_connection(quic_endpoint_state_t &self, vio::quic::connect
   auto found = self.by_connection.find(&connection);
   if (found == self.by_connection.end())
   {
-    auto state = ref_ptr_t<quic_connection_state_t>(&self, &connection, connection.role());
-    found = self.by_connection.emplace(&connection, std::move(state)).first;
+    if (connection.role() == vio::quic::tls_role_t::client)
+    {
+      // Dialled behind this layer's back, through quic_endpoint_native(). It
+      // has no awaiter, and pushing it onto the accept queue would hand a
+      // server an outbound connection. This is the case a peer-to-peer endpoint
+      // makes reachable, and the reason the role is consulted at all.
+      return;
+    }
+    if (self.shutdown_active || self.accept_queue.size() >= self.config.accept_backlog)
+    {
+      // Section 20.1: told no rather than told nothing. A client that is
+      // refused goes elsewhere; one that is ignored waits out its handshake
+      // timeout holding a slot on both sides.
+      //
+      // Nothing is registered, so the CONNECTION_CLOSE has no connection to be
+      // marked against and needs the all-connections flush to leave.
+      connection.close(vio::quic::transport_error_connection_refused, "the accept backlog is full", false);
+      self.flush_all = true;
+      return;
+    }
+    auto fresh = ref_ptr_t<quic_connection_state_t>(&self, &connection, vio::quic::tls_role_t::server);
+    found = self.by_connection.emplace(&connection, std::move(fresh)).first;
   }
   auto state = found->second;
   state->handshake_reached = true;
@@ -978,6 +1015,11 @@ inline void quic_hook_connection(quic_endpoint_state_t &self, vio::quic::connect
     auto *op = std::exchange(state->pending_dial, nullptr);
     quic_op_finish(*op, state);
     quic_op_ready(self, op);
+  }
+  else if (state->role == vio::quic::tls_role_t::server)
+  {
+    self.accept_queue.push_back(state);
+    quic_accept_pump(self);
   }
   quic_mark_pending(self, state);
 }
@@ -1154,7 +1196,7 @@ inline void quic_teardown(quic_endpoint_state_t &self)
 
 namespace detail
 {
-[[nodiscard]] inline std::expected<quic_endpoint_t, error_t> quic_endpoint_build(event_loop_t &loop, std::expected<vio::quic::endpoint_t, error_t> transport, const quic_config_t &config)
+[[nodiscard]] inline std::expected<quic_endpoint_t, error_t> quic_endpoint_build(event_loop_t &loop, std::expected<vio::quic::endpoint_t, error_t> transport, const quic_config_t &config, bool can_accept, bool can_dial)
 {
   if (!transport.has_value())
   {
@@ -1164,6 +1206,8 @@ namespace detail
   quic_endpoint_t endpoint{ref_ptr_t<quic_endpoint_state_t>(loop, std::move(*transport), config)};
   auto *self = &endpoint.handle.data();
   self->rc = endpoint.handle.ref_counted();
+  self->can_accept = can_accept;
+  self->can_dial = can_dial;
 
   if (const int started = uv_prepare_init(loop.loop(), &self->beat); started < 0)
   {
@@ -1194,14 +1238,15 @@ namespace detail
 
 inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t &context, const quic_config_t &config)
 {
+  const bool answering = context.role() == vio::quic::tls_role_t::server;
   auto transport = vio::quic::endpoint_t::create(loop, context, config.transport);
-  return detail::quic_endpoint_build(loop, std::move(transport), config);
+  return detail::quic_endpoint_build(loop, std::move(transport), config, answering, !answering);
 }
 
 inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t *server_context, const vio::quic::tls_context_t *client_context, const quic_config_t &config)
 {
   auto transport = vio::quic::endpoint_t::create(loop, server_context, client_context, config.transport);
-  return detail::quic_endpoint_build(loop, std::move(transport), config);
+  return detail::quic_endpoint_build(loop, std::move(transport), config, server_context != nullptr, client_context != nullptr);
 }
 
 namespace detail
@@ -1269,6 +1314,12 @@ inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &sel
 //
 // Port 0 asks the OS to choose, which is what a test wants; read it back with
 // quic_endpoint_local_port.
+//
+// Worth knowing on an endpoint that also dials: the socket ends up IPv6, and a
+// socket that already has an address family cannot send to an address in
+// another one. So a peer-to-peer endpoint bound this way must dial IPv6 or
+// IPv4-mapped addresses, not bare IPv4 literals. Bind with an explicit sockaddr
+// if the peers are named in IPv4.
 [[nodiscard]] inline std::expected<void, error_t> quic_endpoint_bind(quic_endpoint_t &endpoint, std::uint16_t port)
 {
   sockaddr_in6 any6 = {};
@@ -1305,6 +1356,23 @@ inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &sel
 
 namespace detail
 {
+inline void quic_accept_pump(quic_endpoint_state_t &self)
+{
+  while (!self.accept_queue.empty())
+  {
+    const auto waiting = std::find_if(self.live_ops.begin(), self.live_ops.end(), [](const quic_op_t *op) { return op->accepting && !op->resolved; });
+    if (waiting == self.live_ops.end())
+    {
+      return;
+    }
+    auto *op = *waiting;
+    auto state = std::move(self.accept_queue.front());
+    self.accept_queue.pop_front();
+    quic_op_finish(*op, std::move(state));
+    quic_op_ready(self, op);
+  }
+}
+
 inline void quic_op_ready(quic_endpoint_state_t &self, quic_op_t *op)
 {
   const auto found = std::find(self.live_ops.begin(), self.live_ops.end(), op);
@@ -1427,5 +1495,94 @@ using quic_accept_future_t = quic_connection_awaitable_t;
     detail::quic_sever(self, entry, std::unexpected(error_t{.code = vio_quic_handshake_failed, .msg = "the connection ended before it was dialled"}));
   }
   return out;
+}
+
+// -----------------------------------------------------------------------------
+// Accepting
+// -----------------------------------------------------------------------------
+
+// Resolves once for each connection that has completed a handshake, in the
+// order they complete. Connections that complete while nothing is waiting
+// queue, bounded by quic_config_t::accept_backlog; waiters that arrive while
+// the queue is empty are served in the order they asked.
+//
+// It yields the connection directly rather than needing a separate synchronous
+// accept, because QUIC has no listen call and no backlog to arm: a bound
+// endpoint is already answering Initials, so importing tcp's two-step would be
+// ceremony whose mechanism does not exist here.
+//
+// Two coroutines may accept at once and both are served, oldest first. There is
+// no slot to overwrite and so no busy error.
+//
+// An accept on an endpoint that cannot answer -- one built with no server
+// context -- is refused with a sentence rather than parked for ever. That is
+// the single most valuable refusal in this file: it turns an accept loop
+// silently suspended for the life of the process into a message, and it is
+// knowable only because there is no setter for the context.
+[[nodiscard]] inline quic_accept_future_t quic_endpoint_accept(quic_endpoint_t &endpoint)
+{
+  const auto failed = [](error_t reason)
+  {
+    auto *op = detail::quic_op_create(nullptr);
+    detail::quic_op_finish(*op, std::move(reason));
+    return quic_accept_future_t{op};
+  };
+
+  if (endpoint.handle.ref_counted() == nullptr)
+  {
+    return failed(error_t{.code = -1, .msg = "the endpoint names nothing"});
+  }
+  auto &self = endpoint.handle.data();
+  if (self.closing || self.shutdown_active)
+  {
+    return failed(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint is shutting down"});
+  }
+  if (!self.can_accept)
+  {
+    return failed(error_t{.code = -1, .msg = "this endpoint has no TLS context to answer with"});
+  }
+  if (!self.driver_started)
+  {
+    // Parking here would be indistinguishable from waiting for a peer, and the
+    // peer cannot arrive: there is no socket to arrive on.
+    return failed(error_t{.code = -1, .msg = "this endpoint is not bound, so nothing can reach it"});
+  }
+
+  auto *op = detail::quic_op_create(&self);
+  op->accepting = true;
+  self.live_ops.push_back(op);
+  quic_accept_future_t out{op};
+  // Called here as well as from the arrival hook, which is what makes an accept
+  // whose queue is already full resolve without suspending -- the difference
+  // between draining a burst on one stack and one loop turn per connection.
+  detail::quic_accept_pump(self);
+  return out;
+}
+
+// A snapshot of every connection this endpoint currently holds, which is what a
+// supervisor or a shutdown needs: the transport can name its connections and
+// the callback API could not hand any of them to an application outside a
+// callback. The handles are copyable, so holding the vector is safe, and a
+// connection that ends before the caller gets to it becomes a tombstone rather
+// than a dangling pointer.
+[[nodiscard]] inline std::vector<quic_connection_t> quic_endpoint_connections(const quic_endpoint_t &endpoint)
+{
+  std::vector<quic_connection_t> out;
+  if (endpoint.handle.ref_counted() == nullptr)
+  {
+    return out;
+  }
+  const auto &self = endpoint.handle.data();
+  out.reserve(self.by_connection.size());
+  for (const auto &entry : self.by_connection)
+  {
+    out.push_back(quic_connection_t{entry.second});
+  }
+  return out;
+}
+
+[[nodiscard]] inline std::size_t quic_endpoint_connection_count(const quic_endpoint_t &endpoint)
+{
+  return endpoint.handle.ref_counted() == nullptr ? 0 : endpoint.handle.data().by_connection.size();
 }
 } // namespace vio

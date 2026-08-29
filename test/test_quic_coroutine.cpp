@@ -1299,3 +1299,485 @@ TEST_CASE("an endpoint released mid-dial resolves the dial and closes its loop")
   CHECK(code == vio_quic_endpoint_closed);
 }
 }
+
+TEST_SUITE("quic coroutine accept")
+{
+namespace
+{
+vio::quic::tls_config_t answering_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+vio::quic::tls_config_t dialling_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+sockaddr_in to_loopback(std::uint16_t port)
+{
+  sockaddr_in address = {};
+  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  return address;
+}
+} // namespace
+
+TEST_CASE("an accept and a dial meet")
+{
+  using namespace vio;
+
+  // The headline. Two endpoints, two coroutines, one handshake, and neither
+  // side polls: the server says co_await accept and the client says co_await
+  // connect, and the read loop and the beat do the rest.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(answering_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(dialling_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool accepted = false;
+  bool connected = false;
+  bool accepted_as_server = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &accepted, bool &connected, bool &accepted_as_server) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, answering);
+            REQUIRE(server.has_value());
+            REQUIRE(quic_endpoint_bind(*server, std::uint16_t{0}).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+            REQUIRE(port != 0);
+
+            auto accepting = [](quic_endpoint_t &endpoint, bool &accepted, bool &accepted_as_server) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              accepted = arrived.has_value();
+              if (arrived)
+              {
+                accepted_as_server = arrived->handle->role == vio::quic::tls_role_t::server;
+              }
+            }(*server, accepted, accepted_as_server);
+
+            auto client = quic_endpoint_create(loop, nullptr, &dialling);
+            REQUIRE(client.has_value());
+            const auto target = to_loopback(port);
+            auto dialled = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            connected = dialled.has_value();
+
+            co_await std::move(accepting);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, accepted, connected, accepted_as_server));
+    });
+  event_loop.run();
+
+  CHECK(connected);
+  CHECK(accepted);
+  CHECK(accepted_as_server);
+}
+
+TEST_CASE("a connection that arrives before anyone accepts is queued, not lost")
+{
+  using namespace vio;
+
+  // QUIC has no listen call and no backlog to arm: a bound endpoint is already
+  // answering Initials, so a handshake can and does complete before any
+  // coroutine has asked for one. Queueing is what keeps that from being a
+  // dropped connection, and pumping from the accept factory is what makes the
+  // queued one resolve without suspending.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(answering_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(dialling_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool queued = false;
+  bool accepted_without_suspending = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &queued, bool &at_once) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, answering);
+            REQUIRE(server.has_value());
+            REQUIRE(quic_endpoint_bind(*server, std::uint16_t{0}).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto client = quic_endpoint_create(loop, nullptr, &dialling);
+            REQUIRE(client.has_value());
+            const auto target = to_loopback(port);
+            // Nobody is accepting yet, and the dial completes anyway.
+            const auto dialled = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(dialled.has_value());
+            // The two endpoints are independent: the client resolving its dial
+            // says nothing about when the server ran its arrival hook. Waiting
+            // for it is the point of the test rather than a wrinkle in it --
+            // the connection is complete on the server long before anyone here
+            // asks for it.
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+            queued = server->handle->accept_queue.size() == 1;
+
+            auto accept = quic_endpoint_accept(*server);
+            at_once = accept.await_ready();
+            const auto arrived = co_await std::move(accept);
+            REQUIRE(arrived.has_value());
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, queued, accepted_without_suspending));
+    });
+  event_loop.run();
+
+  CHECK(queued);
+  CHECK(accepted_without_suspending);
+}
+
+TEST_CASE("two accepts are both served, oldest first")
+{
+  using namespace vio;
+
+  // There is no single accept slot and so no busy error: with a per-call
+  // operation a second concurrent accept has nothing to overwrite. That
+  // deletes four failure modes at once -- a stale re-arm, an overwritten
+  // continuation, an abandoned future stranding the slot, and a shared result
+  // whose message is moved out on first read.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(answering_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(dialling_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  int accepted = 0;
+  int order[2] = {0, 0};
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, int &accepted, int *order) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, answering);
+            REQUIRE(server.has_value());
+            REQUIRE(quic_endpoint_bind(*server, std::uint16_t{0}).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto first = [](quic_endpoint_t &endpoint, int &accepted, int *order) -> task_t<void>
+            {
+              const auto arrived = co_await quic_endpoint_accept(endpoint);
+              if (arrived)
+              {
+                order[accepted++] = 1;
+              }
+            }(*server, accepted, order);
+            auto second = [](quic_endpoint_t &endpoint, int &accepted, int *order) -> task_t<void>
+            {
+              const auto arrived = co_await quic_endpoint_accept(endpoint);
+              if (arrived)
+              {
+                order[accepted++] = 2;
+              }
+            }(*server, accepted, order);
+
+            auto client = quic_endpoint_create(loop, nullptr, &dialling);
+            REQUIRE(client.has_value());
+            const auto target = to_loopback(port);
+            REQUIRE((co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost")).has_value());
+            REQUIRE((co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost")).has_value());
+
+            co_await std::move(first);
+            co_await std::move(second);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, accepted, order));
+    });
+  event_loop.run();
+
+  CHECK(accepted == 2);
+  CHECK(order[0] == 1);
+  CHECK(order[1] == 2);
+}
+
+TEST_CASE("an endpoint dialling its own peer does not accept its own dial")
+{
+  using namespace vio;
+
+  // The peer-to-peer case, and the reason the role is consulted at all.
+  // on_connection fires for dialled connections too, so without the registry
+  // and the role sort a peer would hand its own outbound connection to its own
+  // accept loop -- and then wait for the real one for ever.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto answering = vio::quic::tls_context_t::create(answering_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(dialling_tls(identity));
+  REQUIRE(answering.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool alice_dialled = false;
+  bool bob_accepted = false;
+  bool alice_accepted_nothing = true;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &alice_dialled, bool &bob_accepted, bool &alice_accepted_nothing) -> task_t<void>
+        {
+          {
+            auto alice = quic_endpoint_create(loop, &answering, &dialling);
+            auto bob = quic_endpoint_create(loop, &answering, &dialling);
+            REQUIRE(alice.has_value());
+            REQUIRE(bob.has_value());
+            // Bound to IPv4 explicitly, because both of these dial as well as
+            // answer and the dial below names an IPv4 literal. The port-only
+            // bind prefers dual-stack IPv6, and a socket that already has a
+            // family cannot send to an address in another one.
+            const auto any = to_loopback(0);
+            REQUIRE(quic_endpoint_bind(*alice, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            REQUIRE(quic_endpoint_bind(*bob, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto bob_port = quic_endpoint_local_port(*bob).value_or(0);
+
+            auto bob_accepting = [](quic_endpoint_t &endpoint, bool &bob_accepted) -> task_t<void>
+            {
+              const auto arrived = co_await quic_endpoint_accept(endpoint);
+              bob_accepted = arrived.has_value() && arrived->handle->role == vio::quic::tls_role_t::server;
+            }(*bob, bob_accepted);
+
+            const auto target = to_loopback(bob_port);
+            const auto dialled = co_await quic_endpoint_connect(*alice, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            alice_dialled = dialled.has_value();
+            co_await std::move(bob_accepting);
+
+            // Alice dialled; her own connection must not be in her queue.
+            alice_accepted_nothing = alice->handle->accept_queue.empty();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *answering, *dialling, alice_dialled, bob_accepted, alice_accepted_nothing));
+    });
+  event_loop.run();
+
+  CHECK(alice_dialled);
+  CHECK(bob_accepted);
+  CHECK(alice_accepted_nothing);
+}
+
+TEST_CASE("a connection dialled behind this layer's back is ignored, not accepted")
+{
+  using namespace vio;
+
+  // The other half of the sort, and the only branch the role itself decides.
+  // Alice's own dial is kept out of her accept queue by the registry -- it was
+  // entered there before the hook could fire. A connection dialled straight
+  // through the transport has no registry entry, so if the role were not
+  // checked it would be indistinguishable from an arrival, and a server would
+  // be handed an outbound connection.
+  //
+  // This is exactly what an application that reaches for the native endpoint
+  // can do, which is why the check exists rather than being an assertion that
+  // it cannot happen.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto answering = vio::quic::tls_context_t::create(answering_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(dialling_tls(identity));
+  REQUIRE(answering.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool handshaken = false;
+  bool queue_untouched = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &handshaken, bool &queue_untouched) -> task_t<void>
+        {
+          {
+            auto listener = quic_endpoint_create(loop, answering);
+            REQUIRE(listener.has_value());
+            const auto any = to_loopback(0);
+            REQUIRE(quic_endpoint_bind(*listener, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*listener).value_or(0);
+
+            auto peer = quic_endpoint_create(loop, &answering, &dialling);
+            REQUIRE(peer.has_value());
+            REQUIRE(quic_endpoint_bind(*peer, reinterpret_cast<const sockaddr *>(&any)).has_value());
+
+            // Straight through the transport, so nothing registers it.
+            const auto target = to_loopback(port);
+            const auto dialled = peer->handle->transport->connect(reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(dialled.has_value());
+
+            (void)co_await sleep(loop, std::chrono::milliseconds(200));
+
+            auto *raw = peer->handle->transport->connection(*dialled);
+            handshaken = raw != nullptr && raw->handshake_complete();
+            queue_untouched = peer->handle->accept_queue.empty() && peer->handle->by_connection.empty();
+            if (raw != nullptr)
+            {
+              raw->close(vio::quic::transport_error_no_error, "done", false);
+              (void)peer->handle->transport->flush(*raw);
+            }
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *answering, *dialling, handshaken, queue_untouched));
+    });
+  event_loop.run();
+
+  // The handshake really did complete, so the hook really did fire -- which is
+  // what makes the empty queue mean something.
+  CHECK(handshaken);
+  CHECK(queue_untouched);
+}
+
+TEST_CASE("an accept past the backlog is refused rather than queued")
+{
+  using namespace vio;
+
+  // Section 20.1: told no rather than told nothing. The refusal costs the
+  // server a CONNECTION_CLOSE it has to flush without a registered connection
+  // to hang it on, which is what flush_all is for.
+  //
+  // Be clear what this bounds and what it does not. The arrival hook fires
+  // after the handshake, so a refused connection has already cost a TLS session
+  // and three key schedules -- endpoint_config_t::max_connections is the
+  // earlier and cheaper ceiling. And because the refusal is decided at that
+  // point, the client's own dial has already succeeded: it received
+  // HANDSHAKE_DONE and only then the CONNECTION_CLOSE. So what is checked here
+  // is the server's side, which is where the decision was made. The client
+  // learns of it through quic_connection_closed.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(answering_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(dialling_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool first_connected = false;
+  bool second_refused = false;
+  std::size_t queued = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &first_connected, bool &second_refused, std::size_t &queued) -> task_t<void>
+        {
+          {
+            quic_config_t config;
+            config.accept_backlog = 1;
+            auto server = quic_endpoint_create(loop, answering, config);
+            REQUIRE(server.has_value());
+            REQUIRE(quic_endpoint_bind(*server, std::uint16_t{0}).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto client = quic_endpoint_create(loop, nullptr, &dialling);
+            REQUIRE(client.has_value());
+            const auto target = to_loopback(port);
+
+            // Nobody accepts, so the first fills the backlog of one.
+            const auto first = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            first_connected = first.has_value();
+            // The two endpoints are independent: the client resolving its dial
+            // says nothing about when the server ran its arrival hook.
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+            queued = server->handle->accept_queue.size();
+
+            // The second completes its handshake and is then refused, so it
+            // is never registered and never queued.
+            const auto second = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(second.has_value());
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+            second_refused = server->handle->accept_queue.size() == 1 && server->handle->by_connection.size() == 1;
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, first_connected, second_refused, queued));
+    });
+  event_loop.run();
+
+  CHECK(first_connected);
+  CHECK(queued == 1);
+  // Still one queued and still one registered: the refused connection was
+  // never given a state at all, which is what makes the refusal cheap.
+  CHECK(second_refused);
+}
+
+TEST_CASE("an accept on an endpoint that cannot answer is refused with a sentence")
+{
+  using namespace vio;
+
+  // The single most valuable refusal here: it turns an accept loop silently
+  // suspended for the life of the process into a message. And the unbound case
+  // beside it, which is the same mistake with a different cause -- parking
+  // would be indistinguishable from waiting for a peer, and the peer cannot
+  // arrive because there is no socket to arrive on.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(answering_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(dialling_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool dial_only_refused = false;
+  bool unbound_refused = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &dial_only_refused, bool &unbound_refused) -> task_t<void>
+        {
+          {
+            auto dial_only = quic_endpoint_create(loop, nullptr, &dialling);
+            REQUIRE(dial_only.has_value());
+            auto refused = quic_endpoint_accept(*dial_only);
+            REQUIRE(refused.await_ready());
+            const auto result = refused.await_resume();
+            dial_only_refused = !result.has_value() && !result.error().msg.empty();
+
+            auto unbound = quic_endpoint_create(loop, answering);
+            REQUIRE(unbound.has_value());
+            auto waiting = quic_endpoint_accept(*unbound);
+            REQUIRE(waiting.await_ready());
+            unbound_refused = !waiting.await_resume().has_value();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, dial_only_refused, unbound_refused));
+    });
+  event_loop.run();
+
+  CHECK(dial_only_refused);
+  CHECK(unbound_refused);
+}
+}
