@@ -2773,6 +2773,33 @@ TEST_CASE("version negotiation ends an attempt, but only when it is believable")
     CHECK_FALSE(client->version_negotiation_failed());
   }
 
+  SUBCASE("a v2 client offered only v1 abandons rather than stalling")
+  {
+    // The mirror of the case above, and the one that used to be wrong. The
+    // discard rule is about the version THIS client selected; a client that
+    // proposed v2 and is shown v1 has been told the truth by a server that
+    // cannot talk to it, so the attempt is over. Testing against a fixed v1
+    // instead made this look like the discard case, and the attempt then sat
+    // untouched until the handshake timeout.
+    connection_config_t v2_config;
+    v2_config.role = tls_role_t::client;
+    v2_config.version = quic_version_2;
+    v2_config.transport_parameters = sane_parameters();
+    auto v2_client = connection_t::create(contexts.client_context, v2_config, "localhost");
+    REQUIRE(v2_client.has_value());
+    REQUIRE_FALSE(v2_client->version_negotiation_failed());
+
+    std::vector<std::uint8_t> packet(256);
+    const std::array<std::uint32_t, 1> versions = {quic_version_1};
+    const auto size = build_version_negotiation(packet, v2_client->local_connection_id(), v2_client->peer_connection_id(), versions);
+    REQUIRE(size > 0);
+    packet.resize(size);
+
+    REQUIRE(v2_client->receive(packet, at(1ms)).has_value());
+    CHECK(v2_client->version_negotiation_failed());
+    CHECK(v2_client->state() == connection_state_t::closed);
+  }
+
   SUBCASE("one addressed to a different connection id is discarded")
   {
     const std::array<std::uint32_t, 1> versions = {0x6b3343cf};

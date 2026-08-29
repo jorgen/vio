@@ -1759,7 +1759,17 @@ std::expected<void, error_t> receive_version_negotiation(connection_impl_t &impl
   for (std::size_t offset = 0; offset + 4 <= versions.size(); offset += 4)
   {
     const std::uint32_t version = (static_cast<std::uint32_t>(versions[offset]) << 24) | (static_cast<std::uint32_t>(versions[offset + 1]) << 16) | (static_cast<std::uint32_t>(versions[offset + 2]) << 8) | static_cast<std::uint32_t>(versions[offset + 3]);
-    if (version == quic_version_1)
+    // Section 6.2: a Version Negotiation packet listing the version this
+    // client selected is discarded, because a server that speaks it would not
+    // have sent one -- so the packet is either stale or forged.
+    //
+    // Against impl.version rather than a fixed quic_version_1: a client that
+    // proposed v2 and was offered only v1 used to find v1 here and return,
+    // discarding a packet that was telling it the truth. Nothing then retried
+    // and nothing recorded a failure, so the attempt sat there until the
+    // handshake timeout -- while the mirror case, a v1 client offered only v2,
+    // reported itself properly.
+    if (version == impl.version)
     {
       return {};
     }
