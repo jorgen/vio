@@ -1,3 +1,4 @@
+#include <coroutine>
 #include <optional>
 #include <doctest/doctest.h>
 
@@ -128,5 +129,170 @@ TEST_CASE("the error codes are distinct and stay where they were published")
   // And none of them is any other subsystem's.
   CHECK(vio_quic_connection_closed != vio_cancelled);
   CHECK(vio_quic_endpoint_closed != vio_cancelled);
+}
+}
+
+// The milestone, with no endpoint under it. Everything below is reachable
+// without a socket, a loop or a connection, which is the point of building it
+// first: the shapes that go wrong here go wrong the same way when a whole
+// transport is stacked on top, and are far harder to see through one.
+
+namespace
+{
+// A coroutine that waits on a milestone and records what it was told. Takes
+// everything by parameter: task_t is eager, so a lambda's captures are gone by
+// the time the body first suspends.
+vio::detached_task_t await_milestone(vio::quic_milestone_t milestone, bool &woke, bool &failed)
+{
+  auto outcome = co_await milestone;
+  woke = true;
+  failed = !outcome.has_value();
+}
+} // namespace
+
+TEST_SUITE("quic coroutine milestone")
+{
+TEST_CASE("a milestone reached before anyone waits answers without suspending")
+{
+  using namespace vio;
+
+  ref_ptr_t<detail::quic_milestone_state_t> slot;
+  detail::quic_milestone_reach(slot.data(), {});
+
+  bool woke = false;
+  bool failed = true;
+  await_milestone(quic_milestone_t{slot}, woke, failed);
+
+  // No suspension, so it is already done by the time the call returns. An
+  // await after the fact that parked would be a coroutine nothing will ever
+  // resume, which is the shape of every hang in this layer.
+  CHECK(woke);
+  CHECK_FALSE(failed);
+}
+
+TEST_CASE("a waiter is resumed when the milestone is reached")
+{
+  using namespace vio;
+
+  ref_ptr_t<detail::quic_milestone_state_t> slot;
+  bool woke = false;
+  bool failed = false;
+  await_milestone(quic_milestone_t{slot}, woke, failed);
+  CHECK_FALSE(woke);
+
+  detail::quic_milestone_reach(slot.data(), std::unexpected(error_t{.code = vio_quic_idle_timeout, .msg = "idle"}));
+  CHECK(woke);
+  CHECK(failed);
+}
+
+TEST_CASE("every waiter is resumed, and the first reason is the one kept")
+{
+  using namespace vio;
+
+  ref_ptr_t<detail::quic_milestone_state_t> slot;
+  bool first_woke = false;
+  bool second_woke = false;
+  bool first_failed = false;
+  bool second_failed = false;
+  await_milestone(quic_milestone_t{slot}, first_woke, first_failed);
+  await_milestone(quic_milestone_t{slot}, second_woke, second_failed);
+
+  detail::quic_milestone_reach(slot.data(), std::unexpected(error_t{.code = vio_quic_connection_closed, .msg = "peer closed"}));
+  CHECK(first_woke);
+  CHECK(second_woke);
+  CHECK(first_failed);
+  CHECK(second_failed);
+
+  // Reaching it again changes nothing. A connection that ended for one reason
+  // must not be reclassified by a later pass over it, and the second call has
+  // to be harmless because more than one thing notices an ending.
+  detail::quic_milestone_reach(slot.data(), {});
+  CHECK(slot->reached);
+  CHECK_FALSE(slot->result.has_value());
+  CHECK(slot->result.error().code == vio_quic_connection_closed);
+
+  // And a waiter arriving afterwards gets the same answer rather than parking.
+  bool late_woke = false;
+  bool late_failed = false;
+  await_milestone(quic_milestone_t{slot}, late_woke, late_failed);
+  CHECK(late_woke);
+  CHECK(late_failed);
+}
+
+// The case that matters most, and the one a design review will not catch: an
+// awaitable destroyed while its node is still linked would leave the list
+// pointing into storage that is about to go, and the next reach would resume a
+// coroutine that no longer exists.
+//
+// Tested against the awaiter directly rather than by abandoning a coroutine,
+// because vio's task types cannot abandon one: detached_task_t returns an empty
+// object and owns no frame at all, and ~task_t destroys a frame only when it is
+// already done, so dropping a suspended one leaks it rather than destroying it.
+// The unlink is defensive against a frame destroyed by any other means, and
+// this is the honest way to exercise it.
+TEST_CASE("an awaitable destroyed while linked takes itself out of the list")
+{
+  using namespace vio;
+
+  ref_ptr_t<detail::quic_milestone_state_t> slot;
+  {
+    quic_milestone_t::awaiter_t awaiter{slot};
+    CHECK_FALSE(awaiter.await_ready());
+    awaiter.await_suspend(std::noop_coroutine());
+    CHECK(slot->waiters != nullptr);
+  }
+  CHECK(slot->waiters == nullptr);
+
+  // So reaching it now walks an empty list rather than freed storage.
+  detail::quic_milestone_reach(slot.data(), {});
+  CHECK(slot->reached);
+}
+
+TEST_CASE("unlinking from the middle keeps the list whole")
+{
+  using namespace vio;
+
+  // The drain always takes the head, but an abandoned awaitable can be
+  // anywhere -- so the general case has to hold, not just the head case.
+  ref_ptr_t<detail::quic_milestone_state_t> slot;
+  detail::quic_waiter_t first;
+  detail::quic_waiter_t second;
+  detail::quic_waiter_t third;
+  detail::quic_milestone_link(slot.data(), first, std::noop_coroutine());
+  detail::quic_milestone_link(slot.data(), second, std::noop_coroutine());
+  detail::quic_milestone_link(slot.data(), third, std::noop_coroutine());
+
+  // Newest at the head.
+  CHECK(slot->waiters == &third);
+
+  detail::quic_milestone_unlink(second);
+  CHECK(slot->waiters == &third);
+  CHECK(third.next == &first);
+  CHECK(first.prev == &third);
+  // And the node itself is left inert, so a second unlink is harmless -- which
+  // it has to be, because the drain unlinks a node its awaitable will also
+  // unlink when it is destroyed.
+  CHECK(second.slot == nullptr);
+  detail::quic_milestone_unlink(second);
+  CHECK(slot->waiters == &third);
+
+  detail::quic_milestone_unlink(third);
+  CHECK(slot->waiters == &first);
+  detail::quic_milestone_unlink(first);
+  CHECK(slot->waiters == nullptr);
+}
+
+TEST_CASE("a milestone that names nothing resolves rather than hanging")
+{
+  using namespace vio;
+
+  // What an accessor returns for a connection this endpoint never had, or one
+  // whose state has already gone. Parking on it would be a coroutine with
+  // nothing to wake it.
+  bool woke = false;
+  bool failed = false;
+  await_milestone(quic_milestone_t{ref_ptr_t<detail::quic_milestone_state_t>::null()}, woke, failed);
+  CHECK(woke);
+  CHECK(failed);
 }
 }

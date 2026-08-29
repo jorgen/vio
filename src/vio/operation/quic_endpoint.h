@@ -309,6 +309,84 @@ struct quic_op_t
   registration_t cancel_registration;
 };
 
+// Links a waiter into a slot. Nothing checks for a double link: a waiter node
+// lives in exactly one awaitable and an awaitable suspends at most once.
+inline void quic_milestone_link(quic_milestone_state_t &into, quic_waiter_t &node, std::coroutine_handle<> handle)
+{
+  node.continuation = handle;
+  node.slot = &into;
+  node.prev = nullptr;
+  node.next = into.waiters;
+  if (node.next != nullptr)
+  {
+    node.next->prev = &node;
+  }
+  into.waiters = &node;
+}
+
+// Called from the awaitable's destructor, and idempotent because it is also
+// called on a node the drain has already taken out.
+//
+// This is what makes an abandoned await safe. A task_t destroyed while
+// suspended frees its frame, and the node lives in that frame -- so a node left
+// linked would leave the list pointing into freed storage, and the next drain
+// would resume a coroutine that no longer exists.
+inline void quic_milestone_unlink(quic_waiter_t &node)
+{
+  if (node.slot == nullptr)
+  {
+    return;
+  }
+  if (node.prev != nullptr)
+  {
+    node.prev->next = node.next;
+  }
+  if (node.next != nullptr)
+  {
+    node.next->prev = node.prev;
+  }
+  if (node.slot->waiters == &node)
+  {
+    node.slot->waiters = node.next;
+  }
+  node.slot = nullptr;
+  node.prev = nullptr;
+  node.next = nullptr;
+  node.continuation = {};
+}
+
+// Marks a milestone reached and wakes everything waiting on it. The first call
+// wins: a connection that closes for one reason does not get reclassified by a
+// later one, and a milestone reached twice is a bug in the caller rather than
+// something to paper over here.
+//
+// The drain takes one waiter at a time and re-reads the head each pass, rather
+// than walking a snapshot. Resuming a coroutine can do anything, including
+// destroying another coroutine that is waiting on this same milestone -- a
+// supervisor tearing down a peer -- so the node that was going to be next may
+// not exist by the time we get to it. Re-reading is what makes that safe.
+inline void quic_milestone_reach(quic_milestone_state_t &slot, std::expected<void, error_t> result)
+{
+  if (!slot.reached)
+  {
+    slot.reached = true;
+    slot.result = std::move(result);
+  }
+  while (slot.waiters != nullptr)
+  {
+    auto *node = slot.waiters;
+    const auto continuation = node->continuation;
+    // Out of the list before the resume, not after: the resumed coroutine may
+    // destroy this node's own frame, and unlinking a freed node writes through
+    // dangling pointers.
+    quic_milestone_unlink(*node);
+    if (continuation)
+    {
+      continuation.resume();
+    }
+  }
+}
+
 struct quic_connection_state_t
 {
   quic_connection_state_t(quic_endpoint_state_t *owner, vio::quic::connection_t *from, vio::quic::tls_role_t which)
@@ -450,4 +528,86 @@ struct quic_endpoint_state_t
   tick_t shutdown_deadline;
 };
 } // namespace detail
+
+// Something that happens once, is reported rather than consumed, and may be
+// awaited late, twice, or by several coroutines at once. A handshake
+// completing and a connection ending are both this shape; neither is a queue,
+// and asking after the fact must answer rather than block for ever.
+//
+// It is the one thing in this layer that holds a strong reference, and that is
+// safe for a specific reason: a milestone owns no libuv handle, so a suspended
+// waiter keeping one alive keeps nothing open. Every other awaitable here
+// borrows, because holding the endpoint would stop the release that resolves
+// it.
+//
+// The result lives in the shared state rather than in the awaitable, which is
+// what makes an await after the fact correct without a second code path: the
+// fast path and the resumed path read the same place.
+class quic_milestone_t
+{
+public:
+  explicit quic_milestone_t(ref_ptr_t<detail::quic_milestone_state_t> state)
+    : _state(std::move(state))
+  {
+  }
+
+  // Whether it has happened, for a caller that wants to look rather than wait.
+  [[nodiscard]] bool reached() const
+  {
+    return _state.ref_counted() != nullptr && _state->reached;
+  }
+
+  struct awaiter_t
+  {
+    // Declared before the node so that it is destroyed after it. The
+    // destructor body below unlinks first in any case, which is what actually
+    // makes this safe -- a derived class holding the reference and a base
+    // holding the node would destroy them the other way round, and unlink
+    // would then write through storage the reference had just freed.
+    ref_ptr_t<detail::quic_milestone_state_t> state;
+    detail::quic_waiter_t node;
+
+    awaiter_t(const awaiter_t &) = delete;
+    awaiter_t &operator=(const awaiter_t &) = delete;
+
+    explicit awaiter_t(ref_ptr_t<detail::quic_milestone_state_t> owner)
+      : state(std::move(owner))
+    {
+    }
+
+    ~awaiter_t()
+    {
+      detail::quic_milestone_unlink(node);
+    }
+
+    // A milestone that has already happened, and one that never can because
+    // nothing owns it, both resolve without suspending.
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+      return state.ref_counted() == nullptr || state->reached;
+    }
+
+    void await_suspend(std::coroutine_handle<> continuation) noexcept
+    {
+      detail::quic_milestone_link(state.data(), node, continuation);
+    }
+
+    [[nodiscard]] std::expected<void, error_t> await_resume() const noexcept
+    {
+      if (state.ref_counted() == nullptr)
+      {
+        return std::unexpected(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
+      }
+      return state->result;
+    }
+  };
+
+  [[nodiscard]] awaiter_t operator co_await() const
+  {
+    return awaiter_t{_state};
+  }
+
+private:
+  ref_ptr_t<detail::quic_milestone_state_t> _state;
+};
 } // namespace vio
