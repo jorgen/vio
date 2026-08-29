@@ -2582,6 +2582,72 @@ TEST_CASE("a cancelled accept leaves the queue intact for the next one")
   CHECK(second_accepted);
 }
 
+TEST_CASE("a token that dies before the beat runs is never written through")
+{
+  using namespace vio;
+
+  // The bug this layer's first sanitiser run found, and the reason the
+  // registration is dropped when the operation resolves rather than when it
+  // resumes.
+  //
+  // An operation resolved at call time sits on ready_ops until the next beat.
+  // If the deregistration waited for that beat, then a caller which resolved,
+  // ran on, and let its cancellation_t go -- the ordinary shape of a token
+  // scoped to one request -- would leave the beat writing through a dead one.
+  // A release build says nothing; the debug iterators call it an erase outside
+  // the range, and ASan calls it what it is.
+  //
+  // So the token here is deliberately destroyed while the resolved operation is
+  // still queued, and the assertion is that the loop then turns without
+  // incident. That is worth nothing in a release build and everything in a
+  // sanitised one, which is exactly what step 12 of this work is for.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = vio::quic::tls_context_t::create(cancel_server_tls(identity));
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool resolved = false;
+  bool survived = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &resolved, bool &survived) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, listening);
+            REQUIRE(endpoint.has_value());
+            const auto any = cancel_loopback(0);
+            REQUIRE(quic_endpoint_bind(*endpoint, reinterpret_cast<const sockaddr *>(&any)).has_value());
+
+            {
+              cancellation_t token;
+              auto accept = quic_endpoint_accept(*endpoint, &token);
+              REQUIRE_FALSE(accept.await_ready());
+              token.cancel();
+              // Resolved, and now sitting on ready_ops waiting for a beat that
+              // has not run yet.
+              REQUIRE(accept.await_ready());
+              resolved = !accept.await_resume().has_value();
+            } // both the awaitable and the token go here
+
+            // Several beats, in the window where the stale registration would
+            // have been used.
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+            survived = true;
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, resolved, survived));
+    });
+  event_loop.run();
+
+  CHECK(resolved);
+  CHECK(survived);
+}
+
 TEST_CASE("cancelling an accept that has already resolved changes nothing")
 {
   using namespace vio;

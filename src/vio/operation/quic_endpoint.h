@@ -369,6 +369,16 @@ inline void quic_op_release(quic_op_t *op)
 // else, because whatever calls this is standing inside the transport's read
 // loop -- and a coroutine resumed from there may drop the last endpoint
 // reference and destroy the very storage being walked.
+//
+// The cancellation registration goes here, and it has to: a resolved operation
+// can never be cancelled, and the caller's cancellation_t may well be a local
+// in the coroutine that is about to return. Deregistering at the resume instead
+// -- which is where the "reset before anything is resumed" rule first put it --
+// leaves a window in which the operation is resolved, the caller has run on and
+// let its token go, and the beat then writes through a dead one. A release
+// build says nothing about that; the debug iterators call it an erase outside
+// the range. Deregistering from inside a cancel callback is safe, because
+// cancellation_t::cancel moves its list out before running any of it.
 inline void quic_op_finish(quic_op_t &op, ref_ptr_t<quic_connection_state_t> connection)
 {
   if (op.resolved)
@@ -377,6 +387,7 @@ inline void quic_op_finish(quic_op_t &op, ref_ptr_t<quic_connection_state_t> con
   }
   op.result = std::move(connection);
   op.resolved = true;
+  op.cancel_registration.reset();
 }
 
 inline void quic_op_finish(quic_op_t &op, error_t failure)
@@ -388,6 +399,7 @@ inline void quic_op_finish(quic_op_t &op, error_t failure)
   op.failure = std::move(failure);
   op.failed = true;
   op.resolved = true;
+  op.cancel_registration.reset();
 }
 
 // The endpoint letting go: resumes whatever is parked, then drops its hold.
