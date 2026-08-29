@@ -327,6 +327,12 @@ struct quic_op_t
   // same list must be distinguishable from one -- handing a dialling coroutine
   // an inbound connection would be silent and wrong.
   bool accepting = false;
+  // The connection a dial built, held only while the dial is in flight.
+  // Cancelling a dial has to close it as well as resolve the caller, and this
+  // is what says which one. Held by reference rather than by pointer because
+  // the registry entry can be erased -- by the very close this is about -- while
+  // the op is still being unwound.
+  ref_ptr_t<quic_connection_state_t> dialling = ref_ptr_t<quic_connection_state_t>::null();
   registration_t cancel_registration;
 };
 
@@ -862,6 +868,8 @@ inline void quic_op_ready(quic_endpoint_state_t &self, quic_op_t *op);
 // coroutine that was already waiting for it.
 inline void quic_accept_pump(quic_endpoint_state_t &self);
 inline void quic_shutdown_check(quic_endpoint_state_t &self);
+inline void quic_op_cancel(quic_op_t *op);
+inline void quic_close_locally(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_state_t> state, std::uint64_t code, std::string_view reason, bool application);
 
 constexpr int quic_beat_max_passes = 4;
 
@@ -1031,6 +1039,7 @@ inline void quic_hook_connection(quic_endpoint_state_t &self, vio::quic::connect
   if (state->pending_dial != nullptr)
   {
     auto *op = std::exchange(state->pending_dial, nullptr);
+    op->dialling = ref_ptr_t<quic_connection_state_t>::null();
     quic_op_finish(*op, state);
     quic_op_ready(self, op);
   }
@@ -1088,6 +1097,7 @@ inline void quic_sever(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_st
   if (state->pending_dial != nullptr)
   {
     auto *op = std::exchange(state->pending_dial, nullptr);
+    op->dialling = ref_ptr_t<quic_connection_state_t>::null();
     if (ending.has_value())
     {
       quic_op_finish(*op, state);
@@ -1375,6 +1385,37 @@ inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &sel
 
 namespace detail
 {
+// What a cancellation_t's callback does. It latches and makes ready; it does
+// not resume, which keeps the whole layer to one resumption site.
+//
+// That costs no wall clock, by the same derivation that chose a prepare handle
+// for the beat: whatever phase the cancel was called from -- a timer callback,
+// an I/O callback, another coroutine the beat resumed -- the next prepare is
+// reached before the loop next blocks.
+inline void quic_op_cancel(quic_op_t *op)
+{
+  if (op == nullptr || op->resolved)
+  {
+    return;
+  }
+  auto *self = op->endpoint;
+  auto dialling = std::exchange(op->dialling, ref_ptr_t<quic_connection_state_t>::null());
+  quic_op_finish(*op, error_t{.code = vio_cancelled, .msg = "the operation was cancelled"});
+  if (self == nullptr)
+  {
+    return; // already detached from its endpoint; nothing left to close or queue
+  }
+  if (dialling.ref_counted() != nullptr)
+  {
+    // A dial nobody will ever be handed is told so, rather than left to spend
+    // its handshake timeout saying nothing. The registry entry stays, precisely
+    // so the arrival hook cannot later mistake this for an inbound connection.
+    dialling->pending_dial = nullptr;
+    quic_close_locally(*self, dialling, vio::quic::transport_error_no_error, "dial cancelled", false);
+  }
+  quic_op_ready(*self, op);
+}
+
 inline void quic_accept_pump(quic_endpoint_state_t &self)
 {
   while (!self.accept_queue.empty())
@@ -1443,7 +1484,8 @@ using quic_accept_future_t = quic_connection_awaitable_t;
 // never suspending -- a bad address as the raw libuv code, a dial on an endpoint
 // with no client context as a sentence. That is the tcp_connect shape, and it
 // means a caller has one place to look rather than two.
-[[nodiscard]] inline quic_connect_awaitable_t quic_endpoint_connect(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket = {})
+[[nodiscard]] inline quic_connect_awaitable_t quic_endpoint_connect(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket = {},
+                                                                    cancellation_t *cancel = nullptr)
 {
   const auto failed = [](error_t reason)
   {
@@ -1460,6 +1502,13 @@ using quic_accept_future_t = quic_connection_awaitable_t;
   if (self.closing)
   {
     return failed(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
+  }
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    // Never touches the transport, which matters for more than tidiness: the
+    // dial is what fixes the socket's address family, and a dial that was
+    // cancelled before it began must not decide what a later bind can be.
+    return failed(error_t{.code = vio_cancelled, .msg = "the dial was cancelled before it began"});
   }
 
   auto *op = detail::quic_op_create(&self);
@@ -1502,7 +1551,15 @@ using quic_accept_future_t = quic_connection_awaitable_t;
   // connections out of its accept queue.
   auto entry = ref_ptr_t<detail::quic_connection_state_t>(&self, connection, vio::quic::tls_role_t::client);
   entry->pending_dial = op;
+  op->dialling = entry;
   self.by_connection.emplace(connection, entry);
+
+  // Registered last, so that a token cancelled from inside its own registration
+  // finds a fully built operation.
+  if (cancel != nullptr)
+  {
+    op->cancel_registration = cancel->register_callback([op]() { detail::quic_op_cancel(op); });
+  }
 
   // endpoint_t::connect flushes before it returns, so this connection's
   // draining latch -- and with it the gone hook -- may already have fired for a
@@ -1538,7 +1595,7 @@ using quic_accept_future_t = quic_connection_awaitable_t;
 // the single most valuable refusal in this file: it turns an accept loop
 // silently suspended for the life of the process into a message, and it is
 // knowable only because there is no setter for the context.
-[[nodiscard]] inline quic_accept_future_t quic_endpoint_accept(quic_endpoint_t &endpoint)
+[[nodiscard]] inline quic_accept_future_t quic_endpoint_accept(quic_endpoint_t &endpoint, cancellation_t *cancel = nullptr)
 {
   const auto failed = [](error_t reason)
   {
@@ -1567,10 +1624,19 @@ using quic_accept_future_t = quic_connection_awaitable_t;
     return failed(error_t{.code = -1, .msg = "this endpoint is not bound, so nothing can reach it"});
   }
 
+  if (cancel != nullptr && cancel->is_cancelled())
+  {
+    return failed(error_t{.code = vio_cancelled, .msg = "the accept was cancelled before it began"});
+  }
+
   auto *op = detail::quic_op_create(&self);
   op->accepting = true;
   self.live_ops.push_back(op);
   quic_accept_future_t out{op};
+  if (cancel != nullptr)
+  {
+    op->cancel_registration = cancel->register_callback([op]() { detail::quic_op_cancel(op); });
+  }
   // Called here as well as from the arrival hook, which is what makes an accept
   // whose queue is already full resolve without suspending -- the difference
   // between draining a burst on one stack and one loop turn per connection.

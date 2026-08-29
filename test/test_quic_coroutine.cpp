@@ -2373,3 +2373,269 @@ TEST_CASE("a shutdown stops the endpoint accepting")
   CHECK(refused);
 }
 }
+
+TEST_SUITE("quic coroutine cancellation")
+{
+namespace
+{
+vio::quic::tls_config_t cancel_server_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+vio::quic::tls_config_t cancel_client_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+sockaddr_in cancel_loopback(std::uint16_t port)
+{
+  sockaddr_in address = {};
+  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  return address;
+}
+} // namespace
+
+TEST_CASE("a pre-cancelled dial never touches the transport")
+{
+  using namespace vio;
+
+  // More than tidiness. The dial is what fixes the socket's address family, so
+  // a dial cancelled before it began must not decide what a later bind can be
+  // -- exactly the reason the missing-context refusal also sits above the
+  // transport call.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto client_context = vio::quic::tls_context_t::create(cancel_client_tls(identity));
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool cancelled = false;
+  bool nothing_dialled = false;
+  bool still_bindable = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &connecting, bool &cancelled, bool &nothing_dialled, bool &still_bindable) -> task_t<void>
+        {
+          {
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+
+            cancellation_t token;
+            token.cancel();
+            const auto target = cancel_loopback(4433);
+            auto dial = quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost", {}, &token);
+            REQUIRE(dial.await_ready());
+            const auto result = dial.await_resume();
+            cancelled = !result.has_value() && is_cancelled(result.error());
+            nothing_dialled = quic_endpoint_connection_count(*client) == 0 && !client->handle->driver_started;
+
+            // And the socket is still unfamilied, so a bind can choose.
+            const auto any = cancel_loopback(0);
+            still_bindable = quic_endpoint_bind(*client, reinterpret_cast<const sockaddr *>(&any)).has_value();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *client_context, cancelled, nothing_dialled, still_bindable));
+    });
+  event_loop.run();
+
+  CHECK(cancelled);
+  CHECK(nothing_dialled);
+  CHECK(still_bindable);
+}
+
+TEST_CASE("a cancelled dial resolves the caller and closes what it built")
+{
+  using namespace vio;
+
+  // Two things, and the second is the one worth writing down: a dial nobody
+  // will ever be handed is told so, rather than left to spend its handshake
+  // timeout saying nothing. The peer gets a CONNECTION_CLOSE.
+  //
+  // The registry entry stays behind on purpose. Removing it would let the
+  // arrival hook mistake the connection for an inbound one if its handshake
+  // happened to complete in the same turn as the cancel.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(cancel_server_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(cancel_client_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool cancelled = false;
+  bool server_never_accepted = false;
+  bool connection_closed = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &cancelled, bool &server_never_accepted, bool &connection_closed) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = cancel_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+
+            cancellation_t token;
+            const auto target = cancel_loopback(port);
+            auto dial = quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost", {}, &token);
+            REQUIRE_FALSE(dial.await_ready());
+
+            // Cancelled from a callback phase the beat has not yet reached,
+            // which is the ordinary case: whichever phase this is, the next
+            // prepare comes before the loop blocks again.
+            token.cancel();
+            const auto result = co_await std::move(dial);
+            cancelled = !result.has_value() && is_cancelled(result.error());
+
+            // Give the CONNECTION_CLOSE time to leave and the connection time
+            // to be reaped.
+            (void)co_await sleep(loop, std::chrono::milliseconds(200));
+            connection_closed = quic_endpoint_connection_count(*client) == 0;
+            server_never_accepted = server->handle->accept_queue.empty();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, cancelled, server_never_accepted, connection_closed));
+    });
+  event_loop.run();
+
+  CHECK(cancelled);
+  CHECK(connection_closed);
+  CHECK(server_never_accepted);
+}
+
+TEST_CASE("a cancelled accept leaves the queue intact for the next one")
+{
+  using namespace vio;
+
+  // A cancelled accept must take nothing with it. Resolving it out of the queue
+  // and then discarding the connection would lose a peer that had already
+  // completed a handshake -- silently, since nobody is left to notice.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(cancel_server_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(cancel_client_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool first_cancelled = false;
+  bool second_accepted = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &first_cancelled, bool &second_accepted) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = cancel_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            cancellation_t token;
+            auto first = quic_endpoint_accept(*server, &token);
+            REQUIRE_FALSE(first.await_ready());
+            token.cancel();
+            const auto result = co_await std::move(first);
+            first_cancelled = !result.has_value() && is_cancelled(result.error());
+
+            // Only now does a peer arrive. Nothing was consumed by the cancelled
+            // accept, so the ordinary path still works.
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+            const auto target = cancel_loopback(port);
+            REQUIRE((co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost")).has_value());
+
+            second_accepted = (co_await quic_endpoint_accept(*server)).has_value();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, first_cancelled, second_accepted));
+    });
+  event_loop.run();
+
+  CHECK(first_cancelled);
+  CHECK(second_accepted);
+}
+
+TEST_CASE("cancelling an accept that has already resolved changes nothing")
+{
+  using namespace vio;
+
+  // The first outcome wins. A connection handed to an accept and then cancelled
+  // out from under it would be a connection nobody owns and nobody closes --
+  // and the same token may well be cancelled as an ordinary part of shutting a
+  // server down, long after the accept it once guarded resolved.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(cancel_server_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(cancel_client_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool accepted = false;
+  bool still_accepted = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &accepted, bool &still_accepted) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = cancel_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            cancellation_t token;
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+            const auto target = cancel_loopback(port);
+            REQUIRE((co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost")).has_value());
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+
+            auto arrived = co_await quic_endpoint_accept(*server, &token);
+            accepted = arrived.has_value();
+
+            // The token fires after the fact, which is what an ordinary
+            // shutdown does.
+            token.cancel();
+            still_accepted = accepted && quic_connection_is_open(*arrived);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, accepted, still_accepted));
+    });
+  event_loop.run();
+
+  CHECK(accepted);
+  CHECK(still_accepted);
+}
+}
