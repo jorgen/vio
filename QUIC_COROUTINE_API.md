@@ -3804,3 +3804,1477 @@ has to answer for that case itself.
 This is worth stating because it is invisible by inspection and it is the shape of a whole class
 of bug in this layer: every path that resolves an await has to be reachable from both the
 teardown broadcast and the already-torn-down fast path, or one of them silently reports success.
+
+
+---
+
+# Step 4: the settled specification
+
+Produced by three independent designs and three adversarial reviews; every design came back
+"needs-work" and this is the synthesis that answers their findings. Its lifetime model is the
+one validated by running it, above -- the two arrived at it independently, which is the main
+reason to trust it.
+
+Read with one caveat: the synthesis itself has not been through a review pass. The build order
+at the end is deliberately arranged so that each step compiles and is testable on its own, which
+is the cheapest way to find out where it is wrong.
+
+## Decision
+
+SETTLED DESIGN — step 4, the skeleton. No streams.
+
+WHERE IT LIVES. One new file, `src/vio/operation/quic_endpoint.h`, header-only and `inline`, namespace `vio`, beside tcp.h and udp.h. Two deviations from the design doc, both deliberate:
+
+- **No `src/quic_coroutine.cpp`.** `ref_ptr_t<Data>`'s destructor instantiates `storage_t`, which needs `Data` complete, so all three state structs must be in the header regardless — the .cpp buys no encapsulation, and it would need `VIO_EXPORT` on some twenty free functions under `VIO_BUILD_SHARED` with `CXX_VISIBILITY_PRESET hidden`. Every other operation layer (tcp.h, udp.h, tls_client.h, timer_impl.h) is header-only. It also means **no CMakeLists change at all**: `src/CMakeLists.txt:155` installs headers by directory glob.
+- **`quic_stream.h` is not created in step 4.** It has no content until step 5 and an empty header is not a deliverable; the step-5 change that fills it creates it. Error codes `0x9c1c01`–`0x9c1c04` are reserved by comment in quic_endpoint.h so the published numbers stay put.
+
+One additive line lands in `src/vio/quic/connection.h`: `transport_error_connection_refused = 0x02` in the section-20.1 constant block, which the accept-backlog refusal needs. Nothing else outside the new header changes. In particular `endpoint_t`'s three hook setters are **not** given a claim/refuse protocol — that is a public-signature change to a file outside this step, and the doc's own migration note already settles the mitigation: `quic_endpoint_native()` says in its comment which handlers are spoken for.
+
+THE HANDLES. Two aggregate structs over `ref_ptr_t`, member named `handle`, exactly as `tcp_t` (tcp.h:170) and `timer_t` (timer_impl.h:74). Both default to `ref_ptr_t<T>::null()`, so a handle that names nothing is well defined, and **every entry point tests `handle.ref_counted() == nullptr` before `data()`** — `ref_ptr_t::data()` dereferences unconditionally (ref_counted_wrapper.h:158).
+
+Ownership runs strictly downward: endpoint → connection states. Every link back up is a raw pointer nulled by its owner. That is CLAUDE.md's handle rule in pointer terms and the rule timer_impl.h:91-93 already states about `data`.
+
+THE SHARPEST DECISION: **no awaitable ever holds a strong reference to the endpoint state.** The design doc's `quic_future_t { ref_ptr_t<Owner> handle; }` with `Owner = quic_endpoint_state_t` (QUIC_COROUTINE_API.md:924-928, aliased at :1012) is a guaranteed hang and must not be built. Trace it: a coroutine suspended in `co_await quic_endpoint_accept(e)` holds the state; the application drops its last `quic_endpoint_t`; `dec()` takes the count 2→1 and returns false (ref_counted_impl.h:31-33); `on_destroy` never runs; nothing resolves the accept; the beat, the reader's `uv_poll_t` and the `uv_udp_t` all stay open; `event_loop_t::stop()`'s nested `uv_run(UV_RUN_DEFAULT)` (event_loop_impl.h:197-200) runs until nothing is left open, so **`run()` never returns**. That is the second, non-obvious face of the failure CLAUDE.md already names. `tcp_connect_future_t` gets away with the strong ref because libuv guarantees the `uv_connect_t` callback fires; nothing guarantees an accept ever resolves. The build order's own step-4 test — "an endpoint released mid-dial resolves the dial with `vio_quic_endpoint_closed` and `uv_loop_close` succeeds" — cannot pass with a strong reference.
+
+So there are exactly two awaitable shapes, and neither has an endpoint reference to get wrong:
+
+- **`quic_connection_awaitable_t`** — a heap-allocated `detail::quic_op_t` with the two-hold protocol `udp_send_op_t` already uses. Both `quic_endpoint_accept` and `quic_endpoint_connect` return it (`quic_accept_future_t` and `quic_connect_awaitable_t` are aliases, so both published spellings survive). It borrows `quic_endpoint_state_t *`, nulled the instant the op resolves or the endpoint tears down, so the borrow can never outlive the storage — which closes the residual dangling hole a bare borrowed pointer into a slot would have left. This also **replaces the single accept slot**, and with it the doc's rule that a second concurrent accept is refused with `vio_quic_busy`: with a per-call op there is no slot to overwrite, so concurrent accepts are simply served FIFO. That deviation deletes four separate failure modes at once (a stale re-arm, an overwritten continuation, an abandoned future stranding the slot, and a shared "busy" result whose message is moved out on first read). `vio_quic_busy` stays declared and is raised nowhere in step 4; step 5's single stream reader is the operation that genuinely has one slot.
+- **`quic_milestone_t`** — reached-or-not, reported rather than consumed, awaitable late, twice, and by several coroutines at once. It holds one `ref_ptr_t<detail::quic_milestone_state_t>`: a milestone is its own tiny allocation that owns no libuv handle, so holding it is always safe and the ownership question never arises. Three uses, one type: `quic_connection_ready`, `quic_connection_closed`, `quic_endpoint_shutdown`. Its waiters are an **intrusive doubly-linked list of nodes living inside the awaitables**, not a `std::vector<std::coroutine_handle<>>`, for two reasons that are correctness and not economy: an awaiting frame destroyed while suspended unlinks its own node, where a vector entry would dangle; and the drain resumes one waiter at a time re-reading the head, because the first coroutine resumed may destroy the second's frame.
+
+NO USER CODE EVER RUNS ON A TRANSPORT WALK'S STACK, and the reason is narrower than the design doc's. `endpoint_impl_t::connections` is `std::vector<std::unique_ptr<connection_entry_t>>` (quic_endpoint.cpp:158), so a dial's `push_back` reallocates a vector of pointers and the entries themselves do not move — `run()`'s `touched` and `flush_entry`'s `entry` reference are both stable, and the `walking` counter (:150-156) already defers the only thing that frees an entry. Dialling from a handler is genuinely safe today and `test_quic_endpoint.cpp:840` passes for that reason. What is **not** safe, and what the beat exists for, is what a *coroutine* may do that a callback may not: drop the last `quic_endpoint_t`, which destroys `endpoint_impl_t`, `run()`'s own frame, the `datagram_reader_t` inside it and the `touched` vector, from a stack three calls deep inside all of them. No amount of `walking` helps; the storage is gone. So the three hooks **latch and queue and never resume**, and resumption happens in exactly one place.
+
+THE BEAT is a `uv_prepare_t` owned by `quic_endpoint_state_t`, `uv_prepare_init`ed at create, registered with `handle.register_handle(&beat)`, `uv_unref`ed, and started once and never stopped until teardown. `beat.data` is a **borrowed** `quic_endpoint_state_t *`, verbatim `timer_create`'s two lines (timer_impl.h:116-117) and for the reason stated there: a reference parked in a registered handle's data keeps the count above zero forever and the `uv_close` is never issued. Note that `dec()` overwrites `handle->data` with the `reference_counted_t *` before closing (ref_counted_impl.h:58), so a null check in the callback would not even be the right test — libuv fires no callback for a closed handle, which is the guarantee the borrow leans on.
+
+Not `add_about_to_block_listener`: `remove_about_to_block_listener` posts through `_run_in_loop` (event_loop_impl.h:171) and `exit_event_loop_cb` closes that pipe and runs a nested `uv_run` before `uv_prepare_stop` (:194-203), so a removal posted during teardown is never delivered while `about_to_block_cb` keeps firing on freed storage. An owned handle has no such window.
+
+**The `uv_unref` is load-bearing and its reason is not the obvious one.** An endpoint created and never bound has no descriptor at all (libuv makes the UDP socket lazily; `ensure_socket`, quic_endpoint.cpp:268-288), and `uv_prepare_start` calls `uv__handle_start`, which counts a referenced handle in `uv__has_active_handles`. So a ref'd beat on an idle endpoint would be the only active handle and would keep `uv_run` alive by itself. It is a hook, not a reason to keep the loop alive; the reading socket is that.
+
+**Prepare, not check — settled from libuv's own loop order.** See the `seam` field; the short of it is that timers run at the *end* of the iteration and the endpoint's 2 ms ticker is what latches an idle timeout, so prepare is the only hook downstream of every wake source and upstream of the block.
+
+THE CALLBACK-DURATION REF, `rc->inc()` at entry and `rc->dec()` as the last statement, is `socket_stream.h:899/928`'s discipline. Be honest about what it buys here: because the beat is registered with `register_handle`, a `dec()` reaching zero inside the beat would **not** free the storage — `dec()` takes the `closable_handles` branch, issues `uv_close` and returns false (ref_counted_impl.h:52-63), and `destroyer()` runs from the close callback a loop turn later. So this is not a use-after-free guard. What it buys is that the destroy sequence — which resolves awaiters, cancels the driver and destroys `endpoint_impl_t` — runs **after** the beat's walk rather than re-entrantly in the middle of it, which is what makes every "the beat holds locals" argument hold without a case-by-case audit of what teardown has already emptied. It has a direct observable, and the test is written on it rather than on a crash that would not happen.
+
+THE TOMBSTONE POINT IS THE DRAINING LATCH, NOT THE REAP. `reap` (quic_endpoint.cpp:749-774) erases the entry and frees the `connection_t` with no notification; `on_connection_gone`, fired from the draining latch at :730-746, is the last moment anything tells this layer about a connection, and it always precedes the reap because `reap` requires `entry.draining` which is set immediately before the hook. So the registry entry is erased there — while the pointer still names *this* connection — which also closes the address-reuse hazard, since `std::make_unique<connection_t>` may hand the next connection the same address. At that same moment the layer latches `close_reason()` by value, `selected_alpn()` as an owning `std::string`, the path stats, and the classified ending; then nulls `transport`. A `quic_connection_t` held afterwards answers `closed`, `close_reason`, `alpn`, `role` and `stats` from its own copies, `quic_connection_native` returns null, and everything else fails with `vio_quic_connection_closed`.
+
+Stats are latched **at the ending rather than zeroed**, a deliberate deviation from the doc's "zeroed on a tombstone": one struct copy per connection, and a shutdown log line reading "RTT 0" for every closed connection is a worse answer than the truth. `in_slow_start` is derived as `congestion_window < slow_start_threshold` from `path_stats()`, which is exactly `congestion_control_t::in_slow_start()`'s own definition (congestion_control.h:328-331) — no transport accessor is needed. `open_streams` is **not** in the struct at step 4; `connection_t` cannot count them, and shipping a field that reads a fabricated zero is worse than adding one in step 5.
+
+TEARDOWN, in the endpoint's single `on_destroy`, guarded by `closing`:
+1. `closing = true` **first**, before anything is resumed, and `uv_prepare_stop`. Every entry point tests `closing`, not `transport.has_value()` — the transport is alive for most of teardown, so a coroutine resumed at step 2 could otherwise dial and park on an op nothing will ever resolve.
+2. Sever every connection state, taking the union of the registry, the accept queue and the pending list. The third is not redundant: a state whose ending was latched at the gone hook is erased from the registry and pushed onto `pending`, and if the endpoint is released before that beat runs, walking the registry alone abandons its waiters. Any state that can still acquire a waiter is in one of those three, because a drained milestone reads `reached` and `await_ready` never suspends.
+3. Resolve every op — `live_ops` and `ready_ops` — and drain every severed state's milestones and the shutdown milestone, **resuming inline**. There is no later beat to defer to; the prepare is stopped and about to be closed. This is what `tls_server.h`'s `on_destroy` (:95-111) does for its parked listen awaiter and for the same reason.
+4. `driver_stop.cancel()`. `cancellation_t::cancel()` runs its callbacks inline (cancellation.h:122-132); the ticker's `sleep` resolves inline, and `run()`'s `stop_reading` registration calls `reader->cancel()` → `detail::deliver` → `continuation.resume()` (udp_datagram.h:129-138), so `run()` breaks its read loop and reaches `co_return` **inside this call** — guaranteed, because it never calls user code. Reaching `co_return` destroys its automatic `datagram_reader_t`, whose destructor is what issues `uv_close` on the reader's `uv_poll_t` (udp_datagram.h:448-451, :648-664). **This step, not the next, is the one the ordering rule is about.**
+5. `driver.reset()` — the frame is `done()`, so `~task_t` destroys it (task.h:211-217). This frees frame memory only; the reader is already gone. If `driver->done()` is false here the cancel path has changed and the poll will never close, which surfaces as `uv_loop_close` failing.
+6. `transport.reset()` — `~endpoint_impl_t` frees every `connection_t` (which is why step 2 severed first) and then `~udp_t`, whose own `dec()` requests `uv_close` on the `uv_udp_t`.
+
+Then the ref count `uv_close`s the beat and frees storage from that close callback. A coroutine resumed at step 3 that takes a new reference restores `in_destroy_sequence` and defers destruction (ref_counted_impl.h:47-51) — contained, not prevented: `closing` makes every entry point refuse and the state is released for real when that reference goes.
+
+WHAT REPLACES THE EXAMPLES' TEARDOWN DANCE. `examples/quic_echo.cpp`'s `cancel(); sleep 50ms; reset(); sleep 50ms;` becomes `co_await quic_endpoint_shutdown(endpoint);` then letting the handle go out of scope before `loop.stop()`. The sleeps were insurance against an ordering the example could not see; they are unnecessary because both cancellations resolve inline, so `run()` is finished *inside* `driver_stop.cancel()` rather than a loop turn later. CLAUDE.md's one rule — release the handle while the loop can still run — applies unchanged and unextended.
+
+THE DRIVER STARTS ON THE FIRST bind OR connect, NEVER AT create. `endpoint_t::run()` opens with `ensure_socket(impl)` at the `AF_INET` default (quic_endpoint.cpp:944, :268), which is the bug still marked `doctest::should_fail` at test_quic_endpoint.cpp:1790. This is **not** the step-3 experiment that was reverted: that one made `run()` itself wait, costing the reader a loop turn and taking the ECN test from 12/12 to 4/12. `task_t` is eager (`initial_suspend()` returns `suspend_never`), so calling `transport->run(&driver_stop)` on `bind`/`connect`'s own stack executes straight through `datagram_reader_t::create` — whose `uv_poll_start` is synchronous (udp_datagram.h:486) — down to the first `co_await *reader`, before the caller returns and before the loop turns. That is exactly what the comment at test_quic_endpoint.cpp:1786-1788 asks for: "arm the reader the moment the socket appears rather than after a sleep." Order inside each entry point is load-bearing: `transport->bind(address)` first, then start; `transport->connect(...)` first (it calls `ensure_socket(impl, address->sa_family)` at :861), then start. `start_driver` also checks `driver->done()`, because `run()` reports a reader it could not create with a bare `co_return` (:947-951) and without the check a `bind` would report success on an endpoint that will never read a byte.
+
+CONFIG. `quic_flow_control_t` is **dropped**. Its job was done one layer lower by `default_transport_parameters()` (transport_parameters.h:157) and `connection_config_t::transport_parameters` (connection.h:162), which fixes the transport's own callers too; a second copy of the same nine numbers is the "two sources of truth for flow control" the design warns against, pointed the other way, and the doc's rule for it — overwrite `transport.connection.transport_parameters` at create — is now destructive of a value set on the field connection.h documents as the place to set it. One job of it survives and is fixed at the source: `transport_parameters_t::max_ack_delay` (milliseconds, wire) and `connection_config_t::max_ack_delay` (nanoseconds, read by loss recovery at eight sites in quic_connection.cpp) are two fields with two independent defaults that happen to agree, so `quic_endpoint_create` derives the wire value from the config field, **rounded up and clamped below `max_ack_delay_limit`** (transport_parameters.h:89) — because an unclamped derivation turns a legal local 30 s into a wire value the peer's decoder rejects with TRANSPORT_PARAMETER_ERROR.
+
+THE INDEPENDENT CLOSE DISCRIMINATOR IS `closed_locally`, NOT A TRANSPORT CHANGE. All five ending paths write `{error_code = 0, application = false, from_peer = ...}` (quic_connection.cpp:1004, :1788, :3274, :3343, :3361), so an idle timeout and a local `close(0)` differ by nothing but an English reason string. Adding `connection_end_t how` to `connection_close_t` would settle it properly, but it is a step-2-shaped change arriving late and it touches a public struct. Instead every path in *this layer* that closes a connection goes through one helper that sets `closed_locally` — which covers `quic_connection_close`, `quic_endpoint_shutdown` and the cancelled dial, i.e. every way an application using this API closes anything. The one gap, and the header says so: a close issued through `quic_connection_native()->close(0, …)` is reported as an idle timeout.
+
+## The seam
+
+HOW IT INSTALLS. `quic_endpoint_create` takes all three of the transport's dispatch hooks, with a borrowed `quic_endpoint_state_t *` in each closure:
+
+```cpp
+state->transport->on_connection([self](vio::quic::connection_t &c) { detail::quic_hook_connection(*self, c); });
+state->transport->on_activity([self](vio::quic::connection_t &c) { detail::quic_hook_activity(*self, c); });
+state->transport->on_connection_gone([self](vio::quic::connection_t &c) { detail::quic_hook_gone(*self, c); });
+```
+
+They are single slots assigned wholesale (`quic_endpoint.cpp:835-848`), so the coroutine layer owns dispatch and an application driving the same endpoint through the callback API cannot. That is structural rather than a concession: the hooks fire from inside `flush_entry`, and the entire point of the design is that no user code runs there — chaining a user closure into the walk would reinstate exactly the hazard the beat removes. It is not enforced with a `claim_hooks` protocol, because that is a public-signature change to three functions in a file outside step 4; `quic_endpoint_native()`'s doc comment says which handlers are spoken for, which is the mitigation the design doc's own migration section settles on.
+
+`on_activity` is installed although step 4 has nothing to read: it is where step 5 drains the edge lists, and installing it now means the beat's shape is fixed here rather than being reworked later. In step 4 it does one thing — look the connection up and, if it is registered and has a pending dial or an unreached milestone, `quic_mark_pending`. It never marks dirty: `run()` already flushes every touched connection, and marking them would double the endpoint's idle flush cost.
+
+**THE ROLE SORT.** `on_connection` fires from `flush_entry` (:722-727) for every connection that reaches `handshake_complete()`, dialled ones included — `test_quic_endpoint.cpp:1556` records exactly that. A dial is matched by **pre-registration, not by role**, because `endpoint_t::connect` inserts into `by_handle` before it flushes and returns (`:888-892`) and `endpoint_t::connection(handle)` is a bare lookup with no walking (:895-899). So `quic_endpoint_connect` does, on the caller's own stack, before returning:
+
+```cpp
+auto dialled = state.transport->connect(address, server_name, resumption_ticket);   // fixes the socket family
+if (!dialled) { return failed(dialled.error()); }
+auto *connection = state.transport->connection(*dialled);
+if (connection == nullptr) { return failed(...); }
+detail::quic_start_driver(state);                        // after connect, never before
+
+auto entry = ref_ptr_t<detail::quic_connection_state_t>(&state, connection, vio::quic::tls_role_t::client);
+entry->pending_dial = op;
+state.by_connection.emplace(connection, entry);
+
+// endpoint_t::connect calls flush_entry before it returns, so this connection's
+// draining latch -- and with it the gone hook -- may already have fired for a
+// connection nothing had registered yet, in which case it will never fire
+// again. Nothing can drive a fresh dial to closed today, but the registration
+// is not allowed to assume it precedes the first hook.
+if (connection->state() == vio::quic::connection_state_t::closed)
+{
+  detail::quic_sever(state, entry, std::unexpected(error_t{.code = vio_quic_handshake_failed, .msg = "the connection ended before it was dialled"}));
+}
+```
+
+`quic_hook_connection` is then a single `by_connection.find(&c)`:
+
+- **found** — it is the dial this layer made. Latch the alpn, reach `ready` with success, resolve the pending dial with a `quic_connection_t` naming that entry, `quic_mark_pending`.
+- **not found and `c.role() == server`** — a fresh inbound. If `closing`, `shutdown_active`, or `accept_queue.size() >= config.accept_backlog`: `c.close(transport_error_connection_refused, "the accept backlog is full", false)` and `flush_all = true`, registering nothing. Otherwise build a state with `role = server`, latch the alpn, reach `ready`, register it, and either hand it straight to the oldest waiting accept op or push it on `accept_queue`.
+- **not found and `c.role() == client`** — dialled behind this layer's back through `quic_endpoint_native()->connect()`. **Ignore it.** It has no awaiter, and pushing it onto the accept queue would hand a server an outbound connection. This is the case a peer-to-peer endpoint makes reachable and the reason `role()` is checked at all.
+
+The role is latched onto the state at registration in every branch, because a tombstone must still answer `quic_connection_role` and the sort itself needs it before anything else about the connection is known.
+
+**THE ACCEPT QUEUE AND THE WAITER FIFO.** `accept_queue` is a `std::deque<ref_ptr_t<quic_connection_state_t>>`; waiters are the accepting entries of `live_ops`, in call order. One dispatch function keeps the two from ever both being non-empty:
+
+```cpp
+inline void quic_accept_pump(quic_endpoint_state_t &self)
+{
+  while (!self.accept_queue.empty())
+  {
+    auto found = std::find_if(self.live_ops.begin(), self.live_ops.end(), [](const quic_op_t *op) { return op->accepting && !op->done; });
+    if (found == self.live_ops.end())
+    {
+      return;
+    }
+    auto state = std::move(self.accept_queue.front());
+    self.accept_queue.pop_front();
+    quic_op_finish(self, *found, quic_connection_t{std::move(state)});
+  }
+}
+```
+
+Called from `quic_hook_connection` after a connection is queued, and **from `quic_endpoint_accept`'s own factory**, which is what makes an accept whose queue is already non-empty resolve without suspending — the property the design calls out, and the difference between draining a burst on one stack and one loop turn per connection. `quic_op_finish` moves the op from `live_ops` to `ready_ops`, keeping the endpoint's hold, which the beat drops after resuming; it resets the cancel registration **before** anything is resumed, because the resuming coroutine owns the token and may destroy it.
+
+There is no `vio_quic_busy` here. With per-call operations a second concurrent accept has nothing to overwrite; both park and both are served, oldest first.
+
+**CANCELLATION LATCHES AND NEVER RESUMES.** The callback on a `cancellation_t` sets the op's result and calls `quic_op_finish`, which puts it on `ready_ops`; the beat resumes it. One resumption site in the whole layer, no exceptions, and the "reset the registration before the resume" rule is then a property of one function rather than a discipline at five call sites. It costs no wall clock, by the same derivation that chose prepare: whatever phase the cancel was called from — a timer callback, an I/O callback, another coroutine the beat resumed — the next prepare is reached before the loop next blocks. A pre-cancelled call never touches the transport at all and returns an already-resolved awaitable, the `tcp_connect` shape. A cancelled dial additionally closes the connection it built, through the same helper that sets `closed_locally`, with `transport_error_no_error` and "dial cancelled"; its registry entry stays, precisely so `on_connection` cannot later mistake it for an inbound arrival.
+
+**THE GONE HOOK IS THE TOMBSTONE POINT.**
+
+```cpp
+inline void quic_hook_gone(quic_endpoint_state_t &self, vio::quic::connection_t &connection)
+{
+  const auto found = self.by_connection.find(&connection);
+  if (found == self.by_connection.end())
+  {
+    return; // arrived and died before its handshake completed; never registered
+  }
+  const auto state = found->second;
+  // Erased here, while the pointer still names this connection. The reap a
+  // draining period later frees the connection_t with no notification, and the
+  // next one may well be allocated at the same address -- a stale key would
+  // hand a new peer's connection to a retired handle.
+  self.by_connection.erase(found);
+  quic_sever(self, state, {});
+  if (self.shutdown_active && self.shutdown_outstanding > 0)
+  {
+    --self.shutdown_outstanding;   // its CONNECTION_CLOSE is in a datagram
+  }
+}
+```
+
+**SHUTDOWN.** `quic_endpoint_shutdown` closes every registered connection through the `closed_locally` helper, sets `shutdown_active`, records `shutdown_outstanding` as the number it closed and `shutdown_deadline = loop_now(loop) + close_timeout`, marks each dirty, and returns the endpoint's shutdown milestone. `quic_shutdown_check` runs once per beat: it reaches the milestone when `shutdown_outstanding == 0` or the deadline has passed, and clears `shutdown_active`. No `timer_t`: the deadline is compared against `loop_now` in the beat, which the 2 ms ticker guarantees runs — and a shutdown with nothing to close resolves in the factory, which is what covers an endpoint whose driver never started and whose loop may therefore not turn on its own. Shutdown also stops accepting: later accepts pre-resolve with `vio_quic_endpoint_closed` and arriving connections are refused.
+
+**STARTING THE DRIVER.**
+
+```cpp
+inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &self)
+{
+  if (self.driver_started || self.closing)
+  {
+    return {};
+  }
+  self.driver_started = true;
+  self.driver.emplace(self.transport->run(&self.driver_stop));
+  if (self.driver->done())
+  {
+    // run() reports a reader it could not create with a bare co_return, so
+    // done() on the first turn is the only signal there is -- and without this
+    // a bind would report success on an endpoint that will never read a byte.
+    self.driver.reset();
+    self.driver_started = false;
+    return std::unexpected(error_t{.code = -1, .msg = "the endpoint could not start reading its socket"});
+  }
+  return {};
+}
+```
+
+`task_t` is eager, so `run()` executes through `datagram_reader_t::create` — whose `uv_poll_start` is synchronous — down to its first `co_await *reader`, on this stack, before the caller returns. That is the fix the `should_fail` test's own comment asks for, and it is not the reverted experiment, which made `run()` wait and cost a loop turn.
+
+## Errors
+
+SEVEN CODES, `0x9c1c05` … `0x9c1c0b`, which is `10230789`–`10230795` decimal. Checked against every code defined in `src/`: `vio_tls_error` / `clean_shutdown` / `truncated` are `0x715c00`–`0x715c02` (ssl_engine.h:50-52), `vio_cancelled` is `0xca9ce1` (cancellation.h:40), and `vio_uv_ecanceled` is `UV_ECANCELED`, which is negative on every platform. Nothing else in the tree defines one, and `error_t{.code = -1}` is the repo's generic argument-error value. **No collision.**
+
+`0x9c1c01` … `0x9c1c04` are left reserved by comment for `quic_stream.h` (`stream_finished`, `stream_reset`, `stream_stopped`, `stream_stale`). They are not declared in step 4, so the header a program that only dials includes does not carry them, and the published numbers stay put.
+
+| code | value | raised by |
+|---|---|---|
+| `vio_quic_connection_closed` | `0x9c1c05` | `quic_classify_ending`'s last two arms: a `close_reason` with a non-zero code after the handshake completed (the peer's reason string goes into `error_t::msg`), or an ending with no reason recorded at all. Also what a tombstoned `quic_connection_t` returns from anything it can no longer do. |
+| `vio_quic_idle_timeout` | `0x9c1c06` | a zero-code, `from_peer == false` ending that this layer did not ask for. Section 10.1, quic_connection.cpp:3359-3361. |
+| `vio_quic_handshake_failed` | `0x9c1c07` | any ending recorded while `handshake_reached` is false: a certificate that did not verify, no ALPN in common, a TLS alert, and the deadline at quic_connection.cpp:3341-3343. One code for all four, because all four mean the dial produced nothing usable; `close_reason()` separates them and its text is carried in `msg`. |
+| `vio_quic_stateless_reset` | `0x9c1c08` | `connection_t::reset_by_peer()`, tested first because that path records `{0, false, "stateless reset", from_peer = true}` (:3272-3274) and would otherwise read as a clean ending. |
+| `vio_quic_version_unsupported` | `0x9c1c09` | `connection_t::version_negotiation_failed()`, tested second for the same reason (:1786-1788). |
+| `vio_quic_endpoint_closed` | `0x9c1c0a` | every operation and milestone still parked at teardown; every factory called on a `closing` endpoint; and `await_resume` on an awaitable whose operation is gone. The doc's wording — "the endpoint was released" — is widened to "released or shut down". |
+| `vio_quic_busy` | `0x9c1c0b` | **nothing, in step 4.** Declared because it is published and because step 5's single stream reader is the operation that really has one slot. |
+
+NOT AN ERROR CODE, deliberately: configuration and misuse that is not a race. An accept on a dial-only endpoint, a dial on an answer-only one, an accept or a bind on a released endpoint's still-valid-looking handle, and a milestone on a default-constructed handle all come back as `error_t{.code = -1}` with a full sentence — which is what `endpoint_t::connect` already answers for the mirror case ("this endpoint has no TLS context to dial with", quic_endpoint.cpp:859). Overloading `vio_quic_busy` onto "you configured this wrong" would make the one code an application can usefully branch on unbranchable. This narrows the design doc's usage, which had `vio_quic_busy` carrying "This stream has no receiving half" as well; step 5 should keep the narrowing.
+
+A CLEAN ENDING IS `std::expected` SUCCESS, not a code: a zero error code from either side after the handshake completed. `quic_connection_closed` resolving with a value is the only ending here that is not a failure.
+
+THE ORDER IN `quic_classify_ending` IS THE SPECIFICATION, and it is forced by what the five ending paths actually record — verified at quic_connection.cpp:1004, :1788, :3274, :3343 and :3361, all five of which write `error_code = transport_error_no_error` with `application = false`:
+
+1. `reset_by_peer()` — records `from_peer = true`, so testing the code first would call it clean.
+2. `version_negotiation_failed()` — same shape, same reason.
+3. `!handshake_reached` — the handshake deadline records `{0, false, false}`, byte for byte what a local transport-space `close(0)` records.
+4. `!reason.has_value()` — nothing said why.
+5. `reason->error_code != 0` — a real close from either side.
+6. `!reason->from_peer && !closed_locally` — the idle timeout, told from a clean local close by the one fact only this layer has.
+
+`error_t` is `{int, std::string}` and shared by every subsystem in vio, so a peer's 62-bit application code does not fit in it. `quic_connection_close_reason()` is where the full `connection_close_t` — code, application-or-transport, reason, `from_peer` — is read, and it keeps answering on a tombstone because it is copied into the handle's own state.
+
+ONE GAP, STATED IN THE HEADER RATHER THAN PAPERED OVER: `closed_locally` is set only by this layer's own close paths. A connection closed through `quic_connection_native()->close(0, …)` records `{0, application, false}` with nothing claiming it, and is reported as `vio_quic_idle_timeout`. Closing it properly needs a discriminator on `connection_close_t` — a `connection_end_t how` set at the five sites — which is a step-2-shaped change to a public struct and is not made here.
+
+## Proposed header
+
+```cpp
+// =============================================================================
+// src/vio/operation/quic_endpoint.h  --  namespace vio
+//
+// The coroutine face of QUIC: endpoints and connections. Streams and datagrams
+// arrive in quic_stream.h at the next step, and nothing here names one -- a
+// program that only dials and closes should not have to parse the stream API
+// to do it.
+//
+// Everything under vio/quic/ stays exactly as it is. connection_t is a sans-I/O
+// state machine and endpoint_t is a demultiplexer over one UDP socket, both
+// driven by std::function and by integer ids, and both testable with no socket
+// under them. That is the right shape for the inside of a transport and the
+// wrong shape for an application, which wants to write co_await.
+//
+// The organising idea is the loop turn. Datagrams that arrived together are
+// taken in together by the endpoint's read loop, which marks the connections
+// they touched and sends whatever acknowledgements they owe. Then, once, before
+// the loop blocks again, every coroutine that has become runnable is resumed
+// and everything they wrote is pushed onto the socket. That second half is the
+// beat, and it runs from a uv_prepare_t this endpoint owns.
+//
+// No user code ever runs on the read loop's stack or inside the endpoint's
+// reap, and the reason is narrower than it first looks. endpoint_impl_t holds
+// its connections as unique_ptr, so a dial's push_back does not move the
+// entries a walk is standing on, and the walking counter already defers the
+// reap that would free one -- dialling from a callback is safe today. What is
+// not safe is what a coroutine may do that a callback may not: drop the last
+// quic_endpoint_t, which destroys endpoint_impl_t, run()'s own frame, the
+// datagram reader inside it and the vector being walked, from a stack three
+// calls deep inside all of them. No amount of bracketing helps; the storage is
+// gone. So the transport's three hooks only record, and the beat is the one
+// place anything is resumed.
+//
+// There is no run() and no flush() here. An endpoint starts reading the first
+// time it is bound or dialled -- not at create(), because libuv makes a UDP
+// socket lazily and whoever touches it first fixes its address family, which is
+// how an endpoint that started before it knew where it was going ends up unable
+// to reach an IPv6 peer.
+// =============================================================================
+
+#pragma once
+
+#include "vio/cancellation.h"
+#include "vio/error.h"
+#include "vio/event_loop.h"
+#include "vio/quic/endpoint.h"
+#include "vio/ref_counted_wrapper.h"
+#include "vio/task.h"
+#include "vio/tick.h"
+
+#include <chrono>
+#include <coroutine>
+#include <cstdint>
+#include <deque>
+#include <expected>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <uv.h>
+
+namespace vio
+{
+// -----------------------------------------------------------------------------
+// Error codes
+// -----------------------------------------------------------------------------
+//
+// One hex word for the subsystem, the way ssl_engine.h owns 0x715c00. Nothing
+// else in vio uses this block: the only other codes are 0x715c00-02 (TLS),
+// 0xca9ce1 (cancellation), and libuv's, which are negative.
+//
+// 0x9c1c01 .. 0x9c1c04 are reserved for vio/operation/quic_stream.h --
+// stream_finished, stream_reset, stream_stopped, stream_stale. The hole is left
+// rather than closed so the published numbers stay put when step 5 raises them.
+
+// The connection ended under this operation with a non-zero code, after its
+// handshake had completed. quic_connection_close_reason() says who said so and
+// why; the reason string is also in error_t::msg. A code of zero from either
+// side is not this -- it is a clean ending, and arrives as success.
+inline constexpr int vio_quic_connection_closed = 0x9c1c05;
+
+// Section 10.1: the negotiated idle period elapsed. Distinct from a close
+// because nobody said anything, which is the whole reason the timer exists.
+inline constexpr int vio_quic_idle_timeout = 0x9c1c06;
+
+// The connection ended before its handshake completed: a certificate that did
+// not verify, no ALPN in common, a TLS alert, or connection_config_t's
+// handshake deadline. One code for all four, because all four mean the dial
+// produced nothing usable, and close_reason() separates them.
+inline constexpr int vio_quic_handshake_failed = 0x9c1c07;
+
+// Section 10.3: the peer no longer remembers this connection at all.
+inline constexpr int vio_quic_stateless_reset = 0x9c1c08;
+
+// Section 6.2: the peer offered no QUIC version this build speaks.
+inline constexpr int vio_quic_version_unsupported = 0x9c1c09;
+
+// The endpoint was released, or shut down, while this was suspended. Every
+// awaitable an endpoint owns resolves with this before its storage goes,
+// because a coroutine that is never resumed is a leaked frame and, if it holds
+// a handle, an event loop that never returns.
+inline constexpr int vio_quic_endpoint_closed = 0x9c1c0a;
+
+// A second concurrent waiter on an operation that has exactly one slot.
+//
+// Nothing in this header raises it. Accepts and dials are per-call operations,
+// so a second concurrent one has nothing to overwrite and simply waits its
+// turn; the number is declared here because it is published, and because the
+// single reader per stream in quic_stream.h is the operation that really does
+// have one slot.
+//
+// Note what this is not. Asking a dial-only endpoint to accept, or an
+// answer-only one to dial, is a configuration mistake rather than a race, and
+// comes back as error_t{.code = -1} with a full sentence -- which is what
+// endpoint_t::connect already answers for the mirror case. Spending the one
+// code an application can usefully branch on covering both would make it
+// unbranchable.
+inline constexpr int vio_quic_busy = 0x9c1c0b;
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+// There is no separate flow-control type, and there deliberately is not one any
+// more. connection_config_t::transport_parameters is already initialised to
+// default_transport_parameters() -- 8 MiB across the connection, 2 MiB per
+// stream -- so an endpoint configured with nothing carries traffic, and a
+// second copy of those nine numbers here would be a second source of truth for
+// the one thing that must have exactly one.
+//
+// To change one, assign the field; do not brace-initialise the struct:
+//
+//   quic_config_t config;
+//   config.transport.connection.transport_parameters.initial_max_data = 64u << 20;
+//
+// transport_parameters_t{.initial_max_data = x} names one parameter and
+// silently zeroes the other eight, because that struct is also the decoder's
+// accumulator and its initialisers are section 18.2's absent-parameter values.
+struct quic_config_t
+{
+  // Everything the transport already has an opinion about: the retry key, the
+  // stateless reset key, ECN, segmentation offload, the qlog directory, the
+  // connection ceiling, the draining period, and the whole of
+  // connection_config_t underneath. Those defaults are good and are left alone.
+  //
+  // One field of it is written by quic_endpoint_create and whatever is set here
+  // is discarded: connection.transport_parameters.max_ack_delay, which is a
+  // second spelling of connection.max_ack_delay. Those are two fields of two
+  // types with two independent defaults that happen to agree, and nothing
+  // enforces that they still do -- so a caller who tuned one of them put a
+  // promise on the wire the loss recovery does not keep. Set the nanosecond
+  // one; the millisecond one is derived from it.
+  vio::quic::endpoint_config_t transport;
+
+  // Connections whose handshake has completed and which nothing has accepted
+  // yet. Past this a connection is closed with CONNECTION_REFUSED rather than
+  // queued, because a client told no can go elsewhere and one told nothing
+  // waits out its handshake timeout.
+  //
+  // Be clear about what it does not bound. on_connection fires after the
+  // handshake, so a refused connection has already cost a TLS session and three
+  // key schedules; endpoint_config_t::max_connections is the earlier and
+  // cheaper ceiling, and a server reachable from the internet needs that one
+  // and a retry_key, not this.
+  std::size_t accept_backlog = 128;
+
+  // step 5 adds stream_accept_backlog, stream_refused_error and the write
+  // high-water marks here.
+};
+
+// What the path is doing. Nothing steers on these; they are what a progress
+// bar, a log line and a bandwidth-delay-product calculation are made of.
+//
+// Latched as of the ending rather than zeroed on a tombstone, which is one
+// struct copy per connection and a deliberate departure from the design note:
+// a shutdown log line reading "RTT 0" for every connection that has closed is a
+// worse answer than the truth.
+struct quic_connection_stats_t
+{
+  std::chrono::nanoseconds smoothed_rtt{};
+  std::chrono::nanoseconds rtt_variation{};
+  std::chrono::nanoseconds min_rtt{};
+  std::size_t congestion_window = 0;
+  std::size_t slow_start_threshold = 0;
+  std::size_t bytes_in_flight = 0;
+  std::size_t datagram_size = 0;
+  std::uint64_t delivery_rate = 0;
+  std::uint64_t peak_delivery_rate = 0;
+  std::uint64_t migrations = 0;
+  bool in_slow_start = false;
+  // step 5 adds open_streams. It is left out rather than shipped reading zero,
+  // because connection_t cannot count them and a number nothing measures is
+  // worse than a number that is not there.
+};
+
+// ... detail:: state structs and the beat go here; see the state_structs field.
+// The physical order of the file is: error codes, config, stats, the detail
+// block, the handles, the awaitables, the declarations below, and finally the
+// inline definitions -- because ref_ptr_t<T> needs T complete and
+// std::expected<quic_connection_t, error_t> needs quic_connection_t complete.
+
+// -----------------------------------------------------------------------------
+// Handles
+// -----------------------------------------------------------------------------
+//
+// Aggregate structs over ref_ptr_t, member named `handle`, exactly as tcp_t and
+// timer_t are. Copying one is a refcount bump.
+//
+// Both default to a null ref_ptr, so a handle that names nothing is well
+// defined rather than an allocation -- and every entry point below tests for
+// that before it dereferences, because ref_ptr_t::data() does not.
+struct quic_endpoint_t
+{
+  ref_ptr_t<detail::quic_endpoint_state_t> handle = ref_ptr_t<detail::quic_endpoint_state_t>::null();
+};
+
+// It names a connection rather than owning it. The endpoint collects a closed
+// connection after its draining period and that schedule must not slip: the
+// collection is what withdraws the connection IDs from routing. A handle held
+// past that point does not dangle -- it becomes a tombstone, which still
+// answers quic_connection_closed, close_reason, alpn, role and stats from its
+// own latched copies, and fails everything else.
+struct quic_connection_t
+{
+  ref_ptr_t<detail::quic_connection_state_t> handle = ref_ptr_t<detail::quic_connection_state_t>::null();
+};
+
+// -----------------------------------------------------------------------------
+// Awaitables
+// -----------------------------------------------------------------------------
+
+// Something that has either happened or has not, reported rather than consumed:
+// awaitable late, awaitable twice, and awaitable by several coroutines at once.
+// A per-connection supervisor watching for the end while another coroutine
+// works is the ordinary shape, and a single stored continuation would silently
+// drop all but the last of them.
+//
+// It holds the milestone's own small allocation and nothing else. A milestone
+// owns no libuv handle, so holding one keeps nothing open and can never be the
+// reason uv_loop_close fails -- which is exactly why the awaitables below hold
+// no reference to the endpoint. It also tolerates a null one, so awaiting a
+// milestone on a handle that was never valid is well defined.
+//
+// Neither copyable nor movable: the waiter node's address must be stable from
+// construction, and guaranteed copy elision on a prvalue return means no move
+// is ever needed.
+class quic_milestone_t
+{
+public:
+  explicit quic_milestone_t(ref_ptr_t<detail::quic_milestone_state_t> slot);
+  quic_milestone_t(const quic_milestone_t &) = delete;
+  quic_milestone_t &operator=(const quic_milestone_t &) = delete;
+  quic_milestone_t(quic_milestone_t &&) = delete;
+  quic_milestone_t &operator=(quic_milestone_t &&) = delete;
+  // Unlinks before the slot is released, which is why it is written out rather
+  // than defaulted: a member's destruction order is not the place to keep a
+  // rule this load-bearing.
+  ~quic_milestone_t();
+
+  [[nodiscard]] bool await_ready() const noexcept;
+  bool await_suspend(std::coroutine_handle<> continuation) noexcept;
+  std::expected<void, error_t> await_resume() noexcept;
+
+private:
+  ref_ptr_t<detail::quic_milestone_state_t> _slot;
+  detail::quic_waiter_t _node;
+};
+
+// A per-call operation, heap allocated, released by whichever of the awaitable
+// and the endpoint lets go of it last -- the two-party protocol udp_send_op_t
+// already uses. Both accepting and dialling get this shape, because any number
+// of either may be in flight at once and a single slot on the endpoint would
+// make the second concurrent caller either fail or hang.
+//
+// It borrows the endpoint state and never references it. A strong reference
+// here would deadlock: a coroutine suspended in co_await quic_endpoint_accept()
+// would keep the state alive, so releasing the last quic_endpoint_t would never
+// reach zero, so on_destroy would never run, so the accept would never be
+// resolved -- and the beat, the reader's poll and the socket would all stay
+// open, which is event_loop_t::stop() running the loop until nothing is left
+// and never returning. The borrow cannot dangle either, because the endpoint
+// nulls it when the operation resolves and when it tears down, and it never
+// frees the operation while this awaitable still holds it.
+//
+// Abandoning one before it resolves is safe and cancels nothing that has
+// already been handed to the transport: the destructor nulls the continuation
+// first and then drops one hold.
+class quic_connection_awaitable_t
+{
+public:
+  explicit quic_connection_awaitable_t(detail::quic_op_t *op);
+  quic_connection_awaitable_t(const quic_connection_awaitable_t &) = delete;
+  quic_connection_awaitable_t &operator=(const quic_connection_awaitable_t &) = delete;
+  quic_connection_awaitable_t(quic_connection_awaitable_t &&other) noexcept;
+  quic_connection_awaitable_t &operator=(quic_connection_awaitable_t &&other) noexcept;
+  ~quic_connection_awaitable_t();
+
+  [[nodiscard]] bool await_ready() const noexcept;
+  bool await_suspend(std::coroutine_handle<> continuation) noexcept;
+  std::expected<quic_connection_t, error_t> await_resume() noexcept;
+
+private:
+  void reset() noexcept;
+  detail::quic_op_t *_op = nullptr;
+};
+
+// Both published spellings, one implementation. They were two shapes in the
+// design because the accept was a single slot on the endpoint; making it a
+// per-call operation deleted the slot and with it the second-waiter rule, the
+// re-arm, and the question of what an abandoned accept leaves behind.
+using quic_accept_future_t = quic_connection_awaitable_t;
+using quic_connect_awaitable_t = quic_connection_awaitable_t;
+
+// -----------------------------------------------------------------------------
+// Endpoint
+// -----------------------------------------------------------------------------
+
+// No socket is opened here and nothing is started. libuv makes a UDP socket
+// lazily and its address family is fixed by whoever touches it first, so an
+// endpoint that opened one at construction would be pinned to IPv4 before
+// anyone said where it was going -- which is the bug still marked
+// doctest::should_fail in test_quic_endpoint.cpp. The socket, the read loop and
+// the beat all start at the first bind or dial, each of which carries the
+// family it needs.
+//
+// The role comes from the context, which already knows what it was built for.
+[[nodiscard]] inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t &context, const quic_config_t &config = {});
+
+// The peer-to-peer form: one port that both answers and dials. Either may be
+// null -- that is how a dial-only or an answer-only endpoint is expressed --
+// and both must outlive the endpoint. The presence of server_context is what
+// makes quic_endpoint_accept legal and the presence of client_context what
+// makes quic_endpoint_connect legal; asking for the other comes back as a -1
+// with a sentence rather than an awaitable nothing can resolve.
+//
+// This is also where the registry earns itself: a peer that both dials and
+// answers gets its own dialled connections back through on_connection, and only
+// a registry keyed on connection_t* keeps them out of its accept queue.
+[[nodiscard]] inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t &loop, const vio::quic::tls_context_t *server_context, const vio::quic::tls_context_t *client_context,
+                                                                                  const quic_config_t &config = {});
+
+// Binds the socket and starts reading it, in that order, because it is the
+// sockaddr that says which address family the socket must have.
+[[nodiscard]] inline std::expected<void, error_t> quic_endpoint_bind(quic_endpoint_t &endpoint, const sockaddr *address);
+[[nodiscard]] inline std::expected<std::uint16_t, error_t> quic_endpoint_local_port(const quic_endpoint_t &endpoint);
+
+// Resolves once for each connection that has completed a handshake, in the
+// order they complete. Connections that complete while nothing is waiting
+// queue, bounded by quic_config_t::accept_backlog; waiters that arrive while
+// the queue is empty are served in the order they asked.
+//
+// It yields the connection directly rather than needing a separate synchronous
+// accept, because QUIC has no listen call and no backlog to arm: a bound
+// endpoint is already answering Initials.
+//
+// An accept on an endpoint that is not reading its socket -- one that has
+// neither bound nor dialled -- is refused with a sentence rather than parked
+// for ever on a port that does not exist.
+[[nodiscard]] inline quic_accept_future_t quic_endpoint_accept(quic_endpoint_t &endpoint, cancellation_t *cancel = nullptr);
+
+// Dials, and resolves when the handshake completes or fails. Connected means
+// what it means for ssl_client_connect -- the certificate has verified, an ALPN
+// has been agreed and the peer's transport parameters have arrived, so a stream
+// opened on the result will have credit -- and not that the first Initial has
+// been queued.
+//
+// Cancelling closes the connection as well as resolving the caller. A dial
+// nobody will ever be handed is told so rather than left to spend its handshake
+// timeout saying nothing.
+[[nodiscard]] inline quic_connect_awaitable_t quic_endpoint_connect(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name, cancellation_t *cancel = nullptr);
+[[nodiscard]] inline quic_connect_awaitable_t quic_endpoint_connect(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket,
+                                                                    cancellation_t *cancel = nullptr);
+
+// A snapshot of every connection this endpoint currently holds, which is what a
+// server needs in order to shut down: the transport can name its connections
+// and the callback API could not hand any of them to an application outside a
+// callback. The handles are copyable, so holding the vector is safe and the
+// connections in it become tombstones if they end before the caller gets to
+// them.
+[[nodiscard]] inline std::vector<quic_connection_t> quic_endpoint_connections(const quic_endpoint_t &endpoint);
+[[nodiscard]] inline std::size_t quic_endpoint_connection_count(const quic_endpoint_t &endpoint);
+[[nodiscard]] inline vio::quic::endpoint_stats_t quic_endpoint_stats(const quic_endpoint_t &endpoint);
+
+// Closes every live connection with this code and reason, stops accepting, and
+// resolves when each CONNECTION_CLOSE has been built into a datagram -- or when
+// close_timeout has passed for the ones that could not be.
+//
+// That completion needs no polling to observe. begin_close leaves a connection
+// `closing` with a frame pending; the poll_send that writes the frame flips it
+// to `closed`; and the same flush_entry pass latches draining and fires
+// on_connection_gone. So the hook this layer already installs is the signal,
+// and "every entry ended" is exactly "every close has been handed to the
+// socket".
+//
+// The close goes out in transport space by default, unlike
+// quic_connection_close. A connection that has not reached 1-RTT cannot carry
+// an application-space code -- the packet builder rewrites one to
+// INTERNAL_ERROR -- so a shutdown that reached a peer mid-handshake would tell
+// it something untrue. NO_ERROR survives that conversion untouched, and a
+// shutdown is not an application-protocol statement anyway.
+//
+// It is not the whole teardown and does not pretend to be: it does not close
+// the socket. Releasing the last quic_endpoint_t does that, and that must still
+// happen while the loop can turn. Awaiting this first is what makes the release
+// orderly rather than abrupt -- without it the peers learn the connection ended
+// from their own idle timers.
+[[nodiscard]] inline quic_milestone_t quic_endpoint_shutdown(quic_endpoint_t &endpoint, std::uint64_t error_code = 0, std::string_view reason = {}, bool application = false,
+                                                             std::chrono::milliseconds close_timeout = std::chrono::milliseconds(200));
+
+// The transport underneath, for anything this header does not wrap: key update,
+// path validation, qlog, the peer's raw transport parameters. Null once the
+// endpoint has been released.
+//
+// Its three dispatch hooks are spoken for. on_connection, on_activity and
+// on_connection_gone are how this layer learns anything, each is a single slot
+// assigned wholesale, and installing one silently replaces ours -- after which
+// accepts stop arriving, or an ending is never reported, on an endpoint that
+// otherwise looks healthy. Everything else on it is fair game. Do not hold what
+// this returns across a co_await; ask again.
+[[nodiscard]] inline vio::quic::endpoint_t *quic_endpoint_native(quic_endpoint_t &endpoint);
+
+// -----------------------------------------------------------------------------
+// Connection
+// -----------------------------------------------------------------------------
+
+// Resolves when the handshake completes, and is safe to await late, twice, or
+// not at all. After quic_endpoint_connect it has already happened; it is here
+// for a connection that arrived by some other route and for the symmetry step 7
+// needs, where a 0-RTT client learns the verdict is in.
+//
+// A connection that ends before its handshake completes reaches this milestone
+// too, with the reason it ended -- a supervisor waiting for readiness must not
+// wait for ever.
+[[nodiscard]] inline quic_milestone_t quic_connection_ready(quic_connection_t &connection);
+
+// Resolves when the connection ends, however it ends, and says why: a
+// CONNECTION_CLOSE from either side, an idle timeout, a handshake that ran out
+// of time, a stateless reset, a version negotiation that found nothing in
+// common. Success means a clean ending -- error code zero from either side
+// after the handshake completed. Anything else arrives as the matching
+// vio_quic_* code with the peer's reason string in the message.
+[[nodiscard]] inline quic_milestone_t quic_connection_closed(quic_connection_t &connection);
+
+// Queues a CONNECTION_CLOSE, which goes out on the next beat. Void rather than
+// awaitable because the first reason wins: a connection the peer has already
+// closed, or that has already timed out, queues nothing, and an awaitable that
+// resolved successfully having sent nothing would be a lie. Await
+// quic_connection_closed to know it ended.
+//
+// `application` defaults to true because a caller reaching for this from an
+// application is closing for a reason in its own error space. Note that
+// connection_t::close defaults the other way; this is the layer that has an
+// application above it.
+//
+// Calling this is also what lets a clean local close(0) be told apart from an
+// idle timeout, which the transport records with the same three fields. A close
+// issued through quic_connection_native() instead is reported as an idle
+// timeout, and that is the one gap.
+inline void quic_connection_close(quic_connection_t &connection, std::uint64_t error_code = 0, std::string_view reason = {}, bool application = true);
+
+// Engaged from the moment the connection ends and for the life of the handle,
+// including after the endpoint has collected the connection or been released,
+// because both are copied into this handle's own state at the ending rather
+// than read back out of a transport object that may be gone. selected_alpn()
+// returns a view into transport storage the reap frees, which is why the alpn
+// comes back by value -- the same reason ssl_client_alpn_selected does.
+[[nodiscard]] inline std::optional<vio::quic::connection_close_t> quic_connection_close_reason(const quic_connection_t &connection);
+[[nodiscard]] inline std::string quic_connection_alpn(const quic_connection_t &connection);
+[[nodiscard]] inline bool quic_connection_is_open(const quic_connection_t &connection);
+
+// Which end of the handshake this connection ran, latched when this layer first
+// saw it. A peer-to-peer application needs it, because on_connection fires for
+// dialled connections too and both kinds arrive through the same handle type.
+[[nodiscard]] inline vio::quic::tls_role_t quic_connection_role(const quic_connection_t &connection);
+
+[[nodiscard]] inline quic_connection_stats_t quic_connection_stats(const quic_connection_t &connection);
+
+// Null on a tombstone, and valid only for the stretch of code that asked: do not
+// hold it across a co_await, because the endpoint may collect between one
+// resumption and the next.
+[[nodiscard]] inline vio::quic::connection_t *quic_connection_native(quic_connection_t &connection);
+} // namespace vio
+
+
+// =============================================================================
+// src/vio/quic/connection.h  --  the one addition outside the new header
+// =============================================================================
+namespace vio::quic
+{
+// RFC 9000 section 20.1. Missing from the list here, and the code an endpoint
+// owes a client whose handshake completed into a full accept backlog: told no,
+// a client can go elsewhere; told nothing, it waits out its handshake timeout.
+inline constexpr std::uint64_t transport_error_connection_refused = 0x02;
+} // namespace vio::quic
+```
+
+## State structs and the beat
+
+```cpp
+// =============================================================================
+// The detail:: block of src/vio/operation/quic_endpoint.h, in file order.
+// =============================================================================
+namespace vio
+{
+namespace detail
+{
+struct quic_endpoint_state_t;
+struct quic_op_t;
+struct quic_milestone_state_t;
+
+// A waiter lives inside the awaitable, which lives inside the awaiting
+// coroutine's frame. Intrusive rather than a vector of coroutine handles for
+// two reasons that are correctness and not economy: a frame destroyed while
+// still suspended unlinks its own node here, where a vector entry would dangle
+// and be resumed into freed memory; and the drain below resumes one waiter at a
+// time re-reading the head, because the first coroutine resumed may destroy the
+// second's frame -- a supervisor tearing down a peer that is also waiting.
+struct quic_waiter_t
+{
+  std::coroutine_handle<> continuation;
+  quic_waiter_t *prev = nullptr;
+  quic_waiter_t *next = nullptr;
+  quic_milestone_state_t *slot = nullptr;
+
+  void link(quic_milestone_state_t &into, std::coroutine_handle<> handle);
+  void unlink();
+};
+
+// Its own small allocation rather than a member of whatever reached it, so that
+// the awaitable can hold it outright. A milestone owns no libuv handle, so a
+// suspended waiter keeping one alive keeps nothing open -- which is what lets
+// this be a strong reference where nothing pointing at the endpoint may be.
+struct quic_milestone_state_t
+{
+  bool reached = false;
+  std::expected<void, error_t> result;
+  quic_waiter_t *waiters = nullptr;
+};
+
+inline void quic_waiter_t::link(quic_milestone_state_t &into, std::coroutine_handle<> handle)
+{
+  continuation = handle;
+  slot = &into;
+  prev = nullptr;
+  next = into.waiters;
+  if (next != nullptr)
+  {
+    next->prev = this;
+  }
+  into.waiters = this;
+}
+
+inline void quic_waiter_t::unlink()
+{
+  if (slot == nullptr)
+  {
+    return;
+  }
+  if (prev != nullptr)
+  {
+    prev->next = next;
+  }
+  else
+  {
+    slot->waiters = next;
+  }
+  if (next != nullptr)
+  {
+    next->prev = prev;
+  }
+  slot = nullptr;
+  prev = nullptr;
+  next = nullptr;
+}
+
+// The first reason wins, and reaching one never resumes anything: every site
+// that reaches a milestone is inside a walk over the transport's connections.
+// The beat drains it.
+inline void quic_milestone_reach(quic_milestone_state_t &slot, std::expected<void, error_t> result)
+{
+  if (slot.reached)
+  {
+    return;
+  }
+  slot.reached = true;
+  slot.result = std::move(result);
+}
+
+inline void quic_milestone_drain(quic_milestone_state_t &slot)
+{
+  if (!slot.reached)
+  {
+    return;
+  }
+  while (slot.waiters != nullptr)
+  {
+    auto *waiter = slot.waiters;
+    const auto continuation = waiter->continuation;
+    waiter->unlink();
+    if (continuation)
+    {
+      continuation.resume();
+    }
+  }
+}
+
+// One accept or one dial. Two holds: the awaitable's, dropped by its destructor
+// after nulling the continuation, and the endpoint's, taken when the operation
+// is registered and dropped by whichever of the beat or the teardown resolves
+// it. Either party may let go first and neither can free it under the other.
+struct quic_op_t
+{
+  // Borrowed, and nulled the moment this resolves or the endpoint tears down --
+  // which is what makes the borrow safe without the strong reference that would
+  // deadlock the whole endpoint.
+  quic_endpoint_state_t *endpoint = nullptr;
+  // Set for a dial, so that a cancellation can close the connection it built
+  // rather than leaving it to spend its handshake timeout saying nothing.
+  vio::quic::connection_t *dialled = nullptr;
+  std::coroutine_handle<> continuation;
+  std::expected<quic_connection_t, error_t> result;
+  registration_t cancel_registration;
+  bool accepting = false;
+  bool done = false;
+  int holds = 1;
+
+  void release()
+  {
+    if (--holds == 0)
+    {
+      delete this;
+    }
+  }
+};
+
+struct quic_connection_state_t
+{
+  quic_connection_state_t(quic_endpoint_state_t *owner, vio::quic::connection_t *from, vio::quic::tls_role_t which)
+    : endpoint(owner)
+    , transport(from)
+    , role(which)
+  {
+  }
+  quic_connection_state_t(const quic_connection_state_t &) = delete;
+  quic_connection_state_t &operator=(const quic_connection_state_t &) = delete;
+
+  // Both borrowed, and nulled at two different moments. `transport` goes at the
+  // draining latch, because that is the last thing the endpoint tells us: the
+  // reap a draining period later erases the entry and frees the connection_t
+  // with no notification at all, so a pointer kept past the latch is a pointer
+  // nothing will ever say to drop -- and the next connection_t may well be
+  // allocated at the same address. `endpoint` goes when the endpoint tears
+  // down. Never strong in either direction: a connection that kept its endpoint
+  // alive would keep the UDP socket open, which is uv_loop_close failing with
+  // EBUSY and ~event_loop_t aborting on its assert.
+  quic_endpoint_state_t *endpoint = nullptr;
+  vio::quic::connection_t *transport = nullptr;
+
+  // Latched at registration, because on_connection fires for dialled
+  // connections too and the sort between the accept queue and the dial needs it
+  // before anything else about the connection is known.
+  vio::quic::tls_role_t role;
+
+  ref_ptr_t<quic_milestone_state_t> ready;
+  ref_ptr_t<quic_milestone_state_t> closed;
+
+  // Latched at the handshake and at the ending respectively, because both are
+  // read out of a connection_t the endpoint destroys on its own schedule --
+  // selected_alpn() returns a view into that storage, and close_reason() stops
+  // existing entirely.
+  std::string alpn;
+  std::optional<vio::quic::connection_close_t> close_reason;
+  quic_connection_stats_t stats;
+
+  // Borrowed; the dial that is waiting for this connection, nulled when it
+  // resolves.
+  quic_op_t *pending_dial = nullptr;
+
+  bool handshake_reached = false;
+  // Set by every path in this layer that closes: quic_connection_close, the
+  // shutdown, and a cancelled dial. It is the only thing that tells a clean
+  // local close(0) apart from an idle timeout, which the transport records with
+  // the same error code, the same application flag and the same from_peer.
+  bool closed_locally = false;
+  bool severed = false;
+  bool queued = false; // on the endpoint's pending list
+  bool dirty = false;  // on the endpoint's flush list
+  // step 5 adds the stream registry here and nothing else moves.
+};
+} // namespace detail
+
+struct quic_connection_t;  // declared complete just below, before quic_op_t is used
+
+namespace detail
+{
+struct quic_endpoint_state_t
+{
+  quic_endpoint_state_t(event_loop_t &owner, vio::quic::endpoint_t &&from, quic_config_t configuration)
+    : loop(owner)
+    , transport(std::move(from))
+    , config(std::move(configuration))
+  {
+  }
+  quic_endpoint_state_t(const quic_endpoint_state_t &) = delete;
+  quic_endpoint_state_t &operator=(const quic_endpoint_state_t &) = delete;
+
+  event_loop_t &loop;
+  // Declared before driver_stop and driver, so it is destroyed after both: the
+  // driver's frame holds an endpoint_impl_t reference and owns the datagram
+  // reader, whose uv_poll_t is armed on this socket's descriptor. Teardown does
+  // this in order anyway; the declaration order is the second line of defence.
+  std::optional<vio::quic::endpoint_t> transport;
+  cancellation_t driver_stop;
+  std::optional<task_t<void>> driver;
+  quic_config_t config;
+
+  // The seam socket_stream.h's read_cb uses (:203, :899, :928), filled from
+  // handle.ref_counted() at create.
+  reference_counted_t *rc = nullptr;
+  uv_prepare_t beat = {};
+
+  bool driver_started = false;
+  // Set as the very first act of teardown, before anything is resumed. Every
+  // entry point tests this rather than transport.has_value(), because the
+  // transport is alive for most of the teardown -- a coroutine resumed to be
+  // told the endpoint is going away could otherwise dial and park on an
+  // operation nothing will ever resolve.
+  bool closing = false;
+
+  // The identity the hooks hand out is a connection_t &, so this is what turns
+  // one back into something with awaiters on it. Erased at the draining latch,
+  // which always precedes the reap because reap requires entry.draining and
+  // flush_entry sets that immediately before firing the hook.
+  std::unordered_map<const vio::quic::connection_t *, ref_ptr_t<quic_connection_state_t>> by_connection;
+  std::deque<ref_ptr_t<quic_connection_state_t>> accept_queue;
+
+  // Every operation that has not resolved, in the order it was made -- which is
+  // also the FIFO an arriving connection is handed down. One list rather than a
+  // separate accept queue and dial list, because two lists to keep in step is a
+  // way to leave an operation in one of them.
+  std::vector<quic_op_t *> live_ops;
+  // Resolved, waiting for the beat to resume them.
+  std::vector<quic_op_t *> ready_ops;
+
+  // What the beat walks. `pending` drives resumption and `dirty` drives the
+  // flush; they are different sets, and conflating them would flush every
+  // connection that merely received a packet, which run() has already done.
+  std::vector<ref_ptr_t<quic_connection_state_t>> pending;
+  std::vector<ref_ptr_t<quic_connection_state_t>> dirty;
+  // For a connection this layer refused before it ever had a state: it is not
+  // in the registry, so there is nothing to mark, and its CONNECTION_CLOSE
+  // needs the all-connections flush to leave.
+  bool flush_all = false;
+
+  ref_ptr_t<quic_milestone_state_t> shutdown;
+  bool shutdown_active = false;
+  std::size_t shutdown_outstanding = 0;
+  tick_t shutdown_deadline;
+};
+
+// -----------------------------------------------------------------------------
+// The beat
+// -----------------------------------------------------------------------------
+//
+// WHY A uv_prepare_t AND NOT A uv_check_t. libuv's iteration, identical in
+// shape on both backends (3rdparty/libuv-v1.52.0/src/unix/core.c uv_run and
+// src/win/core.c uv_run), is:
+//
+//   pending -> idle -> PREPARE -> [backend timeout] -> poll (blocks)
+//     -> pending x8 -> CHECK -> closing handles -> update time -> TIMERS
+//
+// Read that with the wake sources on it. An I/O callback runs inside poll on
+// unix and from the pending drain immediately after it on Windows, so a
+// coroutine made runnable by a datagram is served by CHECK in the same
+// iteration and by PREPARE at the top of the next -- and the loop does not
+// block anywhere between those two points, so on that path the two are worth
+// the same and neither costs a round trip. That is the honest answer to "does
+// the beat cost a round trip": it does not, and it would not with check either.
+//
+// Timers are what decide it, and they run at the END of the iteration, after
+// check. The endpoint's own 2 ms ticker fires there, and it is that tick which
+// flushes every connection, which is what latches an idle timeout and fires
+// on_connection_gone -- so a connection ending with no traffic on it becomes
+// runnable in the timer phase and nowhere else. PREPARE is the next callback
+// phase after it with nothing blocking in between. CHECK is reached only after
+// the next iteration's poll has blocked for uv__backend_timeout, bounded by the
+// ticker today and unbounded the day the ticker becomes deadline-driven.
+// Prepare is the only hook downstream of every wake source -- pending, idle,
+// poll and timers -- and upstream of the block. It is also why deferring every
+// resumption in this layer to the beat, cancellations included, costs no wall
+// clock: whatever phase latched the work, prepare is reached before the loop
+// next sleeps.
+//
+// A uv_idle_t is disqualified outright: uv__backend_timeout returns 0 while any
+// idle handle is active, so an always-started one turns the loop into a spin.
+// Neither prepare nor check appears in that function, so an always-started
+// prepare cannot do the same -- which is what makes arming it permanently and
+// paying one predicate per turn cheaper to reason about than arming it
+// conditionally. Step 3's evidence is that making a periodic mechanism in this
+// endpoint conditional produced both a spin and a stall.
+//
+// Four passes drain every realistic case within one beat; anything left waits
+// for the next one, which the 2 ms ticker guarantees. The bound is what stops a
+// pathological application from starving I/O inside one prepare callback.
+constexpr int quic_beat_max_passes = 4;
+
+[[nodiscard]] inline bool quic_beat_has_queued_work(const quic_endpoint_state_t &self)
+{
+  return !self.ready_ops.empty() || !self.pending.empty() || !self.dirty.empty() || self.flush_all;
+}
+
+inline void quic_beat_resume(quic_endpoint_state_t &self)
+{
+  // Every list is taken out of the state before anything is resumed, so a
+  // resumed coroutine may dial, close a connection or drop the last handle to
+  // one without invalidating the walk. The connection entries are ref_ptr and
+  // not raw pointers, so an entry the draining latch has already erased from
+  // the registry is still alive when the beat reaches it.
+  auto ops = std::exchange(self.ready_ops, {});
+  for (auto *op : ops)
+  {
+    // The continuation is taken before the hold is dropped, because dropping it
+    // may be what deletes the operation -- an awaitable abandoned before its
+    // dial resolved leaves exactly one hold, and a null continuation.
+    const auto continuation = std::exchange(op->continuation, {});
+    op->endpoint = nullptr;
+    op->release();
+    if (continuation)
+    {
+      continuation.resume();
+    }
+  }
+
+  auto pending = std::exchange(self.pending, {});
+  for (auto &state : pending)
+  {
+    state->queued = false;
+    quic_milestone_drain(*state->ready);
+    quic_milestone_drain(*state->closed);
+  }
+}
+
+inline void quic_beat_flush(quic_endpoint_state_t &self)
+{
+  if (!self.transport.has_value())
+  {
+    return;
+  }
+  if (std::exchange(self.flush_all, false))
+  {
+    (void)self.transport->flush();
+  }
+  auto dirty = std::exchange(self.dirty, {});
+  for (auto &state : dirty)
+  {
+    state->dirty = false;
+    if (state->transport == nullptr)
+    {
+      continue; // a tombstone has nothing left to send
+    }
+    // The per-connection form: the all-connections flush is O(connections) and
+    // builds a vector of connection IDs for each step of it.
+    (void)self.transport->flush(*state->transport);
+  }
+}
+
+inline void quic_shutdown_check(quic_endpoint_state_t &self);
+
+inline void quic_beat_cb(uv_prepare_t *handle)
+{
+  // data is a borrowed pointer, and there is no null check on purpose: libuv
+  // fires no callback for a handle after uv_close, which is the guarantee
+  // timer_impl.h relies on for the same field -- and after uv_close the ref
+  // count has overwritten data with itself, so a null test would not even be
+  // the right test.
+  auto *self = static_cast<quic_endpoint_state_t *>(handle->data);
+  if (!quic_beat_has_queued_work(*self) && !self->shutdown_active)
+  {
+    return;
+  }
+  // Held for the whole body, the discipline socket_stream.h's read_cb uses.
+  // Note what it does and does not buy here: because the beat is registered
+  // with the ref count, a release reaching zero inside this function would take
+  // the uv_close branch and free nothing until the close callback, so this is
+  // not a use-after-free guard. What it buys is that the destroy sequence --
+  // which resolves awaiters, deletes operations, stops the driver and destroys
+  // endpoint_impl_t -- runs after this walk rather than in the middle of it.
+  reference_counted_t *rc = self->rc;
+  rc->inc();
+  int pass = 0;
+  do
+  {
+    quic_beat_resume(*self);
+    quic_beat_flush(*self);
+  } while (++pass < quic_beat_max_passes && quic_beat_has_queued_work(*self));
+  // Once per beat, not once per pass: shutdown_active describes a state rather
+  // than remaining work, so putting it in the pass predicate would burn all
+  // four passes on every turn while a shutdown is outstanding.
+  quic_shutdown_check(*self);
+  rc->dec(); // final -- may destroy the state; nothing after this line
+}
+
+// -----------------------------------------------------------------------------
+// Recording, from inside the transport's walk. None of this resumes anything.
+// -----------------------------------------------------------------------------
+
+inline void quic_mark_pending(quic_endpoint_state_t &self, const ref_ptr_t<quic_connection_state_t> &state)
+{
+  if (state->queued)
+  {
+    return;
+  }
+  state->queued = true;
+  self.pending.push_back(state);
+}
+
+inline void quic_mark_dirty(quic_endpoint_state_t &self, const ref_ptr_t<quic_connection_state_t> &state)
+{
+  if (state->dirty)
+  {
+    return;
+  }
+  state->dirty = true;
+  self.dirty.push_back(state);
+}
+
+inline quic_connection_stats_t quic_read_stats(const vio::quic::connection_t &connection)
+{
+  const auto path = connection.path_stats();
+  quic_connection_stats_t out;
+  out.smoothed_rtt = path.smoothed_rtt;
+  out.rtt_variation = path.rtt_variation;
+  out.min_rtt = path.min_rtt;
+  out.congestion_window = path.congestion_window;
+  out.slow_start_threshold = path.slow_start_threshold;
+  out.bytes_in_flight = path.bytes_in_flight;
+  out.datagram_size = connection.datagram_size();
+  out.delivery_rate = connection.delivery_rate();
+  out.peak_delivery_rate = connection.peak_delivery_rate();
+  out.migrations = connection.migration_count();
+  // congestion_control_t::in_slow_start() is exactly this comparison, and both
+  // of its terms are already on path_stats, so nothing has to be forwarded.
+  out.in_slow_start = path.congestion_window < path.slow_start_threshold;
+  return out;
+}
+
+// Which of the five endings this was, and the difference between them.
+//
+// The order is load-bearing. A stateless reset and a failed version negotiation
+// both record a close_reason whose error code is zero and whose from_peer is
+// true, so reading the code first would report either as a clean ending; and
+// the handshake deadline and the idle timeout record the same zero code with
+// from_peer false, so each ending that has its own predicate has to be
+// recognised by it before anything is read off the code at all.
+[[nodiscard]] inline std::expected<void, error_t> quic_classify_ending(const vio::quic::connection_t &connection, bool handshake_reached, bool closed_locally)
+{
+  if (connection.reset_by_peer())
+  {
+    return std::unexpected(error_t{.code = vio_quic_stateless_reset, .msg = "the peer no longer remembers this connection"});
+  }
+  if (connection.version_negotiation_failed())
+  {
+    return std::unexpected(error_t{.code = vio_quic_version_unsupported, .msg = "the peer offered no QUIC version this build speaks"});
+  }
+  const auto reason = connection.close_reason();
+  if (!handshake_reached)
+  {
+    // A certificate that did not verify, no ALPN in common, a TLS alert, or the
+    // handshake deadline. begin_close already recorded the alert's code and
+    // text, so the detail survives in close_reason().
+    return std::unexpected(error_t{.code = vio_quic_handshake_failed, .msg = reason.has_value() ? reason->reason : std::string("the handshake did not complete")});
+  }
+  if (!reason.has_value())
+  {
+    return std::unexpected(error_t{.code = vio_quic_connection_closed, .msg = "the connection ended"});
+  }
+  if (reason->error_code != 0)
+  {
+    return std::unexpected(error_t{.code = vio_quic_connection_closed, .msg = reason->reason});
+  }
+  // A zero code that nobody claimed. This layer records when it asked, because
+  // a local close(0) and an idle timeout are otherwise the same three fields.
+  if (!reason->from_peer && !closed_locally)
+  {
+    return std::unexpected(error_t{.code = vio_quic_idle_timeout, .msg = reason->reason});
+  }
+  return {};
+}
+
+// Everything read off a connection_t that has to survive it. Called from the
+// draining latch and from teardown, and from nowhere else, because those are
+// the only two moments this layer is told anything.
+inline void quic_sever(quic_endpoint_state_t &self, const ref_ptr_t<quic_connection_state_t> &state, std::expected<void, error_t> fallback)
+{
+  if (state->severed)
+  {
+    return;
+  }
+  state->severed = true;
+  auto ending = std::move(fallback);
+  if (state->transport != nullptr)
+  {
+    auto &connection = *state->transport;
+    state->close_reason = connection.close_reason();
+    if (state->alpn.empty())
+    {
+      state->alpn.assign(connection.selected_alpn());
+    }
+    state->stats = quic_read_stats(connection);
+    ending = quic_classify_ending(connection, state->handshake_reached, state->closed_locally);
+  }
+  quic_milestone_reach(*state->closed, ending);
+  // A connection that ended before its handshake completed never becomes ready;
+  // a supervisor awaiting readiness must not wait for ever.
+  quic_milestone_reach(*state->ready, ending);
+  if (auto *op = std::exchange(state->pending_dial, nullptr); op != nullptr)
+  {
+    quic_op_finish(self, op, std::unexpected(ending.has_value() ? error_t{.code = vio_quic_connection_closed, .msg = "the connection ended"} : ending.error()));
+  }
+  state->transport = nullptr;
+  quic_mark_pending(self, state);
+}
+} // namespace detail
+} // namespace vio
+```
+
+## What the user writes
+
+```cpp
+// =============================================================================
+// A client at step 4: dial, look at what was negotiated, close politely, and
+// let the loop return. No streams -- that is step 5.
+// =============================================================================
+#include "quic_common.h" // make_self_signed, and the Windows include order
+
+#include <vio/operation/quic_endpoint.h>
+#include <vio/run.h>
+
+#include <optional>
+#include <print>
+
+namespace
+{
+vio::task_t<void> client(vio::event_loop_t &loop, const sockaddr *server, vio::quic::tls_context_t &context)
+{
+  // Nothing is configured. connection_config_t::transport_parameters is already
+  // default_transport_parameters(), so this connection has 8 MiB of credit
+  // across it and 2 MiB per stream without anyone saying so.
+  auto endpoint = vio::quic_endpoint_create(loop, context);
+  if (!endpoint)
+  {
+    std::println("could not create the endpoint: {}", endpoint.error().msg);
+    loop.stop();
+    co_return;
+  }
+
+  // The socket is opened here, with the family of the address being dialled,
+  // and the read loop is armed before this call returns.
+  auto connection = co_await vio::quic_endpoint_connect(*endpoint, server, "localhost");
+  if (!connection)
+  {
+    // vio_quic_handshake_failed for a certificate that did not verify or an
+    // ALPN with nothing in common; vio_quic_version_unsupported if the peer
+    // speaks no version this build does.
+    std::println("dial failed ({:#x}): {}", connection.error().code, connection.error().msg);
+    loop.stop();
+    co_return;
+  }
+  std::println("connected, alpn {}, rtt {}ms", vio::quic_connection_alpn(*connection), vio::quic_connection_stats(*connection).smoothed_rtt.count() / 1000000);
+
+  vio::quic_connection_close(*connection, 0, "done");
+  const auto ending = co_await vio::quic_connection_closed(*connection);
+  std::println("closed: {}", ending ? "cleanly" : ending.error().msg);
+
+  // No cancel, no sleeps, no reset dance. The endpoint's last reference goes
+  // out of scope here, which cancels the read loop, destroys its frame, closes
+  // the socket and closes the beat -- all while the loop can still turn, which
+  // is the one rule.
+}
+} // namespace
+
+int main()
+{
+  vio::event_loop_t loop;
+  auto context = make_client_context();
+  sockaddr_in server = {};
+  uv_ip4_addr("127.0.0.1", 4433, &server);
+
+  std::optional<vio::task_t<void>> task;
+  loop.run_in_loop([&] { task.emplace(client(loop, reinterpret_cast<const sockaddr *>(&server), *context)); });
+  loop.run();
+  return 0;
+}
+
+
+// =============================================================================
+// A server at step 4: accept in a loop, report each connection's ending, and
+// shut down politely on a signal.
+// =============================================================================
+namespace
+{
+// State as parameters, never captures: task_t is eager, so a [&] lambda
+// coroutine reads a destroyed closure at its first suspension.
+vio::task_t<void> watch(vio::quic_connection_t connection)
+{
+  std::println("accepted {}, alpn {}", vio::quic_connection_role(connection) == vio::quic::tls_role_t::server ? "an inbound connection" : "our own dial", vio::quic_connection_alpn(connection));
+  const auto ending = co_await vio::quic_connection_closed(connection);
+  if (ending)
+  {
+    std::println("ended cleanly");
+    co_return;
+  }
+  // The five endings, told apart. The handle still answers after the endpoint
+  // has collected the connection, because both of these were copied into it at
+  // the ending rather than read back out of the transport.
+  const auto reason = vio::quic_connection_close_reason(connection);
+  std::println("ended {:#x}: {} (from the peer: {})", ending.error().code, ending.error().msg, reason && reason->from_peer);
+}
+
+vio::task_t<void> server(vio::event_loop_t &loop, vio::quic::tls_context_t &context, vio::cancellation_t &stop)
+{
+  auto endpoint = vio::quic_endpoint_create(loop, context);
+  if (!endpoint)
+  {
+    loop.stop();
+    co_return;
+  }
+  sockaddr_in6 any = {};
+  uv_ip6_addr("::", 4433, &any);
+  // Bound before the driver starts, so the socket is v6 and a v4-mapped or v6
+  // peer can both reach it. An endpoint that started reading first would have
+  // been pinned to AF_INET before anyone said where it was listening.
+  if (auto bound = vio::quic_endpoint_bind(*endpoint, reinterpret_cast<const sockaddr *>(&any)); !bound)
+  {
+    std::println("bind failed: {}", bound.error().msg);
+    loop.stop();
+    co_return;
+  }
+  std::println("listening on {}", *vio::quic_endpoint_local_port(*endpoint));
+
+  std::vector<vio::task_t<void>> watchers;
+  for (;;)
+  {
+    auto connection = co_await vio::quic_endpoint_accept(*endpoint, &stop);
+    if (!connection)
+    {
+      break; // cancelled, or the endpoint is shutting down
+    }
+    // done() is what lets a long-lived accept loop prune its children.
+    std::erase_if(watchers, [](const vio::task_t<void> &child) { return child.done(); });
+    watchers.push_back(watch(std::move(*connection)));
+  }
+
+  // Every peer is told, rather than being left to work it out from its own idle
+  // timer. This resolves when each CONNECTION_CLOSE has been handed to the
+  // socket, or after 200 ms for any that could not be built.
+  (void)co_await vio::quic_endpoint_shutdown(*endpoint, 0, "going away");
+  watchers.clear();
+  loop.stop();
+}
+} // namespace
+```
+
+## Tests
+
+A new `test/test_quic_coroutine.cpp`, added to `test/CMakeLists.txt` beside `test_quic_endpoint.cpp`. Every case uses the repo's coroutine test pattern — `run_in_loop` storing a `task_t` in a `std::optional`, inner coroutines taking state as parameters — and every one of them runs under a watchdog coroutine that sets a `timed_out` flag and stops the loop after five seconds, so a failure is a failed CHECK and not a hung process. That matters here more than usual: three of the mechanisms below fail by never resuming a coroutine, and a test whose failure mode is a hang is not a failing test.
+
+**1. A client and a server complete a handshake with no polling anywhere.** One loop, a server bound to `127.0.0.1:0` with a coroutine in `co_await quic_endpoint_accept`, a client in `co_await quic_endpoint_connect`. CHECK both resolve with a value; CHECK `quic_connection_alpn` is non-empty on both sides; CHECK `quic_connection_role` is `server` on the accepted one and `client` on the dialled one; CHECK `!timed_out`. Then both endpoints are released and `event_loop.run()` returns.
+*Reverted:* delete the `uv_prepare_start` line. Both operations are latched (`op->done == true`, the milestone `reached`) and no continuation is ever resumed, so neither coroutine runs past its `co_await`, `handshaken` stays false, and the watchdog fires. The observable is `CHECK(!timed_out)` failing. This is the build order's first named test and it is the one that proves the beat exists.
+
+**2. Two coroutines await one connection's ending and both are resumed.** After a handshake, two child coroutines each `co_await quic_connection_closed(connection)` on the same handle, each setting its own bool. The peer closes. CHECK `first_woke && second_woke`, and CHECK both saw the same `error_t::code`.
+*Reverted:* replace the intrusive waiter list with a single `std::coroutine_handle<> continuation` — the shape every other future in vio uses. The second `await_suspend` overwrites the first, exactly one bool is set, and the first coroutine's frame is still suspended when the loop is asked to stop. The design doc says this one should be written before anything depends on it, and it is the only test that would catch a milestone that reaches but never drains.
+
+**3. An awaitable abandoned while suspended is not resumed into freed memory.** Run under ASan. A `task_t` awaits `quic_connection_closed` on a connection that has not ended; a second coroutine destroys that `task_t` while it is suspended; then the peer closes. CHECK the loop runs to completion and CHECK a second, still-live waiter on the same milestone was resumed.
+*Reverted:* replace the intrusive node's self-unlinking destructor with a no-op (or hold the waiters in a vector of handles). The drain resumes a `coroutine_handle` into a destroyed frame; ASan reports a heap-use-after-free inside `quic_milestone_drain`. Repeat the same shape for an abandoned accept and an abandoned dial, which exercise `quic_connection_awaitable_t::reset()` instead — revert the `_op->continuation = {}` line in it and the beat resumes a freed frame.
+
+**4. An endpoint released while a dial is outstanding resolves the dial and the loop closes cleanly.** A client dials a UDP port that is bound but never answers; a second coroutine sleeps 20 ms and then releases the last `quic_endpoint_t`. CHECK the dial resolved with `error().code == vio_quic_endpoint_closed`; CHECK a flag set after `event_loop.run()` returns is true; CHECK `!timed_out`. Under ASan there is no leak report for the `quic_op_t`.
+*Reverted, two ways, and the two failures are different, which is the point.* (a) Remove step 3 of teardown: the dialling coroutine is never resumed, its frame leaks (ASan reports the op too) and the watchdog fires. (b) Change `quic_connection_awaitable_t` to hold `ref_ptr_t<detail::quic_endpoint_state_t>` as the design doc has it: the release is not the last one, `dec()` never reaches zero, `on_destroy` never runs, the socket's `uv_close` is never issued, and `event_loop.run()` keeps going past the watchdog — and when the watchdog stops it anyway, `~event_loop_t` prints "udp handle still open" and aborts on its assert. This is the build order's third named test and the falsification of the design doc's own header sketch.
+
+**5. A plain teardown leaves no handle open.** Bind, accept, handshake, both sides close, `co_await quic_endpoint_shutdown` on the server, both endpoints released, `loop.stop()`, `run()` returns. CHECK `uv_loop_close(loop.loop()) == 0` after `run()` (or, since `~event_loop_t` owns that, CHECK the process reaches the end of the test with no assert). This is the two-close-callbacks-deep chain the design reasons about — beat close → `destroyer()` → `~endpoint_t` → `~udp_t` → udp close — and the failure CLAUDE.md says must not be reintroduced.
+*Reverted:* swap teardown steps 4 and 6, so `transport.reset()` runs before `driver_stop.cancel()`. `endpoint_impl_t` and its `udp_t` are destroyed while `run()` is still suspended on a `uv_poll_t` armed on that descriptor; the cancel then resumes a coroutine holding a destroyed `endpoint_impl_t &`. Under ASan that is a heap-use-after-free in `run()`; without it, the poll's close callback fires on a socket that has already been closed.
+
+**6. A dial to a certificate that does not verify reports `vio_quic_handshake_failed`.** A client whose CA did not sign the server's certificate dials it. CHECK `error().code == vio_quic_handshake_failed` and CHECK `error().msg` is non-empty (the alert's text from `close_reason()->reason`).
+*Reverted:* remove the `!handshake_reached` arm from `quic_classify_ending`. A TLS alert is a non-zero error code, so the ending is read off the code and reported as `vio_quic_connection_closed`; the observable is the exact `int`. It also proves the dial is matched by the gone hook, since `on_connection` never fires for a handshake that failed — delete `quic_sever`'s `pending_dial` resolution and the awaitable never resolves at all and the watchdog fires.
+
+**7. An idle timeout is told apart from a clean close.** Two connections on one loop with `max_idle_timeout` set to one second: one closed with `quic_connection_close(c, 0, "", false)` — **transport space, so it records byte for byte what the idle path records** — and one left to expire. CHECK the first resolves `quic_connection_closed` with a value and the second with `error().code == vio_quic_idle_timeout`.
+*Reverted:* drop the `closed_locally` latch from `quic_connection_close`. The clean close is reported as an idle timeout; the first CHECK's `expected<void>` becomes an unexpected carrying `0x9c1c06`. The `application = false` in the test is load-bearing — with the default `true` an implementation that discriminated on `reason->application` would also pass, and would be wrong.
+
+**8. An accept with a connection already queued does not suspend.** Two clients connect before the server's accept loop starts. CHECK `quic_endpoint_accept(endpoint).await_ready()` is true on a factory result while the queue is non-empty, then `co_await` it and CHECK the connection came back and that the second accept in the same resumption also returns without a loop turn.
+*Reverted:* remove the `quic_accept_pump` call from the factory and leave every accept to the beat. `await_ready()` reads false. The behavioural cost is one loop turn per accepted connection, which is invisible in a pass/fail sense, so the mechanism is asserted directly — this is the step-4 form of the design's "step 3 must not need step 2 to have run".
+
+**9. An endpoint bound to `::` reaches an IPv6 peer.** Server: `quic_endpoint_bind` to `[::1]:0`, then accept. Client: `quic_endpoint_connect` to `::1` at that port. CHECK the handshake completes on both sides. Skipped where the host has no IPv6 loopback, as the existing case does.
+*Reverted:* move `quic_start_driver` from bind and connect into `quic_endpoint_create`. `endpoint_t::run()`'s `ensure_socket(impl)` pins the socket to `AF_INET` before the bind is seen, the dial to `::1` never arrives and the accept never resolves. This is the same defect that is still `doctest::should_fail` at test_quic_endpoint.cpp:1790 for the raw transport, and this test is what stops someone from moving the call back for tidiness.
+
+**10. A coroutine resumed by the beat may drop the last endpoint handle, and teardown does not run under the beat.** A coroutine suspended on `quic_connection_closed` is resumed by the beat and, in its resumption, releases the last `quic_endpoint_t` and then immediately reads `quic_connection_native(connection)` off the handle it still holds. CHECK it is **not** null at that instant, CHECK `quic_connection_close_reason` and `quic_connection_alpn` still answer, and CHECK the loop closes cleanly afterwards.
+*Reverted:* remove the `rc->inc()` / `rc->dec()` bracket around the beat's body. The release reaches zero inside the beat, the destroy sequence runs immediately, `quic_sever` nulls the state's `transport`, and `quic_connection_native` reads null at that instant — the CHECK flips. This is the honest observable for the bracket: because the beat is registered with `register_handle`, a zero inside it takes the `uv_close` branch and frees nothing, so there is no crash to catch; what the bracket buys is that teardown runs after the walk rather than in the middle of it, and that is what the test asserts. The second half — reverting the latching of `alpn` and `close_reason` at the ending — makes the tombstone reads report an empty string and `nullopt`.
+
+**11. A coroutine resumed by the beat may dial a second peer.** Under ASan. The accept-resumed coroutine immediately dials a third endpoint; both connections complete and both appear in `quic_endpoint_connections`.
+*Reverted:* replace `auto ops = std::exchange(self.ready_ops, {})` with a range-for over `self.ready_ops` (and the same for `pending`). The dial's `push_back` reallocates the vector the beat is iterating and the walk reads freed storage; ASan reports a heap-use-after-free in `quic_beat_resume`. Note what this does *not* test, and what the design must stop claiming: the transport's own `connections` vector holds `unique_ptr`, so a `push_back` there moves nothing and `touched` is safe — the hazard is in the beat's own containers, not the transport's.
+
+**12. A full accept backlog refuses with CONNECTION_REFUSED rather than dropping the client.** Server with `accept_backlog = 1` and no accept loop. Two clients dial. CHECK the second client's `quic_connection_closed` resolves within a bounded wait with `close_reason()->error_code == 0x02` and `from_peer == true`.
+*Reverted:* remove the backlog test from `quic_hook_connection`. The second connection queues instead, nothing tells the client anything, and its milestone does not resolve inside the bound — it waits out the negotiated idle timeout.
+
+**13. Shutdown reaches the peer well inside its idle timeout.** Server and client with a 30 s idle timeout. The server awaits `quic_endpoint_shutdown(0, "going away")`. CHECK the client's `quic_connection_closed` resolves within 500 ms with `close_reason()->from_peer == true` and `reason == "going away"`, and CHECK the server's own milestone resolved.
+*Reverted:* remove the per-connection close from `quic_endpoint_shutdown` and leave only the milestone. Nothing queues a CONNECTION_CLOSE, the client learns of the ending from its own idle timer, and the 500 ms bound fails.
+
+**14. Alpn and close reason survive the reap.** Hold a `quic_connection_t` after the peer closes and past `draining_period` (3 s) plus a margin, so the endpoint has reaped the transport connection. CHECK `quic_connection_alpn()` still returns the negotiated protocol, `quic_connection_close_reason()` is still engaged, `quic_connection_stats().smoothed_rtt` is non-zero, `quic_connection_native()` is null, and `quic_connection_is_open()` is false.
+*Reverted:* forward to the live `connection_t` instead of latching. After the reap the pointer names freed storage: ASan reports a use-after-free on the alpn read, and unsanitised it is an empty string and a `nullopt`. Reverting only the stats latch makes `smoothed_rtt` read zero, which is the deliberate departure from the doc's "zeroed on a tombstone".
+
+**WHAT HAS NO FALSIFYING TEST AT STEP 4, said plainly rather than faked.** The beat's *flush* pass. The transport's 2 ms ticker flushes every connection unconditionally (quic_endpoint.cpp:978-998), so anything a beat-resumed coroutine writes leaves within 2 ms whether or not the beat flushes it — every candidate test passes with the flush pass deleted, differing only in latency that no in-process assertion can see reliably. It is built now because the beat's shape is fixed here and adding it later means rewriting the beat, and its regression test is step 6's: a write fed in pieces from the beat, where a missing flush is a stall and not a delay.
+
+## Build order and open questions
+
+```
+BUILD ORDER:
+1. 1. `transport_error_connection_refused = 0x02` into `vio/quic/connection.h`'s section-20.1 block, alone. It compiles and changes nothing; the accept-backlog refusal needs it and using a literal instead would defeat the point of the block.
+2. 2. The file skeleton: `src/vio/operation/quic_endpoint.h` with the error codes, `quic_config_t`, `quic_connection_stats_t`, `quic_read_stats`, `quic_classify_ending`, and the three `detail::` state structs with no functions on them. Nothing includes it yet. Compile it into `test_quic_coroutine.cpp` as a bare `#include` plus a `TEST_CASE` that default-constructs both handles and checks they are null, which is what proves the declaration order works — `ref_ptr_t<T>` needs `T` complete and `std::expected<quic_connection_t, error_t>` needs `quic_connection_t` complete, so the file's physical order is not free.
+3. 3. The milestone: `quic_waiter_t`, `quic_milestone_state_t`, `link`/`unlink`/`reach`/`drain`, and `quic_milestone_t`. Test it with no endpoint under it at all — reach a slot, drain it, drain it twice, attach two waiters and drain, attach a waiter and destroy its awaitable first. That is test 2 and test 3's milestone half, and the design doc is right that it should exist before anything depends on it.
+4. 4. The operation: `quic_op_t`, `quic_op_finish`, `quic_op_register`, and `quic_connection_awaitable_t` with its two-hold protocol. Also testable with no endpoint: resolve before the awaitable is awaited, abandon before resolving, abandon after resolving, resolve twice.
+5. 5. `quic_endpoint_create` (both overloads), the beat's registration and `uv_unref`, the three recording hooks installed but doing nothing except the registry insert, and `teardown`. Test: create an endpoint, never bind it, `loop.stop()`, and `run()` returns — which is the case the `uv_unref` exists for and the only one where a ref'd beat would be the sole active handle. Then create and release one, and check no handle is left open.
+6. 6. `quic_endpoint_bind`, `quic_endpoint_local_port`, `quic_start_driver`. Test 9 (the IPv6 bind) and a bind failure that reports rather than half-starting the driver.
+7. 7. `quic_endpoint_connect` with the registry insert, `quic_hook_connection`'s dial branch, `quic_hook_gone`, `quic_sever`, and the beat's resume pass. Test 6 (the failed dial) and test 4 (released mid-dial) land here, and this is the first point at which any of it works end to end.
+8. 8. `quic_endpoint_accept`, the accept queue, `quic_accept_pump`, the inbound and refuse branches of `quic_hook_connection`, and the role sort. Tests 1, 8, 11 and 12. Test 1 is the build order's headline and only becomes possible now.
+9. 9. `quic_connection_close`, `quic_connection_closed`/`ready`, `close_reason`, `alpn`, `role`, `is_open`, `stats`, `native`, `quic_endpoint_connections`/`connection_count`/`stats`, and the beat's flush pass. Tests 2, 7, 10 and 14.
+10. 10. `quic_endpoint_shutdown` and `quic_shutdown_check`. Tests 5 and 13.
+11. 11. Cancellation on both operations, and the cancelled dial's close. Its own three cases: pre-cancelled never touches the transport; cancelled while suspended resolves with `vio_cancelled` and the peer sees a CONNECTION_CLOSE; a cancelled accept leaves the queue intact for the next accept.
+12. 12. Run the whole file under `cmake --preset asan` and under `msvc-asan`, because tests 3, 4, 5, 11 and 14 are memory-safety assertions and pass vacuously without a sanitiser. Then run the existing `test_quic_endpoint.cpp` unchanged — nothing in this step touches the transport except one constant, so a regression there means the constant was not the only change.
+
+OPEN QUESTIONS:
+- Whether `quic_endpoint_shutdown` should also stop the driver. It does not: resolving the milestone leaves the endpoint reading a socket with no connections on it, which is right for one that will dial again and pointless for one about to be dropped. Keeping it tied to the release means the beat, the reader's poll and the socket stay armed between the shutdown resolving and the handle going out of scope. Settle it when there is a program that shuts down and then keeps going.
+- The port-only bind, `quic_endpoint_bind(endpoint, std::uint16_t)`, is left out. It needs `endpoint_t::bind(std::uint16_t)` forwarding to `udp_bind_dual_stack` (udp.h:632), because the `udp_t` is private to `endpoint_impl_t` — six lines of transport addition that step 4's stated scope does not cover. Without it a caller who just wants a port has to pick a family, and picking IPv4 is how an endpoint ends up unable to reach an IPv6 peer. Worth doing in step 5 rather than never.
+- `quic_connection_resumption_ticket` and `quic_connection_new_token` are not here. Both are `std::vector<std::uint8_t>` copies that would have to be latched at the ending to survive the reap, and nothing in step 4 or 5 spends one — step 7 is where 0-RTT lands and where the latching cost is justified.
+- `quic_connection_stats_t::open_streams` is absent rather than present-and-zero. `connection_t` has no stream-count accessor; step 5 adds the field along with the registry that can answer it, which is source-compatible.
+- The `closed_locally` gap: a close issued through `quic_connection_native()->close(0, …)` is reported as `vio_quic_idle_timeout`. Fixing it properly means a `connection_end_t how` on `connection_close_t`, set at the five sites in quic_connection.cpp that build one. That is the right fix and it is a step-2-shaped change to a public struct; whether it is worth making late is a call for whoever owns the transport, and if it is made, `quic_classify_ending` collapses to a switch and `closed_locally` goes away.
+- Whether the beat should flush per connection or all connections once anything was resumed. It flushes per connection, using `flush(connection_t&)` that step 3 added for the purpose, plus one `flush_all` flag for a refused connection that never got a state. At step 4 the difference is unmeasurable because the ticker flushes everything every 2 ms anyway; at step 5 the per-connection form is the only one that scales, which is why it is written now.
+- Ordering on a peer-to-peer endpoint whose first operation is a dial and which later wants a bind. `connect` calls `ensure_socket` with the dial's family and then starts the driver, after which a bind fails because the socket already has a descriptor. The transport has the same restriction today; the coroutine layer makes it less visible, and the header does not yet say so. It needs a sentence, or `quic_endpoint_bind` needs to fail with a better message than libuv's `EINVAL`.
+- `quic_beat_max_passes = 4` is a judgement and not a measurement. Too low and work spills to the next turn, bounded at 2 ms by the ticker; too high and a pathological application can starve I/O inside one prepare callback. Step 6's piecewise write feeding is what will exercise it properly.
+- The whole layer's ending detection rides on the 2 ms ticker walking every connection (quic_endpoint.cpp:978-998), because `on_connection_gone` only fires from `flush_entry`. If that ticker is ever replaced by the deadline-driven `timer_t` that was tried and reverted in step 3, a connection that closes with no traffic on it is never flushed, the gone hook never fires, and `quic_connection_closed` hangs — and the beat, which today relies on the ticker to guarantee it runs, needs its own kick. That coupling has to be written as a comment at the ticker's site in quic_endpoint.cpp as part of this step, or the next person to attempt that change breaks the coroutine API silently.
+- Whether an unaccepted connection sitting in `accept_queue` at teardown should be sent a CONNECTION_CLOSE rather than being dropped when the socket goes. Teardown is the abrupt path and `quic_endpoint_shutdown` is the polite one, so dropping is defensible — but a peer that completed a handshake and is then met with silence waits out its idle timeout, which is exactly the argument that made the backlog refusal a close rather than a drop.
+```

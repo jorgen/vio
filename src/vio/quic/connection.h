@@ -87,6 +87,10 @@ enum class connection_state_t : std::uint8_t
 // RFC 9000 section 20.1, the codes this layer raises.
 inline constexpr std::uint64_t transport_error_no_error = 0x00;
 inline constexpr std::uint64_t transport_error_internal = 0x01;
+// Section 20.1: the server is not accepting, and says so rather than letting
+// the client wait out a handshake nobody is going to finish. What an endpoint
+// whose accept backlog is full answers with.
+inline constexpr std::uint64_t transport_error_connection_refused = 0x02;
 inline constexpr std::uint64_t transport_error_protocol_violation = 0x0a;
 inline constexpr std::uint64_t transport_error_crypto_buffer_exceeded = 0x0d;
 inline constexpr std::uint64_t transport_error_aead_limit_reached = 0x0f;
