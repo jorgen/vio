@@ -1192,4 +1192,103 @@ inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t
   auto transport = vio::quic::endpoint_t::create(loop, server_context, client_context, config.transport);
   return detail::quic_endpoint_build(loop, std::move(transport), config);
 }
+
+namespace detail
+{
+// Starts the read loop, once. Called by whatever first gives the socket an
+// address family -- a bind, or a dial -- and never before, because libuv makes
+// the UDP socket lazily and fixes its family on first touch.
+inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &self)
+{
+  if (self.driver_started || self.closing)
+  {
+    return {};
+  }
+  self.driver_started = true;
+  self.driver.emplace(self.transport->run(&self.driver_stop));
+  if (self.driver->done())
+  {
+    // task_t is eager, so run() has already executed through the reader's
+    // creation -- uv_poll_start is synchronous -- down to its first co_await on
+    // this very stack. A reader it could not create is reported with a bare
+    // co_return, so being done on the first turn is the only signal there is,
+    // and without this a bind would report success on an endpoint that will
+    // never read a byte.
+    self.driver.reset();
+    self.driver_started = false;
+    return std::unexpected(error_t{.code = -1, .msg = "the endpoint could not start reading its socket"});
+  }
+  return {};
+}
+} // namespace detail
+
+// -----------------------------------------------------------------------------
+// Binding
+// -----------------------------------------------------------------------------
+
+// Binds the socket and starts reading it, in that order, because it is the
+// sockaddr that says which address family the socket must have.
+//
+// A server binds; a client may skip this and let the OS choose a port at its
+// first dial, exactly as with udp_bind. Binding a dial-only endpoint is legal
+// and not a mistake -- pinning a source port is ordinary client behaviour, and
+// refusing it for symmetry with accept would be a trap rather than a check.
+[[nodiscard]] inline std::expected<void, error_t> quic_endpoint_bind(quic_endpoint_t &endpoint, const sockaddr *address)
+{
+  if (endpoint.handle.ref_counted() == nullptr)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "the endpoint names nothing"});
+  }
+  auto &self = endpoint.handle.data();
+  if (self.closing)
+  {
+    return std::unexpected(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
+  }
+  if (auto bound = self.transport->bind(address); !bound)
+  {
+    return bound;
+  }
+  return detail::quic_start_driver(self);
+}
+
+// One socket that answers both IPv6 and IPv4-mapped peers, falling back to
+// 0.0.0.0 on a host with no IPv6 -- udp_bind_dual_stack's rule, applied here
+// rather than reused, because endpoint_t owns its socket and hands out only
+// bind().
+//
+// Port 0 asks the OS to choose, which is what a test wants; read it back with
+// quic_endpoint_local_port.
+[[nodiscard]] inline std::expected<void, error_t> quic_endpoint_bind(quic_endpoint_t &endpoint, std::uint16_t port)
+{
+  sockaddr_in6 any6 = {};
+  if (uv_ip6_addr("::", static_cast<int>(port), &any6) == 0)
+  {
+    if (auto bound = quic_endpoint_bind(endpoint, reinterpret_cast<const sockaddr *>(&any6)); bound.has_value())
+    {
+      return bound;
+    }
+  }
+  sockaddr_in any4 = {};
+  if (const int made = uv_ip4_addr("0.0.0.0", static_cast<int>(port), &any4); made < 0)
+  {
+    return std::unexpected(error_t{.code = made, .msg = uv_strerror(made)});
+  }
+  return quic_endpoint_bind(endpoint, reinterpret_cast<const sockaddr *>(&any4));
+}
+
+// The port actually in use, which is the only way to learn it after binding to
+// zero.
+[[nodiscard]] inline std::expected<std::uint16_t, error_t> quic_endpoint_local_port(const quic_endpoint_t &endpoint)
+{
+  if (endpoint.handle.ref_counted() == nullptr)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "the endpoint names nothing"});
+  }
+  const auto &self = endpoint.handle.data();
+  if (!self.transport.has_value())
+  {
+    return std::unexpected(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
+  }
+  return self.transport->local_port();
+}
 } // namespace vio

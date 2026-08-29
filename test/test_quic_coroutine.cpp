@@ -765,3 +765,217 @@ TEST_CASE("teardown resolves an operation nobody would otherwise resume")
   event_loop.run();
 }
 }
+
+TEST_SUITE("quic coroutine bind")
+{
+namespace
+{
+std::expected<vio::quic::tls_context_t, vio::error_t> server_context_for(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return vio::quic::tls_context_t::create(config);
+}
+
+std::expected<vio::quic::tls_context_t, vio::error_t> client_context_for(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return vio::quic::tls_context_t::create(config);
+}
+} // namespace
+
+TEST_CASE("binding to zero picks a port and starts the read loop")
+{
+  using namespace vio;
+
+  // Binding is the moment the socket acquires an address family, which is why
+  // the read loop starts here and not at creation: libuv makes the socket
+  // lazily and pins its family to whoever touches it first, so an endpoint that
+  // started reading before anyone said where would be IPv4 for ever.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = server_context_for(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  std::uint16_t port = 0;
+  bool reading = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, std::uint16_t &port, bool &reading) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, tls);
+            REQUIRE(endpoint.has_value());
+
+            // Before the bind there is no socket, so there is no port either.
+            CHECK(quic_endpoint_local_port(*endpoint).value_or(0) == 0);
+
+            const auto bound = quic_endpoint_bind(*endpoint, std::uint16_t{0});
+            REQUIRE(bound.has_value());
+            port = quic_endpoint_local_port(*endpoint).value_or(0);
+            reading = endpoint->handle->driver_started;
+          }
+          co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, port, reading));
+    });
+  event_loop.run();
+
+  CHECK(port != 0);
+  CHECK(reading);
+}
+
+TEST_CASE("a bind that fails does not leave the endpoint reading")
+{
+  using namespace vio;
+
+  // Binding and starting the read loop are two steps, and the failure has to
+  // come out of the first: an endpoint that reported a bind error and then went
+  // on to read an unbound socket would be the worst of both.
+  //
+  // TEST-NET-1, which is not assigned to any interface anywhere, so the failure
+  // is the operating system refusing an address it does not have. A second bind
+  // on an already-bound port would have been the obvious test and is not a
+  // portable one -- Windows lets two UDP sockets share a port unless one asks
+  // for exclusive use.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = server_context_for(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool refused = false;
+  bool never_read = false;
+  bool no_port = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &refused, bool &never_read, bool &no_port) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, tls);
+            REQUIRE(endpoint.has_value());
+            sockaddr_in unassignable = {};
+            REQUIRE(uv_ip4_addr("192.0.2.1", 4433, &unassignable) == 0);
+            const auto bound = quic_endpoint_bind(*endpoint, reinterpret_cast<const sockaddr *>(&unassignable));
+            refused = !bound.has_value();
+            never_read = !endpoint->handle->driver_started;
+            no_port = quic_endpoint_local_port(*endpoint).value_or(0) == 0;
+          }
+          co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, refused, never_read, no_port));
+    });
+  event_loop.run();
+
+  CHECK(refused);
+  CHECK(never_read);
+  CHECK(no_port);
+}
+
+TEST_CASE("a dial-only endpoint may still pin a source port")
+{
+  using namespace vio;
+
+  // Deliberately not symmetric with accept. An endpoint with no server context
+  // cannot answer, and asking it to is a configuration mistake worth a
+  // sentence -- but pinning a source port is ordinary client behaviour, through
+  // a firewall or to keep a NAT mapping, and refusing it for the sake of
+  // symmetry would be a trap rather than a check.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = client_context_for(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool bound = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &bound) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, nullptr, &tls);
+            REQUIRE(endpoint.has_value());
+            bound = quic_endpoint_bind(*endpoint, std::uint16_t{0}).has_value() && quic_endpoint_local_port(*endpoint).value_or(0) != 0;
+          }
+          co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, bound));
+    });
+  event_loop.run();
+  CHECK(bound);
+}
+
+TEST_CASE("the read loop is started once, however many times bind is called")
+{
+  using namespace vio;
+
+  // uv_udp_bind refuses a second bind on a bound socket, so the second call
+  // never reaches the driver -- but the guard is what makes that a property of
+  // this layer rather than a happy accident of libuv's. Two run() frames on one
+  // socket would be two readers, two poll handles and two owners of the same
+  // datagrams.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = server_context_for(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool one_driver = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &one_driver) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, tls);
+            REQUIRE(endpoint.has_value());
+            REQUIRE(quic_endpoint_bind(*endpoint, std::uint16_t{0}).has_value());
+            const auto *first_driver = &*endpoint->handle->driver;
+
+            // Rebinding fails, and the guard means the driver is untouched
+            // either way.
+            (void)quic_endpoint_bind(*endpoint, std::uint16_t{0});
+            REQUIRE(detail::quic_start_driver(endpoint->handle.data()).has_value());
+            one_driver = &*endpoint->handle->driver == first_driver;
+          }
+          co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, one_driver));
+    });
+  event_loop.run();
+  CHECK(one_driver);
+}
+
+TEST_CASE("binding a released endpoint is refused rather than crashing")
+{
+  using namespace vio;
+
+  // Every entry point tests `closing` rather than whether the transport is
+  // still there, because the transport outlives most of the teardown. A handle
+  // that names nothing is the other half of the same check, and it is the one
+  // that would be a null dereference: ref_ptr_t::data() does not test.
+  quic_endpoint_t nothing;
+  const auto bound = quic_endpoint_bind(nothing, std::uint16_t{0});
+  REQUIRE_FALSE(bound.has_value());
+  CHECK(bound.error().code == -1);
+  CHECK_FALSE(quic_endpoint_local_port(nothing).has_value());
+}
+}
