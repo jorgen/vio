@@ -405,6 +405,46 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   communicates it, by FIN or by RESET_STREAM, so both endpoints agree exactly
   how much credit the stream consumed, and a later frame implying a different
   one is a FINAL_SIZE_ERROR.
+  **The coroutine face** is `src/vio/operation/quic_endpoint.h`, tested by
+  `test/test_quic_coroutine.cpp`. Everything under `src/vio/quic/` stays exactly as it
+  is -- a sans-I/O state machine driven by `std::function` and integer ids is the right
+  shape for the inside of a transport and the wrong one for an application. This layer
+  is built on top: `quic_endpoint_create` / `_bind` / `_accept` / `_connect` /
+  `_shutdown`, and `quic_connection_close` / `_closed` / `_ready` plus accessors.
+
+  The organising idea is the **loop turn**. The transport's three hooks
+  (`on_connection`, `on_activity`, `on_connection_gone`) only *record*; a `uv_prepare_t`
+  -- the beat -- resumes everything that became runnable and flushes what it wrote, in
+  the same turn. That separation is not stylistic. `endpoint_impl_t` holds connections
+  as `unique_ptr` and brackets its walk, so dialling from a callback is already safe;
+  what is not safe is what a coroutine may do that a callback may not -- drop the last
+  `quic_endpoint_t`, destroying `endpoint_impl_t`, `run()`'s frame, the datagram reader
+  inside it and the vector being walked, from a stack several calls deep inside all of
+  them. Prepare rather than check because the endpoint's 2 ms ticker fires in the timer
+  phase; never idle, because `uv__backend_timeout` returns zero while an idle handle is
+  active and the loop stops sleeping. The beat is `uv_unref`ed, so an endpoint that was
+  never bound owns no handle that stops `run()` returning.
+
+  **No awaitable holds a strong reference to the endpoint.** A suspended accept that did
+  would take the count 2->1 on release, `on_destroy` would never run, nothing would
+  resolve it, and the socket's `uv_close` would never be issued -- so `run()` would never
+  return. That is the second, non-obvious face of the handle-lifetime failure below.
+  Operations are per-call heap allocations with a two-hold protocol, so concurrent
+  accepts are served FIFO rather than refused.
+
+  A **tombstone** is what a connection becomes when it ends: `connection_t` is freed by
+  the endpoint on its own schedule with no notification, so the alpn, close reason, stats
+  and ending are latched at the sever and the pointer nulled there. Holding a
+  `quic_connection_t` past the ending is safe and is the point. Milestone slots
+  (`ready`, `closed`) are allocated on first ask and born reached when the thing they
+  name already happened, so asking after the fact answers rather than hanging.
+
+  One rule with teeth: **a cancellation registration is dropped when the operation
+  resolves, not when it resumes** -- an operation resolved at call time waits on
+  `ready_ops` for the next beat, and the caller's request-scoped `cancellation_t` can die
+  in between. `QUIC_COROUTINE_API.md` is the design doc and records what its own build
+  order got wrong.
+
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, boringssl, doctest, cmakerc, ada (fetched via cmake-dep)
 
