@@ -3734,7 +3734,7 @@ that follows: if a derived awaitable holds a `ref_ptr_t` member and the base hol
 node, the member is destroyed **before** the base unlinks, so the state may already be freed when
 `unlink()` writes through it.
 
-## 2. The beat should be a check handle, not a prepare handle
+## 2. The beat's phase is a real trade-off, not an obvious win either way
 
 Verified in `3rdparty/libuv-v1.51.0/src/unix/core.c`, `uv_run`'s iteration is:
 
@@ -3742,20 +3742,65 @@ Verified in `3rdparty/libuv-v1.51.0/src/unix/core.c`, `uv_run`'s iteration is:
       -> uv__run_pending -> uv__run_check -> uv__run_closing_handles
       -> uv__update_time -> uv__run_timers
 
-A QUIC connection's work almost always originates in a datagram, and datagrams arrive in
-`uv__io_poll`. A **check** handle runs immediately after poll, in the same iteration, so a
-coroutine woken by an arriving datagram writes its reply in the same turn. A **prepare** handle
-already ran before that poll, so the same work waits for the next iteration -- one extra trip
-through `epoll_wait` per exchange, which on a request/response workload is a round trip of
-latency added to every exchange.
+Two wake sources matter, and the phases favour opposite ones.
 
-This document's thesis says `uv_prepare_t`; that was chosen for its *ownership* (a handle
-registered through the ref count, rather than
-`event_loop_t::add_about_to_block_listener`, whose removal is posted through a pipe that
-`stop()` closes first -- still the right call). The phase was not the point being made, and
-section "Backpressure" already notes in passing that prepare costs a turn. Take the ownership
-argument and use `uv_check_t`.
+**Datagram-driven work** -- a handshake completing, a stream filling, the ordinary
+request/response case -- is marked during `uv__io_poll`, because `run()` is a coroutine parked on
+the datagram reader and its continuation is resumed from libuv's UDP receive callback. So the
+whole receive batch, `on_activity` and `flush_entry` included, executes on the poll phase's
+stack. A **check** handle runs microseconds later in the same iteration. A **prepare** handle
+already ran, so that work waits for the next iteration.
 
-The one case prepare wins is work created by a timer, since timers run at the end of an
-iteration and a prepare handle sees them before the next poll rather than after it. That is the
-minority case here, and the 2 ms ticker already forces a turn.
+**Timer-driven work** -- an idle timeout latched by the endpoint's 2 ms ticker, and anything else
+`flush_entry` notices from there -- is marked in `uv__run_timers`, at the *end* of an iteration,
+after check has already run. Here it is the other way round: **prepare** picks it up before the
+loop next blocks, and **check** picks it up only after the next poll.
+
+Neither delay is unbounded, because the 2 ms ticker caps how long poll may block -- so each phase
+costs up to a tick on the case it does not favour. The question is only which case dominates, and
+for a QUIC transport whose consumer is an HTTP/3 implementation, it is datagram-driven
+request/response by a wide margin. That argues for **check**.
+
+This is worth measuring rather than arguing: it is exactly what the step 7 benchmark's
+loop-turns-per-operation column exists to show, and the two can be swapped in one line. Build it
+whichever way and let the number decide. What is *not* a trade-off is the ownership question --
+an owned handle registered through the ref count, never
+`event_loop_t::add_about_to_block_listener`, whose removal is posted through a pipe that `stop()`
+closes first (`event_loop_impl.h:171`, `:194-203`).
+
+## 3. The lifetime model, validated by running it
+
+The alternative to the deadlocking sketch was built and run before any of step 4 was written,
+because it is the part three designs got wrong and the failure mode is a hang rather than a wrong
+answer. The shape that works:
+
+- The state holds an **intrusive doubly-linked list of waiters**. A waiter node lives inside the
+  awaitable, not in the state, so parking allocates nothing.
+- An awaitable holds a **borrowed** `state *`, never a `ref_ptr_t`. This is the whole point: the
+  application handle is the only strong reference, so letting it go out of scope really does
+  reach zero.
+- `on_destroy` walks the waiter list and resolves every parked coroutine with an error. It takes
+  the list into a local first and clears the head before resuming anything, because a resumed
+  coroutine may park again and appending to a list being walked does not terminate.
+- The awaitable's **destructor unlinks** its node. An abandoned `task_t` frees its frame while
+  suspended, so a node left linked would leave the list pointing into freed storage and teardown
+  would resume a coroutine that no longer exists.
+- Each node carries a `linked` flag rather than inferring linkage from the continuation, because
+  the two come apart in the case below.
+
+The measured result: a coroutine parks on an await nothing will ever complete; the application
+lets the endpoint handle leave scope, with **no cancel, no sleep and no explicit teardown**; the
+coroutine resumes with an error; and `~event_loop_t` reports no open handles. That last part is
+the real check -- it is the failure this whole model exists to prevent.
+
+### The case the first attempt got wrong
+
+An await made **after** teardown takes the `await_ready` fast path and never links, so the
+teardown broadcast -- which only walks linked waiters -- never reaches it. The first attempt
+resolved such an await with whatever `result` had been initialised to, which was a success value:
+the caller was told its accept had succeeded on an endpoint that no longer existed. `await_resume`
+has to answer for that case itself.
+
+This is worth stating because it is invisible by inspection and it is the shape of a whole class
+of bug in this layer: every path that resolves an await has to be reachable from both the
+teardown broadcast and the already-torn-down fast path, or one of them silently reports success.
