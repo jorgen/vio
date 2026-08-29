@@ -1781,3 +1781,340 @@ TEST_CASE("an accept on an endpoint that cannot answer is refused with a sentenc
   CHECK(unbound_refused);
 }
 }
+
+TEST_SUITE("quic coroutine connection")
+{
+namespace
+{
+vio::quic::tls_config_t listening_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+vio::quic::tls_config_t connecting_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+sockaddr_in at_loopback(std::uint16_t port)
+{
+  sockaddr_in address = {};
+  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  return address;
+}
+} // namespace
+
+TEST_CASE("a close reaches the peer, and the peer learns of it by awaiting")
+{
+  using namespace vio;
+
+  // The F5 rule in its simplest form: a close issued and then immediately
+  // forgotten still has to leave. It goes out on this turn's beat rather than
+  // the next one, which is what the flush pass is for -- the endpoint's own
+  // ticker would get to it eventually, but "eventually" is not what a program
+  // that closes and returns is entitled to.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(listening_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(connecting_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool client_saw_close = false;
+  std::uint64_t code = 0;
+  std::string reason;
+  bool was_from_peer = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &client_saw_close, std::uint64_t &code, std::string &reason, bool &was_from_peer) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = at_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto answering = [](quic_endpoint_t &endpoint) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              // Closed and then dropped, on the same stack.
+              quic_connection_close(*arrived, 42, "that is quite enough");
+            }(*server);
+
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+            const auto target = at_loopback(port);
+            auto dialled = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(dialled.has_value());
+            co_await std::move(answering);
+
+            const auto ending = co_await quic_connection_closed(*dialled);
+            client_saw_close = !ending.has_value();
+            const auto why = quic_connection_close_reason(*dialled);
+            if (why)
+            {
+              code = why->error_code;
+              reason = why->reason;
+              was_from_peer = why->from_peer;
+            }
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, client_saw_close, code, reason, was_from_peer));
+    });
+  event_loop.run();
+
+  CHECK(client_saw_close);
+  CHECK(code == 42);
+  CHECK(reason == "that is quite enough");
+  CHECK(was_from_peer);
+}
+
+TEST_CASE("a milestone asked for after the fact answers rather than blocking")
+{
+  using namespace vio;
+
+  // The slots are allocated on first ask, because most connections are never
+  // asked about. That makes the late ask the interesting case: a milestone
+  // created after the thing it names already happened must be born reached, or
+  // the accessor is a hang rather than an answer.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(listening_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(connecting_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool ready_at_once = false;
+  bool closed_at_once = false;
+  bool open_then_not = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &ready_at_once, bool &closed_at_once, bool &open_then_not) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = at_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+            const auto target = at_loopback(port);
+            auto dialled = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(dialled.has_value());
+
+            // The handshake is long over by the time this asks.
+            ready_at_once = quic_connection_ready(*dialled).reached();
+            const bool was_open = quic_connection_is_open(*dialled);
+
+            quic_connection_close(*dialled, 0, "goodbye");
+            (void)co_await sleep(loop, std::chrono::milliseconds(100));
+
+            // And so is the ending, and this is the first time anything has
+            // asked for the closed milestone at all.
+            closed_at_once = quic_connection_closed(*dialled).reached();
+            open_then_not = was_open && !quic_connection_is_open(*dialled);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, ready_at_once, closed_at_once, open_then_not));
+    });
+  event_loop.run();
+
+  CHECK(ready_at_once);
+  CHECK(closed_at_once);
+  CHECK(open_then_not);
+}
+
+TEST_CASE("a connection handle kept past the ending still answers")
+{
+  using namespace vio;
+
+  // Why the handle is worth holding. The endpoint frees the connection_t on its
+  // own schedule and says nothing about it, so everything an application can
+  // still ask is copied out at the sever. A coroutine that wakes late learns how
+  // its connection ended instead of finding a null pointer, and a supervisor
+  // walking a snapshot reads real numbers rather than zeroes.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(listening_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(connecting_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  quic_connection_t survivor;
+  std::size_t counted = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, quic_connection_t &survivor, std::size_t &counted) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = at_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+            const auto target = at_loopback(port);
+            auto dialled = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(dialled.has_value());
+            survivor = *dialled;
+
+            counted = quic_endpoint_connection_count(*client);
+            const auto snapshot = quic_endpoint_connections(*client);
+            REQUIRE(snapshot.size() == 1);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, survivor, counted));
+    });
+  event_loop.run();
+
+  CHECK(counted == 1);
+  REQUIRE(survivor.handle.ref_counted() != nullptr);
+  CHECK_FALSE(quic_connection_is_open(survivor));
+  CHECK(quic_connection_alpn(survivor) == "test");
+  CHECK(quic_connection_role(survivor) == vio::quic::tls_role_t::client);
+  CHECK(quic_connection_native(survivor) == nullptr);
+  // The stats were copied out rather than zeroed: a connection that carried a
+  // handshake has a datagram size and a round trip time, and a default-
+  // constructed struct has neither.
+  const auto stats = quic_connection_stats(survivor);
+  CHECK(stats.datagram_size > 0);
+  CHECK(stats.smoothed_rtt.count() > 0);
+
+  // And the ending itself survives, which is what the latched outcome is for:
+  // this milestone is allocated here, long after the endpoint that severed the
+  // connection stopped existing, so there is nothing else left to derive it
+  // from.
+  auto ending = quic_connection_closed(survivor);
+  REQUIRE(ending.reached());
+  auto awaiter = ending.operator co_await();
+  REQUIRE(awaiter.await_ready());
+  const auto how = awaiter.await_resume();
+  REQUIRE_FALSE(how.has_value());
+  CHECK(how.error().code == vio_quic_endpoint_closed);
+}
+
+TEST_CASE("an idle timeout is reported as itself, not as a close")
+{
+  using namespace vio;
+
+  // Section 10.1 closes silently, which is exactly why it needs its own code:
+  // the transport records it with the same error code, the same application
+  // flag and the same from_peer as a clean local close, so the only thing that
+  // separates them is whether this layer asked for it.
+  //
+  // The client is given a one-second idle timeout and the server is then taken
+  // away without a word, which is the shape of a peer that crashed.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(listening_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(connecting_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool timed_out = false;
+  int code = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &timed_out, int &code) -> task_t<void>
+        {
+          {
+            quic_config_t client_config;
+            client_config.transport.connection.transport_parameters.max_idle_timeout = 300;
+            auto client = quic_endpoint_create(loop, nullptr, &connecting, client_config);
+            REQUIRE(client.has_value());
+
+            std::optional<quic_connection_t> dialled;
+            {
+              quic_config_t server_config;
+              server_config.transport.connection.transport_parameters.max_idle_timeout = 300;
+              auto server = quic_endpoint_create(loop, listening, server_config);
+              REQUIRE(server.has_value());
+              const auto any = at_loopback(0);
+              REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+              const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+              const auto target = at_loopback(port);
+              auto connected = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+              REQUIRE(connected.has_value());
+              dialled = *connected;
+            } // the server vanishes here, saying nothing
+
+            const auto ending = co_await quic_connection_closed(*dialled);
+            timed_out = !ending.has_value();
+            code = timed_out ? ending.error().code : 0;
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, timed_out, code));
+    });
+  event_loop.run();
+
+  CHECK(timed_out);
+  CHECK(code == vio_quic_idle_timeout);
+}
+
+TEST_CASE("a handle that names nothing answers every accessor without crashing")
+{
+  using namespace vio;
+
+  // Default construction is reachable -- every factory returns one by value and
+  // an application may well declare one before it has anything to put in it --
+  // and ref_ptr_t::data() dereferences unconditionally, so every accessor here
+  // has to test before it reaches.
+  quic_connection_t nothing;
+  CHECK_FALSE(quic_connection_is_open(nothing));
+  CHECK(quic_connection_alpn(nothing).empty());
+  CHECK(quic_connection_native(nothing) == nullptr);
+  CHECK_FALSE(quic_connection_close_reason(nothing).has_value());
+  CHECK(quic_connection_peer_certificate_subject(nothing).empty());
+  CHECK(quic_connection_stats(nothing).datagram_size == 0);
+  quic_connection_close(nothing, 0, "no-one is listening");
+
+  // A milestone naming nothing resolves rather than hanging, which is the same
+  // rule one line further out: a coroutine that awaits it must not be lost.
+  auto closed = quic_connection_closed(nothing);
+  CHECK(closed.reached() == false);
+  auto awaiter = closed.operator co_await();
+  CHECK(awaiter.await_ready());
+  CHECK_FALSE(awaiter.await_resume().has_value());
+
+  quic_endpoint_t no_endpoint;
+  CHECK(quic_endpoint_native(no_endpoint) == nullptr);
+  CHECK(quic_endpoint_connection_count(no_endpoint) == 0);
+  CHECK(quic_endpoint_connections(no_endpoint).empty());
+}
+}

@@ -532,6 +532,11 @@ struct quic_connection_state_t
   std::string alpn;
   std::optional<vio::quic::connection_close_t> close_reason;
   quic_connection_stats_t stats;
+  // How it ended, in this layer's terms rather than the transport's. Latched at
+  // the sever because a milestone allocated afterwards has to be reached with
+  // the outcome that already happened, and there is nothing else left to derive
+  // it from once the transport pointer is gone.
+  std::expected<void, error_t> ending;
 
   // Borrowed: the dial waiting for this connection, nulled when it resolves.
   quic_op_t *pending_dial = nullptr;
@@ -1044,6 +1049,7 @@ inline void quic_sever(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_st
     return;
   }
   state->severed = true;
+  state->ending = ending;
   if (state->transport != nullptr)
   {
     state->close_reason = state->transport->close_reason();
@@ -1584,5 +1590,189 @@ using quic_accept_future_t = quic_connection_awaitable_t;
 [[nodiscard]] inline std::size_t quic_endpoint_connection_count(const quic_endpoint_t &endpoint)
 {
   return endpoint.handle.ref_counted() == nullptr ? 0 : endpoint.handle.data().by_connection.size();
+}
+
+// -----------------------------------------------------------------------------
+// A connection
+// -----------------------------------------------------------------------------
+//
+// Every accessor below answers on a tombstone, and that is the point of the
+// handle. A connection that has ended keeps answering what it latched, so a
+// coroutine that wakes late learns how its connection ended rather than finding
+// a null pointer -- and a shutdown log line reads the truth rather than "RTT 0"
+// for every connection that has already closed.
+
+namespace detail
+{
+// Allocates a milestone slot on first ask, and reaches it at once if the thing
+// it names has already happened.
+//
+// The slots are not allocated up front because most connections are never asked
+// about: a server that accepts, reads and drops never touches either. But an
+// application is entitled to ask after the fact, and an accessor that answered
+// "not yet" for something that happened before it was called would be a hang
+// rather than an answer.
+inline ref_ptr_t<quic_milestone_state_t> &quic_milestone_slot(quic_connection_state_t &state, ref_ptr_t<quic_milestone_state_t> &slot, bool already)
+{
+  if (slot.ref_counted() == nullptr)
+  {
+    slot = ref_ptr_t<quic_milestone_state_t>();
+    if (already)
+    {
+      quic_milestone_reach(slot.data(), state.ending);
+    }
+  }
+  return slot;
+}
+} // namespace detail
+
+// Resolves when the handshake completes, or with the reason it never will.
+//
+// After quic_endpoint_connect or quic_endpoint_accept it has already happened,
+// so awaiting it costs nothing and answers immediately. It is here for a
+// connection reached some other way -- out of quic_endpoint_connections, say --
+// and for a 0-RTT client, where it is how the verdict on the early data arrives.
+[[nodiscard]] inline quic_milestone_t quic_connection_ready(quic_connection_t &connection)
+{
+  if (connection.handle.ref_counted() == nullptr)
+  {
+    return quic_milestone_t{ref_ptr_t<detail::quic_milestone_state_t>::null()};
+  }
+  auto &state = connection.handle.data();
+  return quic_milestone_t{detail::quic_milestone_slot(state, state.ready, state.handshake_reached || state.severed)};
+}
+
+// Resolves when the connection ends, however it ends: a close from either side,
+// the idle timeout, a stateless reset, a failed handshake, or the endpoint
+// going away. Success means it ended cleanly; the error says which of the rest
+// it was, and carries the peer's reason string when there was one.
+//
+// Awaiting it after the fact answers rather than blocking, and several
+// coroutines may await the same one.
+[[nodiscard]] inline quic_milestone_t quic_connection_closed(quic_connection_t &connection)
+{
+  if (connection.handle.ref_counted() == nullptr)
+  {
+    return quic_milestone_t{ref_ptr_t<detail::quic_milestone_state_t>::null()};
+  }
+  auto &state = connection.handle.data();
+  return quic_milestone_t{detail::quic_milestone_slot(state, state.closed, state.severed)};
+}
+
+// Sends a CONNECTION_CLOSE and stops. Section 10.2: this is an immediate close,
+// not a graceful one -- QUIC has no half-close at the connection level, and
+// anything still queued on a stream is lost. Finish the streams first if that
+// matters.
+//
+// The datagram leaves on this turn's beat rather than the next one, so a close
+// immediately followed by dropping the handle still reaches the peer.
+//
+// `application` picks which of the two frame types is used: 0x1d carries an
+// application code that the peer's application sees, 0x1c a transport code from
+// section 20.1. A server saying "shutting down" wants the application form.
+inline void quic_connection_close(quic_connection_t &connection, std::uint64_t code = 0, std::string_view reason = {}, bool application = true)
+{
+  if (connection.handle.ref_counted() == nullptr)
+  {
+    return;
+  }
+  auto &state = connection.handle.data();
+  if (state.endpoint == nullptr || state.transport == nullptr)
+  {
+    return; // already a tombstone, and a tombstone has nothing to say
+  }
+  detail::quic_close_locally(*state.endpoint, connection.handle, code, reason, application);
+}
+
+// Whether the connection can still carry anything. False from the moment it
+// ends, which is before the transport gets round to reaping it.
+[[nodiscard]] inline bool quic_connection_is_open(const quic_connection_t &connection)
+{
+  if (connection.handle.ref_counted() == nullptr)
+  {
+    return false;
+  }
+  const auto &state = connection.handle.data();
+  return !state.severed && state.transport != nullptr;
+}
+
+// Which side of the handshake this was, which a peer-to-peer application needs
+// because it dials and answers on one endpoint. Latched at registration, so it
+// answers on a tombstone.
+[[nodiscard]] inline vio::quic::tls_role_t quic_connection_role(const quic_connection_t &connection)
+{
+  return connection.handle.ref_counted() == nullptr ? vio::quic::tls_role_t::client : connection.handle.data().role;
+}
+
+// The protocol agreed in the handshake. Latched rather than read through,
+// because selected_alpn() returns a view into storage the endpoint frees on its
+// own schedule.
+[[nodiscard]] inline std::string_view quic_connection_alpn(const quic_connection_t &connection)
+{
+  return connection.handle.ref_counted() == nullptr ? std::string_view{} : std::string_view{connection.handle.data().alpn};
+}
+
+// The peer's identity, and only once the chain behind it verified -- so a
+// non-empty answer is an authenticated name and nothing else is. Empty on a
+// connection that asked for no certificate, which is every ordinary client.
+[[nodiscard]] inline std::string quic_connection_peer_certificate_subject(const quic_connection_t &connection)
+{
+  if (connection.handle.ref_counted() == nullptr || connection.handle.data().transport == nullptr)
+  {
+    return {};
+  }
+  return connection.handle.data().transport->peer_certificate_subject();
+}
+
+// Why it ended, in the transport's own terms: the code, whether it was an
+// application code, and whether the peer said it or this side did. Empty while
+// the connection is still open.
+[[nodiscard]] inline std::optional<vio::quic::connection_close_t> quic_connection_close_reason(const quic_connection_t &connection)
+{
+  if (connection.handle.ref_counted() == nullptr)
+  {
+    return std::nullopt;
+  }
+  const auto &state = connection.handle.data();
+  if (state.transport != nullptr)
+  {
+    return state.transport->close_reason();
+  }
+  return state.close_reason;
+}
+
+// What the path is doing. Read through on a live connection and out of the
+// latch on a tombstone, which costs one struct copy per ending and is worth it:
+// a shutdown that reports zero for every connection that has closed is a worse
+// answer than the truth.
+[[nodiscard]] inline quic_connection_stats_t quic_connection_stats(const quic_connection_t &connection)
+{
+  if (connection.handle.ref_counted() == nullptr)
+  {
+    return {};
+  }
+  auto &state = connection.handle.data();
+  return state.transport != nullptr ? quic_read_stats(*state.transport) : state.stats;
+}
+
+// The transport underneath, for everything this layer does not wrap. Null once
+// the connection has ended, and a pointer that must not be kept: the endpoint
+// frees it on its own schedule and says nothing about it.
+//
+// Its on_connection, on_activity and on_connection_gone handlers are spoken for
+// -- they are single slots and this layer owns them, because the whole design
+// rests on no user code running inside the transport's walk.
+[[nodiscard]] inline vio::quic::connection_t *quic_connection_native(const quic_connection_t &connection)
+{
+  return connection.handle.ref_counted() == nullptr ? nullptr : connection.handle.data().transport;
+}
+
+[[nodiscard]] inline vio::quic::endpoint_t *quic_endpoint_native(quic_endpoint_t &endpoint)
+{
+  if (endpoint.handle.ref_counted() == nullptr || !endpoint.handle.data().transport.has_value())
+  {
+    return nullptr;
+  }
+  return &*endpoint.handle.data().transport;
 }
 } // namespace vio
