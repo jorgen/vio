@@ -1,6 +1,19 @@
 # A coroutine QUIC API for vio
 
-A design proposal. Step 1 (transport parameter defaults) is implemented; the rest is not.
+A design proposal. Progress against the eight-step build order at the bottom:
+
+- **Step 1 (transport parameter defaults) — done.** `default_transport_parameters()`, wired
+  through `connection_config_t`. All twelve hand-rolled parameter blocks deleted.
+- **Step 2 (transport edges and accessors) — done.** Peer reset and STOP_SENDING codes, the
+  `take_*` edge drains, a reason on both timeout endings, send-side and path stats, and
+  finished local streams reaped.
+- **Step 3 (endpoint hardening) — partly done.** `flush(connection_t&)`, `on_connection_gone`
+  and the `walking` bracket landed. The deadline-driven timer and the IPv4-pinning fix were
+  both tried and reverted with measurements; see the section at the end.
+- **Steps 4 to 8 — not started.**
+
+Landed alongside these, outside the build order: peer-to-peer endpoints (two TLS contexts),
+mutual TLS, and six verified bug fixes.
 
 > **Revised after the maintainer settled the open questions.** `initial_max_data` is
 > 8 MiB (not 1 MiB) and the per-stream windows are 2 MiB (not 256 KiB); the send-side
@@ -3613,3 +3626,69 @@ OPEN QUESTIONS:
 - Whether the derived stream-lifecycle line should be dropped entirely if the pipeline-1 request/response and the ping-pong turn out not to differ by only the lifecycle in practice -- their loop-turn counts should be identical, and if they are not, the subtraction is contaminated the same way the 64-deep one was and the line should print '--' rather than a number.
 - receive-window auto-tuning. The 8 MiB / 2 MiB decision is a static number chosen large because there is nothing to grow it, and it costs 16 GiB per thousand connections. Auto-tuning is the proper fix, it is what every stack shipping a small starting window has, and it is a separate piece of work that has not been scoped. Until it exists, a server expecting thousands of connections has to know to lower initial_max_data, and nothing tells it so.
 ```
+
+
+---
+
+# Step 3: what was reverted, and the measurements
+
+Two of step 3's four items were built, measured, and taken back out. Both are recorded here
+because the evidence constrains anything that tries again.
+
+## The deadline-driven timer
+
+The plan was to replace the endpoint's fixed 2 ms ticker with a `timer_t` armed to the earliest
+deadline any connection reports, on the grounds that `next_timeout` already computes it. It does
+not work, for two independent reasons, and the measurements are the argument.
+
+**It spins.** A closed connection keeps reporting the past deadline that closed it: `poll_send`
+returns early once the state is closed and never touches any of them, and the idle or handshake
+deadline that usually did the closing is behind us by then. Arming on that answer means arming
+for zero and firing again immediately. Measured over a five second run: **2704 fires**, against
+the ~2500 the 2 ms tick it replaced would have produced. No saving at all.
+
+Skipping closed connections fixes that -- **2704 fires becomes 8** -- so the idea is sound as far
+as it goes.
+
+**But it also stalls.** `next_timeout` reports nothing for a connection that merely has data to
+send. The 2 ms tick was flushing unconditionally and thereby papering over that; a timer armed
+only on reported deadlines never flushes such a connection at all. Measured: the ECN validation
+in `a client and a server reach each other over a UDP socket` went from **12/12 to 4/12**.
+
+There is a third trap for anyone who tries the obvious fix of putting the closed-connection guard
+inside `next_timeout` itself rather than in the endpoint: `a datagram size the path refuses is not
+adopted` steps its clock *from* `next_timeout`, and the stale past deadline was accidentally
+acting as a brake that kept the step at 1 ms. Guarding inside `next_timeout` removes the brake,
+the loop jumps to the far-future idle deadline instead, and the test goes **5/5 to 0/5**.
+
+So: making the endpoint deadline-driven requires `next_timeout` to report every reason a flush is
+needed, including "I have bytes queued", and to report nothing once the connection is closed.
+That is a `connection_t` change, not an endpoint one, and it needs its own regression tests.
+
+Worth knowing: this is **not** a prerequisite for the coroutine API, which drives itself from its
+own `uv_prepare_t` beat. It is an efficiency item on the callback transport.
+
+## The IPv4 pinning fix
+
+`run()` calls `ensure_socket`, whose default family is `AF_INET`. It is normally spawned before
+the first dial and `task_t` is eager, so it gets there first and pins an unbound endpoint to
+IPv4 -- after which a dial to an IPv6 peer has nowhere to go, because a socket's family cannot
+change afterwards. The bug is real and is now recorded as a `doctest::should_fail` test in
+`test_quic_endpoint.cpp`.
+
+The fix attempted was to stop `run()` creating the socket at all, since only `bind()` and
+`connect()` know the family, and have it wait for one instead. That delays the reader by a loop
+turn, and that alone was enough: the same ECN test went **12/12 to 4/12**, isolated by measuring
+with `ensure_socket` restored (**12/12**).
+
+A real fix has to arm the reader the moment the socket appears rather than after a sleep, which
+means a signal from `bind`/`connect` into `run` -- endpoint plumbing that step 3 did not want to
+disturb.
+
+## One verified fact for the beat
+
+The coroutine layer must own its own `uv_prepare_t`, registered through the ref count the way
+`timer_t` is, and must **not** use `event_loop_t::add_about_to_block_listener`. Removal of a
+listener is posted through `_run_in_loop` (`event_loop_impl.h:171`), an event pipe that
+`event_loop_t::stop()` closes before draining -- so a listener destroyed during shutdown may
+never be removed, and the loop would then call `about_to_block()` on freed storage.
