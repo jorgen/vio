@@ -3928,6 +3928,29 @@ bool connection_t::stream_receive_finished(std::uint64_t id)
   return state == receive_state_t::data_received || state == receive_state_t::data_read || state == receive_state_t::reset_received || state == receive_state_t::reset_read;
 }
 
+bool connection_t::stream_receive_reset(std::uint64_t id)
+{
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_receive)
+  {
+    return false;
+  }
+  const auto state = stream->receive.state();
+  return state == receive_state_t::reset_received || state == receive_state_t::reset_read;
+}
+
+std::optional<std::uint64_t> connection_t::stream_peer_reset_error(std::uint64_t id)
+{
+  auto *stream = _impl->streams.find(id);
+  return stream == nullptr ? std::nullopt : stream->peer_reset_error;
+}
+
+std::optional<std::uint64_t> connection_t::stream_peer_stop_sending_error(std::uint64_t id)
+{
+  auto *stream = _impl->streams.find(id);
+  return stream == nullptr ? std::nullopt : stream->stop_sending_error;
+}
+
 bool connection_t::stream_send_finished(std::uint64_t id)
 {
   auto *stream = _impl->streams.find(id);

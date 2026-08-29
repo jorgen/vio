@@ -439,7 +439,25 @@ public:
   // modelling them separately -- so a caller that wants to know whether it can
   // stop reading asks a different question from one that wants to know whether
   // everything it sent arrived.
+  //
+  // Note that finished says nothing about how. A stream the peer reset and one
+  // it completed both report true here, because both are over; which of the
+  // two it was is stream_receive_reset below.
   [[nodiscard]] bool stream_receive_finished(std::uint64_t id);
+
+  // Whether the receiving half ended because the peer gave up on it rather
+  // than because it ran out. Cancellation is not an edge case -- it is a user
+  // closing a tab, a client abandoning a download, HTTP/3 signalling
+  // H3_REQUEST_CANCELLED -- and an application that cannot tell it from a
+  // clean end has to infer it from a length it may not know.
+  [[nodiscard]] bool stream_receive_reset(std::uint64_t id);
+
+  // The code the peer sent with its RESET_STREAM, and the code it sent with
+  // STOP_SENDING. Nothing, when the peer sent neither. These carry whatever
+  // the application protocol above puts in them, which is the only place the
+  // reason for a cancellation exists.
+  [[nodiscard]] std::optional<std::uint64_t> stream_peer_reset_error(std::uint64_t id);
+  [[nodiscard]] std::optional<std::uint64_t> stream_peer_stop_sending_error(std::uint64_t id);
   [[nodiscard]] bool stream_send_finished(std::uint64_t id);
 
   // Abandons the sending half; the peer is told with RESET_STREAM.

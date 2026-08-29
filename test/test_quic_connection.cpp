@@ -3404,4 +3404,96 @@ TEST_CASE("a peer cannot drive connection id issuance with a huge limit")
   CHECK(server->issued_connection_ids().size() <= maximum_active_connection_id_limit);
 }
 
+// Cancellation is not an edge case: it is a user closing a tab, a client
+// abandoning a download, HTTP/3 signalling H3_REQUEST_CANCELLED. An
+// application on top of this transport has to be able to tell it from a
+// stream that simply ended, and to see the code that says why.
+TEST_CASE("a reset stream is distinguishable from one that finished")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(client.has_value());
+  REQUIRE(server.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  // Two streams that end the same way as far as stream_receive_finished is
+  // concerned, and differently in every way that matters to an application.
+  auto finished = client->open_stream(stream_direction_t::bidirectional);
+  auto cancelled = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(finished.has_value());
+  REQUIRE(cancelled.has_value());
+
+  const std::string body = "some bytes";
+  const auto payload = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(body.data()), body.size());
+  CHECK(client->write_stream(*finished, payload, true) == body.size());
+  CHECK(client->write_stream(*cancelled, payload, false) == body.size());
+  run_handshake(*client, *server, at(1ms));
+
+  // The second is abandoned with a code the application above chose.
+  constexpr std::uint64_t cancel_code = 0x10c;
+  client->reset_stream(*cancelled, cancel_code);
+  run_handshake(*client, *server, at(2ms));
+
+  // Both halves are over, which is all the old accessor could say.
+  CHECK(server->stream_receive_finished(*finished));
+  CHECK(server->stream_receive_finished(*cancelled));
+
+  // And now the difference is visible.
+  CHECK_FALSE(server->stream_receive_reset(*finished));
+  CHECK(server->stream_receive_reset(*cancelled));
+
+  CHECK_FALSE(server->stream_peer_reset_error(*finished).has_value());
+  REQUIRE(server->stream_peer_reset_error(*cancelled).has_value());
+  CHECK(*server->stream_peer_reset_error(*cancelled) == cancel_code);
+}
+
+// The other direction. A peer that has stopped reading says so, and the code
+// it sends is the only statement of why -- without it a sender whose stream
+// went terminal cannot tell "the peer cancelled" from "everything arrived".
+TEST_CASE("a peer that stops reading says so with a code")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(client.has_value());
+  REQUIRE(server.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+
+  auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+  const std::string body = "a long answer nobody wants";
+  const auto payload = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(body.data()), body.size());
+  CHECK(client->write_stream(*stream, payload, false) == body.size());
+  run_handshake(*client, *server, at(1ms));
+
+  CHECK_FALSE(client->stream_peer_stop_sending_error(*stream).has_value());
+
+  constexpr std::uint64_t stop_code = 0x10b;
+  server->stop_sending(*stream, stop_code);
+  run_handshake(*client, *server, at(2ms));
+
+  REQUIRE(client->stream_peer_stop_sending_error(*stream).has_value());
+  CHECK(*client->stream_peer_stop_sending_error(*stream) == stop_code);
+}
+
 }

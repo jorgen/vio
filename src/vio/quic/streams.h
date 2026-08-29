@@ -107,6 +107,11 @@ struct stream_t
   // A STOP_SENDING arrived: the peer wants nothing more, and section 3.5 says
   // to answer with RESET_STREAM.
   std::optional<std::uint64_t> stop_sending_error;
+  // The code the peer gave when it reset this stream. Kept because it is the
+  // only thing that distinguishes a stream the peer abandoned from one it
+  // finished, and the reason it abandoned it -- a cancelled download and a
+  // completed one look identical without it.
+  std::optional<std::uint64_t> peer_reset_error;
   bool reset_pending = false;
   // A MAX_STREAM_DATA is owed: the application has taken enough that the peer
   // should be told it may send more.
@@ -389,7 +394,6 @@ public:
 
   [[nodiscard]] streams_error_t receive_reset_stream(std::uint64_t id, std::uint64_t error_code, std::uint64_t final_size, std::uint64_t &credit_released)
   {
-    (void)error_code;
     credit_released = 0;
     auto *stream = ensure_remote(id);
     if (stream == nullptr)
@@ -400,6 +404,9 @@ public:
     {
       return streams_error_t::stream_state;
     }
+    // Recorded before the state machine runs, so it is there whatever the
+    // reset turns out to do to the stream.
+    stream->peer_reset_error = error_code;
     const auto before = stream->receive.read_offset();
     std::uint64_t consumed = 0;
     const auto error = stream->receive.receive_reset(final_size, consumed);
