@@ -169,6 +169,12 @@ struct quic_config_t
   // cheaper ceiling, and a server reachable from the internet wants that one
   // and a retry key rather than this.
   std::size_t accept_backlog = 128;
+
+  // How long quic_endpoint_shutdown waits for its connections to acknowledge
+  // their CONNECTION_CLOSE before resolving anyway. A peer that has gone away
+  // will never answer, and a shutdown that waits for it for ever is a process
+  // that does not exit.
+  std::chrono::milliseconds shutdown_timeout{5000};
 };
 
 // What the path is doing. Nothing steers on these; they are what a progress
@@ -640,6 +646,11 @@ struct quic_endpoint_state_t
   bool flush_all = false;
 
   ref_ptr_t<quic_milestone_state_t> shutdown;
+  // Set once and never cleared, unlike shutdown_active, which is only true
+  // while the closes are in flight. Refusing later accepts has to outlive that
+  // window: an accept loop written the obvious way would otherwise take a new
+  // connection on the way out, the moment the last goodbye was acknowledged.
+  bool shutdown_requested = false;
   bool shutdown_active = false;
   std::size_t shutdown_outstanding = 0;
   tick_t shutdown_deadline;
@@ -850,6 +861,7 @@ inline void quic_op_ready(quic_endpoint_state_t &self, quic_op_t *op);
 // each half-implement the pairing is how a connection ends up queued behind a
 // coroutine that was already waiting for it.
 inline void quic_accept_pump(quic_endpoint_state_t &self);
+inline void quic_shutdown_check(quic_endpoint_state_t &self);
 
 constexpr int quic_beat_max_passes = 4;
 
@@ -961,6 +973,7 @@ inline void quic_beat_cb(uv_prepare_t *handle)
     quic_beat_resume(*self);
     quic_beat_flush(*self);
   }
+  quic_shutdown_check(*self);
 }
 
 // -----------------------------------------------------------------------------
@@ -993,7 +1006,7 @@ inline void quic_hook_connection(quic_endpoint_state_t &self, vio::quic::connect
       // makes reachable, and the reason the role is consulted at all.
       return;
     }
-    if (self.shutdown_active || self.accept_queue.size() >= self.config.accept_backlog)
+    if (self.shutdown_requested || self.accept_queue.size() >= self.config.accept_backlog)
     {
       // Section 20.1: told no rather than told nothing. A client that is
       // refused goes elsewhere; one that is ignored waits out its handshake
@@ -1539,7 +1552,7 @@ using quic_accept_future_t = quic_connection_awaitable_t;
     return failed(error_t{.code = -1, .msg = "the endpoint names nothing"});
   }
   auto &self = endpoint.handle.data();
-  if (self.closing || self.shutdown_active)
+  if (self.closing || self.shutdown_requested)
   {
     return failed(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint is shutting down"});
   }
@@ -1774,5 +1787,105 @@ inline void quic_connection_close(quic_connection_t &connection, std::uint64_t c
     return nullptr;
   }
   return &*endpoint.handle.data().transport;
+}
+
+// -----------------------------------------------------------------------------
+// Shutting down
+// -----------------------------------------------------------------------------
+
+namespace detail
+{
+// Run once per beat while a shutdown is in flight. There is no timer_t: the
+// deadline is compared against the loop's own clock on the beat, which the
+// endpoint's 2 ms ticker guarantees runs.
+inline void quic_shutdown_check(quic_endpoint_state_t &self)
+{
+  if (!self.shutdown_active)
+  {
+    return;
+  }
+  if (self.shutdown_outstanding > 0 && loop_now(self.loop) < self.shutdown_deadline)
+  {
+    return;
+  }
+  self.shutdown_active = false;
+  if (self.shutdown.ref_counted() != nullptr)
+  {
+    // Success either way. A deadline that elapsed means some peer never
+    // acknowledged its CONNECTION_CLOSE, which is not this endpoint's failure
+    // and not something a caller can do anything about -- the datagram was
+    // sent, and section 10.2 asks for nothing more.
+    quic_milestone_reach(self.shutdown.data(), {});
+    quic_milestone_drain(self.shutdown.data());
+  }
+}
+} // namespace detail
+
+// Closes every connection this endpoint holds and resolves when they have all
+// ended, or when the deadline passes -- whichever comes first.
+//
+// This is the polite path. Releasing the endpoint is the abrupt one: it takes
+// the socket with it, so a peer that had a connection is met with silence and
+// waits out its own idle timeout. A shutdown says goodbye first.
+//
+// It does not stop the endpoint reading. Resolving leaves it bound with no
+// connections on it, which is right for one that will dial again and merely
+// idle for one about to be dropped; the socket and the beat go when the last
+// handle does. Accepts, on the other hand, do stop: one made after this is
+// refused, and an arriving connection is refused too.
+//
+// A shutdown with nothing to close resolves immediately, which matters for an
+// endpoint whose driver never started -- its loop may not turn on its own.
+[[nodiscard]] inline quic_milestone_t quic_endpoint_shutdown(quic_endpoint_t &endpoint)
+{
+  if (endpoint.handle.ref_counted() == nullptr)
+  {
+    return quic_milestone_t{ref_ptr_t<detail::quic_milestone_state_t>::null()};
+  }
+  auto &self = endpoint.handle.data();
+  if (self.shutdown.ref_counted() == nullptr)
+  {
+    self.shutdown = ref_ptr_t<detail::quic_milestone_state_t>();
+  }
+  if (self.shutdown->reached || self.closing)
+  {
+    return quic_milestone_t{self.shutdown};
+  }
+
+  self.shutdown_requested = true;
+  self.shutdown_active = true;
+  self.shutdown_outstanding = 0;
+  self.shutdown_deadline = loop_now(self.loop) + self.config.shutdown_timeout;
+
+  // A snapshot, because closing marks connections dirty and the gone hook may
+  // erase one from the registry before this walk is finished.
+  std::vector<ref_ptr_t<detail::quic_connection_state_t>> live;
+  live.reserve(self.by_connection.size());
+  for (auto &entry : self.by_connection)
+  {
+    live.push_back(entry.second);
+  }
+  // Queued connections nobody accepted are closed too. They completed a
+  // handshake and would otherwise be met with silence, which is the same
+  // argument that made the backlog refusal a close rather than a drop.
+  for (auto &state : live)
+  {
+    if (state->transport == nullptr)
+    {
+      continue;
+    }
+    ++self.shutdown_outstanding;
+    detail::quic_close_locally(self, state, 0, "the endpoint is shutting down", true);
+  }
+  self.accept_queue.clear();
+
+  // Nothing to wait for. Resolved here rather than on the beat, because an
+  // endpoint that never started its driver has nothing to make the loop turn.
+  if (self.shutdown_outstanding == 0)
+  {
+    self.shutdown_active = false;
+    detail::quic_milestone_reach(self.shutdown.data(), {});
+  }
+  return quic_milestone_t{self.shutdown};
 }
 } // namespace vio

@@ -2118,3 +2118,258 @@ TEST_CASE("a handle that names nothing answers every accessor without crashing")
   CHECK(quic_endpoint_connections(no_endpoint).empty());
 }
 }
+
+TEST_SUITE("quic coroutine shutdown")
+{
+namespace
+{
+vio::quic::tls_config_t shutdown_server_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+vio::quic::tls_config_t shutdown_client_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+sockaddr_in shutdown_loopback(std::uint16_t port)
+{
+  sockaddr_in address = {};
+  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  return address;
+}
+} // namespace
+
+TEST_CASE("a shutdown with nothing to close resolves at once")
+{
+  using namespace vio;
+
+  // Resolved in the factory rather than on the beat, and the reason is narrow:
+  // an endpoint whose driver never started has nothing to make the loop turn,
+  // so a milestone left for the beat to reach would never be reached at all.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = vio::quic::tls_context_t::create(shutdown_server_tls(identity));
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool at_once = false;
+  bool resolved = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &at_once, bool &resolved) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, tls);
+            REQUIRE(endpoint.has_value());
+            auto done = quic_endpoint_shutdown(*endpoint);
+            at_once = done.reached();
+            resolved = (co_await done).has_value();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, at_once, resolved));
+    });
+  event_loop.run();
+
+  CHECK(at_once);
+  CHECK(resolved);
+}
+
+TEST_CASE("a shutdown closes every connection and the peers hear it")
+{
+  using namespace vio;
+
+  // The polite path. Releasing the endpoint is the abrupt one -- it takes the
+  // socket with it, so every peer is met with silence and waits out its own
+  // idle timeout. A shutdown says goodbye first, and resolves once the goodbyes
+  // have been acknowledged.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(shutdown_server_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(shutdown_client_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool shut_down = false;
+  int first_ending = 0;
+  int second_ending = 0;
+  bool from_peer = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &shut_down, int &first_ending, int &second_ending, bool &from_peer) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = shutdown_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+
+            auto client = quic_endpoint_create(loop, nullptr, &connecting);
+            REQUIRE(client.has_value());
+            const auto target = shutdown_loopback(port);
+            auto first = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            auto second = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(first.has_value());
+            REQUIRE(second.has_value());
+
+            // Both are sitting in the server's accept queue, unaccepted. They
+            // are closed too: a connection that completed a handshake and is
+            // then met with silence is exactly what the backlog refusal exists
+            // to avoid.
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+            REQUIRE(quic_endpoint_connection_count(*server) == 2);
+
+            shut_down = (co_await quic_endpoint_shutdown(*server)).has_value();
+
+            const auto first_how = co_await quic_connection_closed(*first);
+            const auto second_how = co_await quic_connection_closed(*second);
+            first_ending = first_how.has_value() ? 0 : first_how.error().code;
+            second_ending = second_how.has_value() ? 0 : second_how.error().code;
+            const auto why = quic_connection_close_reason(*first);
+            from_peer = why.has_value() && why->from_peer;
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, shut_down, first_ending, second_ending, from_peer));
+    });
+  event_loop.run();
+
+  CHECK(shut_down);
+  // Both ended *cleanly*, which is the right answer and worth being explicit
+  // about: a shutdown says NO_ERROR, and a zero code from either side is a
+  // clean ending rather than a failure. vio_quic_connection_closed is for a
+  // non-zero one. What tells this apart from a connection that simply finished
+  // is the close reason, which names the peer as the one who said so.
+  CHECK(first_ending == 0);
+  CHECK(second_ending == 0);
+  CHECK(from_peer);
+}
+
+TEST_CASE("a shutdown whose connections never end resolves on its deadline")
+{
+  using namespace vio;
+
+  // A peer that has gone away will never acknowledge its CONNECTION_CLOSE, and
+  // a shutdown that waits for it for ever is a process that does not exit.
+  //
+  // The state is set up by hand, and that is a deliberate choice rather than a
+  // shortcut. Arranging a real peer that takes a datagram and then never
+  // reaches the gone hook is not reproducible -- a connection closed with no
+  // peer at all reaches it almost immediately, which is the opposite of what
+  // this is about. What is being tested is the deadline arm of
+  // quic_shutdown_check, so the outstanding count is simply one that nothing
+  // will ever decrement.
+  //
+  // The endpoint is bound so that its 2 ms ticker runs, because that ticker is
+  // what guarantees the loop turns and therefore that the beat -- which is
+  // where the deadline is compared -- runs at all. There is no timer_t here on
+  // purpose.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = vio::quic::tls_context_t::create(shutdown_server_tls(identity));
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool resolved = false;
+  bool waited = false;
+  bool not_before = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &resolved, bool &waited, bool &not_before) -> task_t<void>
+        {
+          {
+            auto endpoint = quic_endpoint_create(loop, listening);
+            REQUIRE(endpoint.has_value());
+            const auto any = shutdown_loopback(0);
+            REQUIRE(quic_endpoint_bind(*endpoint, reinterpret_cast<const sockaddr *>(&any)).has_value());
+
+            auto &state = endpoint->handle.data();
+            state.shutdown = ref_ptr_t<detail::quic_milestone_state_t>();
+            state.shutdown_requested = true;
+            state.shutdown_active = true;
+            state.shutdown_outstanding = 1;
+            const auto started = loop_now(loop);
+            state.shutdown_deadline = started + std::chrono::milliseconds(200);
+
+            quic_milestone_t waiting{state.shutdown};
+            not_before = !waiting.reached();
+            resolved = (co_await waiting).has_value();
+            const auto elapsed = loop_now(loop) - started;
+            waited = elapsed >= std::chrono::milliseconds(150);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, resolved, waited, not_before));
+    });
+  event_loop.run();
+
+  CHECK(not_before);
+  CHECK(resolved);
+  CHECK(waited);
+}
+
+TEST_CASE("a shutdown stops the endpoint accepting")
+{
+  using namespace vio;
+
+  // Otherwise a server that said goodbye to everything would go on answering
+  // Initials, and an accept loop written the obvious way -- while (true)
+  // accept -- would take a new connection on the way out.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(shutdown_server_tls(identity));
+  REQUIRE(server_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool refused = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &refused) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, listening);
+            REQUIRE(server.has_value());
+            const auto any = shutdown_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+
+            REQUIRE((co_await quic_endpoint_shutdown(*server)).has_value());
+
+            auto accept = quic_endpoint_accept(*server);
+            REQUIRE(accept.await_ready());
+            const auto result = accept.await_resume();
+            refused = !result.has_value() && result.error().code == vio_quic_endpoint_closed;
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, refused));
+    });
+  event_loop.run();
+
+  CHECK(refused);
+}
+}
