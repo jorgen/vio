@@ -111,6 +111,71 @@ inline identity_t make_self_signed(const char *common_name)
   return out;
 }
 
+// A certificate authority: self-signed, marked as a CA, and kept so that it
+// can sign others. A mesh needs one of these rather than a pile of pinned
+// certificates -- pinning each peer in every other peer works for two nodes
+// and stops at three, whereas one signature per new node changes nothing that
+// already exists.
+//
+// The private key comes back with it because signing is the whole point.
+inline identity_t make_certificate_authority(const char *common_name)
+{
+  return make_self_signed(common_name);
+}
+
+// A leaf identity signed by the authority above. The name goes in the subject,
+// which is what the peer reads back from peer_certificate_subject() once the
+// chain has verified, and so is what an application makes a decision on.
+inline identity_t make_signed_by(const identity_t &authority, const char *common_name)
+{
+  EVP_PKEY *key = nullptr;
+  EVP_PKEY_CTX *context = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+  EVP_PKEY_keygen_init(context);
+  EVP_PKEY_CTX_set_ec_paramgen_curve_nid(context, NID_X9_62_prime256v1);
+  EVP_PKEY_keygen(context, &key);
+  EVP_PKEY_CTX_free(context);
+
+  // The authority is handed back as PEM, so it has to be read in again to sign
+  // with. That is the same shape a real deployment has, where the CA is a file
+  // rather than a variable.
+  BIO *ca_certificate_bio = BIO_new_mem_buf(authority.certificate_pem.data(), static_cast<int>(authority.certificate_pem.size()));
+  X509 *ca_certificate = PEM_read_bio_X509(ca_certificate_bio, nullptr, nullptr, nullptr);
+  BIO_free(ca_certificate_bio);
+  BIO *ca_key_bio = BIO_new_mem_buf(authority.private_key_pem.data(), static_cast<int>(authority.private_key_pem.size()));
+  EVP_PKEY *ca_key = PEM_read_bio_PrivateKey(ca_key_bio, nullptr, nullptr, nullptr);
+  BIO_free(ca_key_bio);
+
+  X509 *certificate = X509_new();
+  X509_set_version(certificate, 2);
+  ASN1_INTEGER_set(X509_get_serialNumber(certificate), 2);
+  X509_gmtime_adj(X509_getm_notBefore(certificate), 0);
+  X509_gmtime_adj(X509_getm_notAfter(certificate), 31536000L);
+  X509_set_pubkey(certificate, key);
+  X509_NAME *subject = X509_get_subject_name(certificate);
+  X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>(common_name), -1, -1, 0);
+  // Issued by the authority, which is what makes one signature enough for a
+  // peer that has never seen this certificate before.
+  X509_set_issuer_name(certificate, X509_get_subject_name(ca_certificate));
+  const std::string alt_name = std::string("DNS:") + common_name;
+  X509_EXTENSION *san = X509V3_EXT_nconf_nid(nullptr, nullptr, NID_subject_alt_name, alt_name.c_str());
+  X509_add_ext(certificate, san, -1);
+  X509_EXTENSION_free(san);
+  X509_sign(certificate, ca_key, EVP_sha256());
+
+  BIO *certificate_bio = BIO_new(BIO_s_mem());
+  BIO *key_bio = BIO_new(BIO_s_mem());
+  PEM_write_bio_X509(certificate_bio, certificate);
+  PEM_write_bio_PrivateKey(key_bio, key, nullptr, nullptr, 0, nullptr, nullptr);
+  identity_t out{.certificate_pem = read_bio(certificate_bio), .private_key_pem = read_bio(key_bio)};
+  BIO_free(certificate_bio);
+  BIO_free(key_bio);
+  X509_free(certificate);
+  EVP_PKEY_free(key);
+  X509_free(ca_certificate);
+  EVP_PKEY_free(ca_key);
+  return out;
+}
+
 // The stream API takes and returns bytes, and everything an example wants to
 // send is text, so this conversion appears in every one of them.
 inline std::span<const std::uint8_t> bytes_of(std::string_view text)

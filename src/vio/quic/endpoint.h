@@ -218,11 +218,13 @@ public:
   // Both must outlive the endpoint. Passing a context whose role does not
   // match its parameter fails here rather than at the first handshake.
   //
-  // A caveat while it is still true: the answering half authenticates nobody.
-  // tls_config_t has no way to ask for a client certificate, so an endpoint
-  // that answers accepts a connection from anyone, exactly as an ordinary
-  // server does. Two peers that need to know who each other are cannot yet
-  // establish it here.
+  // Note what the answering half does about identity, because the default is
+  // the web's rather than a mesh's: it accepts a connection from anyone, and
+  // leaves authorisation to the application. Peers that need to know which
+  // peer they are talking to set tls_config_t::peer_verify on the answering
+  // context and give both contexts a certificate, after which
+  // connection_t::peer_certificate_subject() names the other end. See
+  // examples/quic_peer.cpp.
   [[nodiscard]] static std::expected<endpoint_t, error_t> create(event_loop_t &loop, const tls_context_t *server_context, const tls_context_t *client_context, const endpoint_config_t &config);
 
   // Binds the socket. A client may skip this and let the OS choose.

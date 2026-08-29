@@ -173,7 +173,7 @@ value** (the values live in the coroutine frame), or capture by value / a
 | **Thread pool** | `thread_pool.h` | `thread_pool_t` — offload blocking work off the loop |
 | **Event pipes** | `awaitable_event_pipe.h` | cross-coroutine / cross-thread signalling |
 | **Addresses** | `operation/tcp.h` | `ip4_addr`, `ip6_addr` |
-| **QUIC** | `quic/endpoint.h` | `tls_context_t`, `endpoint_t::create/bind/connect/run`, `connection_t` streams and datagrams |
+| **QUIC** | `quic/endpoint.h` | `tls_context_t`, `endpoint_t::create/bind/connect/run`, `connection_t` streams and datagrams; two contexts for peer-to-peer, `peer_verify` for mutual TLS |
 
 ### TCP client + server
 
@@ -328,6 +328,7 @@ All under [`examples/`](examples/):
 | `quic_datagram.cpp` | QUIC unreliable datagrams (RFC 9221) and their two-sided negotiation |
 | `quic_zero_rtt.cpp` | QUIC session resumption and 0-RTT, with the anti-replay register |
 | `quic_close.cpp` | How a QUIC connection ends — peer close, dead dial, idle timeout |
+| `quic_peer.cpp` | Peer-to-peer QUIC — one endpoint that dials and answers, with mutual TLS |
 
 ## License
 

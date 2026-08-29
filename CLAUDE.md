@@ -130,6 +130,37 @@ Configuration is in `.clang-tidy` at the project root.
   `transport_parameters.h` is the section 18 extension TLS carries; note that
   an absent parameter means its default and the defaults are not all zero, so
   the struct is initialised to them and decoding overwrites only what arrived.
+  Those initialisers are the wire's "absent" values and must stay that way --
+  raising one makes a silent peer decode as having granted credit it never
+  gave. What vio actually advertises is `default_transport_parameters()`, which
+  `connection_config_t` uses, so an application that configures nothing still
+  gets a connection that carries data. It grants 8 MiB per connection and 2 MiB
+  per stream; a server expecting thousands of concurrent connections should
+  lower `initial_max_data`, because there is no receive-window auto-tuning to
+  grow or shrink it.
+
+  **Peer-to-peer and mutual TLS.** An endpoint holds up to two `tls_context_t`,
+  because a context picks `TLS_server_method` or `TLS_client_method` at
+  creation and gates tickets and early data on that, so no single one can both
+  answer and dial. `endpoint_t::create` has a two-context overload; the
+  one-context form puts it in the slot its `role()` names, and which slots are
+  filled is what decides whether a dial or an arriving Initial is refused. The
+  role is therefore no longer an endpoint-wide fact -- it is written per
+  connection by whichever path built it, and read back through
+  `connection_t::role()`, which a peer-to-peer application needs because
+  `on_connection` fires for dialled connections too.
+
+  Authentication is `tls_config_t::peer_verify`, the same `peer_verify_t` the
+  TCP stack has always had, read per role: a client verifies its peer unless
+  told not to, a server asks for nothing unless told to. A server that verifies
+  needs `ca_certificates_pem` and is refused at create without it -- it falls
+  back to no anchors rather than to the public roots, since the CA that signs a
+  client population is essentially never one of those.
+  `connection_t::peer_certificate_subject()` names the peer, and only once the
+  chain behind it verified, so a non-empty answer is an authenticated identity
+  and nothing else is. BoringSSL documents no QUIC restriction on client
+  certificates -- its QUIC caveats are all about 0-RTT and key release -- so
+  `test_quic_tls.cpp` establishes it by running one with no socket underneath.
   `connection.h` + `src/quic_connection.cpp` is the state machine that drives
   all of it: three packet number spaces, the Initial/Handshake/1-RTT key
   progression, anti-amplification (section 8.1) and connection close. It is
