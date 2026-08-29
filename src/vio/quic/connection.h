@@ -340,6 +340,17 @@ public:
   [[nodiscard]] std::string peer_certificate_subject() const;
 
   [[nodiscard]] std::string_view selected_alpn() const;
+  // Why this connection ended, or nothing while it is still running.
+  //
+  // Broader than the frame it is named after: a version negotiation failure, a
+  // stateless reset, an idle timeout and an abandoned handshake all end a
+  // connection without a CONNECTION_CLOSE ever being sent or received, and all
+  // of them record a reason here. Silent on the wire and silent to the
+  // application are different things, and this is the only place the second
+  // one is answered.
+  //
+  // from_peer separates the two cases an application usually cares about:
+  // whether the far end said something, or whether this end gave up.
   [[nodiscard]] std::optional<connection_close_t> close_reason() const;
 
   // Whether this connection went through a Retry, and so whether the peer

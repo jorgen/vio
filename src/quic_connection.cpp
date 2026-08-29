@@ -3326,8 +3326,17 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
   {
     // Nothing is sent. A handshake this old has either been abandoned or was
     // never real, and in both cases there is no one to tell.
+    //
+    // A reason is recorded even though no frame carries it, because the
+    // application above is the one party that can still be told, and
+    // close_reason is the only thing it has to ask. from_peer is false: this
+    // endpoint gave up, nobody sent anything.
     impl.state = connection_state_t::closed;
     impl.close_frame_pending = false;
+    if (!impl.close_reason.has_value())
+    {
+      impl.close_reason = connection_close_t{.error_code = transport_error_no_error, .application = false, .reason = "the handshake did not complete in time", .from_peer = false};
+    }
     return std::size_t{0};
   }
   if (auto deadline = idle_deadline(impl); deadline.has_value() && now >= *deadline)
@@ -3335,8 +3344,17 @@ std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8
     // Section 10.1: silently closed and the state discarded. No
     // CONNECTION_CLOSE goes out -- there is nobody there to read it, which is
     // the whole reason the timer fired.
+    //
+    // Silent on the wire is not the same as silent to the application, and
+    // these two timeouts are the commonest ways a connection ends. Leaving
+    // close_reason empty for both meant the one accessor built to answer "why
+    // did this end" answered nothing exactly when it mattered.
     impl.state = connection_state_t::closed;
     impl.close_frame_pending = false;
+    if (!impl.close_reason.has_value())
+    {
+      impl.close_reason = connection_close_t{.error_code = transport_error_no_error, .application = false, .reason = "the connection was idle for longer than the negotiated timeout", .from_peer = false};
+    }
     return std::size_t{0};
   }
   if (impl.state == connection_state_t::closed)

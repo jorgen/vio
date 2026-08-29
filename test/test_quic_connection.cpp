@@ -2160,9 +2160,15 @@ TEST_CASE("an idle connection is discarded once both sides stop talking")
   REQUIRE(expired.has_value());
   CHECK(*expired == 0);
   // Silently, with no CONNECTION_CLOSE: there is nobody there to read one,
-  // which is why the timer fired.
+  // which is why the timer fired. That is a statement about the wire, and the
+  // zero-length send above is what checks it.
   CHECK(client->state() == connection_state_t::closed);
-  CHECK_FALSE(client->close_reason().has_value());
+  // The application is still here, though, and it is the one party that can
+  // be told. from_peer is false because nothing arrived -- this endpoint gave
+  // up on its own.
+  REQUIRE(client->close_reason().has_value());
+  CHECK_FALSE(client->close_reason()->from_peer);
+  CHECK_FALSE(client->close_reason()->reason.empty());
 
   SUBCASE("and a connection with no advertised timeout never expires")
   {
@@ -3494,6 +3500,76 @@ TEST_CASE("a peer that stops reading says so with a code")
 
   REQUIRE(client->stream_peer_stop_sending_error(*stream).has_value());
   CHECK(*client->stream_peer_stop_sending_error(*stream) == stop_code);
+}
+
+// The two commonest ways a connection ends are the two timeouts, and neither
+// sends a frame -- an idle timeout has nobody left to tell, and an abandoned
+// handshake never had anyone. But the application above is still there, and
+// close_reason is the only question it can ask. It used to answer nothing for
+// exactly these two.
+TEST_CASE("a connection that times out says why it ended")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  SUBCASE("an idle timeout")
+  {
+    auto parameters = sane_parameters();
+    parameters.max_idle_timeout = 1000;
+
+    connection_config_t client_config;
+    client_config.role = tls_role_t::client;
+    client_config.transport_parameters = parameters;
+    connection_config_t server_config;
+    server_config.role = tls_role_t::server;
+    server_config.transport_parameters = parameters;
+
+    auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+    auto server = connection_t::create(contexts.server_context, server_config);
+    REQUIRE(client.has_value());
+    REQUIRE(server.has_value());
+    REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+    REQUIRE(client->handshake_complete());
+    REQUIRE_FALSE(client->close_reason().has_value());
+
+    // Well past the negotiated timeout, with nothing having arrived.
+    std::array<std::uint8_t, 1500> out = {};
+    const auto sent = client->poll_send(out, at(30s));
+    REQUIRE(sent.has_value());
+    CHECK(client->state() == connection_state_t::closed);
+
+    REQUIRE(client->close_reason().has_value());
+    // Nobody sent anything, so it cannot have come from the peer.
+    CHECK_FALSE(client->close_reason()->from_peer);
+    CHECK_FALSE(client->close_reason()->reason.empty());
+  }
+
+  SUBCASE("a handshake that never completes")
+  {
+    connection_config_t client_config;
+    client_config.role = tls_role_t::client;
+    client_config.transport_parameters = sane_parameters();
+    client_config.handshake_timeout = std::chrono::seconds(1);
+
+    auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+    REQUIRE(client.has_value());
+
+    // The first flight goes out and nothing ever answers it.
+    std::array<std::uint8_t, 1500> out = {};
+    const auto first = client->poll_send(out, at(0ns));
+    REQUIRE(first.has_value());
+    REQUIRE(*first > 0);
+    REQUIRE_FALSE(client->close_reason().has_value());
+
+    const auto later = client->poll_send(out, at(30s));
+    REQUIRE(later.has_value());
+    CHECK(client->state() == connection_state_t::closed);
+    CHECK_FALSE(client->handshake_complete());
+
+    REQUIRE(client->close_reason().has_value());
+    CHECK_FALSE(client->close_reason()->from_peer);
+    CHECK_FALSE(client->close_reason()->reason.empty());
+  }
 }
 
 }
