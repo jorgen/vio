@@ -184,6 +184,15 @@ void route_by(endpoint_impl_t &impl, connection_entry_t &entry, const connection
   {
     return;
   }
+  // A route another connection already holds is left where it is. Overwriting
+  // it would silently steal every datagram addressed to that connection, and
+  // the theft outlives the thief: reap withdraws the ids in entry.routed, so
+  // whichever of the two is collected first takes the route away from the
+  // other.
+  if (const auto existing = impl.by_id.find(id); existing != impl.by_id.end() && existing->second != &entry)
+  {
+    return;
+  }
   entry.routed.push_back(id);
   impl.by_id[id] = &entry;
 }
@@ -202,7 +211,18 @@ void index_connection(endpoint_impl_t &impl, connection_entry_t &entry)
   // unmatched, and each one would be read as a new connection. The value is
   // not known until the first Initial has been processed, so this runs on
   // every flush rather than once at accept.
-  const auto &original = entry.connection->original_destination_id();
+  //
+  // Only for a connection this endpoint answered. On one it dialled, the same
+  // field holds the id this endpoint invented to address the peer, which the
+  // peer never sends back -- and that id is in plaintext in every Initial that
+  // went out, so routing on it lets anyone who saw one steer a datagram to a
+  // connection that cannot authenticate them. On an endpoint that also
+  // answers, that is an inbound handshake refused rather than accepted.
+  connection_id_t original;
+  if (entry.connection->role() == tls_role_t::server)
+  {
+    original = entry.connection->original_destination_id();
+  }
   route_by(impl, entry, original);
 
   // Section 5.1.1: an id the peer has retired is one this endpoint no longer

@@ -3656,6 +3656,11 @@ std::uint64_t connection_t::migration_count() const
   return _impl->migrations;
 }
 
+tls_role_t connection_t::role() const
+{
+  return _impl->config.role;
+}
+
 const connection_id_t &connection_t::original_destination_id() const
 {
   return _impl->original_destination_id;

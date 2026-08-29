@@ -1195,3 +1195,297 @@ TEST_CASE("a connection is not reaped while the endpoint is walking it")
   // outside would then have flushed freed storage.
   CHECK(count_after == 1);
 }
+
+// Several connections on one client endpoint, all to the same server. Each
+// holds its own routes and none may take another's: the table is keyed on
+// connection id, so an overwrite silently redirects every datagram for the
+// first connection -- and reap withdraws the ids the losing entry believes it
+// owns, which then unroutes the winner as well.
+TEST_CASE("concurrent dials on one endpoint each keep their own routes")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  std::size_t reachable = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &count) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        auto server_context = tls_context_t::create(server_tls);
+        REQUIRE(server_context.has_value());
+
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip4_addr("127.0.0.1", *port);
+        REQUIRE(target.has_value());
+
+        std::vector<connection_handle_t> handles;
+        for (int i = 0; i < 4; ++i)
+        {
+          auto handle = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+          REQUIRE(handle.has_value());
+          handles.push_back(*handle);
+        }
+
+        for (int i = 0; i < 600; ++i)
+        {
+          std::size_t done = 0;
+          for (const auto handle : handles)
+          {
+            auto *live = client->connection(handle);
+            done += (live != nullptr && live->handshake_complete()) ? 1 : 0;
+          }
+          if (done == handles.size())
+          {
+            break;
+          }
+          co_await sleep(loop, 5ms);
+        }
+
+        for (const auto handle : handles)
+        {
+          auto *live = client->connection(handle);
+          if (live != nullptr && live->handshake_complete())
+          {
+            ++count;
+            live->close(0, "done", true);
+          }
+        }
+
+        co_await sleep(loop, 50ms);
+        client_cancel.cancel();
+        server_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        client.reset();
+        server.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, reachable);
+    });
+
+  event_loop.run();
+  CHECK(reachable == 4);
+}
+
+// The Destination Connection ID a client invents for its first Initial means
+// the opposite thing on the two sides, and the demultiplexer routed on it for
+// both. On a server it is a value the peer really does address. On a client it
+// is the id this endpoint uses to address the PEER, which nothing ever sends
+// back here -- and it travels in plaintext in every Initial that goes out, so
+// anyone who has seen one can steer a datagram to that connection.
+//
+// Observable through the stateless reset path: a datagram naming an id this
+// endpoint does not answer to earns a reset, and one naming a connection it
+// has earns silence. The invented id must fall in the first group.
+
+TEST_CASE("a dialled connection is not routed by the id it invented")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool connected = false;
+  int replies_to_invented_id = 0;
+  int replies_to_real_id = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &done, int &to_invented, int &to_real) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto server_port = server->local_port();
+        REQUIRE(server_port.has_value());
+
+        // The client is given a reset key and a fixed port, so a probe can ask
+        // it what it does and does not answer to.
+        auto reset_key = stateless_reset_key_t::create();
+        REQUIRE(reset_key.has_value());
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        client_config.stateless_reset_key = &*reset_key;
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
+        auto client_bind = ip4_addr("127.0.0.1", 0);
+        REQUIRE(client_bind.has_value());
+        REQUIRE(client->bind(reinterpret_cast<const sockaddr *>(&*client_bind)).has_value());
+        auto client_port = client->local_port();
+        REQUIRE(client_port.has_value());
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip4_addr("127.0.0.1", *server_port);
+        REQUIRE(target.has_value());
+        auto handle = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        REQUIRE(handle.has_value());
+
+        connection_id_t invented;
+        connection_id_t real;
+        for (int i = 0; i < 400; ++i)
+        {
+          auto *live = client->connection(*handle);
+          if (live == nullptr)
+          {
+            break;
+          }
+          if (live->handshake_complete())
+          {
+            done = true;
+            invented = live->original_destination_id();
+            const auto issued = live->issued_connection_ids();
+            REQUIRE_FALSE(issued.empty());
+            real = issued.front();
+            break;
+          }
+          co_await sleep(loop, 5ms);
+        }
+        REQUIRE(done);
+        REQUIRE_FALSE(invented.empty());
+        REQUIRE_FALSE(real.empty());
+
+        auto probe_created = udp_create(loop);
+        REQUIRE(probe_created.has_value());
+        std::optional<udp_t> probe(std::move(*probe_created));
+        auto probe_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(probe_address.has_value());
+        REQUIRE(udp_bind(*probe, reinterpret_cast<const sockaddr *>(&*probe_address)).has_value());
+        auto reader_created = udp_create_reader(*probe);
+        REQUIRE(reader_created.has_value());
+        std::optional<udp_reader_t> reader(std::move(*reader_created));
+
+        int received = 0;
+        auto pump = [](decltype(*reader) &r, int &count) -> detached_task_t
+        {
+          for (;;)
+          {
+            auto datagram = co_await r;
+            if (!datagram.has_value())
+            {
+              break;
+            }
+            ++count;
+          }
+        }(*reader, received);
+        (void)pump;
+
+        auto client_target = ip4_addr("127.0.0.1", *client_port);
+        REQUIRE(client_target.has_value());
+
+        // A short header naming the given connection id. A reset comes back
+        // only when the endpoint does not recognise it.
+        const auto probe_with = [&](const connection_id_t &id) -> task_t<int>
+        {
+          received = 0;
+          std::vector<std::uint8_t> datagram(100, 0x00);
+          datagram[0] = 0x40;
+          const auto raw = id.bytes();
+          std::copy(raw.begin(), raw.end(), datagram.begin() + 1);
+          (void)udp_try_send(*probe, datagram, reinterpret_cast<const sockaddr *>(&*client_target));
+          for (int i = 0; i < 20 && received == 0; ++i)
+          {
+            co_await sleep(loop, 5ms);
+          }
+          co_return int{received};
+        };
+
+        to_invented = co_await probe_with(invented);
+        to_real = co_await probe_with(real);
+
+        reader->cancel();
+        co_await sleep(loop, 20ms);
+        reader.reset();
+        probe.reset();
+
+        if (auto *live = client->connection(*handle); live != nullptr)
+        {
+          live->close(0, "done", true);
+        }
+        co_await sleep(loop, 50ms);
+        client_cancel.cancel();
+        server_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        client.reset();
+        server.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, connected, replies_to_invented_id, replies_to_real_id);
+    });
+
+  event_loop.run();
+  CHECK(connected);
+  // Not an id this endpoint answers to, so the datagram is unknown and draws a
+  // reset. Routed to the dialled connection it would instead have failed to
+  // authenticate and been dropped in silence.
+  CHECK(replies_to_invented_id == 1);
+  // And an id it really did issue is recognised, so there is no reset for it.
+  CHECK(replies_to_real_id == 0);
+}

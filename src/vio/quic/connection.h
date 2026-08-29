@@ -334,10 +334,25 @@ public:
   // Section 5.1: how many connection IDs each side currently has available.
   // A peer that has run out cannot migrate, since section 9.5 requires it to
   // move to an ID the old path never saw.
+  // Which end of the handshake this connection ran. Written per connection by
+  // whatever built it, so it is the one place the answer lives -- and a
+  // demultiplexer needs it, because the two roles are not routable on the same
+  // terms. See original_destination_id below.
+  [[nodiscard]] tls_role_t role() const;
+
   // Section 7.2: the unpredictable value the client put in the Destination
-  // Connection ID of its first Initial. A server has to keep answering to it
-  // until the client has seen the server's own choice and switched, which is
-  // why a demultiplexer routes on it as well as on the issued ids.
+  // Connection ID of its first Initial.
+  //
+  // It means opposite things on the two sides, which is what makes it a
+  // routing hazard. On a server it is a value the peer really does address, so
+  // a demultiplexer must route on it as well as on the issued ids, until the
+  // client has seen the server's own choice and switched. On a client it is
+  // the value this endpoint invented to address the PEER, and nothing ever
+  // sends it back here -- so routing on it is at best dead weight, and on an
+  // endpoint that also answers it is worse: the value travels in plaintext in
+  // every Initial, so anyone who has seen one can address it and be routed to
+  // a connection that will fail to authenticate them rather than to the
+  // accept path.
   [[nodiscard]] const connection_id_t &original_destination_id() const;
 
   // Every connection ID this endpoint currently accepts as a destination.
