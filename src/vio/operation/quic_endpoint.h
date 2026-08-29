@@ -824,6 +824,11 @@ namespace detail
 // arming it conditionally -- and step 3 of this work found that making a
 // periodic mechanism in this endpoint conditional produced both a spin and a
 // stall.
+// Moves an operation from the waiting list to the resumable one, keeping the
+// endpoint's hold, which the beat drops after resuming. Nothing here resumes:
+// every caller is standing inside the transport's flush.
+inline void quic_op_ready(quic_endpoint_state_t &self, quic_op_t *op);
+
 constexpr int quic_beat_max_passes = 4;
 
 [[nodiscard]] inline bool quic_beat_has_work(const quic_endpoint_state_t &self)
@@ -968,6 +973,12 @@ inline void quic_hook_connection(quic_endpoint_state_t &self, vio::quic::connect
   {
     quic_milestone_reach(state->ready.data(), {});
   }
+  if (state->pending_dial != nullptr)
+  {
+    auto *op = std::exchange(state->pending_dial, nullptr);
+    quic_op_finish(*op, state);
+    quic_op_ready(self, op);
+  }
   quic_mark_pending(self, state);
 }
 
@@ -1024,7 +1035,7 @@ inline void quic_sever(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_st
     {
       quic_op_finish(*op, ending.error());
     }
-    self.ready_ops.push_back(op);
+    quic_op_ready(self, op);
   }
   quic_mark_pending(self, state);
 }
@@ -1290,5 +1301,131 @@ inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &sel
     return std::unexpected(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
   }
   return self.transport->local_port();
+}
+
+namespace detail
+{
+inline void quic_op_ready(quic_endpoint_state_t &self, quic_op_t *op)
+{
+  const auto found = std::find(self.live_ops.begin(), self.live_ops.end(), op);
+  if (found == self.live_ops.end())
+  {
+    return; // already made ready, or never registered
+  }
+  self.live_ops.erase(found);
+  self.ready_ops.push_back(op);
+}
+
+// Closes a connection this layer asked to close, which is the only way to tell
+// a clean local close from an idle timeout: the transport records both with the
+// same error code, the same application flag and the same from_peer.
+inline void quic_close_locally(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_state_t> state, std::uint64_t code, std::string_view reason, bool application)
+{
+  if (state->transport == nullptr)
+  {
+    return;
+  }
+  state->closed_locally = true;
+  state->transport->close(code, reason, application);
+  quic_mark_dirty(self, std::move(state));
+}
+} // namespace detail
+
+// The awaitable a dial and an accept both return. Two names for one type,
+// because "future" is what a thing resolved by an arrival is called elsewhere
+// in vio and "awaitable" is what a thing resolved by a request is called, and
+// the two operations really are the same shape underneath.
+using quic_connect_awaitable_t = quic_connection_awaitable_t;
+using quic_accept_future_t = quic_connection_awaitable_t;
+
+// -----------------------------------------------------------------------------
+// Dialling
+// -----------------------------------------------------------------------------
+
+// Dials, and resolves when the handshake completes or fails. Connected means
+// what it means for ssl_client_connect -- the certificate has verified, an ALPN
+// has been agreed and the peer's transport parameters have arrived, so a stream
+// opened on the result will have credit -- and not that the first Initial has
+// been queued.
+//
+// A ticket kept from an earlier connection to this peer shortens the handshake.
+// Read one with quic_connection_resumption_ticket; a ticket that will not parse
+// is a full handshake rather than a failure to connect.
+//
+// Every synchronous failure comes back on the same awaitable, pre-resolved and
+// never suspending -- a bad address as the raw libuv code, a dial on an endpoint
+// with no client context as a sentence. That is the tcp_connect shape, and it
+// means a caller has one place to look rather than two.
+[[nodiscard]] inline quic_connect_awaitable_t quic_endpoint_connect(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket = {})
+{
+  const auto failed = [](error_t reason)
+  {
+    auto *op = detail::quic_op_create(nullptr);
+    detail::quic_op_finish(*op, std::move(reason));
+    return quic_connect_awaitable_t{op};
+  };
+
+  if (endpoint.handle.ref_counted() == nullptr)
+  {
+    return failed(error_t{.code = -1, .msg = "the endpoint names nothing"});
+  }
+  auto &self = endpoint.handle.data();
+  if (self.closing)
+  {
+    return failed(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
+  }
+
+  auto *op = detail::quic_op_create(&self);
+  self.live_ops.push_back(op);
+  quic_connect_awaitable_t out{op};
+
+  // endpoint_t::connect fixes the socket's address family, so a dial that
+  // cannot happen must be refused before it -- otherwise an endpoint built
+  // without a client context would be pinned to whatever family the impossible
+  // dial named, and a later bind would fail for a reason nothing explains.
+  auto dialled = self.transport->connect(address, server_name, resumption_ticket);
+  if (!dialled)
+  {
+    detail::quic_op_finish(*op, dialled.error());
+    detail::quic_op_ready(self, op);
+    return out;
+  }
+  auto *connection = self.transport->connection(*dialled);
+  if (connection == nullptr)
+  {
+    detail::quic_op_finish(*op, error_t{.code = -1, .msg = "the dialled connection was gone before it was returned"});
+    detail::quic_op_ready(self, op);
+    return out;
+  }
+
+  // After the dial, never before: the dial is what gave the socket a family,
+  // and starting the read loop first would pin it to IPv4.
+  if (auto started = detail::quic_start_driver(self); !started)
+  {
+    connection->close(vio::quic::transport_error_internal, "the endpoint could not start reading", false);
+    (void)self.transport->flush(*connection);
+    detail::quic_op_finish(*op, started.error());
+    detail::quic_op_ready(self, op);
+    return out;
+  }
+
+  // Registered by pointer, before anything else can look one up. This is what
+  // sorts a dial from an arrival: on_connection fires for dialled connections
+  // too, and only a registry keyed on connection_t* keeps a peer's own outbound
+  // connections out of its accept queue.
+  auto entry = ref_ptr_t<detail::quic_connection_state_t>(&self, connection, vio::quic::tls_role_t::client);
+  entry->pending_dial = op;
+  self.by_connection.emplace(connection, entry);
+
+  // endpoint_t::connect flushes before it returns, so this connection's
+  // draining latch -- and with it the gone hook -- may already have fired for a
+  // connection nothing had registered yet, in which case it will never fire
+  // again. Nothing can drive a fresh dial to closed today; the registration is
+  // simply not allowed to assume it precedes the first hook.
+  if (connection->state() == vio::quic::connection_state_t::closed)
+  {
+    detail::quic_sever(self, entry, std::unexpected(error_t{.code = vio_quic_handshake_failed, .msg = "the connection ended before it was dialled"}));
+  }
+  return out;
 }
 } // namespace vio

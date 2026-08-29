@@ -5,6 +5,7 @@
 
 #include <vio/operation/quic_endpoint.h>
 #include <vio/operation/sleep.h>
+#include <vio/operation/udp.h>
 
 #include "quic_identity.h"
 
@@ -542,7 +543,7 @@ TEST_CASE("an endpoint released while the loop can still run leaves nothing open
             REQUIRE(endpoint.has_value());
             was_released = true;
           } // the last handle goes here, and with it the socket and the beat
-          co_await sleep(loop, std::chrono::milliseconds(1));
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
           loop.stop();
         }(event_loop, *context, released));
     });
@@ -616,7 +617,7 @@ TEST_CASE("a permanently armed beat still lets the loop sleep")
         {
           auto endpoint = quic_endpoint_create(loop, tls);
           REQUIRE(endpoint.has_value());
-          co_await sleep(loop, std::chrono::milliseconds(20));
+          (void)co_await sleep(loop, std::chrono::milliseconds(20));
           did_sleep = true;
           loop.stop();
         }(event_loop, *context, slept));
@@ -730,39 +731,64 @@ TEST_CASE("teardown resolves an operation nobody would otherwise resume")
   // vio_quic_endpoint_closed and then resumes them -- latch first, resume
   // second, because a resumed coroutine may destroy the awaitable holding the
   // operation being walked.
+  //
+  // The operation here has no connection behind it, which is the point: a dial
+  // is also resolved by the sever of the connection it registered, so only an
+  // operation with nothing to sever exercises the live-op pass. Without it this
+  // coroutine parks for ever and the watchdog is what reports it.
   const auto identity = vio_test::make_self_signed("localhost");
   const auto context = make_server_context(identity);
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  {
-    auto endpoint = quic_endpoint_create(event_loop, *context);
-    REQUIRE(endpoint.has_value());
-    auto &state = endpoint->handle.data();
+  std::optional<task_t<void>> task;
+  std::optional<task_t<void>> watchdog;
+  cancellation_t stop_watchdog;
+  bool resolved = false;
+  int code = 0;
+  bool timed_out = false;
 
-    auto *op = detail::quic_op_create(&state);
-    state.live_ops.push_back(op);
-
-    // Two holds: the awaitable standing in for a suspended coroutine, and the
-    // endpoint that is going to resolve it.
-    CHECK(op->holds == 2);
-
-    event_loop.stop();
-    event_loop.run();
-
-    // The endpoint is still alive here, so nothing has torn down yet.
-    CHECK_FALSE(op->resolved);
-
+  event_loop.run_in_loop(
+    [&]
     {
-      quic_connection_awaitable_t parked{op};
-      auto released = std::move(*endpoint);
-    } // both go here: the endpoint tears down, then the awaitable releases
+      watchdog.emplace(
+        [](event_loop_t &loop, cancellation_t &cancel, bool &timed_out, const bool &resolved) -> task_t<void>
+        {
+          (void)co_await sleep(loop, std::chrono::seconds(5), &cancel);
+          if (!resolved)
+          {
+            timed_out = true;
+            loop.stop();
+          }
+        }(event_loop, stop_watchdog, timed_out, resolved));
 
-    // Which means the operation was finished, resumed (there was no
-    // continuation) and freed by whichever owner was last. Reading it here
-    // would be a use-after-free; that it is freed at all is what ASan checks.
-  }
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, cancellation_t &stop_watchdog, bool &resolved, int &code) -> task_t<void>
+        {
+          auto endpoint = quic_endpoint_create(loop, tls);
+          REQUIRE(endpoint.has_value());
+
+          auto *op = detail::quic_op_create(&endpoint->handle.data());
+          endpoint->handle->live_ops.push_back(op);
+          quic_connection_awaitable_t parked{op};
+          REQUIRE_FALSE(parked.await_ready());
+
+          {
+            auto letting_go = std::move(*endpoint);
+          }
+
+          const auto result = co_await std::move(parked);
+          resolved = true;
+          code = result.has_value() ? 0 : result.error().code;
+          stop_watchdog.cancel();
+          loop.stop();
+        }(event_loop, *context, stop_watchdog, resolved, code));
+    });
   event_loop.run();
+
+  CHECK_FALSE(timed_out);
+  CHECK(resolved);
+  CHECK(code == vio_quic_endpoint_closed);
 }
 }
 
@@ -825,7 +851,7 @@ TEST_CASE("binding to zero picks a port and starts the read loop")
             port = quic_endpoint_local_port(*endpoint).value_or(0);
             reading = endpoint->handle->driver_started;
           }
-          co_await sleep(loop, std::chrono::milliseconds(1));
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
           loop.stop();
         }(event_loop, *context, port, reading));
     });
@@ -874,7 +900,7 @@ TEST_CASE("a bind that fails does not leave the endpoint reading")
             never_read = !endpoint->handle->driver_started;
             no_port = quic_endpoint_local_port(*endpoint).value_or(0) == 0;
           }
-          co_await sleep(loop, std::chrono::milliseconds(1));
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
           loop.stop();
         }(event_loop, *context, refused, never_read, no_port));
     });
@@ -913,7 +939,7 @@ TEST_CASE("a dial-only endpoint may still pin a source port")
             REQUIRE(endpoint.has_value());
             bound = quic_endpoint_bind(*endpoint, std::uint16_t{0}).has_value() && quic_endpoint_local_port(*endpoint).value_or(0) != 0;
           }
-          co_await sleep(loop, std::chrono::milliseconds(1));
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
           loop.stop();
         }(event_loop, *context, bound));
     });
@@ -956,7 +982,7 @@ TEST_CASE("the read loop is started once, however many times bind is called")
             REQUIRE(detail::quic_start_driver(endpoint->handle.data()).has_value());
             one_driver = &*endpoint->handle->driver == first_driver;
           }
-          co_await sleep(loop, std::chrono::milliseconds(1));
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
           loop.stop();
         }(event_loop, *context, one_driver));
     });
@@ -977,5 +1003,299 @@ TEST_CASE("binding a released endpoint is refused rather than crashing")
   REQUIRE_FALSE(bound.has_value());
   CHECK(bound.error().code == -1);
   CHECK_FALSE(quic_endpoint_local_port(nothing).has_value());
+}
+}
+
+TEST_SUITE("quic coroutine dial")
+{
+namespace
+{
+vio::quic::tls_config_t server_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+vio::quic::tls_config_t client_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+sockaddr_in loopback(std::uint16_t port)
+{
+  sockaddr_in address = {};
+  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  return address;
+}
+} // namespace
+
+TEST_CASE("a dial resolves when the handshake completes")
+{
+  using namespace vio;
+
+  // The first thing in this layer that works end to end: two endpoints, one
+  // real socket each, and a coroutine that says co_await and gets a connection.
+  // Nothing here drives the handshake -- no sleep loop, no flush, no readable
+  // sweep. The read loop takes the datagrams in and the beat resumes the dial.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(server_tls(identity));
+  const auto client_context = vio::quic::tls_context_t::create(client_tls(identity));
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool connected = false;
+  std::string alpn;
+  bool is_client = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &server_tls_context, const vio::quic::tls_context_t &client_tls_context, bool &connected, std::string &alpn, bool &is_client) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, server_tls_context);
+            REQUIRE(server.has_value());
+            REQUIRE(quic_endpoint_bind(*server, std::uint16_t{0}).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+            REQUIRE(port != 0);
+
+            auto client = quic_endpoint_create(loop, nullptr, &client_tls_context);
+            REQUIRE(client.has_value());
+
+            const auto target = loopback(port);
+            auto dialled = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            connected = dialled.has_value();
+            if (dialled)
+            {
+              alpn = dialled->handle->alpn;
+              is_client = dialled->handle->role == vio::quic::tls_role_t::client;
+            }
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, *client_context, connected, alpn, is_client));
+    });
+  event_loop.run();
+
+  CHECK(connected);
+  CHECK(alpn == "test");
+  CHECK(is_client);
+}
+
+TEST_CASE("a dial nobody answers resolves with the handshake failure")
+{
+  using namespace vio;
+
+  // Test 6. The port is bound by a plain UDP socket that answers nothing, so
+  // the Initials are neither refused nor replied to -- which is the case a bare
+  // closed port would not produce, since an ICMP unreachable can arrive
+  // instantly and would test something else.
+  //
+  // What ends it is connection_config_t::handshake_timeout, and that timeout
+  // exists precisely because the idle timeout of section 10.1 is negotiated and
+  // therefore does not exist until the peer's transport parameters arrive.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto client_context = vio::quic::tls_context_t::create(client_tls(identity));
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool failed = false;
+  int code = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &failed, int &code) -> task_t<void>
+        {
+          {
+            // A socket that swallows whatever arrives.
+            auto silence = udp_create(loop);
+            REQUIRE(silence.has_value());
+            sockaddr_in any = {};
+            REQUIRE(uv_ip4_addr("127.0.0.1", 0, &any) == 0);
+            REQUIRE(udp_bind(*silence, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            sockaddr_storage bound = {};
+            int length = sizeof(bound);
+            REQUIRE(uv_udp_getsockname(silence->get_udp(), reinterpret_cast<sockaddr *>(&bound), &length) == 0);
+            const auto port = ntohs(reinterpret_cast<const sockaddr_in *>(&bound)->sin_port);
+
+            quic_config_t config;
+            config.transport.connection.handshake_timeout = std::chrono::milliseconds(300);
+            auto client = quic_endpoint_create(loop, nullptr, &tls, config);
+            REQUIRE(client.has_value());
+
+            const auto target = loopback(port);
+            auto dialled = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            failed = !dialled.has_value();
+            if (!dialled)
+            {
+              code = dialled.error().code;
+            }
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *client_context, failed, code));
+    });
+  event_loop.run();
+
+  CHECK(failed);
+  CHECK(code == vio_quic_handshake_failed);
+}
+
+TEST_CASE("a dial that cannot even be attempted resolves without suspending")
+{
+  using namespace vio;
+
+  // The tcp_connect shape: every synchronous failure comes back on the same
+  // awaitable, pre-resolved. A caller has one place to look rather than a
+  // resolve step and then an await.
+  //
+  // Note what is *not* tested here, because it does not exist: endpoint_t
+  // ::connect validates neither the address nor its family, so a garbage
+  // sockaddr produces a connection that dials into nowhere and ends on the
+  // handshake timeout, not a synchronous error. That is the transport's call
+  // and it is left alone; this layer only promises that whatever the transport
+  // does refuse comes back here rather than on a second call.
+  quic_endpoint_t nothing;
+  const auto target = loopback(4433);
+  auto dial = quic_endpoint_connect(nothing, reinterpret_cast<const sockaddr *>(&target), "localhost");
+  REQUIRE(dial.await_ready());
+  const auto result = dial.await_resume();
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.error().code == -1);
+}
+
+TEST_CASE("a dial on an endpoint with no client context is refused with a sentence")
+{
+  using namespace vio;
+
+  // Knowable only because there is no setter: which context slots are filled is
+  // fixed at create. Refusing here rather than at create is what lets one
+  // answer-only endpoint exist without every dial site having to prove it is
+  // allowed -- and the refusal has to come before endpoint_t::connect touches
+  // the socket, since libuv fixes the address family on first touch and a dial
+  // that cannot happen must not pin the endpoint to IPv4.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto server_context = vio::quic::tls_context_t::create(server_tls(identity));
+  REQUIRE(server_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool refused = false;
+  bool has_sentence = false;
+  bool still_bindable = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &refused, bool &has_sentence, bool &still_bindable) -> task_t<void>
+        {
+          {
+            auto server = quic_endpoint_create(loop, tls);
+            REQUIRE(server.has_value());
+
+            const auto target = loopback(4433);
+            auto dial = quic_endpoint_connect(*server, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(dial.await_ready());
+            const auto result = dial.await_resume();
+            refused = !result.has_value();
+            has_sentence = refused && !result.error().msg.empty();
+
+            // And, having been refused, the socket still has no family: a bind
+            // can still choose one.
+            still_bindable = quic_endpoint_bind(*server, std::uint16_t{0}).has_value();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *server_context, refused, has_sentence, still_bindable));
+    });
+  event_loop.run();
+
+  CHECK(refused);
+  CHECK(has_sentence);
+  CHECK(still_bindable);
+}
+
+TEST_CASE("an endpoint released mid-dial resolves the dial and closes its loop")
+{
+  using namespace vio;
+
+  // Test 4, and the falsification of the design sketch this layer started from.
+  // Had the awaitable held a strong reference to the endpoint state, the
+  // application's release would take the count from two to one, on_destroy
+  // would never run, nothing would resolve the dial, and the socket's uv_close
+  // would never be issued -- so event_loop.run() would never return and the
+  // failure would look like a hang rather than a leak.
+  //
+  // The watchdog is what turns that hang into a reportable failure.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto client_context = vio::quic::tls_context_t::create(client_tls(identity));
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  std::optional<task_t<void>> watchdog;
+  cancellation_t stop_watchdog;
+  bool resolved = false;
+  int code = 0;
+  bool timed_out = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      watchdog.emplace(
+        [](event_loop_t &loop, cancellation_t &cancel, bool &timed_out, bool &resolved) -> task_t<void>
+        {
+          (void)co_await sleep(loop, std::chrono::seconds(5), &cancel);
+          if (!resolved)
+          {
+            timed_out = true;
+            loop.stop();
+          }
+        }(event_loop, stop_watchdog, timed_out, resolved));
+
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, cancellation_t &stop_watchdog, bool &resolved, int &code) -> task_t<void>
+        {
+          auto client = quic_endpoint_create(loop, nullptr, &tls);
+          REQUIRE(client.has_value());
+          // Nothing is listening, and nothing needs to be: the dial parks, and
+          // what resolves it is the release below rather than any datagram.
+          const auto target = loopback(9);
+          auto dial = quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+          REQUIRE_FALSE(dial.await_ready());
+
+          // Released while the dial is suspended -- inside the same coroutine,
+          // so the awaitable is still alive and still parked.
+          {
+            auto letting_go = std::move(*client);
+          }
+
+          const auto result = co_await std::move(dial);
+          resolved = true;
+          code = result.has_value() ? 0 : result.error().code;
+          stop_watchdog.cancel();
+          loop.stop();
+        }(event_loop, *client_context, stop_watchdog, resolved, code));
+    });
+  event_loop.run();
+
+  CHECK_FALSE(timed_out);
+  CHECK(resolved);
+  CHECK(code == vio_quic_endpoint_closed);
 }
 }
