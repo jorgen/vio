@@ -241,6 +241,17 @@ public:
   // can, and both go out with the reply this endpoint was about to send.
   void on_activity(connection_active_t handler);
 
+  // Every time a connection ends, whatever ended it: a close from either side,
+  // an idle or handshake timeout, a stateless reset, a version negotiation
+  // that found nothing in common.
+  //
+  // There is otherwise no notification of an ending at all, and polling for
+  // one does not work either: connection() reports nothing only after the
+  // draining period, by which point the connection_t is gone along with
+  // close_reason() and everything else that would have said why. This fires
+  // while it is all still readable.
+  void on_connection_gone(connection_ready_t handler);
+
   // Dials. The returned pointer is owned by the endpoint and stays valid until
   // the connection closes and is reaped.
   //
@@ -270,6 +281,12 @@ public:
   // just written to a stream outside the loop can use it to flush without
   // waiting for either.
   std::expected<void, error_t> flush();
+
+  // The same for one connection. Worth having separately because the
+  // all-connections form is O(connections) and each step of it builds a vector
+  // of connection IDs, so an application that has written to one connection
+  // and flushes the endpoint pays for every other connection on it.
+  std::expected<void, error_t> flush(connection_t &connection);
 
   [[nodiscard]] std::size_t connection_count() const;
 

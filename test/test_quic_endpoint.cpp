@@ -1772,3 +1772,122 @@ TEST_CASE("an endpoint refuses the direction it has no context for")
   CHECK(socket_untouched);
   CHECK(replies_to_initial == 0);
 }
+
+// KNOWN FAILURE, kept because it is the only statement of the bug.
+//
+// run() creates the socket itself, with ensure_socket's default family of
+// AF_INET. It is normally spawned before the first dial and task_t is eager,
+// so it gets there first and pins the endpoint to IPv4 -- after which a dial
+// to an IPv6 peer has nowhere to go, because a socket's family cannot change.
+//
+// The obvious fix -- have run() wait for bind() or connect() to make the
+// socket, since only they know the family -- was tried and reverted: the wait
+// delays the reader by a loop turn, and that was enough to take the ECN
+// validation in the test above from 12/12 to 4/12. A real fix has to arm the
+// reader the moment the socket appears rather than after a sleep, which is
+// endpoint plumbing this change did not want to disturb.
+
+TEST_CASE("an endpoint reaches an IPv6 peer even with run() started first" * doctest::should_fail())
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool connected = false;
+  bool skipped = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &ok, bool &no_ipv6) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto server_context = tls_context_t::create(server_tls);
+        auto client_context = tls_context_t::create(client_tls);
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+
+        endpoint_config_t server_config;
+        server_config.connection.role = tls_role_t::server;
+        auto server_created = endpoint_t::create(loop, *server_context, server_config);
+        REQUIRE(server_created.has_value());
+        std::optional<endpoint_t> server(std::move(*server_created));
+
+        auto bind_address = ip6_addr("::1", 0);
+        if (!bind_address.has_value() || !server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value())
+        {
+          // A machine with no IPv6 loopback has nothing to say about this.
+          no_ipv6 = true;
+          server.reset();
+          co_await sleep(loop, 20ms);
+          loop.stop();
+          co_return;
+        }
+        auto port = server->local_port();
+        REQUIRE(port.has_value());
+
+        endpoint_config_t client_config;
+        client_config.connection.role = tls_role_t::client;
+        auto client_created = endpoint_t::create(loop, *client_context, client_config);
+        REQUIRE(client_created.has_value());
+        std::optional<endpoint_t> client(std::move(*client_created));
+
+        cancellation_t server_cancel;
+        cancellation_t client_cancel;
+        // The client is never bound, and its run loop is started before the
+        // dial -- exactly the order every program here uses, and the order
+        // that used to decide the address family.
+        auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
+        auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
+        (void)server_run;
+        (void)client_run;
+
+        auto target = ip6_addr("::1", *port);
+        REQUIRE(target.has_value());
+        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        REQUIRE(dialled.has_value());
+
+        for (int attempt = 0; attempt < 600; ++attempt)
+        {
+          auto *live = client->connection(*dialled);
+          if (live == nullptr || live->handshake_complete())
+          {
+            break;
+          }
+          co_await sleep(loop, 5ms);
+        }
+        if (auto *live = client->connection(*dialled); live != nullptr)
+        {
+          ok = live->handshake_complete();
+          live->close(0, "done", true);
+        }
+
+        co_await sleep(loop, 50ms);
+        client_cancel.cancel();
+        server_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        client.reset();
+        server.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, connected, skipped);
+    });
+
+  event_loop.run();
+  if (skipped)
+  {
+    MESSAGE("no IPv6 loopback on this machine");
+    return;
+  }
+  CHECK(connected);
+}

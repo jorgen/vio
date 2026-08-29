@@ -158,9 +158,14 @@ struct endpoint_impl_t
   std::vector<std::unique_ptr<connection_entry_t>> connections;
   std::unordered_map<connection_id_t, connection_entry_t *> by_id;
   std::unordered_map<std::uint64_t, connection_entry_t *> by_handle;
+  // The identity an application actually has: the callbacks hand out a
+  // connection_t and never a handle, so this is what lets one connection be
+  // flushed without walking every connection the endpoint holds.
+  std::unordered_map<const connection_t *, connection_entry_t *> by_connection;
   std::uint64_t next_connection_id = 1;
   connection_ready_t on_connection;
   connection_active_t on_activity;
+  connection_ready_t on_connection_gone;
   bool running = false;
   // One buffer for the whole endpoint, grown once and reused: a batch is built
   // by polling datagrams straight into it rather than copying them in.
@@ -605,6 +610,7 @@ void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connecti
   auto *raw = entry.get();
   impl.connections.push_back(std::move(entry));
   impl.by_handle[raw->id] = raw;
+  impl.by_connection[raw->connection.get()] = raw;
   index_connection(impl, *raw);
   return raw;
 }
@@ -728,6 +734,15 @@ void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
     // stateless reset for a connection that closed politely.
     entry.draining = true;
     entry.draining_since = now;
+    // Told here rather than at reap, which runs a whole draining period later
+    // -- three seconds by default. Reporting an ending three seconds after it
+    // happened is not reporting it. The connection is still alive at this
+    // point, so close_reason(), reset_by_peer() and
+    // version_negotiation_failed() are all still readable from the handler.
+    if (impl.on_connection_gone)
+    {
+      impl.on_connection_gone(*entry.connection);
+    }
   }
 }
 
@@ -753,6 +768,7 @@ void reap(endpoint_impl_t &impl, tick_t now)
       impl.by_id.erase(id);
     }
     impl.by_handle.erase(entry.id);
+    impl.by_connection.erase(entry.connection.get());
     it = impl.connections.erase(it);
   }
 }
@@ -826,6 +842,11 @@ void endpoint_t::on_activity(connection_active_t handler)
   _impl->on_activity = std::move(handler);
 }
 
+void endpoint_t::on_connection_gone(connection_ready_t handler)
+{
+  _impl->on_connection_gone = std::move(handler);
+}
+
 std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket)
 {
   auto &impl = *_impl;
@@ -865,6 +886,7 @@ std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *
   auto *raw = entry.get();
   impl.connections.push_back(std::move(entry));
   impl.by_handle[raw->id] = raw;
+  impl.by_connection[raw->connection.get()] = raw;
   index_connection(impl, *raw);
   flush_entry(impl, *raw, loop_now(impl.loop));
   return connection_handle_t(raw->id);
@@ -885,6 +907,22 @@ std::expected<void, error_t> endpoint_t::flush()
   {
     flush_entry(impl, *impl.connections[index], now);
   }
+  --impl.walking;
+  reap(impl, now);
+  return {};
+}
+
+std::expected<void, error_t> endpoint_t::flush(connection_t &connection)
+{
+  auto &impl = *_impl;
+  const auto found = impl.by_connection.find(&connection);
+  if (found == impl.by_connection.end())
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "that connection does not belong to this endpoint"});
+  }
+  const auto now = loop_now(impl.loop);
+  ++impl.walking;
+  flush_entry(impl, *found->second, now);
   --impl.walking;
   reap(impl, now);
   return {};
@@ -928,6 +966,15 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
   // is normally parked on, and QUIC's deadlines have to fire whether or not a
   // datagram ever arrives -- loss detection and the idle timeout are both
   // about the absence of traffic.
+  //
+  // A fixed 2 ms tick rather than the earliest deadline the connections
+  // report, which was tried and reverted. next_timeout is not complete enough
+  // to drive this: a closed connection keeps reporting the past deadline that
+  // closed it, because poll_send returns early and never clears it, and a
+  // connection that simply has something to send reports no deadline at all.
+  // Arming on the first spins the loop; arming on the second stalls it. The
+  // tick papers over both by flushing unconditionally, and making it
+  // deadline-driven means fixing what next_timeout reports first.
   auto ticker = [](endpoint_impl_t &state, cancellation_t *token) -> detached_task_t
   {
     while (state.running)
