@@ -40,7 +40,25 @@ public:
 
   task_t(const task_t &) = delete;
   task_t &operator=(const task_t &) = delete;
-  task_t &operator=(task_t &&) = delete;
+
+  // Move assignment destroys what this task held first, on the same terms as
+  // the destructor: a finished frame is destroyed, an unfinished one is left
+  // alone because something is still going to resume it. Without this a task_t
+  // cannot live in a container -- std::erase_if goes through std::remove_if,
+  // which move-assigns -- and a long-running server that spawns a task per
+  // connection has nowhere to put them but an ever-growing vector.
+  task_t &operator=(task_t &&other) noexcept
+  {
+    if (this != &other)
+    {
+      if (_coro && _coro.done())
+      {
+        _coro.destroy();
+      }
+      _coro = std::exchange(other._coro, {});
+    }
+    return *this;
+  }
 
   ~task_t()
   {
@@ -48,6 +66,13 @@ public:
     {
       _coro.destroy();
     }
+  }
+
+  // Whether the coroutine has run to completion. The one question a caller
+  // holding a container of tasks needs answered, and the frame knows it.
+  [[nodiscard]] bool done() const noexcept
+  {
+    return _coro && _coro.done();
   }
 
   struct promise_t
@@ -163,7 +188,25 @@ public:
 
   task_t(const task_t &) = delete;
   task_t &operator=(const task_t &) = delete;
-  task_t &operator=(task_t &&) = delete;
+
+  // Move assignment destroys what this task held first, on the same terms as
+  // the destructor: a finished frame is destroyed, an unfinished one is left
+  // alone because something is still going to resume it. Without this a task_t
+  // cannot live in a container -- std::erase_if goes through std::remove_if,
+  // which move-assigns -- and a long-running server that spawns a task per
+  // connection has nowhere to put them but an ever-growing vector.
+  task_t &operator=(task_t &&other) noexcept
+  {
+    if (this != &other)
+    {
+      if (_coro && _coro.done())
+      {
+        _coro.destroy();
+      }
+      _coro = std::exchange(other._coro, {});
+    }
+    return *this;
+  }
 
   ~task_t()
   {
@@ -171,6 +214,13 @@ public:
     {
       _coro.destroy();
     }
+  }
+
+  // Whether the coroutine has run to completion. The one question a caller
+  // holding a container of tasks needs answered, and the frame knows it.
+  [[nodiscard]] bool done() const noexcept
+  {
+    return _coro && _coro.done();
   }
 
   struct promise_t
