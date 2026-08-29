@@ -330,6 +330,15 @@ public:
   [[nodiscard]] const connection_id_t &peer_connection_id() const;
 
   [[nodiscard]] std::optional<transport_parameters_t> peer_transport_parameters() const;
+  // The subject of the certificate the peer presented, once verified. Empty
+  // when the peer presented none, or when it did not verify -- so a non-empty
+  // answer is an authenticated identity and nothing else is.
+  //
+  // A server gets an answer here only if it asked, by setting
+  // tls_config_t::peer_verify. Without that it authenticates nobody, which is
+  // the ordinary server arrangement and the default.
+  [[nodiscard]] std::string peer_certificate_subject() const;
+
   [[nodiscard]] std::string_view selected_alpn() const;
   [[nodiscard]] std::optional<connection_close_t> close_reason() const;
 

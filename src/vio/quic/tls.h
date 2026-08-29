@@ -51,6 +51,7 @@
 #include <vio/quic/anti_replay.h>
 
 #include "vio/error.h"
+#include "vio/ssl_config_t.h"
 #include "vio/quic/packet.h"
 #include "vio/quic/protection.h"
 #include "vio/vio_export.h"
@@ -132,12 +133,40 @@ struct tls_config_t
 {
   tls_role_t role = tls_role_t::server;
 
-  // PEM, for a server. The chain may hold intermediates after the leaf.
+  // PEM. A server always needs both. A client needs them only when the peer
+  // asks for a certificate, which is what makes the handshake mutual -- an
+  // ordinary client leaves them empty and is authenticated by nothing.
   std::vector<std::uint8_t> certificate_chain_pem;
   std::vector<std::uint8_t> private_key_pem;
 
-  // PEM trust anchors for a client. Empty means the platform default.
+  // PEM trust anchors. Empty means the platform default. Both roles use them
+  // now: a client to verify the server, and a server to verify a client
+  // certificate it asked for.
   std::vector<std::uint8_t> ca_certificates_pem;
+
+  // What this endpoint requires of its peer, read the same way as
+  // ssl_config_t::peer_verify on vio's TCP side so that the concept has one
+  // spelling across both transports.
+  //
+  // The policy is one value interpreted per role, because "verify my peer"
+  // means different things on the two ends. A client treats optional and
+  // required alike: it verifies the server, which is what the web does and
+  // what leaving this unset gives. A server distinguishes them, because only a
+  // server can ask for a certificate and then decide whether an absent one is
+  // fatal -- optional means verify what is presented, required means refuse a
+  // peer that presents nothing.
+  //
+  // Unset keeps what vio has always done: a client verifies, a server asks for
+  // nothing and so authenticates nobody. Mutual TLS is required on both ends
+  // setting this, plus each end having a certificate for the other to check.
+  std::optional<peer_verify_t> peer_verify;
+
+  // How long a chain may be. Unset leaves the library default.
+  std::optional<int> verify_depth;
+
+  // Legacy spelling of the client half of peer_verify, kept because it is what
+  // the existing callers set. peer_verify takes precedence where both are
+  // given; false here still means a client that verifies nothing.
   bool verify_peer = true;
 
   // Offered by a client, chosen by a server. HTTP/3 is "h3".
@@ -279,6 +308,15 @@ public:
   // A fatal TLS alert, if one was raised. RFC 9000 section 20.1 maps this onto
   // a CONNECTION_CLOSE with error code 0x0100 + the alert.
   [[nodiscard]] std::optional<std::uint8_t> alert() const;
+
+  // The subject of the certificate the peer presented, or empty if it
+  // presented none. On a server that is the client's identity and the whole
+  // point of asking for one; on a client it is the server's.
+  //
+  // A name only means something once the certificate it came from has been
+  // verified, so this is empty unless verification succeeded -- there is no
+  // way to read an unchecked name and mistake it for an authenticated one.
+  [[nodiscard]] std::string peer_certificate_subject() const;
 
   [[nodiscard]] std::string_view selected_alpn() const;
   [[nodiscard]] std::span<const std::uint8_t> peer_transport_parameters() const;

@@ -689,11 +689,23 @@ std::expected<tls_context_t, error_t> tls_context_t::create(const tls_config_t &
     key_log_destination() = config.key_log_path;
   }
 
-  if (config.role == tls_role_t::server)
+  const bool server = config.role == tls_role_t::server;
+
+  if (server)
   {
     if (config.certificate_chain_pem.empty() || config.private_key_pem.empty())
     {
       return std::unexpected(error_t{.code = 1, .msg = "a server needs a certificate chain and a private key"});
+    }
+  }
+  // A client carries a certificate only for a server that asks. Loading it is
+  // an offer, not a commitment: nothing is sent unless a CertificateRequest
+  // arrives, so an ordinary client that happens to have one is unaffected.
+  if (!config.certificate_chain_pem.empty())
+  {
+    if (config.private_key_pem.empty())
+    {
+      return std::unexpected(error_t{.code = 1, .msg = "a certificate chain without a private key cannot be presented"});
     }
     if (auto r = load_certificate_chain(impl->ctx, config.certificate_chain_pem); !r.has_value())
     {
@@ -703,43 +715,73 @@ std::expected<tls_context_t, error_t> tls_context_t::create(const tls_config_t &
     {
       return std::unexpected(r.error());
     }
-    impl->alpn_wire = encode_alpn(config.alpn);
-    if (!config.alpn.empty() && impl->alpn_wire.empty())
-    {
-      return std::unexpected(error_t{.code = 1, .msg = "an ALPN protocol is empty or longer than 255 bytes"});
-    }
-    if (!impl->alpn_wire.empty())
-    {
-      SSL_CTX_set_alpn_select_cb(impl->ctx, on_alpn_select, &impl->alpn_wire);
-    }
+  }
+
+  // One policy, read per role, exactly as ssl_context.h reads it for the TCP
+  // side. A client verifies its peer unless told not to; a server asks for
+  // nothing unless told to, because requesting a certificate no client has is
+  // a handshake that fails for everyone.
+  auto policy = peer_verify_t::disabled;
+  if (config.peer_verify.has_value())
+  {
+    policy = *config.peer_verify;
+  }
+  else if (!server)
+  {
+    policy = config.verify_peer ? peer_verify_t::required : peer_verify_t::disabled;
+  }
+
+  int mode = SSL_VERIFY_NONE;
+  if (server)
+  {
+    // Only a server can tell "presented nothing" from "presented something
+    // bad", because only a server chooses whether to ask.
+    mode = policy == peer_verify_t::required ? (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT) : policy == peer_verify_t::optional ? SSL_VERIFY_PEER
+                                                                                                                                      : SSL_VERIFY_NONE;
   }
   else
   {
-    if (config.verify_peer)
-    {
-      SSL_CTX_set_verify(impl->ctx, SSL_VERIFY_PEER, nullptr);
-      if (!config.ca_certificates_pem.empty())
-      {
-        if (auto r = load_trust_anchors(impl->ctx, config.ca_certificates_pem); !r.has_value())
-        {
-          return std::unexpected(r.error());
-        }
-      }
-      else if (SSL_CTX_set_default_verify_paths(impl->ctx) != 1)
-      {
-        return std::unexpected(tls_error("SSL_CTX_set_default_verify_paths failed"));
-      }
-    }
-    else
-    {
-      SSL_CTX_set_verify(impl->ctx, SSL_VERIFY_NONE, nullptr);
-    }
+    // For a client the two non-disabled settings mean the same thing: there is
+    // always a server certificate, so there is nothing for optional to relax.
+    mode = policy == peer_verify_t::disabled ? SSL_VERIFY_NONE : SSL_VERIFY_PEER;
+  }
+  SSL_CTX_set_verify(impl->ctx, mode, nullptr);
+  if (config.verify_depth.has_value())
+  {
+    SSL_CTX_set_verify_depth(impl->ctx, *config.verify_depth);
+  }
 
-    impl->alpn_wire = encode_alpn(config.alpn);
-    if (!config.alpn.empty() && impl->alpn_wire.empty())
+  // Whoever is going to check a certificate needs something to check it
+  // against. A server falls back to nothing rather than to the platform store:
+  // the anchors that sign a client population are almost never the public
+  // roots, and quietly trusting those would accept far more than intended.
+  if (mode != SSL_VERIFY_NONE)
+  {
+    if (!config.ca_certificates_pem.empty())
     {
-      return std::unexpected(error_t{.code = 1, .msg = "an ALPN protocol is empty or longer than 255 bytes"});
+      if (auto r = load_trust_anchors(impl->ctx, config.ca_certificates_pem); !r.has_value())
+      {
+        return std::unexpected(r.error());
+      }
     }
+    else if (server)
+    {
+      return std::unexpected(error_t{.code = 1, .msg = "a server that verifies client certificates needs ca_certificates_pem to verify them against"});
+    }
+    else if (SSL_CTX_set_default_verify_paths(impl->ctx) != 1)
+    {
+      return std::unexpected(tls_error("SSL_CTX_set_default_verify_paths failed"));
+    }
+  }
+
+  impl->alpn_wire = encode_alpn(config.alpn);
+  if (!config.alpn.empty() && impl->alpn_wire.empty())
+  {
+    return std::unexpected(error_t{.code = 1, .msg = "an ALPN protocol is empty or longer than 255 bytes"});
+  }
+  if (server && !impl->alpn_wire.empty())
+  {
+    SSL_CTX_set_alpn_select_cb(impl->ctx, on_alpn_select, &impl->alpn_wire);
   }
 
   tls_context_t context;
@@ -1127,6 +1169,32 @@ bool tls_session_t::handshake_complete() const
 std::optional<std::uint8_t> tls_session_t::alert() const
 {
   return _impl == nullptr ? std::nullopt : _impl->alert;
+}
+
+std::string tls_session_t::peer_certificate_subject() const
+{
+  if (_impl == nullptr || _impl->ssl == nullptr)
+  {
+    return {};
+  }
+  // Both halves matter. A peer that sent nothing leaves no certificate to
+  // name, and a peer whose chain did not verify has a name that means nothing
+  // -- returning it would invite an application to authorize on it.
+  if (SSL_get_verify_result(_impl->ssl) != X509_V_OK)
+  {
+    return {};
+  }
+  bssl::UniquePtr<X509> certificate(SSL_get_peer_certificate(_impl->ssl));
+  if (!certificate)
+  {
+    return {};
+  }
+  char buffer[512] = {};
+  if (X509_NAME_oneline(X509_get_subject_name(certificate.get()), buffer, static_cast<int>(sizeof(buffer))) == nullptr)
+  {
+    return {};
+  }
+  return std::string(buffer);
 }
 
 std::string_view tls_session_t::selected_alpn() const

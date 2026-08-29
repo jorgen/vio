@@ -780,4 +780,217 @@ TEST_CASE("early data")
   }
 }
 
+// Mutual TLS, and the reason these run here rather than over a socket: QUIC
+// borrows the TLS handshake wholesale and carries it in CRYPTO frames, so a
+// CertificateRequest and the client Certificate that answers it are ordinary
+// handshake traffic. That they work under SSL_CTX_set_quic_method is not
+// something BoringSSL's headers promise anywhere -- its documented QUIC
+// restrictions are all about 0-RTT and key release -- so it is established
+// here by running one, with no socket underneath to confuse the result.
+
+// Runs both sides as far as they will go without insisting they succeed, which
+// is what the refusal cases need: an advance that reports an error is the
+// outcome under test rather than a failure of the harness.
+bool try_handshake(tls_session_t &client, tls_session_t &server)
+{
+  for (int rounds = 0; rounds < 24; ++rounds)
+  {
+    if (!client.advance().has_value())
+    {
+      return false;
+    }
+    const bool client_moved = pump(client, server);
+    if (!server.advance().has_value())
+    {
+      return false;
+    }
+    const bool server_moved = pump(server, client);
+    if (client.handshake_complete() && server.handshake_complete() && !client_moved && !server_moved)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+TEST_CASE("a server can require a client certificate and learn who presented it")
+{
+  const auto server_identity = make_self_signed("localhost");
+  const auto client_identity = make_self_signed("peer-a");
+
+  tls_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.certificate_chain_pem = server_identity.certificate_pem;
+  server_config.private_key_pem = server_identity.private_key_pem;
+  // What makes the handshake mutual: the server asks, and names what it will
+  // accept. Each identity here is self-signed with CA:TRUE, so a certificate
+  // is its own trust anchor.
+  server_config.peer_verify = vio::peer_verify_t::required;
+  server_config.ca_certificates_pem = client_identity.certificate_pem;
+  server_config.alpn = {"h3"};
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
+
+  tls_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.ca_certificates_pem = server_identity.certificate_pem;
+  client_config.certificate_chain_pem = client_identity.certificate_pem;
+  client_config.private_key_pem = client_identity.private_key_pem;
+  client_config.alpn = {"h3"};
+  client_config.transport_parameters = {0x0a, 0x0b};
+
+  auto server_context = tls_context_t::create(server_config);
+  REQUIRE(server_context.has_value());
+  auto client_context = tls_context_t::create(client_config);
+  REQUIRE(client_context.has_value());
+
+  auto server = tls_session_t::create(*server_context);
+  auto client = tls_session_t::create(*client_context, "localhost");
+  REQUIRE(server.has_value());
+  REQUIRE(client.has_value());
+
+  REQUIRE(try_handshake(*client, *server));
+  CHECK_FALSE(client->alert().has_value());
+  CHECK_FALSE(server->alert().has_value());
+
+  // The point of asking. Both ends can now name the other, and a name is
+  // returned only for a certificate that verified.
+  const auto seen_by_server = server->peer_certificate_subject();
+  const auto seen_by_client = client->peer_certificate_subject();
+  CHECK(seen_by_server.find("peer-a") != std::string::npos);
+  CHECK(seen_by_client.find("localhost") != std::string::npos);
+}
+
+TEST_CASE("a server that requires a certificate refuses a client with none")
+{
+  const auto server_identity = make_self_signed("localhost");
+  const auto client_identity = make_self_signed("peer-a");
+
+  tls_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.certificate_chain_pem = server_identity.certificate_pem;
+  server_config.private_key_pem = server_identity.private_key_pem;
+  server_config.peer_verify = vio::peer_verify_t::required;
+  server_config.ca_certificates_pem = client_identity.certificate_pem;
+  server_config.alpn = {"h3"};
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
+
+  // A client that has no certificate to offer, which is every ordinary client.
+  tls_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.ca_certificates_pem = server_identity.certificate_pem;
+  client_config.alpn = {"h3"};
+  client_config.transport_parameters = {0x0a, 0x0b};
+
+  auto server_context = tls_context_t::create(server_config);
+  REQUIRE(server_context.has_value());
+  auto client_context = tls_context_t::create(client_config);
+  REQUIRE(client_context.has_value());
+
+  auto server = tls_session_t::create(*server_context);
+  auto client = tls_session_t::create(*client_context, "localhost");
+  REQUIRE(server.has_value());
+  REQUIRE(client.has_value());
+
+  CHECK_FALSE(try_handshake(*client, *server));
+  CHECK_FALSE(server->handshake_complete());
+  // Nobody was authenticated, so there is no name to report.
+  CHECK(server->peer_certificate_subject().empty());
+}
+
+TEST_CASE("a client certificate signed by an untrusted anchor is refused")
+{
+  const auto server_identity = make_self_signed("localhost");
+  const auto expected_client = make_self_signed("peer-a");
+  const auto stranger = make_self_signed("peer-b");
+
+  tls_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.certificate_chain_pem = server_identity.certificate_pem;
+  server_config.private_key_pem = server_identity.private_key_pem;
+  server_config.peer_verify = vio::peer_verify_t::required;
+  // The server trusts one identity and is presented with another.
+  server_config.ca_certificates_pem = expected_client.certificate_pem;
+  server_config.alpn = {"h3"};
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
+
+  tls_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.ca_certificates_pem = server_identity.certificate_pem;
+  client_config.certificate_chain_pem = stranger.certificate_pem;
+  client_config.private_key_pem = stranger.private_key_pem;
+  client_config.alpn = {"h3"};
+  client_config.transport_parameters = {0x0a, 0x0b};
+
+  auto server_context = tls_context_t::create(server_config);
+  REQUIRE(server_context.has_value());
+  auto client_context = tls_context_t::create(client_config);
+  REQUIRE(client_context.has_value());
+
+  auto server = tls_session_t::create(*server_context);
+  auto client = tls_session_t::create(*client_context, "localhost");
+  REQUIRE(server.has_value());
+  REQUIRE(client.has_value());
+
+  CHECK_FALSE(try_handshake(*client, *server));
+  CHECK_FALSE(server->handshake_complete());
+  CHECK(server->peer_certificate_subject().empty());
+}
+
+// The default is unchanged and deliberately asymmetric: a client verifies the
+// server because there is always a server certificate to check, and a server
+// asks for nothing because requesting a certificate no client has is a
+// handshake that fails for everyone.
+TEST_CASE("a server asks for no certificate unless told to")
+{
+  const auto server_identity = make_self_signed("localhost");
+
+  tls_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.certificate_chain_pem = server_identity.certificate_pem;
+  server_config.private_key_pem = server_identity.private_key_pem;
+  server_config.alpn = {"h3"};
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
+
+  tls_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.ca_certificates_pem = server_identity.certificate_pem;
+  client_config.alpn = {"h3"};
+  client_config.transport_parameters = {0x0a, 0x0b};
+
+  auto server_context = tls_context_t::create(server_config);
+  REQUIRE(server_context.has_value());
+  auto client_context = tls_context_t::create(client_config);
+  REQUIRE(client_context.has_value());
+
+  auto server = tls_session_t::create(*server_context);
+  auto client = tls_session_t::create(*client_context, "localhost");
+  REQUIRE(server.has_value());
+  REQUIRE(client.has_value());
+
+  REQUIRE(try_handshake(*client, *server));
+  // The client checked the server, as it always has.
+  CHECK(client->peer_certificate_subject().find("localhost") != std::string::npos);
+  // And the server authenticated nobody, which is the ordinary arrangement.
+  CHECK(server->peer_certificate_subject().empty());
+}
+
+// A verification policy with nothing to verify against is refused where it can
+// still be reported. A server falls back to no anchors rather than to the
+// public roots, because the CA that signs a client population is essentially
+// never one of those and quietly trusting them would accept far too much.
+TEST_CASE("a server that verifies clients needs anchors to verify against")
+{
+  const auto server_identity = make_self_signed("localhost");
+
+  tls_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.certificate_chain_pem = server_identity.certificate_pem;
+  server_config.private_key_pem = server_identity.private_key_pem;
+  server_config.peer_verify = vio::peer_verify_t::required;
+  server_config.alpn = {"h3"};
+  server_config.transport_parameters = {0x01, 0x02, 0x03, 0x04};
+
+  CHECK_FALSE(tls_context_t::create(server_config).has_value());
+}
+
 }

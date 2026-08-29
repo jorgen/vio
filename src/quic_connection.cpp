@@ -3741,6 +3741,11 @@ std::optional<transport_parameters_t> connection_t::peer_transport_parameters() 
   return _impl->peer_parameters;
 }
 
+std::string connection_t::peer_certificate_subject() const
+{
+  return _impl->tls.peer_certificate_subject();
+}
+
 std::string_view connection_t::selected_alpn() const
 {
   return _impl->tls.selected_alpn();
