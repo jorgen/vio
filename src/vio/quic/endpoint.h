@@ -200,7 +200,30 @@ public:
   endpoint_t(const endpoint_t &) = delete;
   endpoint_t &operator=(const endpoint_t &) = delete;
 
+  // The context decides what this endpoint is for: one built for a server
+  // answers, one built for a client dials. It must outlive the endpoint, which
+  // borrows rather than owns it.
   [[nodiscard]] static std::expected<endpoint_t, error_t> create(event_loop_t &loop, const tls_context_t &context, const endpoint_config_t &config);
+
+  // The same, for an endpoint that does both on one port.
+  //
+  // A tls_context_t is bound to a role -- it picks TLS_server_method or
+  // TLS_client_method and gates tickets and early data on that choice -- so
+  // there is no single context that can both answer and dial, and peer-to-peer
+  // needs one of each. Either may be null: that is how a dial-only or an
+  // answer-only endpoint is expressed, and it is the presence of the answering
+  // context that decides whether an arriving Initial is built into a
+  // connection or dropped.
+  //
+  // Both must outlive the endpoint. Passing a context whose role does not
+  // match its parameter fails here rather than at the first handshake.
+  //
+  // A caveat while it is still true: the answering half authenticates nobody.
+  // tls_config_t has no way to ask for a client certificate, so an endpoint
+  // that answers accepts a connection from anyone, exactly as an ordinary
+  // server does. Two peers that need to know who each other are cannot yet
+  // establish it here.
+  [[nodiscard]] static std::expected<endpoint_t, error_t> create(event_loop_t &loop, const tls_context_t *server_context, const tls_context_t *client_context, const endpoint_config_t &config);
 
   // Binds the socket. A client may skip this and let the OS choose.
   [[nodiscard]] std::expected<void, error_t> bind(const sockaddr *address);

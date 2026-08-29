@@ -1489,3 +1489,286 @@ TEST_CASE("a dialled connection is not routed by the id it invented")
   // And an id it really did issue is recognised, so there is no reset for it.
   CHECK(replies_to_real_id == 0);
 }
+
+// One endpoint, one port, both directions. A tls_context_t is built for a
+// single role, so an endpoint that answers and dials needs one of each -- and
+// which of them it holds is what decides what it can do.
+
+TEST_CASE("one endpoint both answers and dials on the same port")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool left_dial_connected = false;
+  bool right_dial_connected = false;
+  std::size_t left_accepted = 0;
+  std::size_t right_accepted = 0;
+  std::size_t left_client_role = 0;
+  std::size_t left_server_role = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &left_ok, bool &right_ok, std::size_t &left_in, std::size_t &right_in, std::size_t &clients, std::size_t &servers) -> task_t<void>
+      {
+        // One description, two contexts. Both peers answer with the same
+        // identity and trust it, which is all a two-node demonstration needs.
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto answering = tls_context_t::create(server_tls);
+        auto dialling = tls_context_t::create(client_tls);
+        REQUIRE(answering.has_value());
+        REQUIRE(dialling.has_value());
+
+        const auto make_peer = [&](std::optional<endpoint_t> &out) -> bool
+        {
+          endpoint_config_t config;
+          auto created = endpoint_t::create(loop, &*answering, &*dialling, config);
+          if (!created.has_value())
+          {
+            return false;
+          }
+          out.emplace(std::move(*created));
+          auto address = ip4_addr("127.0.0.1", 0);
+          return address.has_value() && out.value().bind(reinterpret_cast<const sockaddr *>(&*address)).has_value();
+        };
+
+        std::optional<endpoint_t> left;
+        std::optional<endpoint_t> right;
+        REQUIRE(make_peer(left));
+        REQUIRE(make_peer(right));
+
+        auto left_port = left->local_port();
+        auto right_port = right->local_port();
+        REQUIRE(left_port.has_value());
+        REQUIRE(right_port.has_value());
+
+        // on_connection fires for every completed handshake, dialled ones
+        // included, so a peer that does both has to sort them by role.
+        left->on_connection(
+          [&left_in, &clients, &servers](connection_t &connection)
+          {
+            if (connection.role() == tls_role_t::server)
+            {
+              ++left_in;
+              ++servers;
+            }
+            else
+            {
+              ++clients;
+            }
+          });
+        right->on_connection([&right_in](connection_t &connection)
+                             {
+                               if (connection.role() == tls_role_t::server)
+                               {
+                                 ++right_in;
+                               }
+                             });
+
+        cancellation_t left_cancel;
+        cancellation_t right_cancel;
+        auto left_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*left, left_cancel);
+        auto right_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*right, right_cancel);
+        (void)left_run;
+        (void)right_run;
+
+        auto to_right = ip4_addr("127.0.0.1", *right_port);
+        auto to_left = ip4_addr("127.0.0.1", *left_port);
+        REQUIRE(to_right.has_value());
+        REQUIRE(to_left.has_value());
+
+        // Each dials the other at the same time, so both connections on each
+        // endpoint are live together.
+        auto left_handle = left->connect(reinterpret_cast<const sockaddr *>(&*to_right), "localhost");
+        auto right_handle = right->connect(reinterpret_cast<const sockaddr *>(&*to_left), "localhost");
+        REQUIRE(left_handle.has_value());
+        REQUIRE(right_handle.has_value());
+
+        for (int i = 0; i < 600; ++i)
+        {
+          auto *l = left->connection(*left_handle);
+          auto *r = right->connection(*right_handle);
+          const bool l_done = l != nullptr && l->handshake_complete();
+          const bool r_done = r != nullptr && r->handshake_complete();
+          if (l_done && r_done && left_in > 0 && right_in > 0)
+          {
+            break;
+          }
+          co_await sleep(loop, 5ms);
+        }
+
+        if (auto *l = left->connection(*left_handle); l != nullptr)
+        {
+          left_ok = l->handshake_complete();
+          l->close(0, "done", true);
+        }
+        if (auto *r = right->connection(*right_handle); r != nullptr)
+        {
+          right_ok = r->handshake_complete();
+          r->close(0, "done", true);
+        }
+
+        co_await sleep(loop, 50ms);
+        left_cancel.cancel();
+        right_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        left.reset();
+        right.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, left_dial_connected, right_dial_connected, left_accepted, right_accepted, left_client_role, left_server_role);
+    });
+
+  event_loop.run();
+  CHECK(left_dial_connected);
+  CHECK(right_dial_connected);
+  // Each peer answered the other's dial as well as completing its own.
+  CHECK(left_accepted == 1);
+  CHECK(right_accepted == 1);
+  // And one endpoint really did hold a connection of each role at once.
+  CHECK(left_client_role == 1);
+  CHECK(left_server_role == 1);
+}
+
+// What an endpoint holds decides what it can do, and both refusals are
+// immediate rather than a handshake that quietly never completes.
+TEST_CASE("an endpoint refuses the direction it has no context for")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  const auto identity = make_self_signed("localhost");
+  event_loop_t event_loop;
+  bool dial_refused = false;
+  bool socket_untouched = false;
+  int replies_to_initial = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &refused, bool &unbound, int &answered) -> task_t<void>
+      {
+        tls_config_t server_tls;
+        server_tls.role = tls_role_t::server;
+        server_tls.certificate_chain_pem = identity_pem.certificate_pem;
+        server_tls.private_key_pem = identity_pem.private_key_pem;
+        server_tls.alpn = {"test"};
+        tls_config_t client_tls;
+        client_tls.role = tls_role_t::client;
+        client_tls.ca_certificates_pem = identity_pem.certificate_pem;
+        client_tls.alpn = {"test"};
+
+        auto answering = tls_context_t::create(server_tls);
+        auto dialling = tls_context_t::create(client_tls);
+        REQUIRE(answering.has_value());
+        REQUIRE(dialling.has_value());
+
+        // A pair whose roles are swapped is refused at create, where it can
+        // still be reported, rather than at the first handshake.
+        endpoint_config_t config;
+        auto swapped = endpoint_t::create(loop, &*dialling, &*answering, config);
+        CHECK_FALSE(swapped.has_value());
+        auto empty = endpoint_t::create(loop, nullptr, nullptr, config);
+        CHECK_FALSE(empty.has_value());
+
+        // Answer-only: it has nothing to dial with.
+        auto answer_only_created = endpoint_t::create(loop, &*answering, nullptr, config);
+        REQUIRE(answer_only_created.has_value());
+        std::optional<endpoint_t> answer_only(std::move(*answer_only_created));
+
+        auto somewhere = ip4_addr("127.0.0.1", 9);
+        REQUIRE(somewhere.has_value());
+        auto dialled = answer_only->connect(reinterpret_cast<const sockaddr *>(&*somewhere), "localhost");
+        refused = !dialled.has_value();
+        // The refusal came before the socket was acquired, which is what lets
+        // a later bind still choose the address family.
+        unbound = !answer_only->local_port().has_value();
+
+        // Dial-only: it has nothing to answer with, so an Initial addressed to
+        // it builds no connection and draws no reply at all.
+        auto dial_only_created = endpoint_t::create(loop, nullptr, &*dialling, config);
+        REQUIRE(dial_only_created.has_value());
+        std::optional<endpoint_t> dial_only(std::move(*dial_only_created));
+        auto bind_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(bind_address.has_value());
+        REQUIRE(dial_only->bind(reinterpret_cast<const sockaddr *>(&*bind_address)).has_value());
+        auto dial_only_port = dial_only->local_port();
+        REQUIRE(dial_only_port.has_value());
+
+        cancellation_t dial_only_cancel;
+        auto dial_only_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*dial_only, dial_only_cancel);
+        (void)dial_only_run;
+
+        auto probe_created = udp_create(loop);
+        REQUIRE(probe_created.has_value());
+        std::optional<udp_t> probe(std::move(*probe_created));
+        auto probe_address = ip4_addr("127.0.0.1", 0);
+        REQUIRE(probe_address.has_value());
+        REQUIRE(udp_bind(*probe, reinterpret_cast<const sockaddr *>(&*probe_address)).has_value());
+        auto reader_created = udp_create_reader(*probe);
+        REQUIRE(reader_created.has_value());
+        std::optional<udp_reader_t> reader(std::move(*reader_created));
+
+        int received = 0;
+        auto pump = [](decltype(*reader) &r, int &count) -> detached_task_t
+        {
+          for (;;)
+          {
+            auto datagram = co_await r;
+            if (!datagram.has_value())
+            {
+              break;
+            }
+            ++count;
+          }
+        }(*reader, received);
+        (void)pump;
+
+        // A full-sized long header naming a version this build does not speak.
+        // An answering endpoint replies with a Version Negotiation; one that
+        // only dials has no service to offer and stays silent.
+        auto target = ip4_addr("127.0.0.1", *dial_only_port);
+        REQUIRE(target.has_value());
+        std::vector<std::uint8_t> unknown_version(1200, 0x00);
+        unknown_version[0] = 0xC0;
+        unknown_version[1] = 0x0A;
+        unknown_version[2] = 0x0A;
+        unknown_version[3] = 0x0A;
+        unknown_version[4] = 0x0A;
+        (void)udp_try_send(*probe, unknown_version, reinterpret_cast<const sockaddr *>(&*target));
+        for (int i = 0; i < 20 && received == 0; ++i)
+        {
+          co_await sleep(loop, 5ms);
+        }
+        answered = received;
+
+        reader->cancel();
+        co_await sleep(loop, 20ms);
+        reader.reset();
+        probe.reset();
+
+        dial_only_cancel.cancel();
+        co_await sleep(loop, 50ms);
+        dial_only.reset();
+        answer_only.reset();
+        co_await sleep(loop, 50ms);
+        loop.stop();
+      }(event_loop, identity, dial_refused, socket_untouched, replies_to_initial);
+    });
+
+  event_loop.run();
+  CHECK(dial_refused);
+  CHECK(socket_untouched);
+  CHECK(replies_to_initial == 0);
+}

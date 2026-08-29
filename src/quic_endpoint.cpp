@@ -128,16 +128,23 @@ struct connection_entry_t
 
 struct endpoint_impl_t
 {
-  endpoint_impl_t(event_loop_t &event_loop, const tls_context_t &tls_context, endpoint_config_t configuration, udp_t socket)
+  endpoint_impl_t(event_loop_t &event_loop, const tls_context_t *answering, const tls_context_t *dialling, endpoint_config_t configuration, udp_t socket)
     : loop(event_loop)
-    , context(tls_context)
+    , server_context(answering)
+    , client_context(dialling)
     , config(std::move(configuration))
     , udp(std::move(socket))
   {
   }
 
   event_loop_t &loop;
-  const tls_context_t &context;
+  // A tls_context_t is built for one role -- it chooses TLS_server_method or
+  // TLS_client_method and gates the ticket and early-data machinery on that --
+  // so an endpoint that both answers and dials needs one of each. Which of
+  // them is present is what decides what this endpoint can do; neither is
+  // owned, and both must outlive it.
+  const tls_context_t *server_context = nullptr;
+  const tls_context_t *client_context = nullptr;
   endpoint_config_t config;
   udp_t udp;
   // flush_entry hands control to the application, which endpoint.h invites to
@@ -543,7 +550,10 @@ void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connecti
 
 [[nodiscard]] connection_entry_t *accept_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram, const sockaddr *address, const packet_header_t &header, tick_t now)
 {
-  if (impl.config.connection.role != tls_role_t::server)
+  // Having something to answer with is what makes an endpoint answerable. An
+  // endpoint that only dials drops an arriving Initial here rather than
+  // building a connection it has no certificate to finish.
+  if (impl.server_context == nullptr)
   {
     return nullptr;
   }
@@ -561,6 +571,10 @@ void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connecti
   }
 
   auto config = impl.config.connection;
+  // Written here rather than taken from the template, because one endpoint may
+  // now hold connections of both roles and the template cannot be right for
+  // both. The same is done on the dialling side.
+  config.role = tls_role_t::server;
   if (impl.config.retry_key != nullptr && !header.token.empty())
   {
     // This Initial is the answer to a Retry this endpoint sent and kept no
@@ -575,7 +589,7 @@ void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connecti
   config.peer_host_address = host_address_bytes(address);
   config.ecn = impl.config.ecn ? ecn_codepoint_t::ect0 : ecn_codepoint_t::not_ect;
 
-  auto created = connection_t::create(impl.context, config);
+  auto created = connection_t::create(*impl.server_context, config);
   if (!created.has_value())
   {
     return nullptr;
@@ -750,13 +764,36 @@ endpoint_t &endpoint_t::operator=(endpoint_t &&) noexcept = default;
 
 std::expected<endpoint_t, error_t> endpoint_t::create(event_loop_t &loop, const tls_context_t &context, const endpoint_config_t &config)
 {
+  // The context already knows what it was built for, so an endpoint given one
+  // of them can answer or dial but not both -- and which it is needs saying
+  // once here rather than being stated again on connection_config_t::role and
+  // trusted to agree.
+  const auto answering = context.role() == tls_role_t::server;
+  return create(loop, answering ? &context : nullptr, answering ? nullptr : &context, config);
+}
+
+std::expected<endpoint_t, error_t> endpoint_t::create(event_loop_t &loop, const tls_context_t *server_context, const tls_context_t *client_context, const endpoint_config_t &config)
+{
+  if (server_context == nullptr && client_context == nullptr)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "a QUIC endpoint needs a TLS context to answer with, to dial with, or both"});
+  }
+  if (server_context != nullptr && server_context->role() != tls_role_t::server)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "the answering context was built for a client"});
+  }
+  if (client_context != nullptr && client_context->role() != tls_role_t::client)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "the dialling context was built for a server"});
+  }
+
   auto socket = udp_create(loop);
   if (!socket.has_value())
   {
     return std::unexpected(socket.error());
   }
   endpoint_t endpoint;
-  endpoint._impl = std::make_unique<endpoint_impl_t>(loop, context, config, std::move(*socket));
+  endpoint._impl = std::make_unique<endpoint_impl_t>(loop, server_context, client_context, config, std::move(*socket));
   return endpoint;
 }
 
@@ -792,6 +829,14 @@ void endpoint_t::on_activity(connection_active_t handler)
 std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket)
 {
   auto &impl = *_impl;
+  // Before ensure_socket, which binds. An endpoint with nothing to dial with
+  // must not acquire a socket -- and on an unbound one that call would pin the
+  // address family as well, so a refused dial would decide what a later bind
+  // could be.
+  if (impl.client_context == nullptr)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "this endpoint has no TLS context to dial with"});
+  }
   ensure_socket(impl, address != nullptr ? address->sa_family : AF_INET);
   auto config = impl.config.connection;
   config.role = tls_role_t::client;
@@ -804,7 +849,7 @@ std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *
     config.resumption_ticket.assign(resumption_ticket.begin(), resumption_ticket.end());
   }
 
-  auto created = connection_t::create(impl.context, config, server_name);
+  auto created = connection_t::create(*impl.client_context, config, server_name);
   if (!created.has_value())
   {
     return std::unexpected(created.error());
@@ -966,7 +1011,11 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
         // attempt gets no answer at all, for the reason section 14.1 gives
         // about Initials: a reply larger than what arrived is an amplifier
         // pointed at whoever the source address really belongs to.
-        if (invariant->version != quic_version_negotiation && bytes.size() >= smallest_maximum_datagram_size)
+        // And only from an endpoint that answers at all. Version Negotiation is
+        // a server's reply to a client proposing a version it does not speak;
+        // one that only dials has no connection to offer and should be silent
+        // rather than answer for a service it does not run.
+        if (impl.server_context != nullptr && invariant->version != quic_version_negotiation && bytes.size() >= smallest_maximum_datagram_size)
         {
           send_version_negotiation(impl, *invariant, sender);
         }
@@ -982,7 +1031,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
         continue;
       }
 
-      if (impl.config.retry_key != nullptr && !token_proves_address(impl, *initial, sender, now))
+      if (impl.server_context != nullptr && impl.config.retry_key != nullptr && !token_proves_address(impl, *initial, sender, now))
       {
         // Section 8.1.2: nothing has proved this address is real, so it is
         // answered without building anything. Whatever comes back carries the

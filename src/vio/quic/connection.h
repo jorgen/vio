@@ -102,6 +102,12 @@ struct connection_close_t
 
 struct connection_config_t
 {
+  // Which end of the handshake to run. A real input for code building a
+  // connection_t directly, which the tests and the benchmark do -- but
+  // endpoint_t writes it per connection from the path that built it, so
+  // setting it on endpoint_config_t::connection has no effect. It cannot be an
+  // endpoint-wide fact any more: one endpoint may hold connections of both
+  // roles.
   tls_role_t role = tls_role_t::server;
   // The version a client proposes in its first Initial. A server ignores this
   // and adopts whatever the client asked for, provided the endpoint accepts it.
