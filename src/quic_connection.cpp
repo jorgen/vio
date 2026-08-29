@@ -3739,6 +3739,40 @@ std::size_t connection_t::datagram_size() const
   return _impl->mtu.datagram_size();
 }
 
+stream_send_stats_t connection_t::stream_send_stats(std::uint64_t id)
+{
+  stream_send_stats_t out;
+  auto *stream = _impl->streams.find(id);
+  if (stream == nullptr || !stream->has_send)
+  {
+    return out;
+  }
+  const auto &send = stream->send;
+  out.queued = send.queued();
+  out.sent = send.sent_offset();
+  out.acknowledged = send.acknowledged_prefix();
+  out.max_data = send.max_data();
+  out.fin_queued = send.fin_queued();
+  out.blocked_by_stream_limit = send.blocked_by_stream_limit();
+  // Asked of the connection rather than the stream: the window it is waiting
+  // on is the shared one, so the stream cannot answer it alone.
+  out.blocked_by_connection_limit = send.blocked_by_connection_limit(_impl->streams.connection_send_window());
+  return out;
+}
+
+connection_path_stats_t connection_t::path_stats() const
+{
+  connection_path_stats_t out;
+  const auto &rtt = _impl->recovery.rtt();
+  out.smoothed_rtt = rtt.smoothed();
+  out.rtt_variation = rtt.variation();
+  out.min_rtt = rtt.minimum();
+  out.bytes_in_flight = _impl->recovery.bytes_in_flight();
+  out.congestion_window = _impl->congestion.window();
+  out.slow_start_threshold = _impl->congestion.slow_start_threshold();
+  return out;
+}
+
 std::uint64_t connection_t::delivery_rate() const
 {
   return _impl->last_delivery_rate;

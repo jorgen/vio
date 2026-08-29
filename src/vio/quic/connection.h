@@ -91,6 +91,43 @@ inline constexpr std::uint64_t transport_error_protocol_violation = 0x0a;
 inline constexpr std::uint64_t transport_error_crypto_buffer_exceeded = 0x0d;
 inline constexpr std::uint64_t transport_error_aead_limit_reached = 0x0f;
 
+// What a stream's sending half is holding, and why it is not moving.
+//
+// write_stream accepts whatever it is given and puts it on the wire later, so
+// none of this is visible from its return value -- and without it an
+// application has no way to meter itself against a peer that has stopped
+// reading, and no way to answer "why has my write not left".
+struct stream_send_stats_t
+{
+  // Everything handed to write_stream, whether or not it has been sent.
+  std::uint64_t queued = 0;
+  // How far the wire has got, and how far the peer has confirmed. The gap
+  // between acknowledged and queued is what a sender should bound.
+  std::uint64_t sent = 0;
+  std::uint64_t acknowledged = 0;
+  // The peer's limit for this stream, which is the ceiling `sent` moves under.
+  std::uint64_t max_data = 0;
+  bool fin_queued = false;
+  // The two reasons a stream with data to send sends none. They are different
+  // problems: the first is answered by this stream being read, the second by
+  // the connection as a whole being read.
+  bool blocked_by_stream_limit = false;
+  bool blocked_by_connection_limit = false;
+};
+
+// What the path is doing. All of it is measured already; none of it was
+// reachable, so an application could not report a round trip time, size a
+// buffer against the window, or tell a slow path from a lossy one.
+struct connection_path_stats_t
+{
+  std::chrono::nanoseconds smoothed_rtt{0};
+  std::chrono::nanoseconds rtt_variation{0};
+  std::chrono::nanoseconds min_rtt{0};
+  std::size_t bytes_in_flight = 0;
+  std::size_t congestion_window = 0;
+  std::size_t slow_start_threshold = 0;
+};
+
 struct connection_close_t
 {
   std::uint64_t error_code = 0;
@@ -323,6 +360,13 @@ public:
 
   // What the path has been measured delivering, in bytes per second: the most
   // recent sample, and the fastest seen. Nothing steers on these yet.
+  // Per stream, and for the whole path. Cheap reads of state the transport
+  // already keeps; the interesting one is the gap between queued and
+  // acknowledged, which is the only measure of how far ahead of the peer a
+  // sender has run.
+  [[nodiscard]] stream_send_stats_t stream_send_stats(std::uint64_t id);
+  [[nodiscard]] connection_path_stats_t path_stats() const;
+
   [[nodiscard]] std::uint64_t delivery_rate() const;
   [[nodiscard]] std::uint64_t peak_delivery_rate() const;
 

@@ -3572,4 +3572,101 @@ TEST_CASE("a connection that times out says why it ended")
   }
 }
 
+// write_stream takes whatever it is given and puts it on the wire later, so
+// its return value says nothing about progress. Without these an application
+// has no way to meter itself against a peer that has stopped reading, and no
+// way to answer why a write has not left.
+TEST_CASE("a sender can see how far ahead of the peer it has run")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  // A per-stream window far smaller than what is written, so the send half is
+  // certain to be still holding data when it is asked.
+  auto parameters = sane_parameters();
+  parameters.initial_max_stream_data_bidi_local = 4096;
+  parameters.initial_max_stream_data_bidi_remote = 4096;
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = parameters;
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = parameters;
+
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(client.has_value());
+  REQUIRE(server.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  auto stream = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(stream.has_value());
+
+  // Nothing written yet.
+  auto before = client->stream_send_stats(*stream);
+  CHECK(before.queued == 0);
+  CHECK(before.sent == 0);
+  CHECK(before.acknowledged == 0);
+  CHECK_FALSE(before.fin_queued);
+
+  const std::vector<std::uint8_t> body(64 * 1024, 0xab);
+  CHECK(client->write_stream(*stream, body, true) == body.size());
+
+  // Accepted in full and held, which is exactly the thing that needs reporting.
+  auto queued = client->stream_send_stats(*stream);
+  CHECK(queued.queued == body.size());
+  CHECK(queued.fin_queued);
+  CHECK(queued.sent == 0);
+
+  run_handshake(*client, *server, at(1ms));
+
+  auto moved = client->stream_send_stats(*stream);
+  // Some of it is on the wire and confirmed, and the rest is still waiting --
+  // the gap between the two is the number a sender meters against.
+  CHECK(moved.sent > 0);
+  CHECK(moved.sent <= moved.queued);
+  CHECK(moved.acknowledged <= moved.sent);
+  CHECK(moved.queued == body.size());
+  // The peer's window is what stopped it, and it says so.
+  CHECK(moved.max_data > 0);
+  CHECK(moved.sent <= moved.max_data);
+  CHECK(moved.blocked_by_stream_limit);
+}
+
+// Every one of these is measured already; none of it was reachable, so an
+// application could not report a round trip time or size anything against the
+// window.
+TEST_CASE("the path reports what it has measured")
+{
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(client.has_value());
+  REQUIRE(server.has_value());
+  REQUIRE(run_handshake(*client, *server, at(0ns)).rounds > 0);
+  REQUIRE(client->handshake_complete());
+
+  const auto stats = client->path_stats();
+  // Section 5.3 seeds the smoothed estimate before any sample arrives, so this
+  // is non-zero even here -- where the whole handshake runs at one instant and
+  // every real sample is therefore zero. That is also why min_rtt is not
+  // asserted to be positive: on this harness it correctly is not.
+  CHECK(stats.smoothed_rtt.count() > 0);
+  CHECK(stats.min_rtt <= stats.smoothed_rtt);
+  // The window starts at the initial one and nothing here drove it down.
+  CHECK(stats.congestion_window > 0);
+  CHECK(stats.congestion_window >= stats.bytes_in_flight);
+}
+
 }
