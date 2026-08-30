@@ -858,7 +858,19 @@ std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *
   {
     return std::unexpected(error_t{.code = -1, .msg = "this endpoint has no TLS context to dial with"});
   }
-  ensure_socket(impl, address != nullptr ? address->sa_family : AF_INET);
+  // Before ensure_socket for the same reason the check above is: a dial that
+  // cannot happen must not decide the socket's address family.
+  //
+  // The family is checked and not just the pointer, because everything below
+  // reads through this address on the strength of it -- address_bytes switches
+  // on the family, and the memcpy into the entry copies sizeof(sockaddr_in6) or
+  // sizeof(sockaddr_in) accordingly. A null address dereferenced here, and
+  // anything that was neither family read the wrong number of bytes.
+  if (address == nullptr || (address->sa_family != AF_INET && address->sa_family != AF_INET6))
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "connect needs an IPv4 or IPv6 address"});
+  }
+  ensure_socket(impl, address->sa_family);
   auto config = impl.config.connection;
   config.role = tls_role_t::client;
   config.stateless_reset_key = impl.config.stateless_reset_key;

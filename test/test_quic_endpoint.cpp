@@ -1643,6 +1643,49 @@ TEST_CASE("one endpoint both answers and dials on the same port")
 
 // What an endpoint holds decides what it can do, and both refusals are
 // immediate rather than a handshake that quietly never completes.
+TEST_CASE("a dial refuses an address it cannot read")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  // connect() reads through the sockaddr it is given on the strength of its
+  // family: address_bytes switches on it, and the copy into the connection
+  // entry takes sizeof(sockaddr_in6) or sizeof(sockaddr_in) accordingly. A null
+  // pointer was dereferenced, and a family that was neither read the wrong
+  // number of bytes off the caller's stack.
+  //
+  // The refusal also has to come before the socket is created, or a dial that
+  // cannot happen decides the address family a later bind is stuck with.
+  const auto identity = make_self_signed("localhost");
+  tls_config_t client_tls;
+  client_tls.role = tls_role_t::client;
+  client_tls.ca_certificates_pem = identity.certificate_pem;
+  client_tls.alpn = {"test"};
+  auto client_context = tls_context_t::create(client_tls);
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  {
+    endpoint_config_t config;
+    config.connection.role = tls_role_t::client;
+    auto endpoint = endpoint_t::create(event_loop, *client_context, config);
+    REQUIRE(endpoint.has_value());
+
+    CHECK_FALSE(endpoint->connect(nullptr, "localhost").has_value());
+
+    sockaddr_storage nonsense = {};
+    nonsense.ss_family = AF_UNSPEC;
+    CHECK_FALSE(endpoint->connect(reinterpret_cast<const sockaddr *>(&nonsense), "localhost").has_value());
+
+    // And the socket still has no family, so a bind can choose one.
+    sockaddr_in6 any6 = {};
+    REQUIRE(uv_ip6_addr("::", 0, &any6) == 0);
+    CHECK(endpoint->bind(reinterpret_cast<const sockaddr *>(&any6)).has_value());
+  }
+  event_loop.stop();
+  event_loop.run();
+}
+
 TEST_CASE("an endpoint refuses the direction it has no context for")
 {
   using namespace vio;
