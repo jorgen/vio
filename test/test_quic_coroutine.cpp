@@ -189,7 +189,7 @@ TEST_CASE("a waiter is resumed when the milestone is reached")
   await_milestone(quic_milestone_t{slot}, woke, failed);
   CHECK_FALSE(woke);
 
-  detail::quic_milestone_reach(slot.data(), std::unexpected(error_t{.code = vio_quic_idle_timeout, .msg = "idle"}));
+  detail::quic_milestone_reach(slot.data(), std::unexpected(vio::error_t{.code = vio_quic_idle_timeout, .msg = "idle"}));
   // Latched but nobody woken: whatever reached it was standing in the read
   // loop, and resuming there is the one thing this layer never does.
   CHECK_FALSE(woke);
@@ -210,7 +210,7 @@ TEST_CASE("every waiter is resumed, and the first reason is the one kept")
   await_milestone(quic_milestone_t{slot}, first_woke, first_failed);
   await_milestone(quic_milestone_t{slot}, second_woke, second_failed);
 
-  detail::quic_milestone_reach(slot.data(), std::unexpected(error_t{.code = vio_quic_connection_closed, .msg = "peer closed"}));
+  detail::quic_milestone_reach(slot.data(), std::unexpected(vio::error_t{.code = vio_quic_connection_closed, .msg = "peer closed"}));
   detail::quic_milestone_drain(slot.data());
   CHECK(first_woke);
   CHECK(second_woke);
@@ -341,7 +341,7 @@ TEST_CASE("an operation resolved before anyone awaits it does not suspend")
   // Settled with a failure, which is the shape of a dial refused before it
   // ever went out.
   auto *op = detail::quic_op_create(nullptr);
-  detail::quic_op_finish(*op, error_t{.code = vio_quic_handshake_failed, .msg = "no"});
+  detail::quic_op_finish(*op, vio::error_t{.code = vio_quic_handshake_failed, .msg = "no"});
 
   bool woke = false;
   bool failed = false;
@@ -365,7 +365,7 @@ TEST_CASE("an operation resolved while a coroutine is parked resumes it")
   await_operation(quic_connection_awaitable_t{op}, woke, failed, code);
   CHECK_FALSE(woke);
 
-  detail::quic_op_finish(*op, error_t{.code = vio_quic_idle_timeout, .msg = "idle"});
+  detail::quic_op_finish(*op, vio::error_t{.code = vio_quic_idle_timeout, .msg = "idle"});
   CHECK_FALSE(woke);
 
   // Settling records; the beat resumes. Nothing is woken until something
@@ -396,7 +396,7 @@ TEST_CASE("an operation abandoned before it resolves is not resumed")
   CHECK_FALSE(op->continuation);
 
   // The endpoint resolving it now touches nothing that has gone.
-  detail::quic_op_finish(*op, error_t{.code = vio_quic_endpoint_closed, .msg = "released"});
+  detail::quic_op_finish(*op, vio::error_t{.code = vio_quic_endpoint_closed, .msg = "released"});
   detail::quic_op_dispatch(op);
 }
 
@@ -407,7 +407,7 @@ TEST_CASE("an operation abandoned after it resolves is freed by whoever is last"
   using namespace vio;
 
   auto *op = detail::quic_op_create(nullptr);
-  detail::quic_op_finish(*op, error_t{.code = vio_quic_connection_closed, .msg = "closed"});
+  detail::quic_op_finish(*op, vio::error_t{.code = vio_quic_connection_closed, .msg = "closed"});
   // Nothing parked, so this resumes nothing and only drops the endpoint's hold.
   detail::quic_op_dispatch(op);
 
@@ -424,10 +424,10 @@ TEST_CASE("the first outcome is the one reported")
   using namespace vio;
 
   auto *op = detail::quic_op_create(nullptr);
-  detail::quic_op_finish(*op, error_t{.code = vio_quic_handshake_failed, .msg = "first"});
+  detail::quic_op_finish(*op, vio::error_t{.code = vio_quic_handshake_failed, .msg = "first"});
   // More than one thing notices an ending, and a dial that failed for one
   // reason must not be reclassified by a later pass over it.
-  detail::quic_op_finish(*op, error_t{.code = vio_quic_idle_timeout, .msg = "second"});
+  detail::quic_op_finish(*op, vio::error_t{.code = vio_quic_idle_timeout, .msg = "second"});
   CHECK(op->failure.code == vio_quic_handshake_failed);
 
   bool woke = false;
@@ -446,7 +446,7 @@ TEST_CASE("a moved-from awaitable holds nothing")
   // source inert: two awaitables releasing the same operation is a double free,
   // and it would happen on the ordinary path rather than an exotic one.
   auto *op = detail::quic_op_create(nullptr);
-  detail::quic_op_finish(*op, error_t{.code = vio_quic_busy, .msg = "busy"});
+  detail::quic_op_finish(*op, vio::error_t{.code = vio_quic_busy, .msg = "busy"});
   {
     quic_connection_awaitable_t first{op};
     quic_connection_awaitable_t second{std::move(first)};
