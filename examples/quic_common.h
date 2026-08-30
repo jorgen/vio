@@ -24,9 +24,11 @@
 // openssl. Getting it wrong produces "undeclared identifier 'name'".
 
 #include <vio/cancellation.h>
+#include <vio/operation/quic_stream.h>
 #include <vio/operation/sleep.h>
+// For ip4_addr, which every example needs and which lives with the TCP
+// operations because that is where it was first wanted.
 #include <vio/operation/tcp.h>
-#include <vio/quic/endpoint.h>
 #include <vio/run.h>
 
 #include <vio/ssl_backend.h>
@@ -186,6 +188,13 @@ inline std::span<const std::uint8_t> bytes_of(std::string_view text)
 inline std::string text_of(std::span<const std::uint8_t> bytes)
 {
   return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
+}
+
+// The same, for what a stream reader hands back. It owns its buffer, so the
+// text has to be copied out of it before the buffer goes.
+inline std::string text_of(const vio::unique_buf_t &buffer)
+{
+  return {buffer.buf.base, buffer.buf.len};
 }
 
 } // namespace vio_example

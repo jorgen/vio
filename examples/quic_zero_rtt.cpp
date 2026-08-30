@@ -1,20 +1,35 @@
-// Session resumption and 0-RTT: a second connection to a server this client
-// has met before, carrying application data in its very first flight.
+// Session resumption and 0-RTT: a second connection to a server this client has
+// met before, carrying application data in its very first flight.
 //
-// This is QUIC's headline latency feature and the one place where the
-// transport hands the application data it cannot promise is fresh. An attacker
-// who captured a 0-RTT flight can send it again, so a server must be given an
-// anti_replay_t before it will grant early data at all -- and the request
-// itself should be one that is safe to perform twice.
+// This is QUIC's headline latency feature and the one place where the transport
+// hands the application data it cannot promise is fresh. An attacker who
+// captured a 0-RTT flight can send it again, so a server must be given an
+// anti_replay_t before it will grant early data at all -- and the request itself
+// should be one that is safe to perform twice.
 //
 // The program makes two connections. The first is an ordinary handshake whose
 // only purpose is to be issued a session ticket. The second spends that ticket
-// and writes before the server has said anything; watch the server report that
-// its handshake is still running as it answers.
+// and writes before the server has said anything.
+//
+// This is the one example that dials with quic_endpoint_connect_early rather
+// than quic_endpoint_connect, and the reason is the whole feature: an ordinary
+// dial resolves when the handshake completes, which is exactly too late. The
+// early form hands back the connection at once so the first flight can carry
+// something, and the handshake is awaited afterwards.
+//
+// One limit of this layer worth knowing before designing around 0-RTT.
+// quic_endpoint_accept resolves only once a handshake has *completed*, because
+// that is when the transport reports a connection at all -- so a server written
+// against this API cannot act on 0-RTT data during the round trip it saves. The
+// latency is still saved: the client's first flight carries the request, the
+// server has it before its own handshake finishes, and the answer goes out a
+// round trip earlier than it otherwise could. What a server cannot do here is
+// *observe* that window. A server that must react inside it has to reach for
+// quic_endpoint_native and the transport's on_activity, and then it owns the
+// rule that no user code may run inside the transport's walk.
 
 #include <chrono>
 #include <cstdint>
-#include <optional>
 #include <print>
 #include <string>
 #include <vector>
@@ -27,6 +42,46 @@ namespace
 {
 using namespace std::chrono_literals;
 using namespace vio_example;
+
+// Echoes one stream back.
+//
+// The 0-RTT data is already here when this runs -- it arrived in the client's
+// first flight, which is the point -- but the handshake has completed by the
+// time an accept hands the connection over, so this cannot watch it happen. The
+// client side reports the verdict instead.
+vio::task_t<void> serve(vio::quic_connection_t connection)
+{
+  using namespace vio;
+  auto stream = co_await quic_accept_stream(connection);
+  if (!stream)
+  {
+    co_return;
+  }
+  auto reader = quic_stream_create_reader(*stream);
+  if (!reader)
+  {
+    co_return;
+  }
+  std::string request;
+  while (auto chunk = co_await *reader)
+  {
+    request += text_of(*chunk);
+  }
+  std::println("server: \"{}\"", request);
+  (void)co_await quic_stream_write_final(*stream, bytes_of(request));
+}
+
+// One connection's worth of answering. Two of these run over the program's
+// life, one per connection the client makes.
+vio::task_t<void> answer_one(vio::quic_endpoint_t &endpoint)
+{
+  auto connection = co_await vio::quic_endpoint_accept(endpoint);
+  if (!connection)
+  {
+    co_return;
+  }
+  co_await serve(*connection);
+}
 } // namespace
 
 int main()
@@ -50,158 +105,91 @@ int main()
       server_tls.role = tls_role_t::server;
       server_tls.certificate_chain_pem = identity.certificate_pem;
       server_tls.private_key_pem = identity.private_key_pem;
-      server_tls.alpn = {"vio-zero-rtt"};
-      // Two separate decisions. Resumption alone shortens the handshake and
-      // carries no replay exposure; early_data additionally permits 0-RTT and
-      // implies the first.
+      server_tls.alpn = {"vio-0rtt"};
+      // Two knobs because they are two features: session_resumption issues and
+      // offers tickets, which shortens a handshake and carries no replay
+      // exposure; early_data additionally permits 0-RTT, and implies the first.
       server_tls.session_resumption = true;
       server_tls.early_data = true;
       server_tls.anti_replay = &anti_replay;
       auto server_context = tls_context_t::create(server_tls);
-      if (!server_context)
-      {
-        std::println(stderr, "server tls_context_t::create failed: {}", server_context.error().msg);
-        co_return 1;
-      }
 
       tls_config_t client_tls;
       client_tls.role = tls_role_t::client;
       client_tls.ca_certificates_pem = identity.certificate_pem;
-      client_tls.alpn = {"vio-zero-rtt"};
+      client_tls.alpn = {"vio-0rtt"};
       client_tls.session_resumption = true;
       client_tls.early_data = true;
       auto client_context = tls_context_t::create(client_tls);
-      if (!client_context)
+      if (!server_context || !client_context)
       {
-        std::println(stderr, "client tls_context_t::create failed: {}", client_context.error().msg);
+        std::println(stderr, "tls_context_t::create failed");
         co_return 1;
       }
 
-      endpoint_config_t server_config;
-      server_config.connection.role = tls_role_t::server;
-      auto server_created = endpoint_t::create(loop, *server_context, server_config);
-      if (!server_created)
+      auto server = quic_endpoint_create(loop, *server_context);
+      auto client = quic_endpoint_create(loop, nullptr, &*client_context);
+      if (!server || !client)
       {
-        std::println(stderr, "server endpoint_t::create failed: {}", server_created.error().msg);
+        std::println(stderr, "quic_endpoint_create failed");
         co_return 1;
       }
-      std::optional<endpoint_t> server(std::move(*server_created));
-
-      auto bind_address = ip4_addr("127.0.0.1", 0);
-      if (!bind_address || !server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)))
+      if (auto bound = quic_endpoint_bind(*server, std::uint16_t{0}); !bound)
       {
-        std::println(stderr, "could not bind the server socket");
+        std::println(stderr, "quic_endpoint_bind: {}", bound.error().msg);
         co_return 1;
       }
-      const auto port = server->local_port();
-      if (!port)
+      const auto port = quic_endpoint_local_port(*server).value_or(0);
+      std::println("server listening on port {}", port);
+
+      const auto target = ip4_addr("127.0.0.1", port);
+      if (!target)
       {
-        std::println(stderr, "could not read the server port");
+        std::println(stderr, "could not build the target address");
         co_return 1;
       }
-      std::println("server listening on 127.0.0.1:{}", *port);
 
-      server->on_activity(
-        [](connection_t &connection)
-        {
-          for (const auto id : connection.readable_streams())
-          {
-            auto readable = connection.readable_stream(id);
-            // On the resumed connection this prints while the handshake is
-            // still running: that is what 0-RTT means, and it is exactly why
-            // the anti-replay register has to exist.
-            //
-            // It is also a trap for a server that keeps per-connection state.
-            // on_connection fires only once the handshake is complete, so
-            // 0-RTT data reaches on_activity BEFORE on_connection ever fires
-            // for that connection -- a server that allocates its state in
-            // on_connection will look it up here and not find it. This one
-            // holds no per-connection state, which is why it does not care.
-            std::println("server: \"{}\" -- handshake {}", text_of(readable), connection.handshake_complete() ? "complete" : "still running");
-            (void)connection.write_stream(id, readable, connection.stream_receive_finished(id));
-            connection.consume_stream(id, readable.size());
-          }
-        });
-
-      endpoint_config_t client_config;
-      client_config.connection.role = tls_role_t::client;
-      auto client_created = endpoint_t::create(loop, *client_context, client_config);
-      if (!client_created)
-      {
-        std::println(stderr, "client endpoint_t::create failed: {}", client_created.error().msg);
-        co_return 1;
-      }
-      std::optional<endpoint_t> client(std::move(*client_created));
-
-      std::string reply;
-      bool reply_finished = false;
-      client->on_activity(
-        [&reply, &reply_finished](connection_t &connection)
-        {
-          for (const auto id : connection.readable_streams())
-          {
-            auto readable = connection.readable_stream(id);
-            reply += text_of(readable);
-            connection.consume_stream(id, readable.size());
-            if (connection.stream_receive_finished(id))
-            {
-              reply_finished = true;
-            }
-          }
-        });
-
-      cancellation_t server_cancel;
-      cancellation_t client_cancel;
-      auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
-      auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
-      (void)server_run;
-      (void)client_run;
-
-      const auto target = ip4_addr("127.0.0.1", *port);
-
-      // ---- first connection: an ordinary handshake, to be issued a ticket ----
+      // ---- first connection: an ordinary handshake, for the ticket ----
       std::vector<std::uint8_t> ticket;
       {
-        auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
-        if (!dialled)
+        auto answering = answer_one(*server);
+        auto connection = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&*target), "localhost");
+        if (!connection)
         {
-          std::println(stderr, "connect failed: {}", dialled.error().msg);
+          std::println(stderr, "quic_endpoint_connect: {}", connection.error().msg);
           co_return 1;
-        }
-        for (int attempt = 0; attempt < 400; ++attempt)
-        {
-          auto *live = client->connection(*dialled);
-          if (live == nullptr || live->handshake_complete())
-          {
-            break;
-          }
-          co_await sleep(loop, 5ms);
         }
         std::println("first connection: a full handshake");
 
-        // TLS 1.3 sends the ticket AFTER the handshake, often after the
-        // exchange the connection existed for. So polling resumption_ticket()
-        // the moment handshake_complete() turns true yields nothing, and
-        // nothing distinguishes "not yet" from "never".
-        for (int attempt = 0; attempt < 400 && ticket.empty(); ++attempt)
+        auto stream = co_await quic_open_stream(*connection);
+        if (!stream)
         {
-          auto *live = client->connection(*dialled);
-          if (live == nullptr)
+          co_return 1;
+        }
+        (void)co_await quic_stream_write_final(*stream, bytes_of("hello"));
+        auto reader = quic_stream_create_reader(*stream);
+        if (reader)
+        {
+          while ((co_await *reader).has_value())
           {
-            break;
           }
-          ticket = live->resumption_ticket();
+        }
+        co_await std::move(answering);
+
+        // TLS 1.3 sends the ticket AFTER the handshake, often after the
+        // exchange the connection existed for, and there is no event for its
+        // arrival. So this waits for it, which is the one poll left in this
+        // directory and an honest one: nothing in the protocol says when.
+        for (int attempt = 0; attempt < 200 && ticket.empty(); ++attempt)
+        {
+          ticket = quic_connection_resumption_ticket(*connection);
           if (!ticket.empty())
           {
             break;
           }
-          co_await sleep(loop, 5ms);
+          (void)co_await sleep(loop, 5ms);
         }
-        if (auto *live = client->connection(*dialled); live != nullptr)
-        {
-          live->close(0, "have the ticket", true);
-        }
-        co_await sleep(loop, 50ms);
+        quic_connection_close(*connection, 0, "have the ticket");
       }
 
       if (ticket.empty())
@@ -211,72 +199,58 @@ int main()
       }
       // One opaque blob carrying the TLS session and the server's transport
       // parameters together, because a resuming client has to stay inside the
-      // limits it was given last time and there is nothing else to go on
-      // before the server has spoken. Where it is kept is the application's
-      // business, which is why it comes out as bytes.
+      // limits it was given last time and there is nothing else to go on before
+      // the server has spoken.
       std::println("kept a {} byte session ticket", ticket.size());
 
       // ---- second connection: spends the ticket, writes immediately ----
-      reply.clear();
-      reply_finished = false;
-      auto resumed = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost", ticket);
+      auto answering = answer_one(*server);
+
+      auto resumed = quic_endpoint_connect_early(*client, reinterpret_cast<const sockaddr *>(&*target), "localhost", ticket);
       if (!resumed)
       {
-        std::println(stderr, "resumed connect failed: {}", resumed.error().msg);
-        co_return 1;
-      }
-      auto *connection = client->connection(*resumed);
-      if (connection == nullptr)
-      {
-        std::println(stderr, "the resumed connection went away");
+        std::println(stderr, "quic_endpoint_connect_early: {}", resumed.error().msg);
         co_return 1;
       }
 
-      // The write has to happen here, between connect() returning and the next
-      // trip through the event loop. Waiting until the handshake completes --
-      // the natural thing to write -- produces a perfectly good connection
-      // that simply never used 0-RTT, with nothing anywhere to say so.
-      //
-      // There is stream credit to spend already because the ticket carried the
-      // server's transport parameters from last time.
-      auto stream = connection->open_stream(stream_direction_t::bidirectional);
+      // On this stack, before the next trip through the event loop. There is
+      // stream credit to spend already because the ticket carried the server's
+      // transport parameters from last time.
+      auto stream = quic_try_open_stream(*resumed);
       if (!stream)
       {
-        std::println(stderr, "no stream credit for 0-RTT");
+        std::println(stderr, "no stream credit for 0-RTT: {}", stream.error().msg);
         co_return 1;
       }
       const std::string message = "sent at 0-RTT";
-      (void)connection->write_stream(*stream, bytes_of(message), true);
-      (void)client->flush();
+      if (auto written = co_await quic_stream_write_final(*stream, bytes_of(message)); !written)
+      {
+        std::println(stderr, "0-RTT write: {}", written.error().msg);
+        co_return 1;
+      }
       std::println("client: wrote \"{}\" before the handshake began", message);
 
-      for (int attempt = 0; attempt < 400 && !reply_finished; ++attempt)
+      auto reader = quic_stream_create_reader(*stream);
+      if (!reader)
       {
-        co_await sleep(loop, 5ms);
+        co_return 1;
       }
-
-      bool accepted = false;
-      if (auto *live = client->connection(*resumed); live != nullptr)
+      std::string reply;
+      while (auto chunk = co_await *reader)
       {
-        // Resuming and having early data accepted are different things: a
-        // server may take the ticket and still refuse the data on it, in which
-        // case the connection rewinds and sends it again under 1-RTT keys.
-        // early_data_rejected() reports that; the application does not have to
-        // do anything about it.
-        accepted = live->early_data_accepted();
-        std::println("client: early data {}", accepted ? "accepted" : "refused");
-        std::println("client: received \"{}\"", reply);
-        live->close(0, "done", true);
+        reply += text_of(*chunk);
       }
+      co_await std::move(answering);
 
-      co_await sleep(loop, 50ms);
-      client_cancel.cancel();
-      server_cancel.cancel();
-      co_await sleep(loop, 50ms);
-      client.reset();
-      server.reset();
-      co_await sleep(loop, 50ms);
+      // Resuming and having early data accepted are different things: a server
+      // may take the ticket and still refuse the data on it, in which case the
+      // connection rewinds and sends it again under 1-RTT keys. The application
+      // does not have to do anything about it -- this only reports it.
+      const bool accepted = quic_connection_early_data_accepted(*resumed);
+      std::println("client: early data {}", accepted ? "accepted" : "refused");
+      std::println("client: received \"{}\"", reply);
 
-      co_return accepted &&reply == message ? 0 : 1;
+      quic_connection_close(*resumed, 0, "done");
+      co_return accepted && reply == message ? 0 : 1;
     });
 }

@@ -1,21 +1,24 @@
 // Request/response over QUIC: three files fetched at once, each on its own
 // stream, over one connection.
 //
-// This is the shape most applications actually want, and it is where QUIC
-// earns its keep -- the three transfers are independent, so the 900 KB one
-// cannot delay the 4 KB one the way it would over a single TCP connection.
+// This is the shape most applications actually want, and it is where QUIC earns
+// its keep -- the three transfers are independent, so the 900 KB one cannot
+// delay the 4 KB one the way it would over a single TCP connection.
 //
-// Two things worth watching here that quic_echo.cpp does not show. Nothing in
-// this program paces the sender: the whole body goes into write_stream in one
-// call and the transport puts it on the wire as the peer's flow control opens.
-// And the server keeps its own map from stream id to per-request state,
-// because the API has no per-stream object and no way to enumerate the streams
-// a peer has opened.
+// It is also the example that changed most when the coroutine API arrived, and
+// the diff is the argument for it. Both sides used to keep a std::map from
+// stream id to per-request state, because the old surface reported *levels*
+// (which streams have unread bytes right now) rather than *events*, and a
+// stream whose bytes had all been consumed simply dropped off the list. A
+// request split across two packets had to be reassembled by hand into a map
+// entry keyed by id.
+//
+// Now a stream is an object with a lifetime, and each request is a coroutine
+// that owns its own partial buffer as a local. There is no map on either side.
 
-#include <chrono>
+#include <cstddef>
+#include <utility>
 #include <cstdint>
-#include <map>
-#include <optional>
 #include <print>
 #include <string>
 #include <vector>
@@ -24,7 +27,6 @@
 
 namespace
 {
-using namespace std::chrono_literals;
 using namespace vio_example;
 
 // Three "files", made up rather than read from disk so the example has no
@@ -45,12 +47,117 @@ std::string body_for(const std::string &name)
   return out;
 }
 
-struct download_t
+// One request, from the first byte of its name to the last byte of its body.
+//
+// The partial buffer is a local, which is the whole point: a request is a name
+// and a newline, and nothing guarantees it arrives in one piece -- a stream is a
+// byte stream, not a message queue.
+vio::task_t<void> handle_request(vio::quic_stream_t stream)
 {
+  using namespace vio;
+  auto reader = quic_stream_create_reader(stream);
+  if (!reader)
+  {
+    co_return;
+  }
+
+  std::string pending;
   std::string name;
+  while (name.empty())
+  {
+    auto chunk = co_await *reader;
+    if (!chunk)
+    {
+      co_return; // the client gave up before it finished asking
+    }
+    pending += text_of(*chunk);
+    if (const auto newline = pending.find('\n'); newline != std::string::npos)
+    {
+      name = pending.substr(0, newline);
+    }
+  }
+
+  const std::string body = body_for(name);
+  std::println("server: stream {} wants {}, sending {} bytes", quic_stream_id(stream), name, body.size());
+  // Accepted in full whatever the peer's window is: the transport queues it and
+  // releases it as credit arrives. Writes are not yet bounded by a high-water
+  // mark, so a server sending something it cannot afford to buffer still has to
+  // bound it some other way -- see quic_bulk_transfer.cpp.
+  if (auto written = co_await quic_stream_write_final(stream, bytes_of(body)); !written)
+  {
+    std::println(stderr, "server: stream {}: {}", quic_stream_id(stream), written.error().msg);
+  }
+}
+
+// Accepts streams for the life of one connection, and runs each request beside
+// the others rather than one after another. That concurrency is the feature: a
+// server that awaited each request in turn would serialise exactly what QUIC
+// exists to keep independent.
+vio::task_t<void> serve(vio::quic_connection_t connection, std::size_t expected)
+{
+  using namespace vio;
+  std::vector<task_t<void>> requests;
+  requests.reserve(expected);
+  for (std::size_t taken = 0; taken < expected; ++taken)
+  {
+    auto stream = co_await quic_accept_stream(connection);
+    if (!stream)
+    {
+      break;
+    }
+    requests.push_back(handle_request(*stream));
+  }
+  for (auto &request : requests)
+  {
+    co_await std::move(request);
+  }
+}
+
+// One download, counted rather than kept, since the bytes themselves are not
+// the point.
+vio::task_t<std::size_t> fetch(vio::quic_connection_t connection, std::string name)
+{
+  using namespace vio;
+  auto stream = co_await quic_open_stream(connection);
+  if (!stream)
+  {
+    std::println(stderr, "client: {}: {}", name, stream.error().msg);
+    co_return 0;
+  }
+  if (auto written = co_await quic_stream_write_final(*stream, bytes_of(name + "\n")); !written)
+  {
+    std::println(stderr, "client: {}: {}", name, written.error().msg);
+    co_return 0;
+  }
+
+  auto reader = quic_stream_create_reader(*stream);
+  if (!reader)
+  {
+    co_return 0;
+  }
+  // read_into rather than the owning read: the bytes are counted and thrown
+  // away, so there is no reason to allocate a buffer per chunk. Zero is the
+  // clean end of the stream, the same convention tcp_reader_t::read_into uses;
+  // a reset would come back as an error instead.
+  std::vector<std::uint8_t> scratch(64 * 1024);
   std::size_t received = 0;
-  bool complete = false;
-};
+  while (true)
+  {
+    auto taken = co_await reader->read_into(scratch);
+    if (!taken)
+    {
+      std::println(stderr, "client: {} ended early: {}", name, taken.error().msg);
+      break;
+    }
+    if (*taken == 0)
+    {
+      break;
+    }
+    received += *taken;
+  }
+  std::println("client: {} complete, {} bytes", name, received);
+  co_return std::move(received);
+}
 } // namespace
 
 int main()
@@ -69,207 +176,79 @@ int main()
       server_tls.private_key_pem = identity.private_key_pem;
       server_tls.alpn = {"vio-files"};
       auto server_context = tls_context_t::create(server_tls);
-      if (!server_context)
-      {
-        std::println(stderr, "server tls_context_t::create failed: {}", server_context.error().msg);
-        co_return 1;
-      }
 
       tls_config_t client_tls;
       client_tls.role = tls_role_t::client;
       client_tls.ca_certificates_pem = identity.certificate_pem;
       client_tls.alpn = {"vio-files"};
       auto client_context = tls_context_t::create(client_tls);
-      if (!client_context)
+      if (!server_context || !client_context)
       {
-        std::println(stderr, "client tls_context_t::create failed: {}", client_context.error().msg);
+        std::println(stderr, "tls_context_t::create failed");
         co_return 1;
       }
 
-      endpoint_config_t server_config;
-      server_config.connection.role = tls_role_t::server;
-      auto server_created = endpoint_t::create(loop, *server_context, server_config);
-      if (!server_created)
+      auto server = quic_endpoint_create(loop, *server_context);
+      auto client = quic_endpoint_create(loop, nullptr, &*client_context);
+      if (!server || !client)
       {
-        std::println(stderr, "server endpoint_t::create failed: {}", server_created.error().msg);
+        std::println(stderr, "quic_endpoint_create failed");
         co_return 1;
       }
-      std::optional<endpoint_t> server(std::move(*server_created));
+      if (auto bound = quic_endpoint_bind(*server, std::uint16_t{0}); !bound)
+      {
+        std::println(stderr, "quic_endpoint_bind: {}", bound.error().msg);
+        co_return 1;
+      }
+      const auto port = quic_endpoint_local_port(*server).value_or(0);
+      std::println("server listening on port {}", port);
 
-      auto bind_address = ip4_addr("127.0.0.1", 0);
-      if (!bind_address || !server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)))
-      {
-        std::println(stderr, "could not bind the server socket");
-        co_return 1;
-      }
-      const auto port = server->local_port();
-      if (!port)
-      {
-        std::println(stderr, "could not read the server port");
-        co_return 1;
-      }
-      std::println("server listening on 127.0.0.1:{}", *port);
+      const std::vector<std::string> names = {"small.txt", "medium.bin", "large.dat"};
 
-      // A request is a name and a newline. Nothing guarantees it arrives in
-      // one piece -- a stream is a byte stream, not a message queue -- so what
-      // has been taken so far is held per stream until a newline turns up in
-      // it. Consuming the bytes and then looking for the newline among only
-      // what this call happened to see would lose split requests.
-      std::map<std::uint64_t, std::string> partial_requests;
-      server->on_activity(
-        [&partial_requests](connection_t &connection)
+      auto serving = [](quic_endpoint_t &endpoint, std::size_t expected) -> task_t<void>
+      {
+        auto connection = co_await quic_endpoint_accept(endpoint);
+        if (!connection)
         {
-          // The only way to find a stream the peer opened. Note what it is:
-          // a list of streams with unread bytes waiting right now, not a list
-          // of open streams. A stream whose bytes have all been consumed drops
-          // off it, so anything the application still cares about after that
-          // has to be remembered here rather than asked for later.
-          for (const auto id : connection.readable_streams())
-          {
-            auto readable = connection.readable_stream(id);
-            auto &pending = partial_requests[id];
-            pending += text_of(readable);
-            connection.consume_stream(id, readable.size());
-
-            const auto newline = pending.find('\n');
-            if (newline == std::string::npos)
-            {
-              continue;
-            }
-            const std::string name = pending.substr(0, newline);
-            partial_requests.erase(id);
-
-            const std::string body = body_for(name);
-            // Accepted in full whatever the peer's window is: write_stream
-            // queues, and the transport releases it as credit arrives. There
-            // is no partial write to handle here and, equally, no way to ask
-            // how much is still queued -- so a server sending something it
-            // cannot afford to buffer has to bound it some other way.
-            (void)connection.write_stream(id, bytes_of(body), true);
-            std::println("server: stream {} wants {}, queued {} bytes", id, name, body.size());
-          }
-        });
-
-      endpoint_config_t client_config;
-      client_config.connection.role = tls_role_t::client;
-      auto client_created = endpoint_t::create(loop, *client_context, client_config);
-      if (!client_created)
-      {
-        std::println(stderr, "client endpoint_t::create failed: {}", client_created.error().msg);
-        co_return 1;
-      }
-      std::optional<endpoint_t> client(std::move(*client_created));
-
-      std::map<std::uint64_t, download_t> downloads;
-      client->on_activity(
-        [&downloads](connection_t &connection)
-        {
-          for (const auto id : connection.readable_streams())
-          {
-            const auto entry = downloads.find(id);
-            if (entry == downloads.end())
-            {
-              continue;
-            }
-            auto readable = connection.readable_stream(id);
-            entry->second.received += readable.size();
-            connection.consume_stream(id, readable.size());
-            if (!entry->second.complete && connection.stream_receive_finished(id))
-            {
-              entry->second.complete = true;
-              std::println("client: {} complete, {} bytes", entry->second.name, entry->second.received);
-            }
-          }
-        });
-
-      cancellation_t server_cancel;
-      cancellation_t client_cancel;
-      auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
-      auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
-      (void)server_run;
-      (void)client_run;
-
-      const auto target = ip4_addr("127.0.0.1", *port);
-      auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
-      if (!dialled)
-      {
-        std::println(stderr, "connect failed: {}", dialled.error().msg);
-        co_return 1;
-      }
-
-      connection_t *connection = nullptr;
-      for (int attempt = 0; attempt < 400; ++attempt)
-      {
-        connection = client->connection(*dialled);
-        if (connection == nullptr || connection->handshake_complete())
-        {
-          break;
+          co_return;
         }
-        co_await sleep(loop, 5ms);
-      }
-      if (connection == nullptr || !connection->handshake_complete())
+        co_await serve(*connection, expected);
+      }(*server, names.size());
+
+      const auto target = ip4_addr("127.0.0.1", port);
+      if (!target)
       {
-        std::println(stderr, "the handshake did not complete");
+        std::println(stderr, "could not build the target address");
+        co_return 1;
+      }
+      auto connection = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&*target), "localhost");
+      if (!connection)
+      {
+        std::println(stderr, "quic_endpoint_connect: {}", connection.error().msg);
         co_return 1;
       }
 
-      // All three requests are issued before any answer arrives. That is the
-      // point: they are three streams on one connection, and the server may
-      // answer them in any order.
-      const std::vector<std::string> wanted = {"small.txt", "medium.bin", "large.bin"};
-      for (const auto &name : wanted)
+      // All three at once, on one connection. Started here and awaited below,
+      // so they are genuinely concurrent -- which is the property being shown,
+      // and the reason the small file finishes first despite being asked for
+      // first alongside a file two hundred times its size.
+      std::vector<task_t<std::size_t>> downloads;
+      downloads.reserve(names.size());
+      for (const auto &name : names)
       {
-        auto stream = connection->open_stream(stream_direction_t::bidirectional);
-        if (!stream)
-        {
-          std::println(stderr, "the peer granted no more stream credit");
-          co_return 1;
-        }
-        downloads[*stream] = download_t{.name = name};
-        // The request and its FIN go out together. It has to be this way: a
-        // FIN carrying no bytes would leave the stream off readable_streams()
-        // on the far side, and the server would never see the request end.
-        (void)connection->write_stream(*stream, bytes_of(name + "\n"), true);
-      }
-      (void)client->flush();
-      std::println("client: requested {} files on {} streams", wanted.size(), wanted.size());
-
-      const auto everything_arrived = [&downloads, &wanted]
-      {
-        std::size_t complete = 0;
-        for (const auto &entry : downloads)
-        {
-          complete += entry.second.complete ? 1 : 0;
-        }
-        return complete == wanted.size();
-      };
-
-      for (int attempt = 0; attempt < 2000 && !everything_arrived(); ++attempt)
-      {
-        co_await sleep(loop, 5ms);
+        downloads.push_back(fetch(*connection, name));
       }
 
-      const bool ok = everything_arrived();
-      if (auto *live = client->connection(*dialled); live != nullptr)
+      std::size_t total = 0;
+      for (auto &download : downloads)
       {
-        // What the path was measured delivering. On loopback over a transfer
-        // this short the estimator has barely sampled anything, so treat it as
-        // a demonstration of where the number lives rather than a benchmark.
-        std::println("client: {} ({} bytes/s measured)", ok ? "all three arrived" : "gave up waiting", live->delivery_rate());
-        live->close(0, "done", true);
+        total += co_await std::move(download);
       }
+      co_await std::move(serving);
 
-      // As in quic_echo.cpp: let the CONNECTION_CLOSE go out, stop the run
-      // loops, then close the sockets -- all before vio::run() stops the event
-      // loop underneath them.
-      co_await sleep(loop, 50ms);
-      client_cancel.cancel();
-      server_cancel.cancel();
-      co_await sleep(loop, 50ms);
-      client.reset();
-      server.reset();
-      co_await sleep(loop, 50ms);
-
-      co_return ok ? 0 : 1;
+      const std::size_t expected = body_for("small.txt").size() + body_for("medium.bin").size() + body_for("large.dat").size();
+      std::println("client: {} bytes over {} streams", total, names.size());
+      quic_connection_close(*connection, 0, "done");
+      co_return total == expected ? 0 : 1;
     });
 }

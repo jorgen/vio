@@ -5,17 +5,17 @@
 //
 // An endpoint holds two TLS contexts rather than one. A tls_context_t is built
 // for a single role -- it picks TLS_server_method or TLS_client_method and
-// gates tickets and early data on that choice -- so a node that does both
-// needs one of each, and endpoint_t::create takes them as a pair. Which of the
-// two it holds is what decides what it can do: with only an answering context
-// it cannot dial, and with only a dialling one an arriving Initial is dropped.
+// gates tickets and early data on that choice -- so a node that does both needs
+// one of each, and quic_endpoint_create takes them as a pair. Which of the two
+// it holds is what decides what it can do: with only an answering context a
+// dial is refused with a sentence, and with only a dialling one an accept is.
 //
 // And both ends authenticate. An ordinary server accepts a connection from
 // anyone and lets the application sort out authorisation afterwards, which is
 // the right arrangement for the web and the wrong one for a mesh: a node that
-// cannot say which peer it is talking to has nothing to make a decision on.
-// So each node here asks for a certificate and refuses a peer that cannot
-// produce one signed by the mesh's authority.
+// cannot say which peer it is talking to has nothing to make a decision on. So
+// each node here asks for a certificate and refuses a peer that cannot produce
+// one signed by the mesh's authority.
 //
 // The certificate arrangement is the part worth copying. Each node has its own
 // identity, and both trust one CA that signed both -- so adding a third node
@@ -23,18 +23,15 @@
 // changes. Hardcoding each peer's certificate as the other's trust anchor also
 // works for exactly two nodes and then stops.
 
-#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <print>
 #include <string>
-#include <vector>
 
 #include "quic_common.h"
 
 namespace
 {
-using namespace std::chrono_literals;
 using namespace vio_example;
 
 // What one node is: an identity, a socket, and the two contexts that let it
@@ -44,8 +41,7 @@ struct peer_t
   std::string name;
   std::optional<vio::quic::tls_context_t> answering;
   std::optional<vio::quic::tls_context_t> dialling;
-  std::optional<vio::quic::endpoint_t> endpoint;
-  vio::cancellation_t cancel;
+  std::optional<vio::quic_endpoint_t> endpoint;
   std::uint16_t port = 0;
 };
 
@@ -54,6 +50,7 @@ struct peer_t
 // the role differs, and it has to, since a context is bound to one.
 bool build_peer(vio::event_loop_t &loop, peer_t &peer, const identity_t &mesh_ca, const identity_t &self)
 {
+  using namespace vio;
   using namespace vio::quic;
 
   tls_config_t answering_tls;
@@ -62,9 +59,9 @@ bool build_peer(vio::event_loop_t &loop, peer_t &peer, const identity_t &mesh_ca
   answering_tls.private_key_pem = self.private_key_pem;
   answering_tls.ca_certificates_pem = mesh_ca.certificate_pem;
   // The line that makes this a mesh rather than a public service: a peer that
-  // presents no certificate, or one the mesh CA did not sign, is refused
-  // during the handshake rather than let in to be sorted out later.
-  answering_tls.peer_verify = vio::peer_verify_t::required;
+  // presents no certificate, or one the mesh CA did not sign, is refused during
+  // the handshake rather than let in to be sorted out later.
+  answering_tls.peer_verify = peer_verify_t::required;
   answering_tls.alpn = {"vio-peer"};
 
   tls_config_t dialling_tls;
@@ -84,29 +81,96 @@ bool build_peer(vio::event_loop_t &loop, peer_t &peer, const identity_t &mesh_ca
   peer.answering.emplace(std::move(*answering));
   peer.dialling.emplace(std::move(*dialling));
 
-  endpoint_config_t config;
-  auto created = endpoint_t::create(loop, &*peer.answering, &*peer.dialling, config);
+  auto created = quic_endpoint_create(loop, &*peer.answering, &*peer.dialling);
   if (!created)
   {
-    std::println(stderr, "{}: endpoint_t::create failed: {}", peer.name, created.error().msg);
+    std::println(stderr, "{}: quic_endpoint_create: {}", peer.name, created.error().msg);
     return false;
   }
   peer.endpoint.emplace(std::move(*created));
 
-  auto address = vio::ip4_addr("127.0.0.1", 0);
-  if (!address || !peer.endpoint->bind(reinterpret_cast<const sockaddr *>(&*address)))
+  // Bound with an explicit IPv4 address rather than by port, because these
+  // nodes dial each other at IPv4 literals: the port-only bind prefers
+  // dual-stack IPv6, and a socket that has a family cannot send to another.
+  const auto address = ip4_addr("127.0.0.1", 0);
+  if (!address || !quic_endpoint_bind(*peer.endpoint, reinterpret_cast<const sockaddr *>(&*address)))
   {
     std::println(stderr, "{}: could not bind", peer.name);
     return false;
   }
-  auto port = peer.endpoint->local_port();
-  if (!port)
+  peer.port = quic_endpoint_local_port(*peer.endpoint).value_or(0);
+  return peer.port != 0;
+}
+
+// Answers one stream and echoes it back. A node runs one of these per
+// connection it accepted -- and only per connection it accepted, because a
+// connection it dialled carries its own request and whatever comes back on it
+// belongs to whoever made that request.
+vio::task_t<void> serve(vio::quic_connection_t connection, const char *who)
+{
+  using namespace vio;
+  // Non-empty only because the certificate behind it verified, which is what
+  // makes it safe to act on.
+  std::println("{}: accepted a connection from \"{}\"", who, quic_connection_peer_certificate_subject(connection));
+
+  auto stream = co_await quic_accept_stream(connection);
+  if (!stream)
   {
-    std::println(stderr, "{}: could not read its port", peer.name);
-    return false;
+    co_return;
   }
-  peer.port = *port;
-  return true;
+  auto reader = quic_stream_create_reader(*stream);
+  if (!reader)
+  {
+    co_return;
+  }
+  std::string request;
+  while (auto chunk = co_await *reader)
+  {
+    request += text_of(*chunk);
+  }
+  (void)co_await quic_stream_write_final(*stream, bytes_of(request));
+}
+
+// Waits for one connection to arrive and serves it. On a real mesh this would
+// be a loop; one is enough to show the sort.
+vio::task_t<void> answer_one(vio::quic_endpoint_t &endpoint, const char *who)
+{
+  auto connection = co_await vio::quic_endpoint_accept(endpoint);
+  if (!connection)
+  {
+    co_return;
+  }
+  co_await serve(*connection, who);
+}
+
+// The other half: opens a stream on a connection this node dialled, says one
+// thing on it, and reads the answer back.
+vio::task_t<std::string> ask(vio::quic_connection_t connection, std::string message)
+{
+  using namespace vio;
+  auto stream = co_await quic_open_stream(connection);
+  if (!stream)
+  {
+    std::println(stderr, "quic_open_stream: {}", stream.error().msg);
+    co_return std::string{};
+  }
+  if (auto written = co_await quic_stream_write_final(*stream, bytes_of(message)); !written)
+  {
+    std::println(stderr, "quic_stream_write_final: {}", written.error().msg);
+    co_return std::string{};
+  }
+  auto reader = quic_stream_create_reader(*stream);
+  if (!reader)
+  {
+    std::println(stderr, "quic_stream_create_reader: {}", reader.error().msg);
+    co_return std::string{};
+  }
+  std::string echoed;
+  while (auto chunk = co_await *reader)
+  {
+    echoed += text_of(*chunk);
+  }
+  co_return echoed;
 }
 } // namespace
 
@@ -131,134 +195,60 @@ int main()
       }
       std::println("alice on 127.0.0.1:{}, bob on 127.0.0.1:{}", alice.port, bob.port);
 
-      // on_connection fires for every completed handshake, dialled ones
-      // included, so a node that does both sorts them by role. Only the ones
-      // it answered are arrivals.
-      const auto announce = [](const char *who)
-      {
-        return [who](connection_t &connection)
-        {
-          if (connection.role() != tls_role_t::server)
-          {
-            return;
-          }
-          // Non-empty only because the certificate behind it verified, which
-          // is what makes it safe to act on.
-          std::println("{}: accepted a connection from \"{}\"", who, connection.peer_certificate_subject());
-        };
-      };
-      alice.endpoint->on_connection(announce("alice"));
-      bob.endpoint->on_connection(announce("bob"));
-
-      // Each answers whatever arrives on a stream and echoes it back, so the
-      // exchange below can be driven from either side.
-      const auto serve = [](connection_t &connection)
-      {
-        // Only what this node answered. A connection it dialled carries its
-        // own request, and whatever comes back on it belongs to whoever made
-        // that request -- a handler that echoed there would consume the reply
-        // before the caller ever saw it.
-        if (connection.role() != tls_role_t::server)
-        {
-          return;
-        }
-        for (const auto id : connection.readable_streams())
-        {
-          auto readable = connection.readable_stream(id);
-          (void)connection.write_stream(id, readable, connection.stream_receive_finished(id));
-          connection.consume_stream(id, readable.size());
-        }
-      };
-      alice.endpoint->on_activity(serve);
-      bob.endpoint->on_activity(serve);
-
-      auto alice_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*alice.endpoint, alice.cancel);
-      auto bob_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*bob.endpoint, bob.cancel);
-      (void)alice_run;
-      (void)bob_run;
+      // Each node stands ready to answer. This is where the role sort lives
+      // now, and it is structural rather than a test inside a callback: an
+      // accept resolves only for connections that arrived, so a node's own
+      // outbound connection can never be mistaken for one.
+      auto alice_answering = answer_one(*alice.endpoint, "alice");
+      auto bob_answering = answer_one(*bob.endpoint, "bob");
 
       // Each dials the other at once. QUIC does not collapse a simultaneous
-      // open the way TCP can, so this really is two connections per pair --
-      // one dialled and one accepted at each node. A mesh that wants a single
-      // link between two nodes has to pick one itself, and that rule belongs
-      // to the application rather than to the transport.
+      // open the way TCP can, so this really is two connections per pair -- one
+      // dialled and one accepted at each node. A mesh that wants a single link
+      // between two nodes has to pick one itself, and that rule belongs to the
+      // application rather than to the transport.
       const auto to_bob = ip4_addr("127.0.0.1", bob.port);
       const auto to_alice = ip4_addr("127.0.0.1", alice.port);
-      auto alice_dial = alice.endpoint->connect(reinterpret_cast<const sockaddr *>(&*to_bob), "bob");
-      auto bob_dial = bob.endpoint->connect(reinterpret_cast<const sockaddr *>(&*to_alice), "alice");
-      if (!alice_dial || !bob_dial)
+      if (!to_bob || !to_alice)
       {
-        std::println(stderr, "a dial was refused");
+        std::println(stderr, "could not build the peer addresses");
         co_return 1;
       }
 
-      for (int attempt = 0; attempt < 600; ++attempt)
-      {
-        auto *a = alice.endpoint->connection(*alice_dial);
-        auto *b = bob.endpoint->connection(*bob_dial);
-        if (a != nullptr && a->handshake_complete() && b != nullptr && b->handshake_complete())
-        {
-          break;
-        }
-        co_await sleep(loop, 5ms);
-      }
-
-      auto *alice_to_bob = alice.endpoint->connection(*alice_dial);
-      auto *bob_to_alice = bob.endpoint->connection(*bob_dial);
-      if (alice_to_bob == nullptr || !alice_to_bob->handshake_complete() || bob_to_alice == nullptr || !bob_to_alice->handshake_complete())
+      auto alice_to_bob = co_await quic_endpoint_connect(*alice.endpoint, reinterpret_cast<const sockaddr *>(&*to_bob), "bob");
+      auto bob_to_alice = co_await quic_endpoint_connect(*bob.endpoint, reinterpret_cast<const sockaddr *>(&*to_alice), "alice");
+      if (!alice_to_bob || !bob_to_alice)
       {
         std::println(stderr, "the peers did not reach each other");
         co_return 1;
       }
 
       // Each dialling side knows who it reached, for the same reason each
-      // answering side did.
-      std::println("alice dialled \"{}\"", alice_to_bob->peer_certificate_subject());
-      std::println("bob dialled \"{}\"", bob_to_alice->peer_certificate_subject());
+      // answering side did. And each says which end of the handshake it ran,
+      // which a peer-to-peer application needs and a client never has to ask.
+      std::println("alice dialled \"{}\" as a {}", quic_connection_peer_certificate_subject(*alice_to_bob), quic_connection_role(*alice_to_bob) == tls_role_t::client ? "client" : "server");
+      std::println("bob dialled \"{}\" as a {}", quic_connection_peer_certificate_subject(*bob_to_alice), quic_connection_role(*bob_to_alice) == tls_role_t::client ? "client" : "server");
 
-      auto stream = alice_to_bob->open_stream(stream_direction_t::bidirectional);
-      if (!stream)
-      {
-        std::println(stderr, "no stream credit");
-        co_return 1;
-      }
-      const std::string message = "hello from alice";
-      (void)alice_to_bob->write_stream(*stream, bytes_of(message), true);
-      (void)alice.endpoint->flush();
+      // Both directions at once, which is the shape a mesh actually has and the
+      // reason the two coroutines above had to be started before either dial:
+      // each node is answering the other while it waits for its own answer, and
+      // a program that did one and then the other would deadlock the moment
+      // both nodes chose the same order.
+      const std::string from_alice = "hello from alice";
+      const std::string from_bob = "hello from bob";
+      auto alice_asking = ask(*alice_to_bob, from_alice);
+      auto bob_asking = ask(*bob_to_alice, from_bob);
 
-      std::string echoed;
-      for (int attempt = 0; attempt < 400 && echoed.empty(); ++attempt)
-      {
-        co_await sleep(loop, 5ms);
-        if (auto *live = alice.endpoint->connection(*alice_dial); live != nullptr)
-        {
-          auto readable = live->readable_stream(*stream);
-          if (!readable.empty())
-          {
-            echoed = text_of(readable);
-            live->consume_stream(*stream, readable.size());
-          }
-        }
-      }
-      std::println("alice sent \"{}\" and bob returned \"{}\"", message, echoed);
+      const auto alice_heard = co_await std::move(alice_asking);
+      const auto bob_heard = co_await std::move(bob_asking);
+      std::println("alice sent \"{}\" and bob returned \"{}\"", from_alice, alice_heard);
+      std::println("bob sent \"{}\" and alice returned \"{}\"", from_bob, bob_heard);
 
-      if (auto *live = alice.endpoint->connection(*alice_dial); live != nullptr)
-      {
-        live->close(0, "done", true);
-      }
-      if (auto *live = bob.endpoint->connection(*bob_dial); live != nullptr)
-      {
-        live->close(0, "done", true);
-      }
+      co_await std::move(alice_answering);
+      co_await std::move(bob_answering);
 
-      co_await sleep(loop, 50ms);
-      alice.cancel.cancel();
-      bob.cancel.cancel();
-      co_await sleep(loop, 50ms);
-      alice.endpoint.reset();
-      bob.endpoint.reset();
-      co_await sleep(loop, 50ms);
-
-      co_return echoed == message ? 0 : 1;
+      quic_connection_close(*alice_to_bob, 0, "done");
+      quic_connection_close(*bob_to_alice, 0, "done");
+      co_return (alice_heard == from_alice && bob_heard == from_bob) ? 0 : 1;
     });
 }

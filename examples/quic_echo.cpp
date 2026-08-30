@@ -2,15 +2,15 @@
 // talking over a real UDP socket on loopback, exchanging one message on one
 // stream.
 //
-// Read this one first. The other QUIC examples assume the four things it
+// Read this one first. The other QUIC examples assume the three things it
 // establishes: that a QUIC endpoint owns a socket and many connections, that
-// it is driven by a coroutine you spawn and never await, that an application
-// hears about arriving data through on_activity rather than by reading, and
-// that shutting down has an order to it.
+// every step of using one is something you await, and that a stream's ending
+// arrives as an ordinary result rather than a flag to test on the side.
+//
+// Nothing here polls, spawns a run loop, or flushes anything by hand. The
+// endpoint drives itself; a coroutine that has something to wait for says
+// co_await and is resumed when it has arrived.
 
-#include <chrono>
-#include <cstdint>
-#include <optional>
 #include <print>
 #include <string>
 
@@ -18,7 +18,6 @@
 
 namespace
 {
-using namespace std::chrono_literals;
 using namespace vio_example;
 } // namespace
 
@@ -30,22 +29,22 @@ int main()
       using namespace vio;
       using namespace vio::quic;
 
-      // QUIC has no unencrypted mode, so the certificate comes before
-      // anything else. Both sides are given the same PEM: the server as its
-      // identity, the client as the one certificate it trusts.
+      // QUIC has no unencrypted mode, so the certificate comes before anything
+      // else. Both sides are given the same PEM: the server as its identity,
+      // the client as the one certificate it trusts.
       const auto identity = make_self_signed("localhost");
 
       tls_config_t server_tls;
       server_tls.role = tls_role_t::server;
       server_tls.certificate_chain_pem = identity.certificate_pem;
       server_tls.private_key_pem = identity.private_key_pem;
-      // ALPN is not optional in QUIC the way it is in TLS over TCP: a
-      // handshake with no protocol in common is refused.
+      // ALPN is not optional in QUIC the way it is in TLS over TCP: a handshake
+      // with no protocol in common is refused.
       server_tls.alpn = {"vio-echo"};
       auto server_context = tls_context_t::create(server_tls);
       if (!server_context)
       {
-        std::println(stderr, "server tls_context_t::create failed: {}", server_context.error().msg);
+        std::println(stderr, "server tls_context_t::create: {}", server_context.error().msg);
         co_return 1;
       }
 
@@ -56,191 +55,148 @@ int main()
       auto client_context = tls_context_t::create(client_tls);
       if (!client_context)
       {
-        std::println(stderr, "client tls_context_t::create failed: {}", client_context.error().msg);
+        std::println(stderr, "client tls_context_t::create: {}", client_context.error().msg);
         co_return 1;
       }
 
-      endpoint_config_t server_config;
-      // The role is set twice -- once on the TLS context above, once here --
-      // and nothing checks that the two agree.
-      server_config.connection.role = tls_role_t::server;
-
-      auto server_created = endpoint_t::create(loop, *server_context, server_config);
-      if (!server_created)
+      // Nothing configures flow control here, and that is the point:
+      // connection_config_t starts from default_transport_parameters(), so an
+      // endpoint told nothing already grants 8 MiB across the connection and
+      // 2 MiB per stream.
+      auto server = quic_endpoint_create(loop, *server_context);
+      auto client = quic_endpoint_create(loop, nullptr, &*client_context);
+      if (!server || !client)
       {
-        std::println(stderr, "server endpoint_t::create failed: {}", server_created.error().msg);
+        std::println(stderr, "quic_endpoint_create failed");
         co_return 1;
       }
-      // Held in an optional so the socket can be closed at a moment of this
-      // program's choosing. See the teardown at the bottom for why that
-      // matters.
-      std::optional<endpoint_t> server(std::move(*server_created));
 
-      auto bind_address = ip4_addr("127.0.0.1", 0);
-      if (!bind_address || !server->bind(reinterpret_cast<const sockaddr *>(&*bind_address)))
+      if (auto bound = quic_endpoint_bind(*server, std::uint16_t{0}); !bound)
       {
-        std::println(stderr, "could not bind the server socket");
+        std::println(stderr, "quic_endpoint_bind: {}", bound.error().msg);
         co_return 1;
       }
-      const auto port = server->local_port();
-      if (!port)
-      {
-        std::println(stderr, "could not read the server port");
-        co_return 1;
-      }
-      std::println("server listening on 127.0.0.1:{}", *port);
+      const auto port = quic_endpoint_local_port(*server).value_or(0);
+      std::println("server listening on port {}", port);
 
-      // Called after a batch of arriving datagrams has been processed and
-      // before anything is sent, so whatever is written here rides out with
-      // the acknowledgement that was going to be sent anyway.
-      //
-      // readable_streams() is the only way to find a stream the peer opened.
-      // It lists streams that have bytes waiting right now -- which is why an
-      // echo server can be written this way and a request/response server
-      // cannot; quic_file_server.cpp shows the difference.
-      server->on_activity(
-        [](connection_t &connection)
+      // The server, as its own coroutine. It is started here and awaited at the
+      // bottom; between those two points it runs whenever it has something to
+      // do, driven by the endpoint rather than by this function.
+      auto serving = [](quic_endpoint_t &endpoint) -> task_t<void>
+      {
+        auto connection = co_await quic_endpoint_accept(endpoint);
+        if (!connection)
         {
-          for (const auto id : connection.readable_streams())
-          {
-            auto readable = connection.readable_stream(id);
-            std::println("server: stream {} carried \"{}\"", id, text_of(readable));
-            // A stream is a byte stream, so this may be only part of what the
-            // client sent. The echo carries a FIN only once the client has
-            // finished sending -- setting it on the first chunk would close
-            // the sending half and silently drop everything after it.
-            const bool last = connection.stream_receive_finished(id);
-            // write_stream copies, so the span is still good to send back even
-            // though consume_stream below invalidates it.
-            (void)connection.write_stream(id, readable, last);
-            connection.consume_stream(id, readable.size());
-          }
-        });
-
-      endpoint_config_t client_config;
-      client_config.connection.role = tls_role_t::client;
-      auto client_created = endpoint_t::create(loop, *client_context, client_config);
-      if (!client_created)
-      {
-        std::println(stderr, "client endpoint_t::create failed: {}", client_created.error().msg);
-        co_return 1;
-      }
-      std::optional<endpoint_t> client(std::move(*client_created));
-
-      std::string echoed;
-      bool echo_finished = false;
-      client->on_activity(
-        [&echoed, &echo_finished](connection_t &connection)
-        {
-          for (const auto id : connection.readable_streams())
-          {
-            auto readable = connection.readable_stream(id);
-            echoed += text_of(readable);
-            connection.consume_stream(id, readable.size());
-            // True for a clean end of stream and for a peer that reset it;
-            // the two are not distinguishable through this API.
-            if (connection.stream_receive_finished(id))
-            {
-              echo_finished = true;
-            }
-          }
-        });
-
-      // run() is the whole endpoint: it reads the socket, demultiplexes by
-      // connection ID, runs QUIC's timers and sends what is owed. It never
-      // returns until cancelled, so it cannot be awaited here -- and its
-      // task_t must be kept alive, because a task_t destroyed while suspended
-      // leaks its frame. detached_task_t is the wrapper that does both.
-      cancellation_t server_cancel;
-      cancellation_t client_cancel;
-      auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, server_cancel);
-      auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, client_cancel);
-      (void)server_run;
-      (void)client_run;
-
-      const auto target = ip4_addr("127.0.0.1", *port);
-      auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*target), "localhost");
-      if (!dialled)
-      {
-        std::println(stderr, "connect failed: {}", dialled.error().msg);
-        co_return 1;
-      }
-
-      // connect() returns as soon as the first Initial is queued; the
-      // handshake is several round trips after that. There is nothing to
-      // await, so the only way to wait for it is to poll.
-      //
-      // The connection is looked up each time round rather than kept: the
-      // endpoint owns it and may collect it -- an idle timeout, a peer that
-      // stopped answering, a handshake that never finished -- at any point
-      // this coroutine is suspended.
-      connection_t *connection = nullptr;
-      for (int attempt = 0; attempt < 400; ++attempt)
-      {
-        connection = client->connection(*dialled);
-        if (connection == nullptr || connection->handshake_complete())
-        {
-          break;
+          std::println(stderr, "accept: {}", connection.error().msg);
+          co_return;
         }
-        co_await sleep(loop, 5ms);
-      }
-      if (connection == nullptr || !connection->handshake_complete())
+        std::println("server: accepted a connection, protocol \"{}\"", quic_connection_alpn(*connection));
+
+        auto stream = co_await quic_accept_stream(*connection);
+        if (!stream)
+        {
+          std::println(stderr, "accept_stream: {}", stream.error().msg);
+          co_return;
+        }
+
+        auto reader = quic_stream_create_reader(*stream);
+        if (!reader)
+        {
+          std::println(stderr, "create_reader: {}", reader.error().msg);
+          co_return;
+        }
+
+        // A stream is a byte stream, so what the client sent may arrive in
+        // pieces. The loop ends when the read fails, and the failure says which
+        // ending it was -- a clean FIN or a peer that gave up.
+        std::string request;
+        while (true)
+        {
+          auto chunk = co_await *reader;
+          if (!chunk)
+          {
+            if (chunk.error().code != vio_quic_stream_finished)
+            {
+              std::println(stderr, "server: the client abandoned the stream: {}", chunk.error().msg);
+              co_return;
+            }
+            break;
+          }
+          request += text_of(*chunk);
+        }
+        std::println("server: read \"{}\"", request);
+
+        // The FIN rides with the bytes it terminates, which costs no packet and
+        // leaves no window in which the client has the last chunk without
+        // knowing it was the last.
+        if (auto written = co_await quic_stream_write_final(*stream, bytes_of(request)); !written)
+        {
+          std::println(stderr, "server: write: {}", written.error().msg);
+        }
+      }(*server);
+
+      const auto target = ip4_addr("127.0.0.1", port);
+      if (!target)
       {
-        std::println(stderr, "the handshake did not complete");
+        std::println(stderr, "could not build the target address");
         co_return 1;
       }
-      std::println("client: handshake complete, negotiated \"{}\"", connection->selected_alpn());
 
-      // Nothing here fails when the peer's stream limit is reached: it simply
-      // yields nothing, and the caller is expected to try again later.
-      auto stream = connection->open_stream(stream_direction_t::bidirectional);
+      // Connected means what it means for ssl_client_connect: the certificate
+      // has verified, an ALPN has been agreed and the peer's transport
+      // parameters have arrived. There is nothing to poll for.
+      auto connection = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&*target), "localhost");
+      if (!connection)
+      {
+        std::println(stderr, "quic_endpoint_connect: {}", connection.error().msg);
+        co_return 1;
+      }
+      std::println("client: connected");
+
+      // This suspends only if the server has granted no stream credit, which it
+      // has: section 4.6 forbids exceeding the limit, so waiting is the only
+      // correct thing to do and the API does it rather than handing back
+      // nothing and leaving a retry loop to write.
+      auto stream = co_await quic_open_stream(*connection);
       if (!stream)
       {
-        std::println(stderr, "the peer granted no stream credit");
+        std::println(stderr, "quic_open_stream: {}", stream.error().msg);
         co_return 1;
       }
 
       const std::string message = "hello over quic";
-      // The FIN goes with the data: this is the whole of what the client has
-      // to say on this stream.
-      (void)connection->write_stream(*stream, bytes_of(message), true);
-      // Written outside the run loop, so it has to be pushed onto the socket
-      // by hand rather than waiting for the next thing that happens.
-      (void)client->flush();
-      std::println("client: sent \"{}\" on stream {}", message, *stream);
-
-      for (int attempt = 0; attempt < 400 && !echo_finished; ++attempt)
+      if (auto written = co_await quic_stream_write_final(*stream, bytes_of(message)); !written)
       {
-        co_await sleep(loop, 5ms);
+        std::println(stderr, "quic_stream_write_final: {}", written.error().msg);
+        co_return 1;
+      }
+      std::println("client: sent \"{}\" on stream {}", message, quic_stream_id(*stream));
+
+      auto reader = quic_stream_create_reader(*stream);
+      if (!reader)
+      {
+        std::println(stderr, "quic_stream_create_reader: {}", reader.error().msg);
+        co_return 1;
+      }
+
+      std::string echoed;
+      while (true)
+      {
+        auto chunk = co_await *reader;
+        if (!chunk)
+        {
+          break;
+        }
+        echoed += text_of(*chunk);
       }
       std::println("client: received \"{}\"", echoed);
 
-      // Telling the peer why, rather than letting it discover the silence
-      // when its idle timeout expires.
-      if (auto *live = client->connection(*dialled); live != nullptr)
-      {
-        live->close(0, "done", true);
-      }
-      // The CONNECTION_CLOSE is only queued; it goes out on the next pass of
-      // the run loop, which is why this waits before cancelling it.
-      co_await sleep(loop, 50ms);
+      co_await std::move(serving);
 
-      // The order below is the one thing about this program that is not
-      // obvious and cannot be got wrong quietly.
-      //
-      // Cancelling stops each run() loop. Destroying the endpoints closes
-      // their sockets -- and both must happen before vio::run() stops the
-      // event loop, because stop() runs the loop until nothing is open, so a
-      // socket still live at that point is a loop that never returns. The
-      // endpoints must also outlive their run() coroutines, which hold
-      // references to them, which is what the waits are for.
-      client_cancel.cancel();
-      server_cancel.cancel();
-      co_await sleep(loop, 50ms);
-      client.reset();
-      server.reset();
-      co_await sleep(loop, 50ms);
-
+      // Telling the peer why, rather than letting it discover the silence when
+      // its idle timeout expires. The CONNECTION_CLOSE leaves on this turn, so
+      // dropping the handle immediately afterwards is safe.
+      quic_connection_close(*connection, 0, "done");
       co_return echoed == message ? 0 : 1;
     });
 }
