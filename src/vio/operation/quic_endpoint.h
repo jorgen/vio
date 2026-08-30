@@ -2384,4 +2384,100 @@ inline void quic_shutdown_check(quic_endpoint_state_t &self)
   }
   return quic_milestone_t{self.shutdown};
 }
+
+// Dials with a ticket and hands the connection back *before* the handshake, so
+// the caller can write into the very first flight. That is the whole of 0-RTT
+// and it is why this returns a connection rather than an awaitable: waiting is
+// exactly what must not happen here.
+//
+// The order is load-bearing and the natural code is wrong. Open a stream and
+// write immediately, on this stack, before the next trip through the event
+// loop -- there is credit to spend already, because the ticket carried the
+// server's transport parameters from last time. Waiting for the handshake first
+// produces a perfectly good connection that simply never used 0-RTT, with
+// nothing anywhere to say so.
+//
+// Then await quic_connection_ready for the verdict on the handshake, and read
+// quic_connection_early_data_accepted for the verdict on the data. They are
+// different questions: a server may take the ticket and still refuse the data,
+// in which case the transport rewinds those packets and sends them again under
+// 1-RTT keys. The application is not told and does not have to do anything.
+//
+// A ticket that will not parse is a full handshake, never a failure to connect.
+[[nodiscard]] inline std::expected<quic_connection_t, error_t> quic_endpoint_connect_early(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name,
+                                                                                           std::span<const std::uint8_t> resumption_ticket)
+{
+  if (endpoint.handle.ref_counted() == nullptr)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "the endpoint names nothing"});
+  }
+  auto &self = endpoint.handle.data();
+  if (self.closing)
+  {
+    return std::unexpected(error_t{.code = vio_quic_endpoint_closed, .msg = "the endpoint was released"});
+  }
+  if (resumption_ticket.empty())
+  {
+    // Refused rather than quietly downgraded. A caller that asked for 0-RTT and
+    // silently got a full handshake sends its first flight a round trip later
+    // than it believes, and nothing reports it.
+    return std::unexpected(error_t{.code = -1, .msg = "0-RTT needs a resumption ticket from an earlier connection to this peer"});
+  }
+
+  auto dialled = self.transport->connect(address, server_name, resumption_ticket);
+  if (!dialled)
+  {
+    return std::unexpected(dialled.error());
+  }
+  auto *connection = self.transport->connection(*dialled);
+  if (connection == nullptr)
+  {
+    return std::unexpected(error_t{.code = -1, .msg = "the dialled connection was gone before it was returned"});
+  }
+  if (auto started = detail::quic_start_driver(self); !started)
+  {
+    connection->close(vio::quic::transport_error_internal, "the endpoint could not start reading", false);
+    (void)self.transport->flush(*connection);
+    return std::unexpected(started.error());
+  }
+
+  // Registered with no pending dial, which is the only difference from
+  // quic_endpoint_connect: there is no operation to resolve, because the caller
+  // already has the connection.
+  auto entry = ref_ptr_t<detail::quic_connection_state_t>(&self, connection, vio::quic::tls_role_t::client);
+  self.by_connection.emplace(connection, entry);
+  return quic_connection_t{std::move(entry)};
+}
+
+// A ticket for resuming this connection later, once the handshake is done and
+// the server has issued one. Empty until then, and on a server always.
+//
+// TLS 1.3 sends the ticket *after* the handshake, often after the exchange the
+// connection existed for, so asking the moment the connection is ready usually
+// yields nothing and there is no event for its arrival. Where it is kept is the
+// application's business, which is why it comes out as bytes.
+[[nodiscard]] inline std::vector<std::uint8_t> quic_connection_resumption_ticket(const quic_connection_t &connection)
+{
+  if (connection.handle.ref_counted() == nullptr || connection.handle.data().transport == nullptr)
+  {
+    return {};
+  }
+  return connection.handle.data().transport->resumption_ticket();
+}
+
+// Whether the data this connection sent before the handshake finished was
+// taken. Meaningful on a client that spent a ticket.
+[[nodiscard]] inline bool quic_connection_early_data_accepted(const quic_connection_t &connection)
+{
+  return connection.handle.ref_counted() != nullptr && connection.handle.data().transport != nullptr && connection.handle.data().transport->early_data_accepted();
+}
+
+// The server resumed but refused the early data, so nothing sent at 0-RTT
+// arrived. Stream state written early has been rewound and goes out again under
+// 1-RTT keys, which is section 4.6.2's requirement; this reports that it
+// happened rather than asking the caller to do anything about it.
+[[nodiscard]] inline bool quic_connection_early_data_rejected(const quic_connection_t &connection)
+{
+  return connection.handle.ref_counted() != nullptr && connection.handle.data().transport != nullptr && connection.handle.data().transport->early_data_rejected();
+}
 } // namespace vio
