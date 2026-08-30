@@ -3379,6 +3379,84 @@ TEST_CASE("a burst of streams larger than any local queue is all accepted")
   CHECK(with_bytes == burst);
 }
 
+TEST_CASE("dropping a stream handle tells the peer rather than going quiet")
+{
+  using namespace vio;
+
+  // A half this endpoint abandons has to be said. Without it the peer sees no
+  // FIN, no RESET_STREAM and no reason -- it waits out an idle timeout holding
+  // flow-control credit on both sides, and the application that walked away has
+  // no idea it left anything behind.
+  //
+  // This is also what says the registry does not own streams: if it held a
+  // reference, the count would never reach zero while the connection lived and
+  // the destructor below would never run at all.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  int ending = 0;
+  bool registry_emptied = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, bool &registry_emptied) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+
+            // The server accepts the stream and then simply lets it go, without
+            // reading it to the end and without finishing its own half.
+            auto serving = [](event_loop_t &loop, quic_endpoint_t &endpoint, bool &registry_emptied) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              {
+                auto stream = co_await quic_accept_stream(*arrived);
+                REQUIRE(stream.has_value());
+              } // dropped here, mid-stream
+
+              // Checked a turn later, and that is not a fudge. The accept was
+              // resolved by an operation that resumed this coroutine from
+              // inside its own dispatch, and that operation holds a reference
+              // to the stream until it returns -- which is after this line
+              // would otherwise run. An operation's reference outlives the
+              // resumption it triggers, by one function.
+              (void)co_await sleep(loop, std::chrono::milliseconds(1));
+              registry_emptied = arrived->handle->streams.empty();
+            }(loop, *pair.server, registry_emptied);
+
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            (void)co_await quic_stream_write(*stream, bytes_of("a request nobody finishes"));
+
+            auto reader = quic_stream_create_reader(*stream);
+            REQUIRE(reader.has_value());
+            // The client is reading the answering half, which the server never
+            // writes. What arrives instead is the reset the drop produced.
+            auto chunk = co_await *reader;
+            ending = chunk.has_value() ? -1 : chunk.error().code;
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, ending, registry_emptied));
+    });
+  event_loop.run();
+
+  CHECK(ending == vio_quic_stream_reset);
+  CHECK(registry_emptied);
+}
+
 TEST_CASE("a stream handle kept past the connection still answers")
 {
   using namespace vio;

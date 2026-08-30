@@ -248,12 +248,7 @@ inline void quic_stream_mark(const quic_stream_t &stream)
 [[nodiscard]] inline quic_stream_awaitable_t quic_open_stream(quic_connection_t &connection, vio::quic::stream_direction_t direction = vio::quic::stream_direction_t::bidirectional,
                                                               cancellation_t *cancel = nullptr)
 {
-  const auto failed = [](error_t reason)
-  {
-    auto *op = detail::quic_stream_op_create(nullptr);
-    detail::quic_stream_op_finish(*op, std::move(reason));
-    return quic_stream_awaitable_t{op};
-  };
+  const auto failed = [](error_t reason) { return quic_stream_awaitable_t{detail::quic_stream_op_settled(std::move(reason))}; };
 
   if (connection.handle.ref_counted() == nullptr)
   {
@@ -271,11 +266,11 @@ inline void quic_stream_mark(const quic_stream_t &stream)
 
   if (const auto opened = state.transport->open_stream(direction); opened.has_value())
   {
-    auto *op = detail::quic_stream_op_create(&state);
     auto stream = ref_ptr_t<detail::quic_stream_state_t>(&state, *opened, false);
-    state.streams.emplace(*opened, stream);
-    detail::quic_stream_op_finish(*op, std::move(stream));
-    return quic_stream_awaitable_t{op};
+    // The registry borrows; the operation owns until the caller takes it, and
+    // if the caller never does, the stream is reset rather than left open.
+    state.streams.emplace(*opened, &stream.data());
+    return quic_stream_awaitable_t{detail::quic_stream_op_settled(std::move(stream))};
   }
 
   auto *op = detail::quic_stream_op_create(&state);
@@ -334,7 +329,7 @@ inline void quic_stream_mark(const quic_stream_t &stream)
     return std::unexpected(error_t{.code = vio_quic_busy, .msg = "the peer has granted no more stream credit"});
   }
   auto stream = ref_ptr_t<detail::quic_stream_state_t>(&state, *opened, false);
-  state.streams.emplace(*opened, stream);
+  state.streams.emplace(*opened, &stream.data());
   return quic_stream_t{std::move(stream)};
 }
 
@@ -356,12 +351,7 @@ inline void quic_stream_mark(const quic_stream_t &stream)
 // is visible here.
 [[nodiscard]] inline quic_stream_awaitable_t quic_accept_stream(quic_connection_t &connection, cancellation_t *cancel = nullptr)
 {
-  const auto failed = [](error_t reason)
-  {
-    auto *op = detail::quic_stream_op_create(nullptr);
-    detail::quic_stream_op_finish(*op, std::move(reason));
-    return quic_stream_awaitable_t{op};
-  };
+  const auto failed = [](error_t reason) { return quic_stream_awaitable_t{detail::quic_stream_op_settled(std::move(reason))}; };
 
   if (connection.handle.ref_counted() == nullptr)
   {
@@ -377,18 +367,17 @@ inline void quic_stream_mark(const quic_stream_t &stream)
     return failed(error_t{.code = vio_cancelled, .msg = "the accept was cancelled before it began"});
   }
 
-  auto *op = detail::quic_stream_op_create(&state);
-  op->accepting = true;
   if (!state.stream_accept_queue.empty())
   {
     // Resolved in the factory, which is the difference between draining a burst
     // of streams on one stack and taking a loop turn for each of them.
     auto stream = std::move(state.stream_accept_queue.front());
     state.stream_accept_queue.pop_front();
-    detail::quic_stream_op_finish(*op, std::move(stream));
-    return quic_stream_awaitable_t{op};
+    return quic_stream_awaitable_t{detail::quic_stream_op_settled(std::move(stream))};
   }
 
+  auto *op = detail::quic_stream_op_create(&state);
+  op->accepting = true;
   state.stream_ops.push_back(op);
   quic_stream_awaitable_t out{op};
   if (cancel != nullptr)

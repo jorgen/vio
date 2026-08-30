@@ -64,6 +64,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <deque>
 #include <expected>
@@ -375,6 +376,25 @@ struct quic_op_t
   return op;
 }
 
+// An operation that is resolved before it is returned and never registered
+// anywhere: no list holds it, so nothing will ever dispatch it and the second
+// hold would simply never be dropped. One owner, the awaitable.
+//
+// The two-hold protocol is right for an operation that suspends and wrong for
+// one that does not, and getting that backwards leaks the operation and
+// everything it resolved to. It leaked a stream state here, which kept a
+// registry entry alive and a peer waiting on a stream nobody would ever finish
+// -- and no sanitiser on this platform reports it, because MSVC's ASan has no
+// leak detection.
+template <typename Outcome>
+[[nodiscard]] inline quic_op_t *quic_op_settled(Outcome &&outcome)
+{
+  auto *op = new quic_op_t();
+  op->holds = 1;
+  quic_op_finish(*op, std::forward<Outcome>(outcome));
+  return op;
+}
+
 inline void quic_op_release(quic_op_t *op)
 {
   if (op == nullptr)
@@ -564,6 +584,19 @@ struct quic_stream_state_t
   quic_stream_state_t(const quic_stream_state_t &) = delete;
   quic_stream_state_t &operator=(const quic_stream_state_t &) = delete;
 
+  // What letting go of the last handle means.
+  //
+  // A half this endpoint abandons has to be *said*, or the peer is left waiting
+  // on a stream nobody will ever finish -- it sees no FIN, no RESET_STREAM and
+  // no reason, and waits out an idle timeout holding flow-control credit on
+  // both sides. An unfinished sending half becomes a RESET_STREAM and an
+  // unfinished receiving half a STOP_SENDING, which are the two frames section
+  // 3 has for exactly this.
+  //
+  // Defined out of line below, because it needs quic_connection_state_t and the
+  // marking helpers, and this struct has to be complete before that one.
+  ~quic_stream_state_t();
+
   // Borrowed, and nulled when the connection severs or when the peer reopens
   // this id. Never strong: a stream that kept its connection alive would keep
   // the endpoint alive, which is the UDP socket never closed and the event loop
@@ -623,6 +656,15 @@ struct quic_stream_op_t
   auto *op = new quic_stream_op_t();
   op->connection = connection;
   op->holds = 2;
+  return op;
+}
+
+template <typename Outcome>
+[[nodiscard]] inline quic_stream_op_t *quic_stream_op_settled(Outcome &&outcome)
+{
+  auto *op = new quic_stream_op_t();
+  op->holds = 1;
+  quic_stream_op_finish(*op, std::forward<Outcome>(outcome));
   return op;
 }
 
@@ -750,7 +792,17 @@ struct quic_connection_state_t
   // reset an unfinished sending half -- that policy needs the send-side
   // accounting the write layer brings, and until then a peer sees the stream
   // stay open rather than a RESET_STREAM.
-  std::unordered_map<std::uint64_t, ref_ptr_t<quic_stream_state_t>> streams;
+  // Borrowed, not owned, and this is the load-bearing choice in the whole
+  // stream layer's lifetime story.
+  //
+  // A stream is owned by whoever is entitled to it: the accept queue while
+  // nothing has taken it, the operation while a coroutine is being handed it,
+  // and the application's own quic_stream_t afterwards. If the registry held a
+  // reference too, the count would never reach zero while the connection lived
+  // -- so dropping the last handle would be silent, the peer would see a stream
+  // that stays open for ever, and the entry would sit in this map until the
+  // connection ended. The state removes itself here when it dies.
+  std::unordered_map<std::uint64_t, quic_stream_state_t *> streams;
   // Streams the peer has opened that nothing has accepted yet.
   //
   // Deliberately unbounded, unlike the endpoint's connection backlog, and the
@@ -1198,7 +1250,7 @@ inline void quic_stream_open_pump(quic_connection_state_t &self, std::vector<qui
       return;
     }
     auto stream = ref_ptr_t<quic_stream_state_t>(&self, *opened, false);
-    self.streams.emplace(*opened, stream);
+    self.streams.emplace(*opened, &stream.data());
     quic_stream_op_finish(*op, std::move(stream));
     self.stream_ops.erase(self.stream_ops.begin() + static_cast<std::ptrdiff_t>(index));
     out.push_back(op);
@@ -1233,12 +1285,12 @@ inline void quic_drain_streams(quic_connection_state_t &self, std::vector<std::c
       // old handle is retired rather than allowed to act on a different stream,
       // and no generation counter is needed -- an id arriving here for which a
       // state already exists is by definition a new incarnation.
-      quic_stream_retire(found->second.data(), true);
-      quic_stream_wake_reader(found->second.data(), readers);
+      quic_stream_retire(*found->second, true);
+      quic_stream_wake_reader(*found->second, readers);
       self.streams.erase(found);
     }
     auto fresh = ref_ptr_t<quic_stream_state_t>(&self, id, true);
-    self.streams.emplace(id, fresh);
+    self.streams.emplace(id, &fresh.data());
     self.stream_accept_queue.push_back(std::move(fresh));
   }
   quic_stream_accept_pump(self, ops);
@@ -1250,8 +1302,8 @@ inline void quic_drain_streams(quic_connection_state_t &self, std::vector<std::c
     {
       continue;
     }
-    quic_stream_latch_terminal(found->second.data(), *transport);
-    quic_stream_wake_reader(found->second.data(), readers);
+    quic_stream_latch_terminal(*found->second, *transport);
+    quic_stream_wake_reader(*found->second, readers);
   }
 
   for (const auto id : transport->take_send_unblocked())
@@ -1287,10 +1339,10 @@ inline void quic_retire_streams(quic_connection_state_t &self, std::vector<std::
   {
     if (self.transport != nullptr)
     {
-      quic_stream_latch_terminal(entry.second.data(), *self.transport);
+      quic_stream_latch_terminal(*entry.second, *self.transport);
     }
-    quic_stream_retire(entry.second.data(), false);
-    quic_stream_wake_reader(entry.second.data(), readers);
+    quic_stream_retire(*entry.second, false);
+    quic_stream_wake_reader(*entry.second, readers);
   }
   self.stream_accept_queue.clear();
 
@@ -1888,6 +1940,54 @@ inline void quic_close_locally(quic_endpoint_state_t &self, ref_ptr_t<quic_conne
 }
 } // namespace detail
 
+namespace detail
+{
+inline quic_stream_state_t::~quic_stream_state_t()
+{
+  if (connection == nullptr)
+  {
+    return;
+  }
+  // Removed while the pointer still names this stream. The transport reaps its
+  // own stream on its own schedule and ids are never reused, so a stale entry
+  // could only ever be found by a drain looking up an id this state no longer
+  // has any claim to.
+  if (const auto found = connection->streams.find(id); found != connection->streams.end() && found->second == this)
+  {
+    connection->streams.erase(found);
+  }
+
+  auto *transport = connection->transport;
+  if (transport == nullptr || stale)
+  {
+    return;
+  }
+  const bool has_send = direction == vio::quic::stream_direction_t::bidirectional || !peer_initiated;
+  const bool has_receive = direction == vio::quic::stream_direction_t::bidirectional || peer_initiated;
+  bool said_something = false;
+  if (has_send && !send_ended)
+  {
+    transport->reset_stream(id, vio::quic::transport_error_no_error);
+    said_something = true;
+  }
+  if (has_receive && !receive_ended)
+  {
+    transport->stop_sending(id, vio::quic::transport_error_no_error);
+    said_something = true;
+  }
+  if (said_something && connection->endpoint != nullptr)
+  {
+    const auto entry = connection->endpoint->by_connection.find(transport);
+    if (entry != connection->endpoint->by_connection.end())
+    {
+      // On this turn's beat, so a handle dropped and a connection closed in the
+      // same breath still gets the frames out.
+      quic_mark_dirty(*connection->endpoint, entry->second);
+    }
+  }
+}
+} // namespace detail
+
 // The awaitable a dial and an accept both return. Two names for one type,
 // because "future" is what a thing resolved by an arrival is called elsewhere
 // in vio and "awaitable" is what a thing resolved by a request is called, and
@@ -1916,12 +2016,7 @@ using quic_accept_future_t = quic_connection_awaitable_t;
 [[nodiscard]] inline quic_connect_awaitable_t quic_endpoint_connect(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket = {},
                                                                     cancellation_t *cancel = nullptr)
 {
-  const auto failed = [](error_t reason)
-  {
-    auto *op = detail::quic_op_create(nullptr);
-    detail::quic_op_finish(*op, std::move(reason));
-    return quic_connect_awaitable_t{op};
-  };
+  const auto failed = [](error_t reason) { return quic_connect_awaitable_t{detail::quic_op_settled(std::move(reason))}; };
 
   if (endpoint.handle.ref_counted() == nullptr)
   {
@@ -2026,12 +2121,7 @@ using quic_accept_future_t = quic_connection_awaitable_t;
 // knowable only because there is no setter for the context.
 [[nodiscard]] inline quic_accept_future_t quic_endpoint_accept(quic_endpoint_t &endpoint, cancellation_t *cancel = nullptr)
 {
-  const auto failed = [](error_t reason)
-  {
-    auto *op = detail::quic_op_create(nullptr);
-    detail::quic_op_finish(*op, std::move(reason));
-    return quic_accept_future_t{op};
-  };
+  const auto failed = [](error_t reason) { return quic_accept_future_t{detail::quic_op_settled(std::move(reason))}; };
 
   if (endpoint.handle.ref_counted() == nullptr)
   {
