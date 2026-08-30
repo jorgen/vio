@@ -208,6 +208,15 @@ struct sent_frame_t
   // NEW_CONNECTION_ID and RETIRE_CONNECTION_ID: which connection ID, since
   // section 13.3 has both retransmitted carrying the same sequence number.
   std::uint64_t sequence = 0;
+  // STREAM: whether this frame carried the FIN.
+  //
+  // It cannot be inferred from the range, and that is worth saying because the
+  // inference looks sound. The FIN rides with whatever reaches the final size,
+  // so "offset + length == the final size" seems to identify it -- but a frame
+  // sent *before* the FIN was queued can end at what later becomes the final
+  // size, and treating its acknowledgement as the FIN's is exactly the bug this
+  // field exists to prevent.
+  bool fin = false;
 };
 
 struct sent_packet_t

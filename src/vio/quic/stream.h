@@ -636,7 +636,13 @@ public:
 
     // An empty STREAM frame is still worth sending if it carries the FIN and
     // everything before it has gone.
-    const bool fin_only = _fin && amount == 0 && _sent_offset == queued() && _state == send_state_t::send;
+    //
+    // Gated on _fin_sent rather than on the state, and that is what makes a
+    // lost bare FIN recoverable: the state is data_sent the moment the FIN goes
+    // out and never returns to send, so a state test offered it exactly once
+    // and the peer that missed it waited for an end of stream that was never
+    // sent again.
+    const bool fin_only = _fin && amount == 0 && _sent_offset == queued() && !_fin_sent && (_state == send_state_t::send || _state == send_state_t::data_sent);
     if (amount == 0 && !fin_only)
     {
       return std::nullopt;
@@ -670,6 +676,12 @@ public:
 
   void on_chunk_sent(const chunk_t &chunk)
   {
+    // Before the retransmit branch's early return, because a retransmitted
+    // chunk can be the one carrying the FIN.
+    if (chunk.fin)
+    {
+      _fin_sent = true;
+    }
     if (chunk.retransmit)
     {
       auto &front = _retransmit.front();
@@ -689,9 +701,21 @@ public:
     }
   }
 
-  void on_range_lost(std::uint64_t offset, std::uint64_t length)
+  void on_range_lost(std::uint64_t offset, std::uint64_t length, bool fin)
   {
-    if (length == 0 || _state == send_state_t::reset_sent || _state == send_state_t::reset_received)
+    if (_state == send_state_t::reset_sent || _state == send_state_t::reset_received)
+    {
+      return;
+    }
+    // The FIN is put back before the length test, because a FIN sent with no
+    // bytes behind it is a zero-length range and would otherwise fall straight
+    // through. If it rode with bytes, the retransmit of those bytes carries it
+    // again; if it rode alone, the fin_only branch above offers it again.
+    if (fin)
+    {
+      _fin_sent = false;
+    }
+    if (length == 0)
     {
       return;
     }
@@ -716,8 +740,12 @@ public:
   // enough: a duplicate would make the stream look complete before it was.
   // They are merged into ranges, and the contiguous prefix is what decides
   // both completion and how much of the buffer can go.
-  void on_range_acknowledged(std::uint64_t offset, std::uint64_t length)
+  void on_range_acknowledged(std::uint64_t offset, std::uint64_t length, bool fin)
   {
+    if (fin)
+    {
+      _fin_acknowledged = true;
+    }
     if (length > 0)
     {
       insert_acknowledged(offset, offset + length);
@@ -734,19 +762,24 @@ public:
       }
     }
 
-    // Outside the length test, and that is the whole of this function that is
-    // not bookkeeping. A FIN sent with no bytes behind it -- a half-close after
-    // the last write, which is the ordinary end of a request -- is acknowledged
-    // by a range of length zero, so an early return here left the stream in
-    // data_sent for ever. It was then never reaped, and if the peer opened it,
-    // its MAX_STREAMS credit was never returned: a peer that had spent its
-    // allowance waited for a MAX_STREAMS that waited on a request it could not
-    // send, which is the deadlock the comment in reap_and_grant warns about.
+    // Section 3.1: Data Sent becomes Data Recvd when all the stream data *and
+    // the FIN* have been acknowledged. Both halves of that are load-bearing.
     //
-    // The guard is the same one it always was, and it is what makes this safe:
-    // an acknowledgement that arrives while earlier bytes are still outstanding
-    // leaves prefix below queued() and changes nothing.
-    if (_state == send_state_t::data_sent && acknowledged_prefix_end() >= queued())
+    // The byte test alone left a stream in data_sent for ever when the FIN
+    // carried no bytes -- a half-close after the last write, which is the
+    // ordinary end of a request. It was then never reaped, and if the peer had
+    // opened it, its MAX_STREAMS credit was never returned: a peer that had
+    // spent its allowance waited for a MAX_STREAMS that waited on a request it
+    // could not send.
+    //
+    // The FIN test alone is missing is the other error, and it is the quieter
+    // one. queued() counts bytes and a FIN adds none, so acknowledging the last
+    // byte satisfied the byte test whether or not the FIN itself had arrived.
+    // A stream whose data was acknowledged and whose separately-sent FIN was
+    // lost went to data_received, became reapable, and took the retransmit of
+    // that FIN with it -- so the peer waited out its idle timeout with no end
+    // of stream.
+    if (_state == send_state_t::data_sent && _fin_acknowledged && acknowledged_prefix_end() >= queued())
     {
       _state = send_state_t::data_received;
     }
@@ -783,7 +816,14 @@ public:
 
   [[nodiscard]] bool has_pending() const
   {
-    return !_retransmit.empty() || queued() > _sent_offset || (_fin && _state == send_state_t::send);
+    return !_retransmit.empty() || queued() > _sent_offset || (_fin && !_fin_sent);
+  }
+
+  // Whether the peer has confirmed the end of the stream, as opposed to merely
+  // every byte before it.
+  [[nodiscard]] bool fin_acknowledged() const
+  {
+    return _fin_acknowledged;
   }
 
 private:
@@ -866,5 +906,9 @@ private:
   std::uint64_t _max_data = 0;
   std::optional<std::uint64_t> _reset_error;
   bool _fin = false;
+  // The FIN is not a byte, so it cannot be tracked by the range bookkeeping
+  // beside it: sent and acknowledged both have to be their own flag.
+  bool _fin_sent = false;
+  bool _fin_acknowledged = false;
 };
 } // namespace vio::quic

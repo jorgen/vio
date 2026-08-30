@@ -932,7 +932,7 @@ void repair_lost(connection_impl_t &impl, pn_space_t space, const std::vector<se
         // send half refuses the range.
         if (auto *stream = impl.streams.find(frame.stream_id); stream != nullptr && stream->has_send)
         {
-          stream->send.on_range_lost(frame.offset, frame.length);
+          stream->send.on_range_lost(frame.offset, frame.length, frame.fin);
           impl.streams.mark_sendable(*stream);
         }
         break;
@@ -1462,7 +1462,7 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
           }
           if (auto *stream = impl.streams.find(sent.stream_id); stream != nullptr && stream->has_send)
           {
-            stream->send.on_range_acknowledged(sent.offset, sent.length);
+            stream->send.on_range_acknowledged(sent.offset, sent.length, sent.fin);
             // The commonest thing that frees room on a healthy connection.
             // The send marks a writer parks against are measured from what has
             // been acknowledged, so without this a parked writer waits for a
@@ -2740,7 +2740,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
       {
         continue;
       }
-      record.push_back(sent_frame_t{.kind = frame_kind_t::stream, .offset = chunk->offset, .length = chunk->data.size(), .stream_id = stream.id});
+      record.push_back(sent_frame_t{.kind = frame_kind_t::stream, .offset = chunk->offset, .length = chunk->data.size(), .stream_id = stream.id, .fin = chunk->fin});
       stream.send.on_chunk_sent(*chunk);
       if (!chunk->retransmit)
       {

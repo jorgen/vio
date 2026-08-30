@@ -342,7 +342,7 @@ TEST_CASE("the FIN rides with the last byte, or alone if there is none left")
 
   SUBCASE("acknowledging everything finishes the stream")
   {
-    stream.on_range_acknowledged(0, 2);
+    stream.on_range_acknowledged(0, 2, true);
     CHECK(stream.state() == send_state_t::data_received);
   }
 }
@@ -372,7 +372,105 @@ TEST_CASE("a stream that carries nothing but a FIN still finishes")
   stream.on_chunk_sent(*fin);
   CHECK(stream.state() == send_state_t::data_sent);
 
-  stream.on_range_acknowledged(0, 0);
+  stream.on_range_acknowledged(0, 0, true);
+  CHECK(stream.state() == send_state_t::data_received);
+}
+
+TEST_CASE("a stream is not finished until the FIN itself is acknowledged")
+{
+  // queued() counts bytes and a FIN adds none, so acknowledging the last byte
+  // satisfies the byte half of section 3.1's condition whether or not the FIN
+  // arrived. A stream whose data was acknowledged and whose separately-sent FIN
+  // was lost went straight to data_received.
+  //
+  // What that cost is quiet and bad: data_received makes the stream reapable,
+  // and reap_finished erases it -- so the retransmit of that lost FIN finds no
+  // stream to come from, and the peer waits out its idle timeout with no end of
+  // stream. This is the shape any "write, then later finish" sender has.
+  send_stream_t stream(1000);
+  CHECK(stream.write(as_bytes("hi"), false));
+  auto data = stream.next_chunk(100, 1000);
+  REQUIRE(data.has_value());
+  CHECK_FALSE(data->fin);
+  stream.on_chunk_sent(*data);
+
+  CHECK(stream.write({}, true));
+  auto fin = stream.next_chunk(100, 1000);
+  REQUIRE(fin.has_value());
+  CHECK(fin->fin);
+  stream.on_chunk_sent(*fin);
+  CHECK(stream.state() == send_state_t::data_sent);
+
+  // The data frame is acknowledged. The FIN frame was lost, so nothing has
+  // confirmed the end of the stream.
+  stream.on_range_acknowledged(0, 2, false);
+  CHECK(stream.state() == send_state_t::data_sent);
+  CHECK_FALSE(stream.fin_acknowledged());
+
+  // And once it is, the stream really is over.
+  stream.on_range_acknowledged(2, 0, true);
+  CHECK(stream.state() == send_state_t::data_received);
+}
+
+TEST_CASE("a lost FIN with no bytes behind it is sent again")
+{
+  // The other half of the same defect, and the one that hangs the peer on its
+  // own. A bare FIN is a zero-length range, so on_range_lost fell straight
+  // through its length test and queued nothing -- and the fin_only branch that
+  // produces the frame was gated on the state being `send`, which it leaves the
+  // instant the FIN first goes out and never returns to. So the FIN was offered
+  // exactly once and a peer that missed it never heard the stream end.
+  send_stream_t stream(1000);
+  CHECK(stream.write(as_bytes("hi"), false));
+  auto data = stream.next_chunk(100, 1000);
+  REQUIRE(data.has_value());
+  stream.on_chunk_sent(*data);
+
+  CHECK(stream.write({}, true));
+  auto fin = stream.next_chunk(100, 1000);
+  REQUIRE(fin.has_value());
+  CHECK(fin->fin);
+  CHECK(fin->data.empty());
+  stream.on_chunk_sent(*fin);
+  // Sent, so there is nothing more to offer.
+  CHECK_FALSE(stream.has_pending());
+  CHECK_FALSE(stream.next_chunk(100, 1000).has_value());
+
+  // Declared lost. It is a zero-length range and it still has to come back.
+  stream.on_range_lost(2, 0, true);
+  CHECK(stream.has_pending());
+  auto again = stream.next_chunk(100, 1000);
+  REQUIRE(again.has_value());
+  CHECK(again->fin);
+  CHECK(again->data.empty());
+  CHECK(again->offset == 2);
+  stream.on_chunk_sent(*again);
+  CHECK_FALSE(stream.has_pending());
+}
+
+TEST_CASE("a lost FIN that rode with bytes comes back with them")
+{
+  // The commoner case, and the one that already worked: the retransmit of the
+  // range that reaches the final size carries the FIN again. Worth pinning,
+  // because the fix above moves when _fin_sent is cleared and this is what says
+  // it did not break the path that was fine.
+  send_stream_t stream(1000);
+  CHECK(stream.write(as_bytes("hi"), true));
+  auto chunk = stream.next_chunk(100, 1000);
+  REQUIRE(chunk.has_value());
+  CHECK(chunk->fin);
+  stream.on_chunk_sent(*chunk);
+  CHECK(stream.state() == send_state_t::data_sent);
+
+  stream.on_range_lost(0, 2, true);
+  auto again = stream.next_chunk(100, 1000);
+  REQUIRE(again.has_value());
+  CHECK(again->retransmit);
+  CHECK(as_text(again->data) == "hi");
+  CHECK(again->fin);
+  stream.on_chunk_sent(*again);
+
+  stream.on_range_acknowledged(0, 2, true);
   CHECK(stream.state() == send_state_t::data_received);
 }
 
@@ -389,7 +487,7 @@ TEST_CASE("a zero-length acknowledgement before the bytes changes nothing")
   stream.on_chunk_sent(*chunk);
   CHECK(stream.state() == send_state_t::data_sent);
 
-  stream.on_range_acknowledged(2, 0);
+  stream.on_range_acknowledged(2, 0, true);
   CHECK(stream.state() == send_state_t::data_sent);
 }
 
@@ -402,7 +500,7 @@ TEST_CASE("a lost range is sent again before anything new")
   CHECK(as_text(first->data) == "01234");
   stream.on_chunk_sent(*first);
 
-  stream.on_range_lost(0, 5);
+  stream.on_range_lost(0, 5, false);
   auto repeat = stream.next_chunk(100, 1000);
   REQUIRE(repeat.has_value());
   // Section 13.3: retransmissions go first, and carry the same bytes.
@@ -420,8 +518,8 @@ TEST_CASE("a lost range is sent again before anything new")
   {
     send_stream_t other(1000);
     CHECK(other.write(as_bytes("hello"), false));
-    other.on_range_lost(0, 5);
-    other.on_range_lost(0, 5);
+    other.on_range_lost(0, 5, false);
+    other.on_range_lost(0, 5, false);
     auto chunk = other.next_chunk(100, 1000);
     REQUIRE(chunk.has_value());
     other.on_chunk_sent(*chunk);
@@ -438,7 +536,7 @@ TEST_CASE("a reset abandons what has not been delivered")
   auto chunk = stream.next_chunk(2, 1000);
   REQUIRE(chunk.has_value());
   stream.on_chunk_sent(*chunk);
-  stream.on_range_lost(0, 2);
+  stream.on_range_lost(0, 2, false);
 
   stream.reset(7);
   CHECK(stream.state() == send_state_t::reset_sent);
@@ -804,11 +902,11 @@ TEST_CASE("a retransmit range whose bytes were acknowledged does not loop")
   send.on_chunk_sent(*first);
 
   // Declared lost, so it is queued to go again...
-  send.on_range_lost(0, payload.size());
+  send.on_range_lost(0, payload.size(), false);
   REQUIRE(send.has_pending());
 
   // ...and then acknowledged after all, which retires the bytes behind it.
-  send.on_range_acknowledged(0, payload.size());
+  send.on_range_acknowledged(0, payload.size(), false);
 
   // Whatever comes next must not be an empty frame at offset zero, and the
   // queue must drain rather than reoffering the same range for ever.
@@ -859,7 +957,7 @@ TEST_CASE("a finished stream is reaped whichever side opened it")
     REQUIRE(chunk.has_value());
     const auto length = chunk->data.size();
     stream->send.on_chunk_sent(*chunk);
-    stream->send.on_range_acknowledged(chunk->offset, length);
+    stream->send.on_range_acknowledged(chunk->offset, length, chunk->fin);
     CHECK(stream->send.state() == send_state_t::data_received);
   }
 
