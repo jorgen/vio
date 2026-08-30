@@ -718,24 +718,35 @@ public:
   // both completion and how much of the buffer can go.
   void on_range_acknowledged(std::uint64_t offset, std::uint64_t length)
   {
-    if (length == 0)
+    if (length > 0)
     {
-      return;
-    }
-    insert_acknowledged(offset, offset + length);
+      insert_acknowledged(offset, offset + length);
 
-    // Anything acknowledged can never be asked for again. Without this a
-    // stream holds every byte it ever sent for the life of the connection,
-    // which on a long-lived stream is unbounded growth rather than a leak
-    // only in the sense that it is reachable.
-    const std::uint64_t prefix = acknowledged_prefix_end();
-    if (prefix > _base)
-    {
-      const std::size_t drop = static_cast<std::size_t>((std::min<std::uint64_t>)(prefix - _base, queued_bytes()));
-      retire(drop);
+      // Anything acknowledged can never be asked for again. Without this a
+      // stream holds every byte it ever sent for the life of the connection,
+      // which on a long-lived stream is unbounded growth rather than a leak
+      // only in the sense that it is reachable.
+      const std::uint64_t acknowledged = acknowledged_prefix_end();
+      if (acknowledged > _base)
+      {
+        const std::size_t drop = static_cast<std::size_t>((std::min<std::uint64_t>)(acknowledged - _base, queued_bytes()));
+        retire(drop);
+      }
     }
 
-    if (_state == send_state_t::data_sent && prefix >= queued())
+    // Outside the length test, and that is the whole of this function that is
+    // not bookkeeping. A FIN sent with no bytes behind it -- a half-close after
+    // the last write, which is the ordinary end of a request -- is acknowledged
+    // by a range of length zero, so an early return here left the stream in
+    // data_sent for ever. It was then never reaped, and if the peer opened it,
+    // its MAX_STREAMS credit was never returned: a peer that had spent its
+    // allowance waited for a MAX_STREAMS that waited on a request it could not
+    // send, which is the deadlock the comment in reap_and_grant warns about.
+    //
+    // The guard is the same one it always was, and it is what makes this safe:
+    // an acknowledgement that arrives while earlier bytes are still outstanding
+    // leaves prefix below queued() and changes nothing.
+    if (_state == send_state_t::data_sent && acknowledged_prefix_end() >= queued())
     {
       _state = send_state_t::data_received;
     }

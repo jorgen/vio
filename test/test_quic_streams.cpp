@@ -347,6 +347,52 @@ TEST_CASE("the FIN rides with the last byte, or alone if there is none left")
   }
 }
 
+TEST_CASE("a stream that carries nothing but a FIN still finishes")
+{
+  // The acknowledgement of a FIN is a range of length zero, and the length test
+  // at the top of on_range_acknowledged used to return before the state could
+  // move. On a stream that carried bytes this never showed: acknowledging the
+  // last byte already takes the acknowledged prefix up to the queued total,
+  // because a FIN adds no bytes to it. On a stream that carried none, there is
+  // no other acknowledgement to arrive, so it stayed in data_sent for ever.
+  //
+  // What that cost was not the state itself. reap_finished requires
+  // data_received before it will retire a stream, and retiring a peer-initiated
+  // stream is what returns its MAX_STREAMS credit -- so a peer that had spent
+  // its allowance waited for a MAX_STREAMS that waited on a request it could not
+  // send. That is the exact deadlock reap_and_grant's own comment warns about,
+  // reached by a different road: half-closing a stream with nothing left to say,
+  // which is the ordinary end of a request that has been fully read.
+  send_stream_t stream(1000);
+  CHECK(stream.write({}, true));
+  auto fin = stream.next_chunk(100, 1000);
+  REQUIRE(fin.has_value());
+  CHECK(fin->data.empty());
+  CHECK(fin->fin);
+  stream.on_chunk_sent(*fin);
+  CHECK(stream.state() == send_state_t::data_sent);
+
+  stream.on_range_acknowledged(0, 0);
+  CHECK(stream.state() == send_state_t::data_received);
+}
+
+TEST_CASE("a zero-length acknowledgement before the bytes changes nothing")
+{
+  // The other half of the same rule. Moving the state test outside the length
+  // check would be wrong if it could fire early, so this is the case that says
+  // it cannot: an acknowledgement arriving while earlier bytes are still
+  // outstanding leaves the acknowledged prefix below the queued total.
+  send_stream_t stream(1000);
+  CHECK(stream.write(as_bytes("hi"), true));
+  auto chunk = stream.next_chunk(100, 1000);
+  REQUIRE(chunk.has_value());
+  stream.on_chunk_sent(*chunk);
+  CHECK(stream.state() == send_state_t::data_sent);
+
+  stream.on_range_acknowledged(2, 0);
+  CHECK(stream.state() == send_state_t::data_sent);
+}
+
 TEST_CASE("a lost range is sent again before anything new")
 {
   send_stream_t stream(1000);
