@@ -751,6 +751,21 @@ struct quic_connection_state_t
   // accounting the write layer brings, and until then a peer sees the stream
   // stay open rather than a RESET_STREAM.
   std::unordered_map<std::uint64_t, ref_ptr_t<quic_stream_state_t>> streams;
+  // Streams the peer has opened that nothing has accepted yet.
+  //
+  // Deliberately unbounded, unlike the endpoint's connection backlog, and the
+  // asymmetry is the point. A peer cannot open more streams than the
+  // MAX_STREAMS this endpoint granted it -- that is section 4.6, it is
+  // negotiated, and the peer honours it by not opening them at all. A second,
+  // smaller, local cap would be invisible to the peer and could only enforce
+  // itself by resetting streams the peer was entitled to open.
+  //
+  // There was one, at 256, and the benchmark found what it cost: a peer opening
+  // a burst of 500 streams has them all queued by a single drain, so the
+  // overflow was refused within that drain -- before the application, which was
+  // accepting every one of them, got a chance to take a single one. An
+  // application that wants a smaller bound lowers initial_max_streams_bidi,
+  // which stops the streams being opened rather than killing them afterwards.
   std::deque<ref_ptr_t<quic_stream_state_t>> stream_accept_queue;
   // Opens and accepts wait on one list, in call order, the way the endpoint's
   // dials and accepts do.
@@ -759,11 +774,6 @@ struct quic_connection_state_t
   // resume anything, so what it woke waits here for the next beat.
   std::vector<std::coroutine_handle<>> pending_readers;
   std::vector<quic_stream_op_t *> pending_stream_ops;
-  // Streams the peer opened that nothing has accepted. Past this the stream is
-  // refused with STOP_SENDING and RESET_STREAM rather than queued, for the same
-  // reason the connection backlog refuses rather than drops: a peer told
-  // nothing waits out a timeout holding credit on both sides.
-  std::size_t stream_accept_backlog = 256;
 };
 } // namespace detail
 
@@ -1229,18 +1239,7 @@ inline void quic_drain_streams(quic_connection_state_t &self, std::vector<std::c
     }
     auto fresh = ref_ptr_t<quic_stream_state_t>(&self, id, true);
     self.streams.emplace(id, fresh);
-    if (self.stream_accept_queue.size() < self.stream_accept_backlog)
-    {
-      self.stream_accept_queue.push_back(std::move(fresh));
-    }
-    else
-    {
-      // Told no rather than told nothing: an application that is not accepting
-      // has no way to learn about a stream it will never be handed, and the
-      // peer would wait out its own timeout holding credit on both sides.
-      transport->stop_sending(id, vio::quic::transport_error_no_error);
-      transport->reset_stream(id, vio::quic::transport_error_no_error);
-    }
+    self.stream_accept_queue.push_back(std::move(fresh));
   }
   quic_stream_accept_pump(self, ops);
 

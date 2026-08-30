@@ -3262,6 +3262,123 @@ TEST_CASE("an open past the peer's limit waits for the credit that raises it")
   CHECK(third_opened);
 }
 
+TEST_CASE("a burst of streams larger than any local queue is all accepted")
+{
+  using namespace vio;
+
+  // The defect the benchmark found, and the reason there is no local bound on
+  // the stream accept queue.
+  //
+  // A peer opens its whole allowance in one flight, so a single drain queues
+  // every one of them at once -- before the application, which is accepting all
+  // of them, has been given a chance to take a single one. A local cap can only
+  // enforce itself by resetting streams the peer was entitled to open, and the
+  // application never even sees them. MAX_STREAMS is the bound QUIC already
+  // has, it is negotiated, and the peer honours it by not opening the streams
+  // at all.
+  //
+  // 400 is chosen to be comfortably past the 256 the queue used to cap at.
+  constexpr int burst = 400;
+
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  int opened = 0;
+  int accepted = 0;
+  int with_bytes = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &opened, int &accepted, int &with_bytes) -> task_t<void>
+        {
+          {
+            // The server grants more streams than the burst, so the burst is
+            // legal and the *only* thing that could refuse it is a local queue.
+            // The default of 100 would make quic_open_stream suspend instead,
+            // which is a different mechanism entirely and the correct one.
+            quic_config_t server_config;
+            server_config.transport.connection.transport_parameters.initial_max_streams_bidi = 1000;
+            auto server = quic_endpoint_create(loop, listening, server_config);
+            REQUIRE(server.has_value());
+            const auto any = stream_loopback(0);
+            REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = quic_endpoint_local_port(*server).value_or(0);
+            auto client = quic_endpoint_create(loop, nullptr, &dialling);
+            REQUIRE(client.has_value());
+
+            const auto target = stream_loopback(port);
+            auto connection = co_await quic_endpoint_connect(*client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+
+            // Every stream opened and written before anything accepts one, so
+            // they arrive together and are queued together.
+            std::vector<quic_stream_t> streams;
+            streams.reserve(burst);
+            for (int index = 0; index < burst; ++index)
+            {
+              auto stream = co_await quic_open_stream(*connection);
+              if (!stream)
+              {
+                break;
+              }
+              if (!(co_await quic_stream_write_final(*stream, bytes_of("x"))).has_value())
+              {
+                break;
+              }
+              ++opened;
+              streams.push_back(*stream);
+            }
+
+            auto serving = [](quic_endpoint_t &endpoint, int &accepted, int &with_bytes) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              for (int taken = 0; taken < burst; ++taken)
+              {
+                auto stream = co_await quic_accept_stream(*arrived);
+                if (!stream)
+                {
+                  co_return;
+                }
+                ++accepted;
+                auto reader = quic_stream_create_reader(*stream);
+                if (!reader)
+                {
+                  continue;
+                }
+                std::string got;
+                while (auto chunk = co_await *reader)
+                {
+                  got += text_of(*chunk);
+                }
+                if (got == "x")
+                {
+                  ++with_bytes;
+                }
+              }
+            }(*server, accepted, with_bytes);
+
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, opened, accepted, with_bytes));
+    });
+  event_loop.run();
+
+  CHECK(opened == burst);
+  CHECK(accepted == burst);
+  // And each carried its byte, so none of them was reset on the way.
+  CHECK(with_bytes == burst);
+}
+
 TEST_CASE("a stream handle kept past the connection still answers")
 {
   using namespace vio;

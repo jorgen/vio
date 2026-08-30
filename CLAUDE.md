@@ -195,7 +195,22 @@ Two things dominated when it was first written, both since fixed: TLS was
 driven on every received packet long after the handshake, and
 `ack_eliciting_in_flight` scanned every packet in flight from the PTO
 calculation on every `poll_send`. With those gone the profile is 80%+ AES-GCM,
-which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
+which is where an encrypted transport's time belongs.
+
+It also prices the **coroutine API against the callback one**, and for that it has to be
+I/O: each shape runs twice over the same real socket, and only the difference between the
+pair means anything. Bulk is free -- the rows are inside each other's noise and the
+coroutine layer adds 0.2 allocations per datagram, which is what you would hope for when
+80% of the profile is AES-GCM. Pipelined request/response is ~1.5x *faster* through the
+coroutine API (34.5k against 23k req/s) at the price of 8.6 more allocations per request,
+and the reason is not coroutines: `readable_streams()` is a level, so it walks every
+stream, sorts and allocates a vector on every call, and a callback server calls it once
+per arriving datagram. The layer buys a per-operation allocation and sells an O(n log n)
+sweep per datagram. That shape is also what found the stream-accept-backlog defect -- a
+burst of 500 streams was queued by one drain and the overflow reset inside that same
+drain, before the application could accept any of it.
+
+`loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
   transcribed from the appendix A pseudocode. A sent packet records *what it
   meant* -- a list of `sent_frame_t` -- never the bytes, which is what makes
