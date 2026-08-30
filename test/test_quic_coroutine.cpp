@@ -1,9 +1,13 @@
 #include <chrono>
 #include <coroutine>
+#include <span>
+#include <string>
+#include <string_view>
 #include <optional>
 #include <doctest/doctest.h>
 
 #include <vio/operation/quic_endpoint.h>
+#include <vio/operation/quic_stream.h>
 #include <vio/operation/sleep.h>
 #include <vio/operation/udp.h>
 
@@ -2703,5 +2707,752 @@ TEST_CASE("cancelling an accept that has already resolved changes nothing")
 
   CHECK(accepted);
   CHECK(still_accepted);
+}
+}
+
+TEST_SUITE("quic coroutine stream")
+{
+namespace
+{
+vio::quic::tls_config_t stream_server_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::server;
+  config.certificate_chain_pem = identity.certificate_pem;
+  config.private_key_pem = identity.private_key_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+vio::quic::tls_config_t stream_client_tls(const vio_test::identity_t &identity)
+{
+  vio::quic::tls_config_t config;
+  config.role = vio::quic::tls_role_t::client;
+  config.ca_certificates_pem = identity.certificate_pem;
+  config.alpn = {"test"};
+  return config;
+}
+
+sockaddr_in stream_loopback(std::uint16_t port)
+{
+  sockaddr_in address = {};
+  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  return address;
+}
+
+std::span<const std::uint8_t> bytes_of(std::string_view text)
+{
+  return {reinterpret_cast<const std::uint8_t *>(text.data()), text.size()};
+}
+
+std::string text_of(const vio::unique_buf_t &buffer)
+{
+  return std::string(buffer.buf.base, buffer.buf.len);
+}
+
+// A server and a client on one loop, both bound to IPv4 so the dial can name a
+// literal. Everything below needs this and nothing below is about it.
+struct pair_t
+{
+  std::optional<vio::quic_endpoint_t> server;
+  std::optional<vio::quic_endpoint_t> client;
+  std::uint16_t port = 0;
+};
+
+pair_t make_pair(vio::event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling)
+{
+  using namespace vio;
+  pair_t out;
+  auto server = quic_endpoint_create(loop, listening);
+  REQUIRE(server.has_value());
+  const auto any = stream_loopback(0);
+  REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+  out.port = quic_endpoint_local_port(*server).value_or(0);
+  REQUIRE(out.port != 0);
+  out.server.emplace(std::move(*server));
+
+  auto client = quic_endpoint_create(loop, nullptr, &dialling);
+  REQUIRE(client.has_value());
+  out.client.emplace(std::move(*client));
+  return out;
+}
+} // namespace
+
+TEST_CASE("a stream carries bytes and a clean ending")
+{
+  using namespace vio;
+
+  // The echo pair, and the whole argument for this layer in one place: the
+  // server says accept, then reads until the read fails, and the failure
+  // *names* the ending. Nothing polls, nothing sweeps a list of readable
+  // streams, and nobody has to ask stream_receive_finished() a question it
+  // cannot answer.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  std::string echoed;
+  int ending = 0;
+  bool server_saw_fin = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, std::string &echoed, int &ending, bool &server_saw_fin) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+
+            auto serving = [](quic_endpoint_t &endpoint, bool &saw_fin) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              auto stream = co_await quic_accept_stream(*arrived);
+              REQUIRE(stream.has_value());
+
+              auto reader = quic_stream_create_reader(*stream);
+              REQUIRE(reader.has_value());
+              std::string received;
+              while (true)
+              {
+                auto chunk = co_await *reader;
+                if (!chunk)
+                {
+                  saw_fin = chunk.error().code == vio_quic_stream_finished;
+                  break;
+                }
+                received += text_of(*chunk);
+              }
+              (void)co_await quic_stream_write_final(*stream, bytes_of(received));
+            }(*pair.server, server_saw_fin);
+
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            (void)co_await quic_stream_write_final(*stream, bytes_of("hello over quic"));
+
+            auto reader = quic_stream_create_reader(*stream);
+            REQUIRE(reader.has_value());
+            while (true)
+            {
+              auto chunk = co_await *reader;
+              if (!chunk)
+              {
+                ending = chunk.error().code;
+                break;
+              }
+              echoed += text_of(*chunk);
+            }
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, echoed, ending, server_saw_fin));
+    });
+  event_loop.run();
+
+  CHECK(echoed == "hello over quic");
+  CHECK(ending == vio_quic_stream_finished);
+  CHECK(server_saw_fin);
+}
+
+TEST_CASE("a stream that carries only a FIN is still accepted")
+{
+  using namespace vio;
+
+  // What readable_streams() could never report, and the reason quic_accept_stream
+  // is built on take_opened_streams() instead. A level tells you which streams
+  // have unread bytes right now; a stream that carried nothing but a
+  // zero-length FIN never has any, so through the old API it simply does not
+  // exist.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool accepted = false;
+  int ending = 0;
+  std::uint64_t accepted_id = 0;
+  std::uint64_t opened_id = 1;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &accepted, int &ending, std::uint64_t &accepted_id, std::uint64_t &opened_id) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+
+            auto serving = [](quic_endpoint_t &endpoint, bool &accepted, int &ending, std::uint64_t &accepted_id) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              auto stream = co_await quic_accept_stream(*arrived);
+              accepted = stream.has_value();
+              if (!accepted)
+              {
+                co_return;
+              }
+              accepted_id = quic_stream_id(*stream);
+              auto reader = quic_stream_create_reader(*stream);
+              REQUIRE(reader.has_value());
+              auto chunk = co_await *reader;
+              ending = chunk.has_value() ? -1 : chunk.error().code;
+            }(*pair.server, accepted, ending, accepted_id);
+
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            opened_id = quic_stream_id(*stream);
+            // Nothing but the FIN.
+            (void)co_await quic_stream_finish(*stream);
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, accepted, ending, accepted_id, opened_id));
+    });
+  event_loop.run();
+
+  CHECK(accepted);
+  CHECK(accepted_id == opened_id);
+  CHECK(ending == vio_quic_stream_finished);
+}
+
+TEST_CASE("a reset is reported as itself and carries the peer's code")
+{
+  using namespace vio;
+
+  // The distinction the transport cannot draw: stream_receive_finished() is
+  // true for a clean FIN and for a peer that gave up, so an application reading
+  // through it has to infer cancellation from a length it may not know.
+  //
+  // The peer's 62-bit code does not fit in error_t, which carries an int and is
+  // shared by all of vio, so it comes back separately -- and that code is what
+  // an application protocol actually branches on.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  int ending = 0;
+  std::uint64_t peer_code = 0;
+  bool got_bytes_first = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, std::uint64_t &peer_code, bool &got_bytes_first) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+
+            auto serving = [](quic_endpoint_t &endpoint, int &ending, std::uint64_t &peer_code, bool &got_bytes_first) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              auto stream = co_await quic_accept_stream(*arrived);
+              REQUIRE(stream.has_value());
+              auto reader = quic_stream_create_reader(*stream);
+              REQUIRE(reader.has_value());
+              while (true)
+              {
+                auto chunk = co_await *reader;
+                if (!chunk)
+                {
+                  ending = chunk.error().code;
+                  peer_code = quic_stream_peer_reset_error(*stream).value_or(0);
+                  break;
+                }
+                got_bytes_first = true;
+              }
+            }(*pair.server, ending, peer_code, got_bytes_first);
+
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            (void)co_await quic_stream_write(*stream, bytes_of("half a message"));
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+            quic_stream_reset(*stream, 0x1234);
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, ending, peer_code, got_bytes_first));
+    });
+  event_loop.run();
+
+  CHECK(got_bytes_first);
+  CHECK(ending == vio_quic_stream_reset);
+  CHECK(peer_code == 0x1234);
+}
+
+TEST_CASE("read_into fills a caller's buffer and reports EOF as zero")
+{
+  using namespace vio;
+
+  // The tcp_reader_t::read_into convention, including the part that matters: a
+  // clean end is zero and a reset is an error, which is a distinction a byte
+  // count alone could never carry.
+  //
+  // It is not the true scatter read tcp_reader_t performs and does not claim to
+  // be -- QUIC decrypts in place and reassembles out of order into its own
+  // storage, so there is no moment at which the kernel could be handed this
+  // buffer. What it saves is the allocation.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  std::string received;
+  bool saw_zero = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, std::string &received, bool &saw_zero) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+
+            auto serving = [](quic_endpoint_t &endpoint, std::string &received, bool &saw_zero) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              auto stream = co_await quic_accept_stream(*arrived);
+              REQUIRE(stream.has_value());
+              auto reader = quic_stream_create_reader(*stream);
+              REQUIRE(reader.has_value());
+              std::uint8_t storage[8] = {};
+              while (true)
+              {
+                auto taken = co_await reader->read_into(std::span(storage));
+                REQUIRE(taken.has_value());
+                if (*taken == 0)
+                {
+                  saw_zero = true;
+                  break;
+                }
+                received.append(reinterpret_cast<const char *>(storage), *taken);
+              }
+            }(*pair.server, received, saw_zero);
+
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            // Longer than the buffer, so the loop has to go round.
+            (void)co_await quic_stream_write_final(*stream, bytes_of("twenty-four characters!!"));
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, received, saw_zero));
+    });
+  event_loop.run();
+
+  CHECK(received == "twenty-four characters!!");
+  CHECK(saw_zero);
+}
+
+TEST_CASE("a unidirectional stream has one half and says so")
+{
+  using namespace vio;
+
+  // The transport answers a read on a half that does not exist with an empty
+  // span and a write with zero, and neither is distinguishable from a slow
+  // peer. Asking is how a protocol that uses unidirectional streams avoids
+  // suspending for ever; the operations refuse rather than pretending too.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool sender_cannot_read = false;
+  bool receiver_cannot_write = false;
+  bool reader_refused = false;
+  bool write_refused = false;
+  std::string received;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &sender_cannot_read, bool &receiver_cannot_write, bool &reader_refused, bool &write_refused, std::string &received) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+
+            auto serving = [](quic_endpoint_t &endpoint, bool &receiver_cannot_write, bool &write_refused, std::string &received) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              auto stream = co_await quic_accept_stream(*arrived);
+              REQUIRE(stream.has_value());
+              receiver_cannot_write = !quic_stream_can_write(*stream) && quic_stream_can_read(*stream);
+              write_refused = !(co_await quic_stream_write(*stream, bytes_of("nope"))).has_value();
+
+              auto reader = quic_stream_create_reader(*stream);
+              REQUIRE(reader.has_value());
+              while (auto chunk = co_await *reader)
+              {
+                received += text_of(*chunk);
+              }
+            }(*pair.server, receiver_cannot_write, write_refused, received);
+
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+
+            auto stream = co_await quic_open_stream(*connection, vio::quic::stream_direction_t::unidirectional);
+            REQUIRE(stream.has_value());
+            sender_cannot_read = quic_stream_can_write(*stream) && !quic_stream_can_read(*stream);
+            reader_refused = !quic_stream_create_reader(*stream).has_value();
+            (void)co_await quic_stream_write_final(*stream, bytes_of("one way only"));
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, sender_cannot_read, receiver_cannot_write, reader_refused, write_refused, received));
+    });
+  event_loop.run();
+
+  CHECK(sender_cannot_read);
+  CHECK(receiver_cannot_write);
+  CHECK(reader_refused);
+  CHECK(write_refused);
+  CHECK(received == "one way only");
+}
+
+TEST_CASE("an open past the peer's limit waits for the credit that raises it")
+{
+  using namespace vio;
+
+  // Section 4.6 forbids exceeding the limit, so waiting is the only correct
+  // behaviour -- open_stream returning std::optional was not a simpler API, it
+  // was the same wait pushed onto every caller with no event to wait on.
+  //
+  // The credit comes back as the server's application finishes with the streams
+  // this client opened, which makes the suspension real backpressure and not a
+  // formality.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool third_refused = false;
+  bool third_opened = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &third_refused, bool &third_opened) -> task_t<void>
+        {
+          {
+            using namespace vio;
+            pair_t pair;
+            {
+              // Two bidirectional streams and no more, which is the smallest
+              // limit that lets this run at all.
+              quic_config_t server_config;
+              server_config.transport.connection.transport_parameters.initial_max_streams_bidi = 2;
+              auto server = quic_endpoint_create(loop, listening, server_config);
+              REQUIRE(server.has_value());
+              const auto any = stream_loopback(0);
+              REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
+              pair.port = quic_endpoint_local_port(*server).value_or(0);
+              pair.server.emplace(std::move(*server));
+
+              auto client = quic_endpoint_create(loop, nullptr, &dialling);
+              REQUIRE(client.has_value());
+              pair.client.emplace(std::move(*client));
+            }
+
+            // The server accepts every stream and finishes with it at once,
+            // which is what returns the credit.
+            auto serving = [](quic_endpoint_t &endpoint) -> task_t<void>
+            {
+              auto arrived = co_await quic_endpoint_accept(endpoint);
+              REQUIRE(arrived.has_value());
+              for (int taken = 0; taken < 3; ++taken)
+              {
+                auto stream = co_await quic_accept_stream(*arrived);
+                if (!stream)
+                {
+                  co_return;
+                }
+                auto reader = quic_stream_create_reader(*stream);
+                if (reader)
+                {
+                  while ((co_await *reader).has_value())
+                  {
+                  }
+                }
+                // A bare FIN, which is the ordinary end of a request and the
+                // one shape that used to leave a stream unreapable for ever.
+                (void)co_await quic_stream_finish(*stream);
+              }
+            }(*pair.server);
+
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+
+            auto first = co_await quic_open_stream(*connection);
+            auto second = co_await quic_open_stream(*connection);
+            REQUIRE(first.has_value());
+            REQUIRE(second.has_value());
+
+            // The limit is spent, so the impatient form fails outright...
+            third_refused = !quic_try_open_stream(*connection).has_value();
+
+            // ...and the patient one waits for the MAX_STREAMS the server sends
+            // once it has finished with these.
+            (void)co_await quic_stream_write_final(*first, bytes_of("one"));
+            (void)co_await quic_stream_write_final(*second, bytes_of("two"));
+            auto third = co_await quic_open_stream(*connection);
+            third_opened = third.has_value();
+            if (third)
+            {
+              (void)co_await quic_stream_write_final(*third, bytes_of("three"));
+            }
+            co_await std::move(serving);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, third_refused, third_opened));
+    });
+  event_loop.run();
+
+  CHECK(third_refused);
+  CHECK(third_opened);
+}
+
+TEST_CASE("a stream handle kept past the connection still answers")
+{
+  using namespace vio;
+
+  // The same bargain quic_connection_t makes, one level down. The transport
+  // reaps a finished stream on its own schedule and everything stops being
+  // readable when it does, so the terminals are latched at the drain -- and a
+  // coroutine that wakes late learns whether its stream finished or was reset
+  // rather than finding a null pointer.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  quic_stream_t survivor;
+  std::uint64_t id = 0;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, quic_stream_t &survivor, std::uint64_t &id) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            (void)co_await quic_stream_write_final(*stream, bytes_of("goodbye"));
+            survivor = *stream;
+            id = quic_stream_id(*stream);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, survivor, id));
+    });
+  event_loop.run();
+
+  REQUIRE(survivor.handle.ref_counted() != nullptr);
+  CHECK(quic_stream_id(survivor) == id);
+  CHECK_FALSE(quic_stream_is_peer_initiated(survivor));
+  CHECK(quic_stream_direction(survivor) == vio::quic::stream_direction_t::bidirectional);
+  // Every operation refuses rather than reaching through a null pointer, and
+  // the reader is refused too.
+  CHECK_FALSE(quic_stream_create_reader(survivor).has_value());
+  quic_stream_reset(survivor, 1);
+  CHECK(quic_stream_stats(survivor).bytes_written == 7);
+}
+
+TEST_CASE("stop_sending ends this endpoint's read without waiting a round trip")
+{
+  using namespace vio;
+
+  // A peer that ignores STOP_SENDING keeps sending, so waiting for its
+  // answering RESET_STREAM is not a bounded-time promise. Ending the receiving
+  // half here is honest -- the application has said it wants nothing more --
+  // and it is what makes a read abortable from a coroutine that does not own
+  // the reader.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  int ending = 0;
+  bool stopped_while_parked = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, bool &stopped_while_parked) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            (void)co_await quic_stream_write(*stream, bytes_of("a request nobody answers"));
+
+            auto reader = quic_stream_create_reader(*stream);
+            REQUIRE(reader.has_value());
+
+            // A second coroutine gives up on the read while this one is parked
+            // on it. That is the case reader.cancel() cannot serve, because the
+            // reader is a local one frame down.
+            auto giving_up = [](event_loop_t &loop, quic_stream_t stream, bool &stopped) -> task_t<void>
+            {
+              (void)co_await sleep(loop, std::chrono::milliseconds(50));
+              stopped = true;
+              quic_stream_stop_sending(stream, 0x99);
+            }(loop, *stream, stopped_while_parked);
+
+            auto chunk = co_await *reader;
+            ending = chunk.has_value() ? -1 : chunk.error().code;
+            co_await std::move(giving_up);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, ending, stopped_while_parked));
+    });
+  event_loop.run();
+
+  CHECK(stopped_while_parked);
+  CHECK(ending == vio_quic_stream_stopped);
+}
+
+TEST_CASE("a second reader on one stream is refused")
+{
+  using namespace vio;
+
+  // Two readers cannot share a byte stream: it has one cursor, and consuming is
+  // what returns flow-control credit. The refusal says what to do about it, in
+  // the style tcp_create_reader uses.
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto listening = vio::quic::tls_context_t::create(stream_server_tls(identity));
+  const auto dialling = vio::quic::tls_context_t::create(stream_client_tls(identity));
+  REQUIRE(listening.has_value());
+  REQUIRE(dialling.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool second_refused = false;
+  bool third_allowed = false;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &second_refused, bool &third_allowed) -> task_t<void>
+        {
+          {
+            auto pair = make_pair(loop, listening, dialling);
+            const auto target = stream_loopback(pair.port);
+            auto connection = co_await quic_endpoint_connect(*pair.client, reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(connection.has_value());
+            auto stream = co_await quic_open_stream(*connection);
+            REQUIRE(stream.has_value());
+            {
+              auto first = quic_stream_create_reader(*stream);
+              REQUIRE(first.has_value());
+              second_refused = !quic_stream_create_reader(*stream).has_value();
+            } // and the first reader's destructor undoes what its constructor did
+            third_allowed = quic_stream_create_reader(*stream).has_value();
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *listening, *dialling, second_refused, third_allowed));
+    });
+  event_loop.run();
+
+  CHECK(second_refused);
+  CHECK(third_allowed);
+}
+
+TEST_CASE("a stream on a handle that names nothing refuses every operation")
+{
+  using namespace vio;
+
+  // ref_ptr_t::data() dereferences unconditionally, so every accessor has to
+  // test before it reaches. A default-constructed handle is reachable -- an
+  // application may well declare one before it has anything to put in it.
+  quic_stream_t nothing;
+  CHECK(quic_stream_id(nothing) == 0);
+  CHECK_FALSE(quic_stream_can_read(nothing));
+  CHECK_FALSE(quic_stream_can_write(nothing));
+  CHECK_FALSE(quic_stream_is_peer_initiated(nothing));
+  CHECK_FALSE(quic_stream_peer_reset_error(nothing).has_value());
+  CHECK_FALSE(quic_stream_peer_stop_sending_error(nothing).has_value());
+  CHECK_FALSE(quic_stream_create_reader(nothing).has_value());
+  CHECK(quic_stream_stats(nothing).bytes_written == 0);
+  CHECK(quic_stream_connection(nothing).handle.ref_counted() == nullptr);
+  quic_stream_reset(nothing, 0);
+  quic_stream_stop_sending(nothing, 0);
+
+  quic_connection_t no_connection;
+  auto opened = quic_open_stream(no_connection);
+  CHECK(opened.await_ready());
+  CHECK_FALSE(opened.await_resume().has_value());
+  auto accepted = quic_accept_stream(no_connection);
+  CHECK(accepted.await_ready());
+  CHECK_FALSE(accepted.await_resume().has_value());
+  CHECK_FALSE(quic_try_open_stream(no_connection).has_value());
 }
 }

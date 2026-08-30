@@ -85,9 +85,34 @@ namespace vio
 // else in vio uses this block: the only other codes are 0x715c00-02 for TLS,
 // 0xca9ce1 for cancellation, and libuv's, which are negative.
 //
-// 0x9c1c01 to 0x9c1c04 are reserved for quic_stream.h -- stream finished,
-// reset, stopped and stale. The hole is left rather than closed so that the
-// numbers published here do not move when those arrive.
+// 0x9c1c01 to 0x9c1c04 are the stream endings. They are declared here rather
+// than in quic_stream.h because quic_connection_state_t owns the stream
+// registry and the edge drain that raises them, and that has to be complete
+// before anything holding a stream can be declared.
+
+// The peer finished the stream cleanly: every byte it sent has been handed over
+// and a FIN followed. Distinct from a reset on purpose -- the transport's
+// stream_receive_finished() answers true for both, which is exactly the defect
+// this pair fixes, and it is the same distinction vio_tls_clean_shutdown and
+// vio_tls_truncated already draw one layer down.
+inline constexpr int vio_quic_stream_finished = 0x9c1c01;
+
+// The peer gave up on the stream with RESET_STREAM. Its 62-bit code does not
+// fit in error_t, which carries an int and is shared by all of vio, so it is
+// read with quic_stream_peer_reset_error -- the error says what happened and
+// that says what the peer called it, which is what an application protocol
+// branches on.
+inline constexpr int vio_quic_stream_reset = 0x9c1c02;
+
+// The sending half is over: the peer sent STOP_SENDING, or this endpoint called
+// quic_stream_stop_sending on its own receiving half. Reported to whichever
+// half it ended.
+inline constexpr int vio_quic_stream_stopped = 0x9c1c03;
+
+// This handle names an id the peer has since reopened. Section 3.2 makes that
+// legitimate, so the handle is retired rather than being allowed to act on a
+// stream it never named.
+inline constexpr int vio_quic_stream_stale = 0x9c1c04;
 
 // The connection ended under this operation with a non-zero code, after its
 // handshake had completed. Which side said so, and why, is in the connection's
@@ -265,7 +290,9 @@ namespace detail
 {
 struct quic_endpoint_state_t;
 struct quic_connection_state_t;
+struct quic_stream_state_t;
 struct quic_op_t;
+struct quic_stream_op_t;
 struct quic_milestone_state_t;
 
 // A waiter lives inside the awaitable, which lives inside the awaiting
@@ -517,6 +544,143 @@ inline void quic_milestone_drain(quic_milestone_state_t &slot)
   }
 }
 
+// One stream, as this layer sees it. Two independent halves that share an
+// identifier, exactly as section 2 has it, which is why the terminals below
+// come in pairs and why finishing one says nothing about the other.
+//
+// It lives here rather than in quic_stream.h for a mechanical reason:
+// quic_connection_state_t owns the registry, and a ref_ptr_t<T> member needs T
+// complete before the struct holding it can be destroyed. The application face
+// -- the handle's operations, the reader, the awaitables -- is in quic_stream.h.
+struct quic_stream_state_t
+{
+  quic_stream_state_t(quic_connection_state_t *owner, std::uint64_t stream_id, bool from_peer)
+    : connection(owner)
+    , id(stream_id)
+    , peer_initiated(from_peer)
+    , direction(vio::quic::stream_direction(stream_id))
+  {
+  }
+  quic_stream_state_t(const quic_stream_state_t &) = delete;
+  quic_stream_state_t &operator=(const quic_stream_state_t &) = delete;
+
+  // Borrowed, and nulled when the connection severs or when the peer reopens
+  // this id. Never strong: a stream that kept its connection alive would keep
+  // the endpoint alive, which is the UDP socket never closed and the event loop
+  // never returning.
+  quic_connection_state_t *connection = nullptr;
+  std::uint64_t id = 0;
+  bool peer_initiated = false;
+  vio::quic::stream_direction_t direction = vio::quic::stream_direction_t::bidirectional;
+
+  // Latched at the drain, because the transport reaps a finished stream on its
+  // own schedule and every one of these stops being readable when it does. A
+  // handle held past the reap is a tombstone that still answers, which is the
+  // same bargain quic_connection_t makes.
+  bool receive_ended = false;
+  bool receive_reset = false;
+  bool send_ended = false;
+  std::optional<std::uint64_t> peer_reset_error;
+  std::optional<std::uint64_t> peer_stop_sending_error;
+
+  // Section 3.2 lets a peer reopen an id that was reaped, and ensure_remote
+  // will build a second stream there because the open counter is a high-water
+  // mark and not a set. The old handle is retired rather than allowed to act on
+  // a stream it never named.
+  bool stale = false;
+
+  // One reader at a time. A second is refused rather than silently sharing the
+  // consume position, which two readers cannot do -- a byte stream has one
+  // cursor.
+  bool reader_attached = false;
+  bool reader_cancelled = false;
+  std::coroutine_handle<> read_continuation;
+
+  std::uint64_t bytes_read = 0;
+  std::uint64_t bytes_written = 0;
+};
+
+// One suspended open or accept. The same shape and the same two-hold protocol
+// as quic_op_t, and a separate type only because it resolves to a stream.
+struct quic_stream_op_t
+{
+  quic_connection_state_t *connection = nullptr;
+  std::coroutine_handle<> continuation;
+  ref_ptr_t<quic_stream_state_t> result = ref_ptr_t<quic_stream_state_t>::null();
+  error_t failure;
+  bool resolved = false;
+  bool failed = false;
+  // Which of the two this is. They wait on the same list, and an accept handed
+  // the credit an open was waiting for would be silent and wrong.
+  bool accepting = false;
+  vio::quic::stream_direction_t direction = vio::quic::stream_direction_t::bidirectional;
+  int holds = 0;
+  registration_t cancel_registration;
+};
+
+[[nodiscard]] inline quic_stream_op_t *quic_stream_op_create(quic_connection_state_t *connection)
+{
+  auto *op = new quic_stream_op_t();
+  op->connection = connection;
+  op->holds = 2;
+  return op;
+}
+
+inline void quic_stream_op_release(quic_stream_op_t *op)
+{
+  if (op == nullptr)
+  {
+    return;
+  }
+  --op->holds;
+  if (op->holds <= 0)
+  {
+    delete op;
+  }
+}
+
+// The first outcome wins, and the registration dies with it -- the same rule
+// quic_op_finish follows, and for the same reason: a resolved operation can
+// never be cancelled, and the caller's token may be a local in the coroutine
+// that is about to return.
+inline void quic_stream_op_finish(quic_stream_op_t &op, ref_ptr_t<quic_stream_state_t> stream)
+{
+  if (op.resolved)
+  {
+    return;
+  }
+  op.result = std::move(stream);
+  op.resolved = true;
+  op.cancel_registration.reset();
+}
+
+inline void quic_stream_op_finish(quic_stream_op_t &op, error_t failure)
+{
+  if (op.resolved)
+  {
+    return;
+  }
+  op.failure = std::move(failure);
+  op.failed = true;
+  op.resolved = true;
+  op.cancel_registration.reset();
+}
+
+inline void quic_stream_op_dispatch(quic_stream_op_t *op)
+{
+  if (op == nullptr)
+  {
+    return;
+  }
+  const auto continuation = op->continuation;
+  op->continuation = {};
+  if (continuation)
+  {
+    continuation.resume();
+  }
+  quic_stream_op_release(op);
+}
+
 struct quic_connection_state_t
 {
   quic_connection_state_t(quic_endpoint_state_t *owner, vio::quic::connection_t *from, vio::quic::tls_role_t which)
@@ -574,6 +738,32 @@ struct quic_connection_state_t
   bool severed = false;
   bool queued = false;
   bool dirty = false;
+
+  // Every stream this layer knows about, and it holds them: a stream the peer
+  // opened exists before anything has accepted it, and a handle the
+  // application drops must not take the transport's stream with it.
+  //
+  // What that costs, and it is worth being honest about it rather than
+  // discovering it: an entry is released when the peer reopens the id, when the
+  // connection severs, or when the application lets its own handle go *and* the
+  // stream is finished on both halves. Dropping a handle does not currently
+  // reset an unfinished sending half -- that policy needs the send-side
+  // accounting the write layer brings, and until then a peer sees the stream
+  // stay open rather than a RESET_STREAM.
+  std::unordered_map<std::uint64_t, ref_ptr_t<quic_stream_state_t>> streams;
+  std::deque<ref_ptr_t<quic_stream_state_t>> stream_accept_queue;
+  // Opens and accepts wait on one list, in call order, the way the endpoint's
+  // dials and accepts do.
+  std::vector<quic_stream_op_t *> stream_ops;
+  // What the sever collected. It runs inside the transport's flush and may not
+  // resume anything, so what it woke waits here for the next beat.
+  std::vector<std::coroutine_handle<>> pending_readers;
+  std::vector<quic_stream_op_t *> pending_stream_ops;
+  // Streams the peer opened that nothing has accepted. Past this the stream is
+  // refused with STOP_SENDING and RESET_STREAM rather than queued, for the same
+  // reason the connection backlog refuses rather than drops: a peer told
+  // nothing waits out a timeout holding credit on both sides.
+  std::size_t stream_accept_backlog = 256;
 };
 } // namespace detail
 
@@ -910,9 +1100,220 @@ inline void quic_mark_dirty(quic_endpoint_state_t &self, ref_ptr_t<quic_connecti
   self.dirty.push_back(std::move(state));
 }
 
+// -----------------------------------------------------------------------------
+// Stream edges
+// -----------------------------------------------------------------------------
+//
+// The transport records four edges and empties each one by reporting it, which
+// is what makes them safe to read on a beat rather than at the moment they
+// happen. `readable_streams()` could not do this job: it is a *level*, so a
+// stream that carried a zero-length FIN, or was reset before anything was read,
+// or whose bytes have just been consumed, is invisible through it.
+
+// Ends a stream's receiving half from this layer's point of view, latching
+// everything a tombstone still has to answer.
+inline void quic_stream_latch_terminal(quic_stream_state_t &stream, vio::quic::connection_t &transport)
+{
+  if (stream.receive_ended || !transport.stream_receive_finished(stream.id))
+  {
+    return;
+  }
+  stream.receive_ended = true;
+  stream.receive_reset = transport.stream_receive_reset(stream.id);
+  if (auto code = transport.stream_peer_reset_error(stream.id); code.has_value())
+  {
+    stream.peer_reset_error = code;
+  }
+}
+
+// Retires a handle that can never name its stream again: the connection ended,
+// or the peer reopened the id. Both halves are terminal afterwards.
+inline void quic_stream_retire(quic_stream_state_t &stream, bool as_stale)
+{
+  stream.stale = stream.stale || as_stale;
+  stream.receive_ended = true;
+  stream.send_ended = true;
+  stream.connection = nullptr;
+}
+
+inline void quic_stream_wake_reader(quic_stream_state_t &stream, std::vector<std::coroutine_handle<>> &out)
+{
+  if (stream.read_continuation)
+  {
+    out.push_back(std::exchange(stream.read_continuation, {}));
+  }
+}
+
+// Hands queued streams to waiting accepts, oldest first, and keeps the two from
+// ever both being non-empty -- the same one-function rule quic_accept_pump
+// follows for connections.
+inline void quic_stream_accept_pump(quic_connection_state_t &self, std::vector<quic_stream_op_t *> &out)
+{
+  while (!self.stream_accept_queue.empty())
+  {
+    const auto waiting = std::find_if(self.stream_ops.begin(), self.stream_ops.end(), [](const quic_stream_op_t *op) { return op->accepting && !op->resolved; });
+    if (waiting == self.stream_ops.end())
+    {
+      return;
+    }
+    auto *op = *waiting;
+    auto stream = std::move(self.stream_accept_queue.front());
+    self.stream_accept_queue.pop_front();
+    quic_stream_op_finish(*op, std::move(stream));
+    self.stream_ops.erase(waiting);
+    out.push_back(op);
+  }
+}
+
+// Serves opens that were waiting on the peer's MAX_STREAMS, oldest first, and
+// stops at the first one the transport will not satisfy -- the credit that
+// arrived is finite and the next waiter has to keep waiting.
+inline void quic_stream_open_pump(quic_connection_state_t &self, std::vector<quic_stream_op_t *> &out)
+{
+  if (self.transport == nullptr)
+  {
+    return;
+  }
+  for (std::size_t index = 0; index < self.stream_ops.size();)
+  {
+    auto *op = self.stream_ops[index];
+    if (op->accepting || op->resolved)
+    {
+      ++index;
+      continue;
+    }
+    const auto opened = self.transport->open_stream(op->direction);
+    if (!opened.has_value())
+    {
+      return;
+    }
+    auto stream = ref_ptr_t<quic_stream_state_t>(&self, *opened, false);
+    self.streams.emplace(*opened, stream);
+    quic_stream_op_finish(*op, std::move(stream));
+    self.stream_ops.erase(self.stream_ops.begin() + static_cast<std::ptrdiff_t>(index));
+    out.push_back(op);
+  }
+}
+
+// Reads the four edge lists and turns them into this layer's terms. Called from
+// the beat, which is the one place anything may be resumed -- and the reason
+// nothing is resumed *here*: the lists are read first, whatever became runnable
+// is collected, and only the caller resumes it, so a coroutine that opens a
+// stream or drops a handle cannot invalidate a walk in progress.
+inline void quic_drain_streams(quic_connection_state_t &self, std::vector<std::coroutine_handle<>> &readers, std::vector<quic_stream_op_t *> &ops)
+{
+  auto *transport = self.transport;
+  if (transport == nullptr)
+  {
+    return;
+  }
+  const auto local = transport->role() == vio::quic::tls_role_t::server ? vio::quic::stream_initiator_t::server : vio::quic::stream_initiator_t::client;
+
+  for (const auto id : transport->take_opened_streams())
+  {
+    // Both sides are reported here, so a stream this endpoint opened arrives
+    // too -- already registered by quic_open_stream, and not a reincarnation.
+    if (vio::quic::stream_initiator(id) == local)
+    {
+      continue;
+    }
+    if (const auto found = self.streams.find(id); found != self.streams.end())
+    {
+      // Section 3.2: the id was reaped and the peer has opened it again. The
+      // old handle is retired rather than allowed to act on a different stream,
+      // and no generation counter is needed -- an id arriving here for which a
+      // state already exists is by definition a new incarnation.
+      quic_stream_retire(found->second.data(), true);
+      quic_stream_wake_reader(found->second.data(), readers);
+      self.streams.erase(found);
+    }
+    auto fresh = ref_ptr_t<quic_stream_state_t>(&self, id, true);
+    self.streams.emplace(id, fresh);
+    if (self.stream_accept_queue.size() < self.stream_accept_backlog)
+    {
+      self.stream_accept_queue.push_back(std::move(fresh));
+    }
+    else
+    {
+      // Told no rather than told nothing: an application that is not accepting
+      // has no way to learn about a stream it will never be handed, and the
+      // peer would wait out its own timeout holding credit on both sides.
+      transport->stop_sending(id, vio::quic::transport_error_no_error);
+      transport->reset_stream(id, vio::quic::transport_error_no_error);
+    }
+  }
+  quic_stream_accept_pump(self, ops);
+
+  for (const auto id : transport->take_data_arrived())
+  {
+    const auto found = self.streams.find(id);
+    if (found == self.streams.end())
+    {
+      continue;
+    }
+    quic_stream_latch_terminal(found->second.data(), *transport);
+    quic_stream_wake_reader(found->second.data(), readers);
+  }
+
+  for (const auto id : transport->take_send_unblocked())
+  {
+    const auto found = self.streams.find(id);
+    if (found == self.streams.end())
+    {
+      continue;
+    }
+    // Step 5 writes are unbounded, so there is no parked writer to wake. The
+    // one thing that still has to be caught here is STOP_SENDING, which ends
+    // the sending half and is the only edge that reports it.
+    if (auto code = transport->stream_peer_stop_sending_error(id); code.has_value())
+    {
+      found->second->peer_stop_sending_error = code;
+      found->second->send_ended = true;
+    }
+  }
+
+  if (transport->take_stream_credit_opened())
+  {
+    quic_stream_open_pump(self, ops);
+  }
+}
+
+// Everything the connection still holds, told that it is over. Called from the
+// sever, so it runs before the transport pointer is nulled and while the
+// terminals can still be read out of it.
+inline void quic_retire_streams(quic_connection_state_t &self, std::vector<std::coroutine_handle<>> &readers, std::vector<quic_stream_op_t *> &ops)
+{
+  auto registry = std::exchange(self.streams, {});
+  for (auto &entry : registry)
+  {
+    if (self.transport != nullptr)
+    {
+      quic_stream_latch_terminal(entry.second.data(), *self.transport);
+    }
+    quic_stream_retire(entry.second.data(), false);
+    quic_stream_wake_reader(entry.second.data(), readers);
+  }
+  self.stream_accept_queue.clear();
+
+  auto waiting = std::exchange(self.stream_ops, {});
+  for (auto *op : waiting)
+  {
+    quic_stream_op_finish(*op, error_t{.code = vio_quic_connection_closed, .msg = "the connection ended"});
+    ops.push_back(op);
+  }
+}
+
 inline void quic_drain_connection(ref_ptr_t<quic_connection_state_t> &state)
 {
   state->queued = false;
+
+  // Collected first and resumed afterwards, because a resumed reader may open a
+  // stream, drop a handle or close the connection -- any of which would
+  // invalidate a walk over the registry.
+  auto readers = std::exchange(state->pending_readers, {});
+  auto ops = std::exchange(state->pending_stream_ops, {});
+  quic_drain_streams(state.data(), readers, ops);
+
   if (state->ready.ref_counted() != nullptr)
   {
     quic_milestone_drain(state->ready.data());
@@ -920,6 +1321,18 @@ inline void quic_drain_connection(ref_ptr_t<quic_connection_state_t> &state)
   if (state->closed.ref_counted() != nullptr)
   {
     quic_milestone_drain(state->closed.data());
+  }
+  for (auto *op : ops)
+  {
+    op->connection = nullptr;
+    quic_stream_op_dispatch(op);
+  }
+  for (const auto continuation : readers)
+  {
+    if (continuation)
+    {
+      continuation.resume();
+    }
   }
 }
 
@@ -1084,6 +1497,11 @@ inline void quic_sever(quic_endpoint_state_t &self, ref_ptr_t<quic_connection_st
   }
   state->severed = true;
   state->ending = ending;
+  // Before the transport pointer goes: the terminals are read out of it, and
+  // after this line there is nothing to read them from. Nothing is resumed --
+  // this is the transport's flush -- so both lists ride to the beat on the
+  // state, which quic_mark_pending below is what queues.
+  quic_retire_streams(state.data(), state->pending_readers, state->pending_stream_ops);
   if (state->transport != nullptr)
   {
     state->close_reason = state->transport->close_reason();
