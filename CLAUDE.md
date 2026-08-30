@@ -485,6 +485,33 @@ drain, before the application could accept any of it.
   the 0-RTT window, because `quic_endpoint_accept` resolves only once a handshake has
   completed -- `quic_zero_rtt.cpp` records that.
 
+## Verification
+
+What has actually been run against the QUIC stack, so the next person knows what
+a green Windows build does and does not cover.
+
+**Platforms.** MSVC release and MSVC ASan on Windows; GCC 14 on Ubuntu 24.04
+under ASan, UBSan and TSan, through `ghcr.io/jorgen/vio-ci`. All clean. Two
+things only the Linux run can tell you: MSVC's ASan has **no LeakSanitizer**, so
+leaks are invisible on Windows -- one in the coroutine layer's pre-resolved
+operations survived a full ASan run there and was caught the first time
+LeakSanitizer saw it -- and glibc declares `error_t`, so `using namespace vio`
+in a test that is only ever built on Windows will not compile on Linux.
+
+TSan needs ASLR off on a modern kernel or it aborts with "unexpected memory
+mapping" before running a line: `docker run --privileged ... setarch $(uname -m)
+-R ./build/test/vio_tests`.
+
+**Interop with picoquic** (`3rdparty/interop/picoquic`, v1.1.52). Both
+directions, byte-exact: picoquicdemo client to `vio_interop_server` over three
+concurrent streams, and `vio_interop_endpoint` as a client against picoquicdemo's
+server. Retry with vio minting and validating the token, QUIC version 2
+(`picoquicdemo -v 6b3343cf`), session resumption, and 0-RTT reporting "early data
+accepted" all pass. One gap: `picoquicdemo -r` does not start a server in this
+build -- it prints its token-file line and exits -- so picoquic *sending* a Retry
+to a vio client is untested. vio sending one is covered, which is the direction
+that exercises vio's own `retry_token.h`.
+
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, boringssl, doctest, cmakerc, ada (fetched via cmake-dep)
 
