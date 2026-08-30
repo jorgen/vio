@@ -14,7 +14,26 @@ A design proposal. Progress against the eight-step build order at the bottom:
   bottom of this file. `src/vio/operation/quic_endpoint.h` and `test/test_quic_coroutine.cpp`;
   53 test cases. Streams, writes and datagrams (steps 5 to 7 of the *feature* list, not the
   build order) are still to come, and nothing in the header names a stream yet.
-- **Steps 5 to 8 — not started.**
+- **Step 5 (streams) — done.** `src/vio/operation/quic_stream.h`: open, try-open, accept,
+  the reader with `co_await` and `read_into`, latched terminals and peer codes,
+  finish/reset/stop_sending, and section 3.2 reincarnation. Writes are still
+  submit-and-resolve, which is what step 6 changes.
+- **Step 8 (migrate the examples) — done early**, out of order, because it was what was
+  asked for. All seven examples are on the coroutine API. Two deliberate exceptions, both
+  written into the examples themselves: `quic_datagram.cpp` reaches through
+  `quic_connection_native()` because datagrams are step 7, and `quic_bulk_transfer.cpp`
+  keeps a hand-rolled credit loop because bounded writes are step 6. The interop programs
+  have *not* moved.
+- **Steps 6 and 7 — not started.**
+
+Landed alongside step 5, outside the build order: `quic_endpoint_connect_early` and the
+ticket accessor (the 0-RTT example is unwritable without them, since an ordinary dial
+resolves exactly too late to put anything in the first flight), and one transport fix --
+`send_stream_t::on_range_acknowledged` returned early on a zero-length range, so a stream
+half-closed with a bare FIN never reached `data_received`, was never reaped, and never
+returned its MAX_STREAMS credit. That is the deadlock `reap_and_grant`'s own comment warns
+about, and it is reached by the most ordinary shape there is: read a request to the end,
+then half-close.
 
 Landed alongside these, outside the build order: peer-to-peer endpoints (two TLS contexts),
 mutual TLS, and six verified bug fixes.

@@ -445,6 +445,31 @@ which is where an encrypted transport's time belongs. `loss_recovery.h` is RFC 9
   in between. `QUIC_COROUTINE_API.md` is the design doc and records what its own build
   order got wrong.
 
+  **Streams** are `src/vio/operation/quic_stream.h`, with the state and the edge drain in
+  `quic_endpoint.h` next to the other state -- `quic_connection_state_t` owns the registry
+  and a `ref_ptr_t` member needs its type complete, so the physical split is mechanism
+  here, application face there. The organising idea is that **an ending is an ordinary
+  entry, not a flag on the side**: a read yields bytes until there are none, then
+  `vio_quic_stream_finished` or `vio_quic_stream_reset`, which is the whole fix for
+  `stream_receive_finished()` answering true for both. Nothing is buffered on the
+  application's behalf -- bytes stay in the transport's reassembly until an await takes
+  them, and taking them is the call that returns MAX_STREAM_DATA credit, so a stream
+  nobody reads stops the peer through the mechanism the protocol already has.
+  `quic_accept_stream` is built on `take_opened_streams()` rather than
+  `readable_streams()`, because the latter is a *level* and cannot report a stream that
+  carried only a zero-length FIN. Section 3.2 reincarnation is handled by that same list:
+  an id arriving for which a state already exists is by definition a new stream, so the
+  old handle is retired with `vio_quic_stream_stale`.
+
+  **Writes are not yet bounded.** `quic_stream_write` hands everything to the transport
+  and resolves at once; the awaitable shape exists so the write layer can add high-water
+  marks without moving a call site. `quic_bulk_transfer.cpp` is the example that shows
+  what an application still has to do about it, and `quic_stream_stats` is the accounting
+  it meters against. Also missing: dropping a handle with an unfinished sending half does
+  *not* reset it (that policy needs the send-side accounting), and a server cannot observe
+  the 0-RTT window, because `quic_endpoint_accept` resolves only once a handshake has
+  completed -- `quic_zero_rtt.cpp` records that.
+
 - `test/` - Tests using doctest
 - `3rdparty/` - libuv, boringssl, doctest, cmakerc, ada (fetched via cmake-dep)
 
