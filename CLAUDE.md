@@ -170,8 +170,41 @@ Configuration is in `.clang-tidy` at the project root.
   Everything TLS produces is kept per level until acknowledged so a lost CRYPTO
   frame can be resent byte for byte, and a PTO probe carries outstanding data
   rather than a bare PING (section 6.2.4) -- during a handshake a PING would
-  elicit an ACK while telling the peer nothing it is waiting for. Connection
-  migration is **not** built yet.
+  elicit an ACK while telling the peer nothing it is waiting for.
+
+  **Connection migration** (section 9) is in, and the whole of it lives in the
+  receive path: a datagram from an address the connection is not using moves it,
+  but only on the *highest-numbered non-probing* packet that authenticated
+  (9.3), so neither reordering nor a replay can drag a connection somewhere the
+  peer has already left. Moving resets the congestion controller, the RTT
+  estimator and the pacer (9.4) -- the new path is a different path and what the
+  old one measured is worth nothing -- switches to a peer connection id the old
+  path never carried (9.5), and starts the anti-amplification allowance again
+  from zero, because section 8's limit is per path and a spoofed source address
+  would otherwise make the server an amplifier aimed at whoever was named. The
+  endpoint follows by watching migration_count *change across one datagram*: the
+  running total stays above zero for the rest of the connection, so testing it
+  would redirect on any later datagram from anywhere.
+
+  The part that is easy to miss, and was: a peer probes a new path *before* it
+  moves to it (9.2), and a probing packet by definition does **not** migrate the
+  connection (9.1). So the PATH_RESPONSE it is owed goes to an address the
+  connection is not using and never will unless that echo arrives -- section
+  8.2.2 requires the response on the path the challenge came in on. A
+  demultiplexer holding one peer address per connection sends it to the old one
+  instead, and the peer's validation quietly times out. That is why
+  `path_response_queue_t` carries the arrival address with each echo, and why
+  `poll_send` has a three-argument form reporting a per-datagram destination;
+  the two-argument form cannot address a datagram, so it holds such an echo
+  rather than sending it to the wrong place. An off-path echo goes out alone,
+  carrying nothing else at all: the address is unvalidated by definition, and
+  section 9.3.1 is about what a spoofed source gets delivered to it.
+
+  Worth knowing how this fails, because it fails *silently*: with the echo
+  misaddressed, `picoquicdemo -f 3` still transfers every byte and still exits
+  zero -- it simply never migrates, and stays on the path it wanted to leave.
+  The interop server prints `migrations=` for exactly this reason. Judging
+  migration by whether the data arrived will tell you it works when it does not.
   Retry (section 17.2.5) and key update (RFC 9001 section 6) are both in.
   `retry_token.h` seals the token under a server-held AEAD key with the client
   address as associated data and a lifetime, because a token that is forgeable,

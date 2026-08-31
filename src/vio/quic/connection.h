@@ -338,6 +338,18 @@ public:
   // there is nothing to send right now, which is the normal idle answer.
   [[nodiscard]] std::expected<std::size_t, error_t> poll_send(std::span<std::uint8_t> out, tick_t now);
 
+  // The same, for a caller that can address a datagram itself.
+  //
+  // `destination` is cleared and left empty for every datagram belonging to the
+  // path the connection is on, which is almost all of them. It is filled in
+  // only for a PATH_RESPONSE owed to somewhere else -- a peer probing an address
+  // before it migrates there -- which section 8.2.2 requires be answered on the
+  // path the challenge arrived by, and which the two-argument form above
+  // therefore cannot send at all. A demultiplexer that keeps one peer address
+  // per connection has to consult this or the peer's validation times out and
+  // it never moves.
+  [[nodiscard]] std::expected<std::size_t, error_t> poll_send(std::span<std::uint8_t> out, tick_t now, std::vector<std::uint8_t> *destination);
+
   // When poll_send should next be called even if nothing else happens: an ACK
   // is owed, or loss detection has something to report. Nothing pending means
   // no deadline.

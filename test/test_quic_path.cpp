@@ -205,7 +205,7 @@ TEST_CASE("the echo queue keeps the newest and is bounded")
   std::vector<path_challenge_data_t> drained;
   while (!queue.empty())
   {
-    drained.push_back(queue.front());
+    drained.push_back(queue.front().data);
     queue.pop();
   }
   REQUIRE(drained.size() == max_queued_path_responses);

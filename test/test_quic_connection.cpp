@@ -2669,6 +2669,235 @@ TEST_CASE("a peer that moves is followed, cautiously")
     CHECK_FALSE(server->close_reason().has_value());
   }
 }
+TEST_CASE("a path is probed before it is moved to")
+{
+  // Section 9.2 asks a peer to validate a new address before migrating to it,
+  // and section 8.2.2 says the answer goes back on the path the challenge
+  // arrived by. Those two together are how a client that knows it has moved --
+  // a phone leaving wifi -- checks the new path still reaches the server before
+  // committing a live connection to it.
+  //
+  // The probe is the awkward case for a demultiplexer that keeps one peer
+  // address per connection, because a probing packet is precisely the one that
+  // does NOT move the connection (section 9.1: probing frames prove nothing
+  // about where the peer is). So the echo is owed to an address the connection
+  // is not using and will never use unless the echo arrives.
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  server_config.transport_parameters.active_connection_id_limit = 4;
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+  client_config.transport_parameters.active_connection_id_limit = 4;
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  const std::vector<std::uint8_t> home = {10, 0, 0, 1, 0xc0, 0x00};
+  const std::vector<std::uint8_t> away = {10, 0, 0, 2, 0xc0, 0x01};
+
+  auto pump = [&](vio::tick_t now, const std::vector<std::uint8_t> &from)
+  {
+    std::size_t moved = 0;
+    for (int round = 0; round < 8; ++round)
+    {
+      bool any = false;
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = client->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        REQUIRE(server->receive(datagram, now, from).has_value());
+        any = true;
+        ++moved;
+      }
+      for (;;)
+      {
+        std::vector<std::uint8_t> datagram(1500);
+        auto size = server->poll_send(datagram, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        datagram.resize(*size);
+        REQUIRE(client->receive(datagram, now).has_value());
+        any = true;
+        ++moved;
+      }
+      if (!any)
+      {
+        break;
+      }
+    }
+    return moved;
+  };
+
+  REQUIRE(pump(at(0ns), home) > 0);
+  REQUIRE(client->handshake_complete());
+  REQUIRE(server->handshake_complete());
+
+  // A 1-RTT exchange, so the server has an address to compare against at all.
+  auto warmup = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(warmup.has_value());
+  const std::vector<std::uint8_t> hello = {'h', 'o', 'm', 'e'};
+  REQUIRE(client->write_stream(*warmup, hello, true) == hello.size());
+  REQUIRE(pump(at(1ms), home) > 0);
+  REQUIRE(server->migration_count() == 0);
+
+  // The client probes the address it is thinking of moving to. Nothing else is
+  // outstanding, so what comes out carries the challenge and no more -- which
+  // is what makes it a probing packet.
+  client->validate_path(at(5ms));
+  std::vector<std::uint8_t> probe(1500);
+  auto probe_size = client->poll_send(probe, at(5ms));
+  REQUIRE(probe_size.has_value());
+  REQUIRE(*probe_size > 0);
+  probe.resize(*probe_size);
+  REQUIRE(server->receive(probe, at(5ms), away).has_value());
+
+  // Section 9.1: a probing packet does not move the connection, however
+  // convincing the address it came from.
+  CHECK(server->migration_count() == 0);
+
+  // Section 8.2.2: and yet the echo is owed, to the address it came from. The
+  // three-argument poll_send is the only way to learn that; the two-argument
+  // one has no way to say it and holds the echo instead of sending it wrong.
+  std::vector<std::uint8_t> destination;
+  std::vector<std::uint8_t> answer(1500);
+  auto answer_size = server->poll_send(answer, at(5ms), &destination);
+  REQUIRE(answer_size.has_value());
+  REQUIRE(*answer_size > 0);
+  CHECK(destination == away);
+  answer.resize(*answer_size);
+
+  // And it validates the client's new path, which is the whole point of the
+  // exercise: only now would a well-behaved client migrate.
+  CHECK(client->path_state() == path_state_t::validating);
+  REQUIRE(client->receive(answer, at(6ms)).has_value());
+  CHECK(client->path_state() == path_state_t::validated);
+
+  // The connection itself never moved. It is still talking to the old address,
+  // and the server's own path is untouched.
+  CHECK(server->migration_count() == 0);
+}
+
+TEST_CASE("an echo owed elsewhere never rides with the connection's own traffic")
+{
+  // Section 9.3.1: the probed address is unvalidated by definition -- answering
+  // is how it becomes validated -- so an endpoint must not send it anything it
+  // would mind an attacker receiving. A spoofed source address turns any
+  // passenger frame into a packet delivered to the victim, and charges the real
+  // path's byte ledger for it.
+  const auto identity = make_self_signed("localhost");
+  auto contexts = make_contexts(identity);
+
+  connection_config_t server_config;
+  server_config.role = tls_role_t::server;
+  server_config.transport_parameters = sane_parameters();
+  connection_config_t client_config;
+  client_config.role = tls_role_t::client;
+  client_config.transport_parameters = sane_parameters();
+
+  auto server = connection_t::create(contexts.server_context, server_config);
+  REQUIRE(server.has_value());
+  auto client = connection_t::create(contexts.client_context, client_config, "localhost");
+  REQUIRE(client.has_value());
+
+  const std::vector<std::uint8_t> home = {10, 0, 0, 1, 0xc0, 0x00};
+  const std::vector<std::uint8_t> away = {10, 0, 0, 2, 0xc0, 0x01};
+
+  auto pump = [&](vio::tick_t now)
+  {
+    for (int round = 0; round < 8; ++round)
+    {
+      bool any = false;
+      for (;;)
+      {
+        std::vector<std::uint8_t> d(1500);
+        auto size = client->poll_send(d, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        d.resize(*size);
+        REQUIRE(server->receive(d, now, home).has_value());
+        any = true;
+      }
+      for (;;)
+      {
+        std::vector<std::uint8_t> d(1500);
+        auto size = server->poll_send(d, now);
+        REQUIRE(size.has_value());
+        if (*size == 0)
+        {
+          break;
+        }
+        d.resize(*size);
+        REQUIRE(client->receive(d, now).has_value());
+        any = true;
+      }
+      if (!any)
+      {
+        return;
+      }
+    }
+  };
+
+  pump(at(0ns));
+  REQUIRE(server->handshake_complete());
+  auto warmup = client->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(warmup.has_value());
+  REQUIRE(client->write_stream(*warmup, std::vector<std::uint8_t>{'h', 'i'}, true) == 2u);
+  pump(at(1ms));
+
+  // The server has something of its own to say at the same moment the probe
+  // lands, so the two could be conflated.
+  auto reply = server->open_stream(stream_direction_t::bidirectional);
+  REQUIRE(reply.has_value());
+  const std::vector<std::uint8_t> secret(400, 0x5a);
+  REQUIRE(server->write_stream(*reply, secret, false) == secret.size());
+
+  client->validate_path(at(5ms));
+  std::vector<std::uint8_t> probe(1500);
+  auto probe_size = client->poll_send(probe, at(5ms));
+  REQUIRE(probe_size.has_value());
+  REQUIRE(*probe_size > 0);
+  probe.resize(*probe_size);
+  REQUIRE(server->receive(probe, at(5ms), away).has_value());
+
+  // The first datagram out is the echo, addressed to the probe, and it carries
+  // nothing the connection owns: the stream bytes are still waiting.
+  std::vector<std::uint8_t> destination;
+  std::vector<std::uint8_t> first(1500);
+  auto first_size = server->poll_send(first, at(5ms), &destination);
+  REQUIRE(first_size.has_value());
+  REQUIRE(*first_size > 0);
+  REQUIRE(destination == away);
+  const auto before = server->stream_send_stats(*reply).sent;
+  CHECK(before == 0);
+
+  // The stream bytes go to the real peer, on the next datagram.
+  std::vector<std::uint8_t> next(1500);
+  auto next_size = server->poll_send(next, at(5ms), &destination);
+  REQUIRE(next_size.has_value());
+  REQUIRE(*next_size > 0);
+  CHECK(destination.empty());
+  CHECK(server->stream_send_stats(*reply).sent > 0);
+}
+
 TEST_CASE("a stateless reset ends the connection and a lookalike does not")
 {
   const auto identity = make_self_signed("localhost");

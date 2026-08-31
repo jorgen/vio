@@ -1643,6 +1643,262 @@ TEST_CASE("one endpoint both answers and dials on the same port")
 
 // What an endpoint holds decides what it can do, and both refusals are
 // immediate rather than a handshake that quietly never completes.
+TEST_CASE("a connection survives its peer's address changing under it")
+{
+  using namespace vio;
+  using namespace vio::quic;
+
+  // NAT rebinding, over real sockets, which is the shape migration actually
+  // arrives in: nobody tells the client anything, its datagrams simply start
+  // reaching the server from a different source address. Section 9.3 says the
+  // server follows -- and everything below the endpoint has been tested with
+  // byte arrays, so this is the first thing that exercises the demultiplexer
+  // rerouting a live connection and the socket sending to the new address.
+  //
+  // The rebind is faked with a relay: the client talks to one socket, and the
+  // relay forwards to the server from `up_a` and then, on command, from `up_b`.
+  // To the server that is one connection whose peer moved; to the client
+  // nothing happened at all, which is exactly what a NAT does to you.
+  const auto identity = make_self_signed("localhost");
+  tls_config_t server_tls;
+  server_tls.role = tls_role_t::server;
+  server_tls.certificate_chain_pem = identity.certificate_pem;
+  server_tls.private_key_pem = identity.private_key_pem;
+  server_tls.alpn = {"test"};
+  tls_config_t client_tls;
+  client_tls.role = tls_role_t::client;
+  client_tls.ca_certificates_pem = identity.certificate_pem;
+  client_tls.alpn = {"test"};
+  auto server_context = tls_context_t::create(server_tls);
+  auto client_context = tls_context_t::create(client_tls);
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<task_t<void>> task;
+  bool handshaken = false;
+  std::uint64_t migrations = 0;
+  std::string before_move;
+  std::string after_move;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const tls_context_t &server_ctx, const tls_context_t &client_ctx, bool &handshaken, std::uint64_t &migrations, std::string &before_move, std::string &after_move) -> task_t<void>
+        {
+          {
+            endpoint_config_t server_config;
+            server_config.connection.role = tls_role_t::server;
+            server_config.connection.transport_parameters = sane_parameters();
+            auto server_made = endpoint_t::create(loop, server_ctx, server_config);
+            REQUIRE(server_made.has_value());
+            std::optional<endpoint_t> server(std::move(*server_made));
+            auto any = ip4_addr("127.0.0.1", 0);
+            REQUIRE(any.has_value());
+            REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&*any)).has_value());
+            const auto server_port = server->local_port();
+            REQUIRE(server_port.has_value());
+
+            // The server answers whatever arrives on a stream.
+            connection_t *accepted = nullptr;
+            server->on_connection([&accepted](connection_t &c) { accepted = &c; });
+            server->on_activity(
+              [](connection_t &c)
+              {
+                for (const auto id : c.readable_streams())
+                {
+                  auto readable = c.readable_stream(id);
+                  (void)c.write_stream(id, readable, false);
+                  c.consume_stream(id, readable.size());
+                }
+              });
+
+            // The relay's three sockets.
+            auto face_made = udp_create(loop);
+            auto up_a_made = udp_create(loop);
+            auto up_b_made = udp_create(loop);
+            REQUIRE(face_made.has_value());
+            REQUIRE(up_a_made.has_value());
+            REQUIRE(up_b_made.has_value());
+            std::optional<udp_t> face(std::move(*face_made));
+            std::optional<udp_t> up_a(std::move(*up_a_made));
+            std::optional<udp_t> up_b(std::move(*up_b_made));
+            for (auto *sock : {&*face, &*up_a, &*up_b})
+            {
+              REQUIRE(udp_bind(*sock, reinterpret_cast<const sockaddr *>(&*any)).has_value());
+            }
+            auto face_name = udp_sockname(*face);
+            REQUIRE(face_name.has_value());
+            const int face_port = ntohs(reinterpret_cast<const sockaddr_in *>(&*face_name)->sin_port);
+
+            const auto to_server = ip4_addr("127.0.0.1", *server_port);
+            REQUIRE(to_server.has_value());
+            bool use_b = false;
+            sockaddr_storage client_addr = {};
+            bool have_client = false;
+
+            // The readers live out here so the pumps below can be woken before
+            // anything they hold a reference to goes away: cancel, then release
+            // the reader, then the socket. A pump parked on a reader that is
+            // simply dropped never returns, and its socket's uv_close is never
+            // issued, and run() never returns.
+            auto face_reader_made = udp_create_reader(*face);
+            auto up_a_reader_made = udp_create_reader(*up_a);
+            auto up_b_reader_made = udp_create_reader(*up_b);
+            REQUIRE(face_reader_made.has_value());
+            REQUIRE(up_a_reader_made.has_value());
+            REQUIRE(up_b_reader_made.has_value());
+            std::optional<udp_reader_t> face_reader(std::move(*face_reader_made));
+            std::optional<udp_reader_t> up_a_reader(std::move(*up_a_reader_made));
+            std::optional<udp_reader_t> up_b_reader(std::move(*up_b_reader_made));
+
+            // Client -> server, through whichever uplink is current.
+            auto forward_up = [](udp_reader_t &r, udp_t &a, udp_t &b, sockaddr_in dest, bool &use_b, sockaddr_storage &client_addr, bool &have_client) -> detached_task_t
+            {
+              for (;;)
+              {
+                auto dgram = co_await r;
+                if (!dgram.has_value())
+                {
+                  break;
+                }
+                client_addr = dgram->sender_addr;
+                have_client = true;
+                const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t *>(dgram->data.buf.base), dgram->data.buf.len);
+                (void)udp_try_send(use_b ? b : a, bytes, reinterpret_cast<const sockaddr *>(&dest));
+              }
+            }(*face_reader, *up_a, *up_b, *to_server, use_b, client_addr, have_client);
+
+            // Server -> client, from whichever uplink it answered on.
+            //
+            // `retired` is what makes this a rebind rather than a second path:
+            // once the NAT has moved, the old mapping is gone, and a reply the
+            // server still addresses to it is dropped on the floor. Without
+            // that the test proves nothing -- the server could keep answering
+            // the old address for ever and the client would never notice.
+            auto forward_down = [](udp_reader_t &r, udp_t &face_sock, sockaddr_storage &client_addr, bool &have_client, const bool &retired) -> detached_task_t
+            {
+              for (;;)
+              {
+                auto dgram = co_await r;
+                if (!dgram.has_value())
+                {
+                  break;
+                }
+                if (!have_client || retired)
+                {
+                  continue;
+                }
+                const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t *>(dgram->data.buf.base), dgram->data.buf.len);
+                (void)udp_try_send(face_sock, bytes, reinterpret_cast<const sockaddr *>(&client_addr));
+              }
+            };
+            bool never_retired = false;
+            auto down_a = forward_down(*up_a_reader, *face, client_addr, have_client, use_b);
+            auto down_b = forward_down(*up_b_reader, *face, client_addr, have_client, never_retired);
+            (void)forward_up;
+            (void)down_a;
+            (void)down_b;
+
+            endpoint_config_t client_config;
+            client_config.connection.role = tls_role_t::client;
+            client_config.connection.transport_parameters = sane_parameters();
+            auto client_made = endpoint_t::create(loop, client_ctx, client_config);
+            REQUIRE(client_made.has_value());
+            std::optional<endpoint_t> client(std::move(*client_made));
+
+            std::string echoed;
+            client->on_activity(
+              [&echoed](connection_t &c)
+              {
+                for (const auto id : c.readable_streams())
+                {
+                  auto readable = c.readable_stream(id);
+                  echoed.append(reinterpret_cast<const char *>(readable.data()), readable.size());
+                  c.consume_stream(id, readable.size());
+                }
+              });
+
+            cancellation_t server_stop;
+            cancellation_t client_stop;
+            auto run_one = [](endpoint_t &e, cancellation_t &c) -> detached_task_t { co_await e.run(&c); };
+            auto server_run = run_one(*server, server_stop);
+            auto client_run = run_one(*client, client_stop);
+            (void)server_run;
+            (void)client_run;
+
+            const auto via_relay = ip4_addr("127.0.0.1", face_port);
+            REQUIRE(via_relay.has_value());
+            auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&*via_relay), "localhost");
+            REQUIRE(dialled.has_value());
+            for (int i = 0; i < 400 && (client->connection(*dialled) == nullptr || !client->connection(*dialled)->handshake_complete()); ++i)
+            {
+              (void)co_await sleep(loop, 5ms);
+            }
+            auto *connection = client->connection(*dialled);
+            REQUIRE(connection != nullptr);
+            handshaken = connection->handshake_complete();
+
+            auto stream = connection->open_stream(stream_direction_t::bidirectional);
+            REQUIRE(stream.has_value());
+            const std::string one = "before";
+            (void)connection->write_stream(*stream, std::span(reinterpret_cast<const std::uint8_t *>(one.data()), one.size()), false);
+            (void)client->flush();
+            for (int i = 0; i < 400 && echoed.size() < one.size(); ++i)
+            {
+              (void)co_await sleep(loop, 5ms);
+            }
+            before_move = echoed;
+            echoed.clear();
+
+            // The NAT rebinds. Nothing else changes.
+            use_b = true;
+
+            const std::string two = "after";
+            auto *live = client->connection(*dialled);
+            REQUIRE(live != nullptr);
+            (void)live->write_stream(*stream, std::span(reinterpret_cast<const std::uint8_t *>(two.data()), two.size()), false);
+            (void)client->flush();
+            for (int i = 0; i < 600 && echoed.size() < two.size(); ++i)
+            {
+              (void)co_await sleep(loop, 5ms);
+            }
+            after_move = echoed;
+            if (accepted != nullptr)
+            {
+              migrations = accepted->migration_count();
+            }
+
+            server_stop.cancel();
+            client_stop.cancel();
+            face_reader->cancel();
+            up_a_reader->cancel();
+            up_b_reader->cancel();
+            (void)co_await sleep(loop, 50ms);
+            face_reader.reset();
+            up_a_reader.reset();
+            up_b_reader.reset();
+            server.reset();
+            client.reset();
+            face.reset();
+            up_a.reset();
+            up_b.reset();
+            (void)co_await sleep(loop, 50ms);
+          }
+          loop.stop();
+        }(event_loop, *server_context, *client_context, handshaken, migrations, before_move, after_move));
+    });
+  event_loop.run();
+
+  CHECK(handshaken);
+  CHECK(before_move == "before");
+  // The bytes that matter: these crossed a path the connection was not on when
+  // it started, and only arrived because the server followed the move.
+  CHECK(after_move == "after");
+  CHECK(migrations == 1);
+}
+
 TEST_CASE("a dial refuses an address it cannot read")
 {
   using namespace vio;

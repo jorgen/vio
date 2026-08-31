@@ -93,6 +93,31 @@ constexpr std::size_t coalesced_receive_size = 64 * 1024;
   return out;
 }
 
+// The inverse of address_bytes, for the one caller that is handed an address as
+// bytes rather than as a sockaddr: a PATH_RESPONSE the connection says must go
+// to a path it is not on.
+[[nodiscard]] bool address_from_bytes(std::span<const std::uint8_t> bytes, sockaddr_storage &out)
+{
+  std::memset(&out, 0, sizeof(out));
+  if (bytes.size() == 1 + 4 + 2 && bytes[0] == 4)
+  {
+    auto *in4 = reinterpret_cast<sockaddr_in *>(&out);
+    in4->sin_family = AF_INET;
+    std::memcpy(&in4->sin_addr, bytes.data() + 1, 4);
+    std::memcpy(&in4->sin_port, bytes.data() + 5, 2);
+    return true;
+  }
+  if (bytes.size() == 1 + 16 + 2 && bytes[0] == 6)
+  {
+    auto *in6 = reinterpret_cast<sockaddr_in6 *>(&out);
+    in6->sin6_family = AF_INET6;
+    std::memcpy(&in6->sin6_addr, bytes.data() + 1, 16);
+    std::memcpy(&in6->sin6_port, bytes.data() + 17, 2);
+    return true;
+  }
+  return false;
+}
+
 // Section 8.1.3: the same address with the port left off. A NEW_TOKEN token is
 // meant to be redeemed on a later connection, and the client's port will
 // almost certainly have changed by then, so binding one to the port would make
@@ -682,10 +707,37 @@ void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
     {
       impl.batch.resize(used + max_datagram);
     }
-    auto size = entry.connection->poll_send(std::span<std::uint8_t>(impl.batch).subspan(used, max_datagram), now);
+    std::vector<std::uint8_t> destination;
+    auto size = entry.connection->poll_send(std::span<std::uint8_t>(impl.batch).subspan(used, max_datagram), now, &destination);
     if (!size.has_value() || *size == 0)
     {
       break;
+    }
+
+    if (!destination.empty())
+    {
+      // Section 8.2.2: an echo owed to a path this connection is not on. It
+      // cannot join the batch, which is addressed to the peer, so whatever is
+      // held goes first and this leaves on its own.
+      //
+      // Not ECN-marked and not counted against the path's congestion state: it
+      // is an obligation to an address that has proven nothing yet, and it is
+      // the one datagram here that is not part of the connection's own flow.
+      // Where poll_send actually wrote it, which is past whatever the batch is
+      // still holding -- and flush_batch below does not move those bytes.
+      const std::size_t at = used;
+      flush_batch(impl, entry, used, segment, count);
+      used = 0;
+      segment = 0;
+      count = 0;
+      sockaddr_storage probe = {};
+      if (address_from_bytes(destination, probe))
+      {
+        send_to(impl, std::span<const std::uint8_t>(impl.batch).subspan(at, *size), reinterpret_cast<const sockaddr *>(&probe));
+        ++impl.stats.sends;
+        ++impl.stats.datagrams_sent;
+      }
+      continue;
     }
 
     if (count == 0)

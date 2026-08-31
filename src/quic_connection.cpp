@@ -332,6 +332,11 @@ struct connection_impl_t
   std::vector<std::uint64_t> qlog_pending_lost;
   bool qlog_metrics_pending = false;
   bool peer_address_known = false;
+  // Where the datagram being processed came from, and how big it was. Set once
+  // per receive() and read by the PATH_CHALLENGE handler, which is several
+  // calls down and has no other way to learn either.
+  std::vector<std::uint8_t> arrival_address;
+  std::uint64_t arrival_bytes = 0;
   std::uint64_t highest_non_probing = 0;
   bool have_non_probing = false;
   std::uint64_t migrations = 0;
@@ -1666,8 +1671,11 @@ std::expected<bool, error_t> process_frames(connection_impl_t &impl, std::span<c
 
     case frame_kind_t::path_challenge:
       // Section 8.2.2: the echo is owed unconditionally, and is the only
-      // evidence the peer will get that this endpoint holds this address.
-      impl.path_responses.push(frame.path_data);
+      // evidence the peer will get that this endpoint holds this address. It is
+      // owed *on the path it arrived on*, which is not necessarily the one this
+      // connection is using -- a peer probing a new address before moving to it
+      // sends from there and listens there.
+      impl.path_responses.push(frame.path_data, impl.arrival_address, impl.arrival_bytes);
       break;
 
     case frame_kind_t::path_response:
@@ -2228,7 +2236,17 @@ void reap_and_grant(connection_impl_t &impl)
 // force_expand says the datagram owes that size for a reason decided before
 // this packet -- an Initial ahead of it -- as opposed to one this packet
 // discovers for itself by writing a PATH_CHALLENGE or PATH_RESPONSE.
-std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack, std::size_t expand_to = 0, bool force_expand = false, bool mtu_probe = false)
+// off_path, when set, restricts this packet to the PATH_RESPONSE frames owed to
+// that address and nothing else at all.
+//
+// Nothing else, and that is the point rather than an economy. The address has
+// not been validated -- answering a challenge is how it gets validated -- so
+// section 9.3.1 says an endpoint must not send it anything it would mind having
+// sent to an attacker who spoofed the source. An acknowledgement or a stream
+// frame riding along would be exactly that, and would also charge the real
+// path's accounting for bytes that went somewhere else.
+std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryption_level_t level, std::span<std::uint8_t> out, tick_t now, bool allow_empty_ack, std::size_t expand_to = 0, bool force_expand = false, bool mtu_probe = false,
+                                                 const std::vector<std::uint8_t> *off_path = nullptr)
 {
   auto &space = impl.spaces[space_index(level)];
   // RFC 9001 section 4.6: before the handshake finishes a client may send
@@ -2262,7 +2280,7 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   // Section 17.2.3 and the frame table in frame.h: a 0-RTT packet carries
   // neither CRYPTO nor ACK. The handshake does not run at this level and there
   // is nothing yet to acknowledge at it.
-  const bool want_crypto = space.crypto_send.has_pending() && !use_early;
+  const bool want_crypto = off_path == nullptr && space.crypto_send.has_pending() && !use_early;
   // Section 13.2.1 draws a line the previous reading of this missed. An
   // endpoint MUST acknowledge ack-eliciting Initial and Handshake packets
   // *immediately*, but 1-RTT packets only within its advertised
@@ -2281,13 +2299,26 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   const bool handshake_space = level == encryption_level_t::initial || level == encryption_level_t::handshake;
   const bool ack_owed = space.acks.has_received() && space.acks.ack_pending();
   const bool must_ack = ack_owed && !use_early && (handshake_space || space.acks.should_send_ack(now, impl.config.max_ack_delay));
-  const bool want_ack = allow_empty_ack ? ack_owed : must_ack;
-  const bool want_handshake_done = level == encryption_level_t::application && impl.config.role == tls_role_t::server && impl.handshake_complete && !impl.handshake_done_sent;
-  const bool want_close = impl.close_frame_pending && space.have_write;
-  const bool want_probe = space.probes_pending > 0 || mtu_probe;
+  const bool want_ack = off_path == nullptr && (allow_empty_ack ? ack_owed : must_ack);
+  const bool want_handshake_done = off_path == nullptr && level == encryption_level_t::application && impl.config.role == tls_role_t::server && impl.handshake_complete && !impl.handshake_done_sent;
+  const bool want_close = off_path == nullptr && impl.close_frame_pending && space.have_write;
+  const bool want_probe = off_path == nullptr && (space.probes_pending > 0 || mtu_probe);
 
   bool want_path = false;
-  if (level == encryption_level_t::application && !want_close)
+  if (off_path != nullptr)
+  {
+    // One reason to build, and one kind of frame to put in it.
+    want_path = false;
+    for (std::size_t i = 0; i < impl.path_responses.size(); ++i)
+    {
+      if (impl.path_responses.owed_to(*off_path, i))
+      {
+        want_path = true;
+        break;
+      }
+    }
+  }
+  else if (level == encryption_level_t::application && !want_close)
   {
     // Section 8.2.2 forbids delaying a PATH_RESPONSE, so an owed echo is by
     // itself a reason to send.
@@ -2296,14 +2327,19 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
   }
 
   bool want_streams = false;
-  if (level == encryption_level_t::application && !want_close)
+  if (off_path == nullptr && level == encryption_level_t::application && !want_close)
   {
     reap_and_grant(impl);
     want_streams = impl.max_data_pending || impl.max_streams_pending[0] || impl.max_streams_pending[1] || impl.data_blocked_pending || impl.streams.streams_blocked_owed() || impl.streams.has_sendable();
   }
 
+  if (off_path != nullptr && !want_path)
+  {
+    return std::size_t{0};
+  }
+
   // Only must_ack justifies a packet by itself; want_ack merely rides along.
-  if (!mtu_probe && !want_crypto && !must_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
+  if (off_path == nullptr && !mtu_probe && !want_crypto && !must_ack && !want_handshake_done && !want_close && !want_probe && !want_streams && !want_path)
   {
     return std::size_t{0};
   }
@@ -2526,24 +2562,34 @@ std::expected<std::size_t, error_t> build_packet(connection_impl_t &impl, encryp
     // PATH_RESPONSE is discard, so an entry leaves the queue when it reaches
     // the wire and is not repaired if that packet is lost -- the peer asks
     // again instead.
-    while (!impl.path_responses.empty())
+    // Only the echoes owed to the path this packet is going out on. Section
+    // 8.2.2: a response belongs on the path its challenge arrived by, so an
+    // echo owed elsewhere waits for the datagram addressed there.
+    const std::vector<std::uint8_t> &here = off_path != nullptr ? *off_path : impl.peer_address;
+    for (std::size_t i = 0; i < impl.path_responses.size();)
     {
+      if (!impl.path_responses.owed_to(here, i))
+      {
+        ++i;
+        continue;
+      }
       frame_t frame;
       frame.kind = frame_kind_t::path_response;
-      frame.path_data = impl.path_responses.front();
+      frame.path_data = impl.path_responses.at(i).data;
       if (!frames.write(frame))
       {
         break;
       }
-      impl.path_responses.pop();
+      impl.path_responses.erase(i);
       record.push_back(sent_frame_t{.kind = frame_kind_t::path_response});
       wrote_path_frame = true;
     }
 
     // Section 8.2.1: at most one challenge per packet, and fresh data every
     // time, so that a response can only have come from something this
-    // endpoint actually sent.
-    if (impl.path.challenge_due(now, impl.recovery.rtt().pto_base() + impl.config.max_ack_delay))
+    // endpoint actually sent. Never on a foreign path: the validator is
+    // tracking the path this connection is on.
+    if (off_path == nullptr && impl.path.challenge_due(now, impl.recovery.rtt().pto_base() + impl.config.max_ack_delay))
     {
       auto data = impl.path.issue(now, path_abandon_timeout(impl));
       if (!data.has_value())
@@ -3183,6 +3229,10 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
   const std::uint64_t processed_before = impl.packets_processed;
   const std::size_t datagram_size = datagram.size();
   migration_signal_t signal;
+  // Recorded before any frame is read, because the PATH_CHALLENGE handler needs
+  // both and is several calls below here.
+  impl.arrival_address.assign(peer_address.begin(), peer_address.end());
+  impl.arrival_bytes = datagram_size;
 
   // Section 10.3.1 compares the trailing bytes of the datagram *as received*,
   // and this is the only chance to read them: decryption works in place, and a
@@ -3310,7 +3360,59 @@ std::expected<void, error_t> connection_t::receive(std::span<std::uint8_t> datag
 
 std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8_t> out, tick_t now)
 {
+  return poll_send(out, now, nullptr);
+}
+
+std::expected<std::size_t, error_t> connection_t::poll_send(std::span<std::uint8_t> out, tick_t now, std::vector<std::uint8_t> *destination)
+{
   auto &impl = *_impl;
+  if (destination != nullptr)
+  {
+    destination->clear();
+  }
+
+  // Section 8.2.2: an echo owed to a path this connection is not using goes out
+  // in a datagram of its own, addressed there by hand. It is taken before
+  // anything else because the frame may not be delayed, and because everything
+  // below this point is about the path the connection is actually on.
+  //
+  // A caller that cannot address a datagram -- the sans-I/O tests, the
+  // benchmark, anything with one peer -- passes no destination and never sees
+  // these: the echo stays queued rather than being sent to the wrong place.
+  if (destination != nullptr)
+  {
+    if (const auto index = impl.path_responses.first_off_path(impl.peer_address); index.has_value())
+    {
+      const auto target = impl.path_responses.at(*index).address;
+      const std::uint64_t arrived = impl.path_responses.at(*index).arrived;
+      // Section 8.2.2 asks for 1200 bytes so the echo also proves the path
+      // carries a full-size datagram, and then takes it back when the
+      // anti-amplification limit for that path will not allow it. The path is
+      // unvalidated by definition, so the limit is three times what came from
+      // it -- which a peer that padded its challenge, as section 8.2.1 requires,
+      // makes no constraint at all.
+      const std::size_t allowance = static_cast<std::size_t>((std::min<std::uint64_t>)(arrived * 3, out.size()));
+      const std::size_t budget = (std::min)(allowance, impl.mtu.datagram_size());
+      if (budget == 0)
+      {
+        return std::size_t{0};
+      }
+      const std::size_t expand_to = (std::min)(budget, minimum_initial_datagram);
+      auto size = build_packet(impl, encryption_level_t::application, out.subspan(0, budget), now, false, expand_to, false, false, &target);
+      if (!size.has_value())
+      {
+        return std::unexpected(size.error());
+      }
+      if (*size > 0)
+      {
+        // Charged to the path it went to, not to the one the connection is on:
+        // impl.bytes_sent is the current path's ledger and this datagram never
+        // touched it.
+        destination->assign(target.begin(), target.end());
+        return size;
+      }
+    }
+  }
   if (!impl.started_seen)
   {
     impl.started_seen = true;

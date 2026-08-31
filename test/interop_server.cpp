@@ -243,9 +243,17 @@ int main(int argc, char **argv)
         };
         std::vector<pending_response_t> pending;
 
+        // Read here rather than at the end, because a connection that moved is
+        // usually gone by then: the peer closes, the draining period elapses,
+        // and the endpoint reaps it. on_activity is the only place a server
+        // sees its connections at all -- and it is a single slot, so this has
+        // to ride in the existing handler rather than install a second one.
+        std::uint64_t migrations = 0;
+
         server->on_activity(
-          [&bytes_read, &answered, &pending](connection_t &connection)
+          [&bytes_read, &answered, &pending, &migrations](connection_t &connection)
           {
+            migrations = (std::max)(migrations, connection.migration_count());
             for (const auto id : connection.readable_streams())
             {
               auto readable = connection.readable_stream(id);
@@ -319,8 +327,8 @@ int main(int argc, char **argv)
         }
 
         const auto counters = server->stats();
-        std::printf("done: handshakes=%d request_bytes=%zu answered_bytes=%zu connections=%zu sends=%llu reads=%llu\n", handshakes, bytes_read, answered, server->connection_count(),
-                    static_cast<unsigned long long>(counters.sends), static_cast<unsigned long long>(counters.reads));
+        std::printf("done: handshakes=%d request_bytes=%zu answered_bytes=%zu connections=%zu sends=%llu reads=%llu migrations=%llu\n", handshakes, bytes_read, answered, server->connection_count(),
+                    static_cast<unsigned long long>(counters.sends), static_cast<unsigned long long>(counters.reads), static_cast<unsigned long long>(migrations));
         std::fflush(stdout);
 
         cancel.cancel();

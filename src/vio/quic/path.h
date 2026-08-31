@@ -229,22 +229,48 @@ private:
 // re-sent already.
 inline constexpr std::size_t max_queued_path_responses = 4;
 
+// One echo that is owed, and where it is owed to.
+//
+// The address is the whole reason this is a struct rather than a byte array.
+// Section 8.2.2 requires the response to go out on the path the challenge
+// arrived on, and a challenge is exactly what arrives on a path the connection
+// is *not* using -- that is what probing a new path before migrating to it
+// means. Answering it to the address the connection currently talks to sends
+// the proof to the one place that did not ask for it, and the peer's validation
+// times out.
+//
+// `arrived` is the size of the datagram that carried the challenge, kept for
+// the anti-amplification carve-out in the same section: the response is
+// expanded to 1200 bytes unless the limit for that path does not allow it, and
+// for an unvalidated path the limit is three times what has come from it.
+struct owed_response_t
+{
+  path_challenge_data_t data = {};
+  // Opaque, and compared only for equality -- the same encoding the connection
+  // uses for a peer address. Empty means the path the challenge came from was
+  // not recorded, which is every caller that does not know.
+  std::vector<std::uint8_t> address;
+  std::uint64_t arrived = 0;
+};
+
 class path_response_queue_t
 {
 public:
-  void push(std::span<const std::uint8_t> data)
+  void push(std::span<const std::uint8_t> data, std::span<const std::uint8_t> address = {}, std::uint64_t arrived = 0)
   {
     if (data.size() != path_challenge_data_size)
     {
       return;
     }
-    path_challenge_data_t entry = {};
-    std::copy(data.begin(), data.end(), entry.begin());
+    owed_response_t entry;
+    std::copy(data.begin(), data.end(), entry.data.begin());
+    entry.address.assign(address.begin(), address.end());
+    entry.arrived = arrived;
     if (_pending.size() == max_queued_path_responses)
     {
       _pending.erase(_pending.begin());
     }
-    _pending.push_back(entry);
+    _pending.push_back(std::move(entry));
   }
 
   [[nodiscard]] bool empty() const
@@ -252,9 +278,53 @@ public:
     return _pending.empty();
   }
 
-  [[nodiscard]] const path_challenge_data_t &front() const
+  [[nodiscard]] const owed_response_t &front() const
   {
     return _pending.front();
+  }
+
+  [[nodiscard]] std::size_t size() const
+  {
+    return _pending.size();
+  }
+
+  [[nodiscard]] const owed_response_t &at(std::size_t index) const
+  {
+    return _pending[index];
+  }
+
+  // The first echo owed to somewhere other than `here`, or nothing. This is
+  // what tells the send path that a datagram has to be addressed by hand.
+  [[nodiscard]] std::optional<std::size_t> first_off_path(std::span<const std::uint8_t> here) const
+  {
+    for (std::size_t i = 0; i < _pending.size(); ++i)
+    {
+      const auto &entry = _pending[i];
+      if (entry.address.empty())
+      {
+        continue;
+      }
+      if (entry.address.size() != here.size() || !std::equal(entry.address.begin(), entry.address.end(), here.begin()))
+      {
+        return i;
+      }
+    }
+    return std::nullopt;
+  }
+
+  [[nodiscard]] bool owed_to(std::span<const std::uint8_t> address, std::size_t index) const
+  {
+    const auto &entry = _pending[index];
+    if (entry.address.empty())
+    {
+      return address.empty();
+    }
+    return entry.address.size() == address.size() && std::equal(entry.address.begin(), entry.address.end(), address.begin());
+  }
+
+  void erase(std::size_t index)
+  {
+    _pending.erase(_pending.begin() + static_cast<std::ptrdiff_t>(index));
   }
 
   void pop()
@@ -263,6 +333,6 @@ public:
   }
 
 private:
-  std::vector<path_challenge_data_t> _pending;
+  std::vector<owed_response_t> _pending;
 };
 } // namespace vio::quic
