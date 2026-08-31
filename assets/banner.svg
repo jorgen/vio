@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240" width="720" height="240">
-  <title>vio — async I/O, straightened</title>
+  <title>vio — async I/O, awaited</title>
   <g transform="translate(40, 22)">
     <rect x="18.01" y="25.53" width="20.87" height="20.87" rx="6.26" fill="#431a85"/>
     <rect x="29.60" y="46.21" width="20.87" height="20.87" rx="6.26" fill="#4d2098"/>
@@ -17,6 +17,6 @@
   </g>
   <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
     <text x="264" y="135" font-size="100" font-weight="650" letter-spacing="-2" fill="#2e1065">v<tspan fill="#7c3aed">io</tspan></text>
-    <text x="268" y="184" font-size="28" fill="#64748b">async I/O, straightened.</text>
+    <text x="268" y="184" font-size="28" fill="#64748b">async I/O, awaited.</text>
   </g>
 </svg>

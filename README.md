@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="vio — async I/O, straightened." width="720">
+  <img src="assets/banner.svg" alt="vio — async I/O, awaited." width="720">
 </p>
 
 # vio

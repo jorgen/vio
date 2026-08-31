@@ -99,13 +99,13 @@ writeFileSync(join(outdir, 'logo.svg'), icon);
 
 const BH = 240, BW = 720, DS = 196, DPAD = 4;
 const banner = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${BW} ${BH}" width="${BW}" height="${BH}">
-  <title>vio — async I/O, straightened</title>
+  <title>vio — async I/O, awaited</title>
   <g transform="translate(40, 22)">
     ${markSvg(cells, DS, DPAD)}
   </g>
   <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
     <text x="264" y="135" font-size="100" font-weight="650" letter-spacing="-2" fill="#2e1065">v<tspan fill="#7c3aed">io</tspan></text>
-    <text x="268" y="184" font-size="28" fill="#64748b">async I/O, straightened.</text>
+    <text x="268" y="184" font-size="28" fill="#64748b">async I/O, awaited.</text>
   </g>
 </svg>
 `;
