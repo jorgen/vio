@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="vio — async I/O, straightened." width="720">
+</p>
+
 # vio
 
 **vio** is a lean C++23 async I/O library: [libuv](https://libuv.org) for the

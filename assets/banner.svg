@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240" width="720" height="240">
+  <title>vio — async I/O, straightened</title>
+  <g transform="translate(40, 22)">
+    <rect x="18.01" y="25.53" width="20.87" height="20.87" rx="6.26" fill="#431a85"/>
+    <rect x="29.60" y="46.21" width="20.87" height="20.87" rx="6.26" fill="#4d2098"/>
+    <rect x="41.19" y="66.89" width="20.87" height="20.87" rx="6.26" fill="#5826ab"/>
+    <rect x="52.79" y="87.57" width="20.87" height="20.87" rx="6.26" fill="#622bbe"/>
+    <rect x="64.38" y="108.25" width="20.87" height="20.87" rx="6.26" fill="#6c31d0"/>
+    <rect x="75.97" y="128.93" width="20.87" height="20.87" rx="6.26" fill="#7737e3"/>
+    <rect x="87.57" y="149.61" width="20.87" height="20.87" rx="6.26" fill="#8143ee"/>
+    <rect x="99.16" y="128.93" width="20.87" height="20.87" rx="6.26" fill="#8a54f1"/>
+    <rect x="110.75" y="108.25" width="20.87" height="20.87" rx="6.26" fill="#9366f4"/>
+    <rect x="122.35" y="87.57" width="20.87" height="20.87" rx="6.26" fill="#9d78f7"/>
+    <rect x="133.94" y="66.89" width="20.87" height="20.87" rx="6.26" fill="#a68afa"/>
+    <rect x="145.53" y="46.21" width="20.87" height="20.87" rx="6.26" fill="#67aef4"/>
+    <rect x="157.13" y="25.53" width="20.87" height="20.87" rx="6.26" fill="#22d3ee"/>
+  </g>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
+    <text x="264" y="135" font-size="100" font-weight="650" letter-spacing="-2" fill="#2e1065">v<tspan fill="#7c3aed">io</tspan></text>
+    <text x="268" y="184" font-size="28" fill="#64748b">async I/O, straightened.</text>
+  </g>
+</svg>

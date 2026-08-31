@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>vio</title>
+  <g>
+    <rect x="72.18" y="89.46" width="47.95" height="47.95" rx="14.39" fill="#431a85"/>
+    <rect x="98.82" y="136.98" width="47.95" height="47.95" rx="14.39" fill="#4d2098"/>
+    <rect x="125.46" y="184.50" width="47.95" height="47.95" rx="14.39" fill="#5826ab"/>
+    <rect x="152.10" y="232.02" width="47.95" height="47.95" rx="14.39" fill="#622bbe"/>
+    <rect x="178.74" y="279.54" width="47.95" height="47.95" rx="14.39" fill="#6c31d0"/>
+    <rect x="205.38" y="327.06" width="47.95" height="47.95" rx="14.39" fill="#7737e3"/>
+    <rect x="232.02" y="374.58" width="47.95" height="47.95" rx="14.39" fill="#8143ee"/>
+    <rect x="258.66" y="327.06" width="47.95" height="47.95" rx="14.39" fill="#8a54f1"/>
+    <rect x="285.30" y="279.54" width="47.95" height="47.95" rx="14.39" fill="#9366f4"/>
+    <rect x="311.94" y="232.02" width="47.95" height="47.95" rx="14.39" fill="#9d78f7"/>
+    <rect x="338.58" y="184.50" width="47.95" height="47.95" rx="14.39" fill="#a68afa"/>
+    <rect x="365.22" y="136.98" width="47.95" height="47.95" rx="14.39" fill="#67aef4"/>
+    <rect x="391.86" y="89.46" width="47.95" height="47.95" rx="14.39" fill="#22d3ee"/>
+  </g>
+</svg>
