@@ -59,6 +59,7 @@ add_executable(vio_tests
     test_cancellation.cpp
     test_work.cpp
     test_thread_pool.cpp
+    test_loop_core.cpp
 )
 
 CmDepTargetLinkLibrary(vio_tests PRIVATE vio vio_objstore BoringSSL::SSL BoringSSL::Crypto)

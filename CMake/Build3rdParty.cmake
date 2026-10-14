@@ -34,7 +34,6 @@ macro(Build3rdParty)
         endif ()
     endif ()
 
-    CmDepAddPackage(libuv NO_SYSTEM_FIND OPTIONS LIBUV_BUILD_TESTS=OFF LIBUV_BUILD_BENCH=OFF LIBUV_BUILD_SHARED=OFF)
     CmDepAddPackage(ada OPTIONS ADA_TESTING=OFF ADA_BENCHMARKS=OFF ADA_TOOLS=OFF)
 
     if (VIO_BUILD_TESTS)

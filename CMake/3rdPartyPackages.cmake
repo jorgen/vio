@@ -11,10 +11,6 @@ CmDepFetchPackage(cmakerc 952ff
     https://github.com/vector-of-bool/cmrc/archive/952ffddba731fc110bd50409e8d2b8a06abbd237.zip
     SHA256=b199e7481dda667cd1b1936c9acb64e496ebc3c5ad90b381ba8d0f361c80638d)
 
-CmDepFetchPackage(libuv v1.51.0
-    https://github.com/libuv/libuv/archive/refs/tags/v1.51.0.tar.gz
-    SHA256=27e55cf7083913bfb6826ca78cde9de7647cded648d35f24163f2d31bb9f51cd)
-
 if(VIO_BUILD_TESTS)
     CmDepFetchPackage(doctest v2.4.11
         https://github.com/doctest/doctest/archive/refs/tags/v2.4.12.tar.gz

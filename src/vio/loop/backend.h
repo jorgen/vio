@@ -22,6 +22,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -56,7 +57,29 @@ struct io_watch_t
   void *backend_state = nullptr;
 };
 
-struct file_op_t;
+enum class file_op_kind : std::uint8_t
+{
+  read,
+  write,
+  fsync,
+  fdatasync
+};
+
+struct file_op_t
+{
+  using complete_fn_t = void (*)(file_op_t *op);
+
+  complete_fn_t complete = nullptr;
+  void *owner = nullptr;
+  file_op_kind kind = file_op_kind::read;
+  native_file_t file = invalid_native_file;
+  std::int64_t offset = -1;
+  std::byte *data = nullptr;
+  std::size_t size = 0;
+  std::int64_t result = 0;
+  bool in_flight = false;
+  alignas(16) unsigned char backend_storage[64] = {};
+};
 
 class VIO_EXPORT backend_t
 {

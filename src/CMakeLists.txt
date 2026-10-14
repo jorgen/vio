@@ -87,7 +87,7 @@ else()
         message(FATAL_ERROR "Unknown VIO_SSL_BACKEND '${VIO_SSL_BACKEND}' (expected libressl|openssl|boringssl)")
     endif()
 
-    # Dependencies are PUBLIC because vio's inline header code calls libuv/libressl directly.
+    # Dependencies are PUBLIC because vio's inline header code calls BoringSSL directly.
     # Phase 2 (PIMPL) will allow switching to PRIVATE for full symbol hiding.
     # vio now speaks only the OpenSSL SSL_*/BIO API (the memory-BIO engine), so libtls
     # (libtls) never had a user here -- only the SSL and Crypto libraries.
@@ -103,16 +103,22 @@ else()
 
     target_link_libraries(vio PRIVATE vio::default_certs)
 
-    if (VIO_USE_SYSTEM_LIBUV)
-        find_package(libuv CONFIG REQUIRED)
-        target_link_libraries(vio PUBLIC libuv::uv_a)
-    else ()
-        target_link_libraries(vio PUBLIC uv_a)
-        target_include_directories(vio PUBLIC ${libuv_SOURCE_DIR}/include)
+    if (WIN32)
+        target_link_libraries(vio PUBLIC ws2_32)
     endif ()
 
     if(VIO_BUILD_SHARED AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_options(vio PRIVATE "-Wl,--exclude-libs,ALL")
+    endif()
+endif()
+
+if(NOT EMSCRIPTEN AND VIO_BUILD_TESTS AND PROJECT_IS_TOP_LEVEL AND NOT VIO_BUILD_SHARED)
+    target_sources(vio PRIVATE doctest_impl.cpp)
+    target_compile_definitions(vio PRIVATE VIO_INTERNAL_TESTS INTERFACE VIO_DOCTEST_IN_LIBRARY)
+    if(VIO_USE_SYSTEM_DOCTEST)
+        target_link_libraries(vio PRIVATE doctest::doctest)
+    else()
+        target_include_directories(vio PRIVATE ${doctest_SOURCE_DIR})
     endif()
 endif()
 
@@ -176,10 +182,9 @@ if(VIO_INSTALL AND NOT EMSCRIPTEN)
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.h")
 
-    if(VIO_USE_SYSTEM_LIBUV AND VIO_USE_SYSTEM_LIBRESSL AND VIO_USE_SYSTEM_ADA)
+    if(VIO_USE_SYSTEM_LIBRESSL AND VIO_USE_SYSTEM_ADA)
         set(_vio_export_targets vio vio_objstore vio_default_certs)
         set(VIO_CONFIG_DEPS "")
-        string(APPEND VIO_CONFIG_DEPS "find_dependency(libuv CONFIG)\n")
         string(APPEND VIO_CONFIG_DEPS "find_dependency(LibreSSL)\n")
         string(APPEND VIO_CONFIG_DEPS "find_dependency(ada CONFIG)\n")
         if(VIO_USE_SYSTEM_CMAKERC)
@@ -215,6 +220,6 @@ if(VIO_INSTALL AND NOT EMSCRIPTEN)
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-        message(STATUS "vio: VIO_INSTALL is on but vio is built with bundled dependencies; installing library + headers only (no find_package config). Configure with VIO_USE_SYSTEM_LIBUV/BORINGSSL/ADA=ON for a relocatable package config.")
+        message(STATUS "vio: VIO_INSTALL is on but vio is built with bundled dependencies; installing library + headers only (no find_package config). Configure with VIO_USE_SYSTEM_BORINGSSL/ADA=ON for a relocatable package config.")
     endif()
 endif()

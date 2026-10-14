@@ -126,7 +126,14 @@ jobs:
           cmake --build build
           ccache --show-stats
 
-      - name: Test
+      - name: Test on epoll
+        env:
+          VIO_BACKEND: epoll
+        run: ./build/test/vio_tests
+
+      - name: Test on io_uring
+        env:
+          VIO_BACKEND: io_uring
         run: ./build/test/vio_tests
 
   macos:
