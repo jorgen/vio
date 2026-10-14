@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -51,14 +51,22 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
-  sanitizers:
+  linux:
     needs: docker
     runs-on: ubuntu-24.04
-    container: ghcr.io/jorgen/vio-ci:${{ needs.docker.outputs.image-tag }}
+    container:
+      image: ghcr.io/jorgen/vio-ci:${{ needs.docker.outputs.image-tag }}
+      options: --security-opt seccomp=unconfined
     strategy:
       fail-fast: false
       matrix:
         include:
+          - name: linux-debug
+            cc: gcc-14
+            cxx: g++-14
+            c_flags: ""
+            cxx_flags: ""
+            linker_flags: ""
           - name: asan
             cc: gcc-14
             cxx: g++-14
@@ -121,8 +129,66 @@ jobs:
       - name: Test
         run: ./build/test/vio_tests
 
+  macos:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-debug
+            cxx_flags: ""
+            linker_flags: ""
+          - name: macos-asan
+            cxx_flags: -fsanitize=address -fno-omit-frame-pointer
+            linker_flags: -fsanitize=address
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install tools
+        run: brew install ninja ccache
+
+      - name: Cache 3rdparty dependencies
+        uses: actions/cache@v4
+        with:
+          path: 3rdparty
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          restore-keys: 3rdparty-${{ runner.os }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.name }}-
+
+      - name: Configure
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          cmake -G Ninja -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}"
+
+      - name: Build
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: cmake --build build
+
+      - name: Test
+        run: ./build/test/vio_tests
+
   windows-msvc:
-    runs-on: windows-2022
+    runs-on: windows-2025
     strategy:
       fail-fast: false
       matrix:
