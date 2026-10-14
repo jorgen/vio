@@ -189,6 +189,22 @@ Phases 1 to 6 happen on one branch, because the public API changes at once for p
 latency and timer accuracy. The numbers go in `BASELINE.md` with the machine they came from. A
 shared CI runner is too noisy to judge speed, so CI only checks that the benchmarks still run.
 
+## Comparison benchmarks
+
+A separate repository measures vio against libuv, Boost.Asio and Tokio on the same work, on the
+same machine, with the same payloads:
+
+- TCP echo and pipelined request/response, one connection and many;
+- TLS bulk transfer;
+- UDP datagram batches, with and without GSO;
+- file reads and writes, buffered and direct;
+- timers: accuracy and cost per timer;
+- waking a loop from another thread.
+
+Each library gets the idiomatic version of each test, written by someone who would defend it.
+Results go in a table with the machine, kernel and versions. The repository needs your approval
+before it is created.
+
 ## Not in this work
 
 - The window library itself.

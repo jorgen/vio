@@ -65,15 +65,20 @@ everything vio wants. Older kernels use epoll. vio carries a small ring class in
 on liburing, which has no CMake build and lags the kernel. libuv, Zig's standard library and
 TigerBeetle take the same approach.
 
-**D15. Rings are created after the loop starts.** Rings capture the credentials of the thread that
-creates them, and Node's CVE-2024-22017 came from a ring created before `setuid()`. A ring is also
-not safe across `fork()`. Both facts are documented.
+**D15. A ring is created with its loop, so create loops after dropping privileges.** Rings
+capture the credentials of the thread that creates them; Node's CVE-2024-22017 came from a ring
+created before `setuid()`. A ring is also not safe across `fork()`. The ring does not use
+`SINGLE_ISSUER` or `DEFER_TASKRUN`: vio builds a loop on one thread and runs it on another
+(`thread_with_event_loop_t`), and those flags bind the ring to its creator. It uses
+`COOP_TASKRUN` instead.
 
 **D16. Windows sockets use AFD polling for readiness.** It is undocumented, but libuv's `uv_poll`
 uses it, and vio already depends on `uv_poll` on Windows, as do mio and wepoll. No new risk.
 
-**D17. Windows files use overlapped I/O with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`.** Opening a
-file and changing metadata have no overlapped form and go to the blocking pool.
+**D17. Windows files use the blocking pool for now.** Overlapped I/O needs a handle opened with
+`FILE_FLAG_OVERLAPPED`, and vio's file API hands out CRT file descriptors, as libuv did. Switching
+means changing what `native_file_t` is on Windows, so it is a follow-up with its own benchmark.
+Linux gets real asynchronous file I/O through io_uring now.
 
 **D18. macOS uses kqueue with `EV_CLEAR` and `EVFILT_USER` for wakes.** Sockets get `SO_NOSIGPIPE`.
 
@@ -106,6 +111,39 @@ child processes inherit it. Sockets also set `MSG_NOSIGNAL` or `SO_NOSIGPIPE`.
 **D26. On Windows vio calls `WSAStartup` once. It does not call `SetErrorMode`.** libuv changed the
 process error mode as a side effect. A library should not, so the test program sets it instead.
 
+**D31. `stop()` is sticky.** After `stop()`, every later `run()` returns as soon as nothing is in
+flight. Tests rely on calling `run()` again to drain closes they started after the first `run()`
+returned.
+
+**D32. Work posted before `stop()` always runs.** Under libuv on Unix it could be dropped if both
+arrived in the same wakeup; on Windows it ran. Now it runs everywhere.
+
+**D33. A sleep with a negative duration returns on the next turn.** Under libuv it never fired.
+
+**D34. The QUIC beat and ticker are internal hooks and timers that never keep the loop alive.**
+They replace a `uv_prepare_t` and a `uv_timer_t` that were `uv_unref`ed.
+
+**D35. Event pipes unlink themselves when destroyed.** They no longer have to outlive `stop()` and
+`run()`, and `event_loop_t::add_event_pipe` is gone. Destroy a pipe on its loop's thread, or after
+the loop has stopped.
+
+**D36. Destroying a socket that was never closed aborts with a message.** Sockets live in
+reference-counted storage that closes them, so this only fires on a real lifetime bug, and the
+alternative is a backend holding a pointer to freed memory.
+
+**D37. The blocking pool starts 4 file threads and 2 DNS threads, on first use.**
+`VIO_FILE_THREADS` and `VIO_DNS_THREADS` override the counts.
+
+**D38. `uv_coro.h` becomes `future.h`.** The old name still forwards, so existing includes build.
+
+**D39. Error codes live in `vio::errc` with values from -3001 down; DNS codes from -3101 down.**
+The values are fixed on every platform, so a code compiled into prism means the same thing on
+Linux, macOS and Windows.
+
+**D40. A comparison benchmark project lives in its own repository.** It compares vio with libuv,
+Boost.Asio and Tokio on the same operations. Creating a repository on your account needs your
+approval, so its design is in the plan and the repository does not exist yet.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan), macos-15
@@ -118,6 +156,11 @@ seccomp profile, so io_uring is available to test.
 Orwell's six rules.
 
 **D30. No attribution lines in commits.**
+
+**D41. Tests for internals may live at the bottom of a `src/*.cpp` file**, inside
+`#if defined(VIO_INTERNAL_TESTS)`. A top-level static build with tests on defines that macro for
+the library and puts the doctest implementation in the library, so the tests run inside
+`vio_tests`. Shared builds and builds where vio is a subproject leave the macro unset.
 
 ## Open questions
 
