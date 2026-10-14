@@ -21,20 +21,5 @@
 */
 
 #pragma once
-#include "ref_counted_wrapper.h"
 
-namespace vio
-{
-template <typename STATE>
-struct future_t
-{
-  using future_ref_ptr_t = ref_ptr_t<STATE>;
-  future_ref_ptr_t state_ptr = make_ref_ptr<STATE>();
-
-  auto &operator co_await() noexcept
-  {
-    return state_ptr.data();
-  }
-};
-
-} // namespace vio
+#include "vio/future.h"

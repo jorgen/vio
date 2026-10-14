@@ -21,88 +21,131 @@ Copyright (c) 2025 Jørgen Lind
 */
 
 #pragma once
+
+#include <cstddef>
+#include <span>
+#include <utility>
+
 namespace vio
 {
-using alloc_cb_t = void (*)(void *user_ptr, size_t suggested_size, uv_buf_t *buf);
-using dealloc_cb_t = void (*)(void *user_ptr, uv_buf_t *buf);
-struct unique_buf_t
+using alloc_cb_t = std::span<std::byte> (*)(void *user_ptr, std::size_t suggested_size);
+using dealloc_cb_t = void (*)(void *user_ptr, std::span<std::byte> buffer);
+
+class unique_buf_t
 {
-  uv_buf_t buf{};
-  dealloc_cb_t dealloc_cb{};
-  void *user_handle{};
+public:
   unique_buf_t() = default;
-  unique_buf_t(uv_buf_t buffer, dealloc_cb_t dealloc, void *handle)
-    : buf(buffer)
-    , dealloc_cb(dealloc)
-    , user_handle(handle)
+
+  unique_buf_t(std::span<std::byte> buffer, dealloc_cb_t dealloc, void *user_handle) noexcept
+    : _data(buffer.data())
+    , _size(buffer.size())
+    , _capacity(buffer.size())
+    , _dealloc(dealloc)
+    , _user_handle(user_handle)
   {
   }
+
   unique_buf_t(const unique_buf_t &) = delete;
   unique_buf_t &operator=(const unique_buf_t &) = delete;
+
   unique_buf_t(unique_buf_t &&other) noexcept
-    : buf(other.buf)
-    , dealloc_cb(other.dealloc_cb)
-    , user_handle(other.user_handle)
+    : _data(std::exchange(other._data, nullptr))
+    , _size(std::exchange(other._size, 0))
+    , _capacity(std::exchange(other._capacity, 0))
+    , _dealloc(std::exchange(other._dealloc, nullptr))
+    , _user_handle(std::exchange(other._user_handle, nullptr))
   {
-    other.buf.base = nullptr;
-    other.dealloc_cb = nullptr;
-    other.user_handle = nullptr;
   }
+
   unique_buf_t &operator=(unique_buf_t &&other) noexcept
   {
     if (this != &other)
     {
-      if (buf.base && dealloc_cb)
-      {
-        dealloc_cb(user_handle, &buf);
-      }
-      buf = other.buf;
-      dealloc_cb = other.dealloc_cb;
-      user_handle = other.user_handle;
-      other.buf.base = nullptr;
-      other.dealloc_cb = nullptr;
-      other.user_handle = nullptr;
+      reset();
+      _data = std::exchange(other._data, nullptr);
+      _size = std::exchange(other._size, 0);
+      _capacity = std::exchange(other._capacity, 0);
+      _dealloc = std::exchange(other._dealloc, nullptr);
+      _user_handle = std::exchange(other._user_handle, nullptr);
     }
     return *this;
   }
+
   ~unique_buf_t()
   {
-    if (buf.base && dealloc_cb)
-    {
-      dealloc_cb(user_handle, &buf);
-    }
+    reset();
   }
 
-  uv_buf_t *operator->()
+  void reset() noexcept
   {
-    return &buf;
+    if (_data && _dealloc)
+      _dealloc(_user_handle, std::span<std::byte>(_data, _capacity));
+    _data = nullptr;
+    _size = 0;
+    _capacity = 0;
+    _dealloc = nullptr;
+    _user_handle = nullptr;
   }
+
+  void resize(std::size_t size) noexcept
+  {
+    _size = size <= _capacity ? size : _capacity;
+  }
+
+  [[nodiscard]] std::byte *data() const noexcept
+  {
+    return _data;
+  }
+
+  [[nodiscard]] char *chars() const noexcept
+  {
+    return reinterpret_cast<char *>(_data);
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept
+  {
+    return _size;
+  }
+
+  [[nodiscard]] std::size_t capacity() const noexcept
+  {
+    return _capacity;
+  }
+
+  [[nodiscard]] bool empty() const noexcept
+  {
+    return _size == 0;
+  }
+
+  [[nodiscard]] std::span<std::byte> span() const noexcept
+  {
+    return {_data, _size};
+  }
+
+  [[nodiscard]] void *user_handle() const noexcept
+  {
+    return _user_handle;
+  }
+
+private:
+  std::byte *_data = nullptr;
+  std::size_t _size = 0;
+  std::size_t _capacity = 0;
+  dealloc_cb_t _dealloc = nullptr;
+  void *_user_handle = nullptr;
 };
 
-inline void default_alloc(void * /*user_ptr*/, size_t suggested_size, uv_buf_t *buf)
+inline std::span<std::byte> default_alloc(void * /*user_ptr*/, std::size_t suggested_size)
 {
-  if (buf == nullptr)
-  {
-    return;
-  }
-  buf->base = new char[suggested_size];
-  buf->len = suggested_size;
+  return {new std::byte[suggested_size], suggested_size};
 }
 
-inline void default_dealloc(void * /*user_ptr*/, uv_buf_t *data)
+inline void default_dealloc(void * /*user_ptr*/, std::span<std::byte> buffer)
 {
-  delete[] data->base;
-  data->base = nullptr;
-  data->len = 0;
+  delete[] buffer.data();
 }
 
-// Deallocator for buffers whose memory is owned by the caller (e.g. a span
-// handed to a scatter read). It must never free the memory; it only clears the
-// view so unique_buf_t's destructor is a no-op.
-inline void noop_dealloc(void * /*user_ptr*/, uv_buf_t *data)
+inline void noop_dealloc(void * /*user_ptr*/, std::span<std::byte> /*buffer*/)
 {
-  data->base = nullptr;
-  data->len = 0;
 }
-
 } // namespace vio

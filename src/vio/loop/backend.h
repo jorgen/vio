@@ -1,0 +1,96 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
+#pragma once
+
+#include <cstdint>
+#include <memory>
+
+#include "vio/detail/native.h"
+#include "vio/loop/intrusive.h"
+#include "vio/vio_export.h"
+
+namespace vio::detail
+{
+class loop_core_t;
+
+enum class backend_kind
+{
+  automatic,
+  epoll,
+  io_uring,
+  kqueue,
+  iocp
+};
+
+inline constexpr std::uint8_t interest_read = 1;
+inline constexpr std::uint8_t interest_write = 2;
+
+struct io_watch_t
+{
+  native_socket_t socket = invalid_native_socket;
+  op_list_t readers;
+  op_list_t writers;
+  std::uint32_t epoch = 0;
+  bool closed = false;
+  std::uint8_t armed = 0;
+  void *backend_state = nullptr;
+};
+
+struct file_op_t;
+
+class VIO_EXPORT backend_t
+{
+public:
+  explicit backend_t(loop_core_t &loop) noexcept
+    : _loop(loop)
+  {
+  }
+  backend_t(const backend_t &) = delete;
+  backend_t &operator=(const backend_t &) = delete;
+  virtual ~backend_t() = default;
+
+  [[nodiscard]] virtual const char *name() const noexcept = 0;
+  [[nodiscard]] virtual int add_watch(io_watch_t &watch) = 0;
+  virtual void remove_watch(io_watch_t &watch, posted_t &done) = 0;
+  virtual void wake() noexcept = 0;
+  virtual void poll(std::int64_t timeout_ns) = 0;
+
+  [[nodiscard]] virtual bool supports_async_files() const noexcept
+  {
+    return false;
+  }
+  virtual void submit_file(file_op_t &op);
+  virtual void cancel_file(file_op_t &op) noexcept;
+
+  void wait(io_watch_t &watch, std::uint8_t interest, io_op_t &op);
+  void cancel_wait(io_watch_t &watch, io_op_t &op) noexcept;
+
+protected:
+  virtual void arm(io_watch_t &watch, std::uint8_t interest);
+  void dispatch(io_watch_t &watch, bool readable, bool writable);
+
+  loop_core_t &_loop;
+};
+
+VIO_EXPORT std::unique_ptr<backend_t> make_backend(loop_core_t &loop, backend_kind kind, int &error);
+} // namespace vio::detail

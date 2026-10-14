@@ -7,7 +7,7 @@
 #ifdef __EMSCRIPTEN__
 #include "vio/platform/wasm/ref_counted_impl.h"
 #else
-#include "vio/platform/uv/ref_counted_impl.h"
+#include "vio/platform/native/ref_counted_impl.h"
 #endif
 
 namespace vio
@@ -81,7 +81,6 @@ public:
     {
       if (_storage && _storage->ref_count.dec())
       {
-        // Object was destroyed, _storage is now invalid
         _storage = nullptr;
       }
       _storage = other._storage;
@@ -99,7 +98,6 @@ public:
     {
       if (_storage && _storage->ref_count.dec())
       {
-        // Object was destroyed, _storage is now invalid
         _storage = nullptr;
       }
       _storage = other._storage;
@@ -142,17 +140,6 @@ public:
     return ref_ptr_t(static_cast<storage_t *>(nullptr));
   }
 
-#ifndef __EMSCRIPTEN__
-  template <typename UV_HANDLE>
-  void inc_ref_and_store_in_handle(UV_HANDLE &handle)
-  {
-    if (_storage)
-    {
-      _storage->ref_count.inc();
-    }
-    handle.data = _storage;
-  }
-#endif
 
   Data *operator->()
   {
@@ -182,10 +169,9 @@ public:
   }
 
 #ifndef __EMSCRIPTEN__
-  template <typename UV_HANDLE>
-  void register_handle(UV_HANDLE *handle)
+  void register_resource(detail::resource_t &resource)
   {
-    _storage->ref_count.register_closable_handle(handle);
+    _storage->ref_count.register_closable(resource);
   }
 #endif
 

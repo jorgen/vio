@@ -30,27 +30,16 @@
 #include <functional>
 #include <vector>
 
-#ifndef __EMSCRIPTEN__
-#include <uv.h>
-#endif
+#include "vio/errc.h"
 
 namespace vio
 {
 
 constexpr int vio_cancelled = 0xca9ce1;
-#ifndef __EMSCRIPTEN__
-// The libuv cancellation code. Platform-dependent: on Unix UV_ECANCELED maps to
-// -ECANCELED (e.g. -125 on Linux), on Windows to -4081 -- so track the real
-// value rather than hardcoding it, or is_cancelled() misses cancelled reads.
-constexpr int vio_uv_ecanceled = UV_ECANCELED;
-#else
-// No libuv on wasm; cancellation flows only through vio_cancelled.
-constexpr int vio_uv_ecanceled = vio_cancelled;
-#endif
 
 inline bool is_cancelled(const error_t &err)
 {
-  return err.code == vio_cancelled || err.code == vio_uv_ecanceled;
+  return err.code == vio_cancelled || err.code == errc::canceled;
 }
 
 class cancellation_t;

@@ -22,6 +22,10 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 #include <string>
+
+#include "vio/errc.h"
+#include "vio/vio_export.h"
+
 namespace vio
 {
 struct error_t
@@ -29,4 +33,11 @@ struct error_t
   int code;
   std::string msg;
 };
+
+VIO_EXPORT const char *error_message(int code) noexcept;
+
+inline error_t make_error(int code)
+{
+  return error_t{.code = code, .msg = error_message(code)};
+}
 } // namespace vio

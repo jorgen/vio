@@ -10,6 +10,16 @@ else()
     if(VIO_BUILD_SHARED)
         add_library(vio SHARED
             library.cpp
+            loop_core.cpp
+            backend_select.cpp
+            backend_epoll.cpp
+            backend_uring.cpp
+            backend_kqueue.cpp
+            backend_iocp.cpp
+            blocking_pool.cpp
+            errc.cpp
+            sys_posix.cpp
+            sys_win.cpp
             crypto.cpp
             crypto_aead.cpp
             crypto_encoding.cpp
@@ -21,6 +31,16 @@ else()
     else()
         add_library(vio STATIC
             library.cpp
+            loop_core.cpp
+            backend_select.cpp
+            backend_epoll.cpp
+            backend_uring.cpp
+            backend_kqueue.cpp
+            backend_iocp.cpp
+            blocking_pool.cpp
+            errc.cpp
+            sys_posix.cpp
+            sys_win.cpp
             crypto.cpp
             crypto_aead.cpp
             crypto_encoding.cpp

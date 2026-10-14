@@ -29,5 +29,5 @@
 #ifdef __EMSCRIPTEN__
 #include "vio/platform/wasm/event_loop_impl.h"
 #else
-#include "vio/platform/uv/event_loop_impl.h"
+#include "vio/platform/native/event_loop_impl.h"
 #endif

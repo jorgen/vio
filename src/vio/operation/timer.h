@@ -22,4 +22,4 @@
 
 #pragma once
 
-#include "vio/platform/uv/timer_impl.h"
+#include "vio/platform/native/timer_impl.h"

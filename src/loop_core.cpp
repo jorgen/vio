@@ -1,0 +1,430 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
+#include "vio/loop/loop_core.h"
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+#include "backends.h"
+#include "vio/about_to_block.h"
+#include "vio/errc.h"
+
+namespace vio::detail
+{
+resource_t::resource_t(loop_core_t &loop, const char *kind) noexcept
+  : _loop(&loop)
+  , _kind(kind)
+{
+  _done_node.run = &resource_t::on_done;
+  _done_node.owner = this;
+  loop.track(*this);
+}
+
+resource_t::~resource_t()
+{
+  if (_tracked)
+    _loop->untrack(*this);
+}
+
+void resource_t::close(done_fn_t done, void *context) noexcept
+{
+  if (_closing)
+    return;
+  _closing = true;
+  _done = done;
+  _context = context;
+  _loop->retain();
+  do_close();
+}
+
+void resource_t::close_finished() noexcept
+{
+  _loop->defer(_done_node);
+}
+
+void resource_t::on_done(posted_t *node)
+{
+  auto *self = static_cast<resource_t *>(node->owner);
+  auto *loop = self->_loop;
+  loop->untrack(*self);
+  auto done = self->_done;
+  auto *context = self->_context;
+  loop->release();
+  if (done)
+    done(context);
+}
+
+void backend_t::submit_file(file_op_t &)
+{
+  std::fprintf(stderr, "vio: backend %s has no asynchronous file support\n", name());
+  std::abort();
+}
+
+void backend_t::cancel_file(file_op_t &) noexcept
+{
+}
+
+void backend_t::arm(io_watch_t &, std::uint8_t)
+{
+}
+
+void backend_t::wait(io_watch_t &watch, std::uint8_t interest, io_op_t &op)
+{
+  op.interest = interest;
+  op.epoch = watch.epoch;
+  op.parked = true;
+  if (interest == interest_read)
+    watch.readers.push_back(op);
+  else
+    watch.writers.push_back(op);
+  if (op.keeps_alive)
+    _loop.retain();
+  arm(watch, interest);
+}
+
+void backend_t::cancel_wait(io_watch_t &watch, io_op_t &op) noexcept
+{
+  if (!op.parked)
+    return;
+  if (op.interest == interest_read)
+    watch.readers.remove(op);
+  else
+    watch.writers.remove(op);
+  op.parked = false;
+  if (op.keeps_alive)
+    _loop.release();
+}
+
+static void complete_older_than(loop_core_t &loop, io_watch_t &watch, op_list_t &list, std::uint32_t epoch)
+{
+  for (;;)
+  {
+    if (watch.closed)
+      return;
+    auto *op = list.front();
+    if (!op || op->epoch == epoch)
+      return;
+    list.remove(*op);
+    op->parked = false;
+    if (op->keeps_alive)
+      loop.release();
+    op->complete(op);
+  }
+}
+
+void backend_t::dispatch(io_watch_t &watch, bool readable, bool writable)
+{
+  if (watch.closed)
+    return;
+  auto epoch = ++watch.epoch;
+  if (readable)
+    complete_older_than(_loop, watch, watch.readers, epoch);
+  if (writable)
+    complete_older_than(_loop, watch, watch.writers, epoch);
+}
+
+loop_core_t::loop_core_t(backend_kind kind)
+  : _thread_id(std::this_thread::get_id())
+{
+  _stop_node.run = &loop_core_t::on_stop;
+  _stop_node.owner = this;
+  _backend = make_backend(*this, kind, _init_error);
+  if (!_backend)
+  {
+    std::fprintf(stderr, "vio: event loop could not create a backend (%d)\n", _init_error);
+    std::abort();
+  }
+}
+
+loop_core_t::~loop_core_t()
+{
+  if (_resource_count > 0 || _alive > 0)
+  {
+    std::fprintf(stderr, "vio: ~event_loop_t: %zu resource(s) still open, %zu operation(s) in flight\n", _resource_count, _alive);
+    for (auto *it = _resources; it; it = it->_next)
+      std::fprintf(stderr, "vio: ~event_loop_t: %s still open\n", it->_kind);
+    std::fprintf(stderr, "vio: ~event_loop_t: a vio handle outlived its event loop; release it before the loop stops running -- "
+                         "owning it inside a coroutine that completes, or in a scope that ends, before stop() is the usual fix.\n");
+    assert(_resource_count == 0 && _alive == 0);
+  }
+  auto discard_all = [](posted_t *head) {
+    while (head)
+    {
+      auto *next = head->next;
+      head->next = nullptr;
+      head->queued = false;
+      if (head->discard)
+        head->discard(head);
+      head = next;
+    }
+  };
+  {
+    std::lock_guard lock(_post_mutex);
+    discard_all(_posted.take_all());
+  }
+  discard_all(_deferred.take_all());
+  _backend.reset();
+}
+
+std::int64_t loop_core_t::now() noexcept
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+const char *loop_core_t::backend_name() const noexcept
+{
+  return _backend->name();
+}
+
+bool loop_core_t::in_loop_thread() const noexcept
+{
+  return _thread_id.load(std::memory_order_relaxed) == std::this_thread::get_id();
+}
+
+void loop_core_t::set_thread(std::thread::id id) noexcept
+{
+  _thread_id.store(id, std::memory_order_relaxed);
+}
+
+int loop_core_t::run()
+{
+  set_thread(std::this_thread::get_id());
+  _running = true;
+  for (;;)
+  {
+    run_timers();
+    drain_posted();
+    drain_deferred();
+    if (_stopping && !alive())
+      break;
+    run_before_block();
+    _backend->poll(wait_timeout());
+  }
+  _running = false;
+  return 0;
+}
+
+void loop_core_t::stop()
+{
+  post(_stop_node);
+}
+
+void loop_core_t::on_stop(posted_t *node)
+{
+  static_cast<loop_core_t *>(node->owner)->_stopping = true;
+}
+
+void loop_core_t::post(posted_t &node)
+{
+  {
+    std::lock_guard lock(_post_mutex);
+    if (node.queued)
+      return;
+    node.queued = true;
+    _posted.push_back(node);
+  }
+  if (!_wake_pending.exchange(true, std::memory_order_acq_rel))
+    _backend->wake();
+}
+
+bool loop_core_t::unpost(posted_t &node) noexcept
+{
+  std::lock_guard lock(_post_mutex);
+  if (!node.queued)
+    return false;
+  node.queued = false;
+  return _posted.remove(node);
+}
+
+void loop_core_t::defer(posted_t &node) noexcept
+{
+  if (node.queued)
+    return;
+  node.queued = true;
+  _deferred.push_back(node);
+}
+
+void loop_core_t::drain_posted()
+{
+  _wake_pending.store(false, std::memory_order_release);
+  _draining.clear();
+  {
+    std::lock_guard lock(_post_mutex);
+    auto *head = _posted.take_all();
+    while (head)
+    {
+      auto *next = head->next;
+      head->next = nullptr;
+      head->queued = false;
+      _draining.push_back(head);
+      head = next;
+    }
+  }
+  for (auto *node : _draining)
+    node->run(node);
+}
+
+void loop_core_t::drain_deferred()
+{
+  auto *head = _deferred.take_all();
+  while (head)
+  {
+    auto *next = head->next;
+    head->next = nullptr;
+    head->queued = false;
+    head->run(head);
+    head = next;
+  }
+}
+
+void loop_core_t::add_timer(timer_node_t &node, std::int64_t deadline)
+{
+  remove_timer(node);
+  node.deadline = deadline;
+  _timers.insert(node);
+  if (node.keeps_alive)
+    retain();
+}
+
+void loop_core_t::remove_timer(timer_node_t &node) noexcept
+{
+  if (!node.armed())
+    return;
+  _timers.erase(node);
+  if (node.keeps_alive)
+    release();
+}
+
+void loop_core_t::run_timers()
+{
+  if (_timers.empty())
+    return;
+  auto current = now();
+  auto limit = _timers.next_sequence();
+  for (;;)
+  {
+    auto *top = _timers.top();
+    if (!top || top->deadline > current || top->sequence >= limit)
+      return;
+    _timers.erase(*top);
+    if (top->keeps_alive)
+      release();
+    top->fire(top);
+  }
+}
+
+void loop_core_t::run_before_block()
+{
+  if (!_stopping)
+  {
+    for (std::size_t i = 0; i < _listeners.size(); ++i)
+      _listeners[i]->about_to_block();
+  }
+  for (std::size_t i = 0; i < _hooks.size(); ++i)
+    _hooks[i]->run(_hooks[i]);
+}
+
+std::int64_t loop_core_t::wait_timeout() noexcept
+{
+  if (!_deferred.empty())
+    return 0;
+  {
+    std::lock_guard lock(_post_mutex);
+    if (!_posted.empty())
+      return 0;
+  }
+  auto *top = _timers.top();
+  if (!top)
+    return -1;
+  return std::max<std::int64_t>(0, top->deadline - now());
+}
+
+bool loop_core_t::alive() noexcept
+{
+  if (_alive > 0 || !_deferred.empty())
+    return true;
+  std::lock_guard lock(_post_mutex);
+  return !_posted.empty();
+}
+
+void loop_core_t::retain() noexcept
+{
+  ++_alive;
+}
+
+void loop_core_t::release() noexcept
+{
+  assert(_alive > 0);
+  --_alive;
+}
+
+void loop_core_t::add_listener(about_to_block_t *listener)
+{
+  _listeners.push_back(listener);
+}
+
+void loop_core_t::remove_listener(about_to_block_t *listener) noexcept
+{
+  _listeners.erase(std::remove(_listeners.begin(), _listeners.end(), listener), _listeners.end());
+}
+
+void loop_core_t::add_hook(hook_t &hook)
+{
+  _hooks.push_back(&hook);
+}
+
+void loop_core_t::remove_hook(hook_t &hook) noexcept
+{
+  _hooks.erase(std::remove(_hooks.begin(), _hooks.end(), &hook), _hooks.end());
+}
+
+void loop_core_t::track(resource_t &resource) noexcept
+{
+  resource._previous = nullptr;
+  resource._next = _resources;
+  if (_resources)
+    _resources->_previous = &resource;
+  _resources = &resource;
+  resource._tracked = true;
+  ++_resource_count;
+}
+
+void loop_core_t::untrack(resource_t &resource) noexcept
+{
+  if (!resource._tracked)
+    return;
+  if (resource._previous)
+    resource._previous->_next = resource._next;
+  else
+    _resources = resource._next;
+  if (resource._next)
+    resource._next->_previous = resource._previous;
+  resource._previous = nullptr;
+  resource._next = nullptr;
+  resource._tracked = false;
+  --_resource_count;
+}
+} // namespace vio::detail

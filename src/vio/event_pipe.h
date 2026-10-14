@@ -39,5 +39,5 @@ struct event_bind_t
 #ifdef __EMSCRIPTEN__
 #include "vio/platform/wasm/event_pipe_impl.h"
 #else
-#include "vio/platform/uv/event_pipe_impl.h"
+#include "vio/platform/native/event_pipe_impl.h"
 #endif
