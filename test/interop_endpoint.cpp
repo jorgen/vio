@@ -227,7 +227,7 @@ void answer_requests(server_state_t &state, connection_t &connection)
   }
 }
 
-task_t<int> run_server(event_loop_t &loop, const std::string &testcase)
+vio::task_t<int> run_server(event_loop_t &loop, const std::string &testcase)
 {
   const auto certificate = read_file(environment("CERTS", "/certs") + "/cert.pem");
   const auto key = read_file(environment("CERTS", "/certs") + "/priv.key");
@@ -362,7 +362,7 @@ void collect(client_state_t &state, connection_t &connection)
 
 // One connection carrying every request in the batch. multiconnect calls this
 // once per request instead, which is the whole of that test.
-task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector<request_t> &batch, const std::string &directory, bool key_update, std::vector<std::uint8_t> *ticket = nullptr, bool early_data = false)
+vio::task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector<request_t> &batch, const std::string &directory, bool key_update, std::vector<std::uint8_t> *ticket = nullptr, bool early_data = false)
 {
   if (batch.empty())
   {
@@ -513,7 +513,7 @@ task_t<bool> fetch(event_loop_t &loop, tls_context_t &context, const std::vector
   co_return std::move(ok);
 }
 
-task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
+vio::task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
 {
   const auto requests = parse_requests(environment("REQUESTS"));
   if (requests.empty())

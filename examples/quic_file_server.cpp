@@ -96,7 +96,7 @@ vio::task_t<void> handle_request(vio::quic_stream_t stream)
 vio::task_t<void> serve(vio::quic_connection_t connection, std::size_t expected)
 {
   using namespace vio;
-  std::vector<task_t<void>> requests;
+  std::vector<vio::task_t<void>> requests;
   requests.reserve(expected);
   for (std::size_t taken = 0; taken < expected; ++taken)
   {
@@ -205,7 +205,7 @@ int main()
 
       const std::vector<std::string> names = {"small.txt", "medium.bin", "large.dat"};
 
-      auto serving = [](quic_endpoint_t &endpoint, std::size_t expected) -> task_t<void>
+      auto serving = [](quic_endpoint_t &endpoint, std::size_t expected) -> vio::task_t<void>
       {
         auto connection = co_await quic_endpoint_accept(endpoint);
         if (!connection)
@@ -232,7 +232,7 @@ int main()
       // so they are genuinely concurrent -- which is the property being shown,
       // and the reason the small file finishes first despite being asked for
       // first alongside a file two hundred times its size.
-      std::vector<task_t<std::size_t>> downloads;
+      std::vector<vio::task_t<std::size_t>> downloads;
       downloads.reserve(names.size());
       for (const auto &name : names)
       {

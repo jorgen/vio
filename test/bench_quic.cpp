@@ -181,7 +181,7 @@ double socket_transfer(const certificate_t &identity, bool offload, std::size_t 
   loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &event_loop, const certificate_t &pem, bool use_offload, std::size_t total_mb, double &elapsed) -> task_t<void>
+      return [](event_loop_t &event_loop, const certificate_t &pem, bool use_offload, std::size_t total_mb, double &elapsed) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -466,7 +466,7 @@ report_t bulk_callback(const certificate_t &identity, std::size_t megabytes)
   loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t total_mb, report_t &out) -> task_t<void>
+      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t total_mb, report_t &out) -> vio::task_t<void>
       {
         auto contexts = make_contexts(pem);
         auto server_made = endpoint_t::create(event_loop, *contexts.server, bench_endpoint_config(tls_role_t::server));
@@ -580,7 +580,7 @@ report_t bulk_coroutine(const certificate_t &identity, std::size_t megabytes, bo
   loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t total_mb, bool owning, report_t &out) -> task_t<void>
+      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t total_mb, bool owning, report_t &out) -> vio::task_t<void>
       {
         auto contexts = make_contexts(pem);
         quic_config_t server_config;
@@ -598,7 +598,7 @@ report_t bulk_coroutine(const certificate_t &identity, std::size_t megabytes, bo
         const std::size_t total = total_mb * 1024 * 1024;
         std::size_t drained = 0;
 
-        auto receiving = [](quic_endpoint_t &endpoint, std::size_t expected, bool owning, std::size_t &drained) -> task_t<void>
+        auto receiving = [](quic_endpoint_t &endpoint, std::size_t expected, bool owning, std::size_t &drained) -> vio::task_t<void>
         {
           auto connection = co_await quic_endpoint_accept(endpoint);
           auto stream = co_await quic_accept_stream(*connection);
@@ -683,7 +683,7 @@ report_t requests_callback(const certificate_t &identity, std::size_t count, std
   loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t requests, std::size_t body_size, report_t &out) -> task_t<void>
+      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t requests, std::size_t body_size, report_t &out) -> vio::task_t<void>
       {
         auto contexts = make_contexts(pem);
         auto server_made = endpoint_t::create(event_loop, *contexts.server, bench_endpoint_config(tls_role_t::server));
@@ -797,7 +797,7 @@ report_t requests_coroutine(const certificate_t &identity, std::size_t count, st
   loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t requests, std::size_t body_size, report_t &out) -> task_t<void>
+      return [](event_loop_t &event_loop, const certificate_t &pem, std::size_t requests, std::size_t body_size, report_t &out) -> vio::task_t<void>
       {
         auto contexts = make_contexts(pem);
         quic_config_t server_config;
@@ -815,10 +815,10 @@ report_t requests_coroutine(const certificate_t &identity, std::size_t count, st
         const std::vector<std::uint8_t> body(body_size, 0x27);
         std::size_t received = 0;
 
-        auto serving = [](quic_endpoint_t &endpoint, std::size_t requests, const std::vector<std::uint8_t> &body) -> task_t<void>
+        auto serving = [](quic_endpoint_t &endpoint, std::size_t requests, const std::vector<std::uint8_t> &body) -> vio::task_t<void>
         {
           auto connection = co_await quic_endpoint_accept(endpoint);
-          std::vector<task_t<void>> handlers;
+          std::vector<vio::task_t<void>> handlers;
           handlers.reserve(requests);
           for (std::size_t taken = 0; taken < requests; ++taken)
           {
@@ -828,7 +828,7 @@ report_t requests_coroutine(const certificate_t &identity, std::size_t count, st
               break;
             }
             handlers.push_back(
-              [](quic_stream_t stream, const std::vector<std::uint8_t> &body) -> task_t<void>
+              [](quic_stream_t stream, const std::vector<std::uint8_t> &body) -> vio::task_t<void>
               {
                 auto reader = quic_stream_create_reader(stream);
                 std::uint8_t scratch[64];
@@ -855,12 +855,12 @@ report_t requests_coroutine(const certificate_t &identity, std::size_t count, st
         phase_t phase;
         phase.begin();
         const std::string request = "get\n";
-        std::vector<task_t<std::size_t>> asks;
+        std::vector<vio::task_t<std::size_t>> asks;
         asks.reserve(requests);
         for (std::size_t i = 0; i < requests; ++i)
         {
           asks.push_back(
-            [](quic_connection_t connection, const std::string &request) -> task_t<std::size_t>
+            [](quic_connection_t connection, const std::string &request) -> vio::task_t<std::size_t>
             {
               auto stream = co_await quic_open_stream(connection);
               if (!stream)

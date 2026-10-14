@@ -535,12 +535,12 @@ TEST_CASE("an endpoint released while the loop can still run leaves nothing open
   event_loop_t event_loop;
   bool released = false;
 
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   event_loop.run_in_loop(
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &was_released) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &was_released) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, tls);
@@ -610,14 +610,14 @@ TEST_CASE("a permanently armed beat still lets the loop sleep")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool slept = false;
 
   event_loop.run_in_loop(
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &did_sleep) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &did_sleep) -> vio::task_t<void>
         {
           auto endpoint = quic_endpoint_create(loop, tls);
           REQUIRE(endpoint.has_value());
@@ -745,8 +745,8 @@ TEST_CASE("teardown resolves an operation nobody would otherwise resume")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
-  std::optional<task_t<void>> watchdog;
+  std::optional<vio::task_t<void>> task;
+  std::optional<vio::task_t<void>> watchdog;
   cancellation_t stop_watchdog;
   bool resolved = false;
   int code = 0;
@@ -756,7 +756,7 @@ TEST_CASE("teardown resolves an operation nobody would otherwise resume")
     [&]
     {
       watchdog.emplace(
-        [](event_loop_t &loop, cancellation_t &cancel, bool &timed_out, const bool &resolved) -> task_t<void>
+        [](event_loop_t &loop, cancellation_t &cancel, bool &timed_out, const bool &resolved) -> vio::task_t<void>
         {
           (void)co_await sleep(loop, std::chrono::seconds(5), &cancel);
           if (!resolved)
@@ -767,7 +767,7 @@ TEST_CASE("teardown resolves an operation nobody would otherwise resume")
         }(event_loop, stop_watchdog, timed_out, resolved));
 
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, cancellation_t &stop_watchdog, bool &resolved, int &code) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, cancellation_t &stop_watchdog, bool &resolved, int &code) -> vio::task_t<void>
         {
           auto endpoint = quic_endpoint_create(loop, tls);
           REQUIRE(endpoint.has_value());
@@ -833,7 +833,7 @@ TEST_CASE("binding to zero picks a port and starts the read loop")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   std::uint16_t port = 0;
   bool reading = false;
 
@@ -841,7 +841,7 @@ TEST_CASE("binding to zero picks a port and starts the read loop")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, std::uint16_t &port, bool &reading) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, std::uint16_t &port, bool &reading) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, tls);
@@ -883,7 +883,7 @@ TEST_CASE("a bind that fails does not leave the endpoint reading")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool refused = false;
   bool never_read = false;
   bool no_port = false;
@@ -892,7 +892,7 @@ TEST_CASE("a bind that fails does not leave the endpoint reading")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &refused, bool &never_read, bool &no_port) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &refused, bool &never_read, bool &no_port) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, tls);
@@ -929,14 +929,14 @@ TEST_CASE("a dial-only endpoint may still pin a source port")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool bound = false;
 
   event_loop.run_in_loop(
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &bound) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &bound) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, nullptr, &tls);
@@ -965,14 +965,14 @@ TEST_CASE("the read loop is started once, however many times bind is called")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool one_driver = false;
 
   event_loop.run_in_loop(
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &one_driver) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &one_driver) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, tls);
@@ -1056,7 +1056,7 @@ TEST_CASE("a dial resolves when the handshake completes")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool connected = false;
   std::string alpn;
   bool is_client = false;
@@ -1065,7 +1065,7 @@ TEST_CASE("a dial resolves when the handshake completes")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &server_tls_context, const vio::quic::tls_context_t &client_tls_context, bool &connected, std::string &alpn, bool &is_client) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &server_tls_context, const vio::quic::tls_context_t &client_tls_context, bool &connected, std::string &alpn, bool &is_client) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, server_tls_context);
@@ -1114,7 +1114,7 @@ TEST_CASE("a dial nobody answers resolves with the handshake failure")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool failed = false;
   int code = 0;
 
@@ -1122,7 +1122,7 @@ TEST_CASE("a dial nobody answers resolves with the handshake failure")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &failed, int &code) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &failed, int &code) -> vio::task_t<void>
         {
           {
             // A socket that swallows whatever arrives.
@@ -1197,7 +1197,7 @@ TEST_CASE("a dial on an endpoint with no client context is refused with a senten
   REQUIRE(server_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool refused = false;
   bool has_sentence = false;
   bool still_bindable = false;
@@ -1206,7 +1206,7 @@ TEST_CASE("a dial on an endpoint with no client context is refused with a senten
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &refused, bool &has_sentence, bool &still_bindable) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &refused, bool &has_sentence, bool &still_bindable) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, tls);
@@ -1251,8 +1251,8 @@ TEST_CASE("an endpoint released mid-dial resolves the dial and closes its loop")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
-  std::optional<task_t<void>> watchdog;
+  std::optional<vio::task_t<void>> task;
+  std::optional<vio::task_t<void>> watchdog;
   cancellation_t stop_watchdog;
   bool resolved = false;
   int code = 0;
@@ -1262,7 +1262,7 @@ TEST_CASE("an endpoint released mid-dial resolves the dial and closes its loop")
     [&]
     {
       watchdog.emplace(
-        [](event_loop_t &loop, cancellation_t &cancel, bool &timed_out, bool &resolved) -> task_t<void>
+        [](event_loop_t &loop, cancellation_t &cancel, bool &timed_out, bool &resolved) -> vio::task_t<void>
         {
           (void)co_await sleep(loop, std::chrono::seconds(5), &cancel);
           if (!resolved)
@@ -1273,7 +1273,7 @@ TEST_CASE("an endpoint released mid-dial resolves the dial and closes its loop")
         }(event_loop, stop_watchdog, timed_out, resolved));
 
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, cancellation_t &stop_watchdog, bool &resolved, int &code) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, cancellation_t &stop_watchdog, bool &resolved, int &code) -> vio::task_t<void>
         {
           auto client = quic_endpoint_create(loop, nullptr, &tls);
           REQUIRE(client.has_value());
@@ -1349,7 +1349,7 @@ TEST_CASE("an accept and a dial meet")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool accepted = false;
   bool connected = false;
   bool accepted_as_server = false;
@@ -1358,7 +1358,7 @@ TEST_CASE("an accept and a dial meet")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &accepted, bool &connected, bool &accepted_as_server) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &accepted, bool &connected, bool &accepted_as_server) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, answering);
@@ -1367,7 +1367,7 @@ TEST_CASE("an accept and a dial meet")
             const auto port = quic_endpoint_local_port(*server).value_or(0);
             REQUIRE(port != 0);
 
-            auto accepting = [](quic_endpoint_t &endpoint, bool &accepted, bool &accepted_as_server) -> task_t<void>
+            auto accepting = [](quic_endpoint_t &endpoint, bool &accepted, bool &accepted_as_server) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               accepted = arrived.has_value();
@@ -1412,7 +1412,7 @@ TEST_CASE("a connection that arrives before anyone accepts is queued, not lost")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool queued = false;
   bool accepted_without_suspending = false;
 
@@ -1420,7 +1420,7 @@ TEST_CASE("a connection that arrives before anyone accepts is queued, not lost")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &queued, bool &at_once) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &queued, bool &at_once) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, answering);
@@ -1473,7 +1473,7 @@ TEST_CASE("two accepts are both served, oldest first")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   int accepted = 0;
   int order[2] = {0, 0};
 
@@ -1481,7 +1481,7 @@ TEST_CASE("two accepts are both served, oldest first")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, int &accepted, int *order) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, int &accepted, int *order) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, answering);
@@ -1489,7 +1489,7 @@ TEST_CASE("two accepts are both served, oldest first")
             REQUIRE(quic_endpoint_bind(*server, std::uint16_t{0}).has_value());
             const auto port = quic_endpoint_local_port(*server).value_or(0);
 
-            auto first = [](quic_endpoint_t &endpoint, int &accepted, int *order) -> task_t<void>
+            auto first = [](quic_endpoint_t &endpoint, int &accepted, int *order) -> vio::task_t<void>
             {
               const auto arrived = co_await quic_endpoint_accept(endpoint);
               if (arrived)
@@ -1497,7 +1497,7 @@ TEST_CASE("two accepts are both served, oldest first")
                 order[accepted++] = 1;
               }
             }(*server, accepted, order);
-            auto second = [](quic_endpoint_t &endpoint, int &accepted, int *order) -> task_t<void>
+            auto second = [](quic_endpoint_t &endpoint, int &accepted, int *order) -> vio::task_t<void>
             {
               const auto arrived = co_await quic_endpoint_accept(endpoint);
               if (arrived)
@@ -1541,7 +1541,7 @@ TEST_CASE("an endpoint dialling its own peer does not accept its own dial")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool alice_dialled = false;
   bool bob_accepted = false;
   bool alice_accepted_nothing = true;
@@ -1550,7 +1550,7 @@ TEST_CASE("an endpoint dialling its own peer does not accept its own dial")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &alice_dialled, bool &bob_accepted, bool &alice_accepted_nothing) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &alice_dialled, bool &bob_accepted, bool &alice_accepted_nothing) -> vio::task_t<void>
         {
           {
             auto alice = quic_endpoint_create(loop, &answering, &dialling);
@@ -1566,7 +1566,7 @@ TEST_CASE("an endpoint dialling its own peer does not accept its own dial")
             REQUIRE(quic_endpoint_bind(*bob, reinterpret_cast<const sockaddr *>(&any)).has_value());
             const auto bob_port = quic_endpoint_local_port(*bob).value_or(0);
 
-            auto bob_accepting = [](quic_endpoint_t &endpoint, bool &bob_accepted) -> task_t<void>
+            auto bob_accepting = [](quic_endpoint_t &endpoint, bool &bob_accepted) -> vio::task_t<void>
             {
               const auto arrived = co_await quic_endpoint_accept(endpoint);
               bob_accepted = arrived.has_value() && arrived->handle->role == vio::quic::tls_role_t::server;
@@ -1612,7 +1612,7 @@ TEST_CASE("a connection dialled behind this layer's back is ignored, not accepte
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool handshaken = false;
   bool queue_untouched = false;
 
@@ -1620,7 +1620,7 @@ TEST_CASE("a connection dialled behind this layer's back is ignored, not accepte
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &handshaken, bool &queue_untouched) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &handshaken, bool &queue_untouched) -> vio::task_t<void>
         {
           {
             auto listener = quic_endpoint_create(loop, answering);
@@ -1684,7 +1684,7 @@ TEST_CASE("an accept past the backlog is refused rather than queued")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool first_connected = false;
   bool second_refused = false;
   std::size_t queued = 0;
@@ -1693,7 +1693,7 @@ TEST_CASE("an accept past the backlog is refused rather than queued")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &first_connected, bool &second_refused, std::size_t &queued) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &first_connected, bool &second_refused, std::size_t &queued) -> vio::task_t<void>
         {
           {
             quic_config_t config;
@@ -1751,7 +1751,7 @@ TEST_CASE("an accept on an endpoint that cannot answer is refused with a sentenc
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool dial_only_refused = false;
   bool unbound_refused = false;
 
@@ -1759,7 +1759,7 @@ TEST_CASE("an accept on an endpoint that cannot answer is refused with a sentenc
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &dial_only_refused, bool &unbound_refused) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &answering, const vio::quic::tls_context_t &dialling, bool &dial_only_refused, bool &unbound_refused) -> vio::task_t<void>
         {
           {
             auto dial_only = quic_endpoint_create(loop, nullptr, &dialling);
@@ -1833,7 +1833,7 @@ TEST_CASE("a close reaches the peer, and the peer learns of it by awaiting")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool client_saw_close = false;
   std::uint64_t code = 0;
   std::string reason;
@@ -1843,7 +1843,7 @@ TEST_CASE("a close reaches the peer, and the peer learns of it by awaiting")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &client_saw_close, std::uint64_t &code, std::string &reason, bool &was_from_peer) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &client_saw_close, std::uint64_t &code, std::string &reason, bool &was_from_peer) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -1852,7 +1852,7 @@ TEST_CASE("a close reaches the peer, and the peer learns of it by awaiting")
             REQUIRE(quic_endpoint_bind(*server, reinterpret_cast<const sockaddr *>(&any)).has_value());
             const auto port = quic_endpoint_local_port(*server).value_or(0);
 
-            auto answering = [](quic_endpoint_t &endpoint) -> task_t<void>
+            auto answering = [](quic_endpoint_t &endpoint) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -1904,7 +1904,7 @@ TEST_CASE("a milestone asked for after the fact answers rather than blocking")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool ready_at_once = false;
   bool closed_at_once = false;
   bool open_then_not = false;
@@ -1913,7 +1913,7 @@ TEST_CASE("a milestone asked for after the fact answers rather than blocking")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &ready_at_once, bool &closed_at_once, bool &open_then_not) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &ready_at_once, bool &closed_at_once, bool &open_then_not) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -1967,7 +1967,7 @@ TEST_CASE("a connection handle kept past the ending still answers")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   quic_connection_t survivor;
   std::size_t counted = 0;
 
@@ -1975,7 +1975,7 @@ TEST_CASE("a connection handle kept past the ending still answers")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, quic_connection_t &survivor, std::size_t &counted) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, quic_connection_t &survivor, std::size_t &counted) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -2045,7 +2045,7 @@ TEST_CASE("an idle timeout is reported as itself, not as a close")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool timed_out = false;
   int code = 0;
 
@@ -2053,7 +2053,7 @@ TEST_CASE("an idle timeout is reported as itself, not as a close")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &timed_out, int &code) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &timed_out, int &code) -> vio::task_t<void>
         {
           {
             quic_config_t client_config;
@@ -2166,7 +2166,7 @@ TEST_CASE("a shutdown with nothing to close resolves at once")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool at_once = false;
   bool resolved = false;
 
@@ -2174,7 +2174,7 @@ TEST_CASE("a shutdown with nothing to close resolves at once")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &at_once, bool &resolved) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, bool &at_once, bool &resolved) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, tls);
@@ -2208,7 +2208,7 @@ TEST_CASE("a shutdown closes every connection and the peers hear it")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool shut_down = false;
   int first_ending = 0;
   int second_ending = 0;
@@ -2218,7 +2218,7 @@ TEST_CASE("a shutdown closes every connection and the peers hear it")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &shut_down, int &first_ending, int &second_ending, bool &from_peer) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &shut_down, int &first_ending, int &second_ending, bool &from_peer) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -2292,7 +2292,7 @@ TEST_CASE("a shutdown whose connections never end resolves on its deadline")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool resolved = false;
   bool waited = false;
   bool not_before = false;
@@ -2301,7 +2301,7 @@ TEST_CASE("a shutdown whose connections never end resolves on its deadline")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &resolved, bool &waited, bool &not_before) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &resolved, bool &waited, bool &not_before) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, listening);
@@ -2346,14 +2346,14 @@ TEST_CASE("a shutdown stops the endpoint accepting")
   REQUIRE(server_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool refused = false;
 
   event_loop.run_in_loop(
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &refused) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &refused) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -2422,7 +2422,7 @@ TEST_CASE("a pre-cancelled dial never touches the transport")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool cancelled = false;
   bool nothing_dialled = false;
   bool still_bindable = false;
@@ -2431,7 +2431,7 @@ TEST_CASE("a pre-cancelled dial never touches the transport")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &connecting, bool &cancelled, bool &nothing_dialled, bool &still_bindable) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &connecting, bool &cancelled, bool &nothing_dialled, bool &still_bindable) -> vio::task_t<void>
         {
           {
             auto client = quic_endpoint_create(loop, nullptr, &connecting);
@@ -2479,7 +2479,7 @@ TEST_CASE("a cancelled dial resolves the caller and closes what it built")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool cancelled = false;
   bool server_never_accepted = false;
   bool connection_closed = false;
@@ -2488,7 +2488,7 @@ TEST_CASE("a cancelled dial resolves the caller and closes what it built")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &cancelled, bool &server_never_accepted, bool &connection_closed) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &cancelled, bool &server_never_accepted, bool &connection_closed) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -2543,7 +2543,7 @@ TEST_CASE("a cancelled accept leaves the queue intact for the next one")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool first_cancelled = false;
   bool second_accepted = false;
 
@@ -2551,7 +2551,7 @@ TEST_CASE("a cancelled accept leaves the queue intact for the next one")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &first_cancelled, bool &second_accepted) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &first_cancelled, bool &second_accepted) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -2610,7 +2610,7 @@ TEST_CASE("a token that dies before the beat runs is never written through")
   REQUIRE(context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool resolved = false;
   bool survived = false;
 
@@ -2618,7 +2618,7 @@ TEST_CASE("a token that dies before the beat runs is never written through")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &resolved, bool &survived) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, bool &resolved, bool &survived) -> vio::task_t<void>
         {
           {
             auto endpoint = quic_endpoint_create(loop, listening);
@@ -2667,7 +2667,7 @@ TEST_CASE("cancelling an accept that has already resolved changes nothing")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool accepted = false;
   bool still_accepted = false;
 
@@ -2675,7 +2675,7 @@ TEST_CASE("cancelling an accept that has already resolved changes nothing")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &accepted, bool &still_accepted) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &connecting, bool &accepted, bool &still_accepted) -> vio::task_t<void>
         {
           {
             auto server = quic_endpoint_create(loop, listening);
@@ -2794,7 +2794,7 @@ TEST_CASE("a stream carries bytes and a clean ending")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   std::string echoed;
   int ending = 0;
   bool server_saw_fin = false;
@@ -2803,12 +2803,12 @@ TEST_CASE("a stream carries bytes and a clean ending")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, std::string &echoed, int &ending, bool &server_saw_fin) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, std::string &echoed, int &ending, bool &server_saw_fin) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
 
-            auto serving = [](quic_endpoint_t &endpoint, bool &saw_fin) -> task_t<void>
+            auto serving = [](quic_endpoint_t &endpoint, bool &saw_fin) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -2880,7 +2880,7 @@ TEST_CASE("a stream that carries only a FIN is still accepted")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool accepted = false;
   int ending = 0;
   std::uint64_t accepted_id = 0;
@@ -2890,12 +2890,12 @@ TEST_CASE("a stream that carries only a FIN is still accepted")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &accepted, int &ending, std::uint64_t &accepted_id, std::uint64_t &opened_id) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &accepted, int &ending, std::uint64_t &accepted_id, std::uint64_t &opened_id) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
 
-            auto serving = [](quic_endpoint_t &endpoint, bool &accepted, int &ending, std::uint64_t &accepted_id) -> task_t<void>
+            auto serving = [](quic_endpoint_t &endpoint, bool &accepted, int &ending, std::uint64_t &accepted_id) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -2952,7 +2952,7 @@ TEST_CASE("a reset is reported as itself and carries the peer's code")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   int ending = 0;
   std::uint64_t peer_code = 0;
   bool got_bytes_first = false;
@@ -2961,12 +2961,12 @@ TEST_CASE("a reset is reported as itself and carries the peer's code")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, std::uint64_t &peer_code, bool &got_bytes_first) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, std::uint64_t &peer_code, bool &got_bytes_first) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
 
-            auto serving = [](quic_endpoint_t &endpoint, int &ending, std::uint64_t &peer_code, bool &got_bytes_first) -> task_t<void>
+            auto serving = [](quic_endpoint_t &endpoint, int &ending, std::uint64_t &peer_code, bool &got_bytes_first) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -3028,7 +3028,7 @@ TEST_CASE("read_into fills a caller's buffer and reports EOF as zero")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   std::string received;
   bool saw_zero = false;
 
@@ -3036,12 +3036,12 @@ TEST_CASE("read_into fills a caller's buffer and reports EOF as zero")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, std::string &received, bool &saw_zero) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, std::string &received, bool &saw_zero) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
 
-            auto serving = [](quic_endpoint_t &endpoint, std::string &received, bool &saw_zero) -> task_t<void>
+            auto serving = [](quic_endpoint_t &endpoint, std::string &received, bool &saw_zero) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -3097,7 +3097,7 @@ TEST_CASE("a unidirectional stream has one half and says so")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool sender_cannot_read = false;
   bool receiver_cannot_write = false;
   bool reader_refused = false;
@@ -3108,12 +3108,12 @@ TEST_CASE("a unidirectional stream has one half and says so")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &sender_cannot_read, bool &receiver_cannot_write, bool &reader_refused, bool &write_refused, std::string &received) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &sender_cannot_read, bool &receiver_cannot_write, bool &reader_refused, bool &write_refused, std::string &received) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
 
-            auto serving = [](quic_endpoint_t &endpoint, bool &receiver_cannot_write, bool &write_refused, std::string &received) -> task_t<void>
+            auto serving = [](quic_endpoint_t &endpoint, bool &receiver_cannot_write, bool &write_refused, std::string &received) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -3172,7 +3172,7 @@ TEST_CASE("an open past the peer's limit waits for the credit that raises it")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool third_refused = false;
   bool third_opened = false;
 
@@ -3180,7 +3180,7 @@ TEST_CASE("an open past the peer's limit waits for the credit that raises it")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &third_refused, bool &third_opened) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &third_refused, bool &third_opened) -> vio::task_t<void>
         {
           {
             using namespace vio;
@@ -3204,7 +3204,7 @@ TEST_CASE("an open past the peer's limit waits for the credit that raises it")
 
             // The server accepts every stream and finishes with it at once,
             // which is what returns the credit.
-            auto serving = [](quic_endpoint_t &endpoint) -> task_t<void>
+            auto serving = [](quic_endpoint_t &endpoint) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -3287,7 +3287,7 @@ TEST_CASE("a burst of streams larger than any local queue is all accepted")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   int opened = 0;
   int accepted = 0;
   int with_bytes = 0;
@@ -3296,7 +3296,7 @@ TEST_CASE("a burst of streams larger than any local queue is all accepted")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &opened, int &accepted, int &with_bytes) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &opened, int &accepted, int &with_bytes) -> vio::task_t<void>
         {
           {
             // The server grants more streams than the burst, so the burst is
@@ -3336,7 +3336,7 @@ TEST_CASE("a burst of streams larger than any local queue is all accepted")
               streams.push_back(*stream);
             }
 
-            auto serving = [](quic_endpoint_t &endpoint, int &accepted, int &with_bytes) -> task_t<void>
+            auto serving = [](quic_endpoint_t &endpoint, int &accepted, int &with_bytes) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -3398,7 +3398,7 @@ TEST_CASE("dropping a stream handle tells the peer rather than going quiet")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   int ending = 0;
   bool registry_emptied = false;
 
@@ -3406,14 +3406,14 @@ TEST_CASE("dropping a stream handle tells the peer rather than going quiet")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, bool &registry_emptied) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, bool &registry_emptied) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
 
             // The server accepts the stream and then simply lets it go, without
             // reading it to the end and without finishing its own half.
-            auto serving = [](event_loop_t &loop, quic_endpoint_t &endpoint, bool &registry_emptied) -> task_t<void>
+            auto serving = [](event_loop_t &loop, quic_endpoint_t &endpoint, bool &registry_emptied) -> vio::task_t<void>
             {
               auto arrived = co_await quic_endpoint_accept(endpoint);
               REQUIRE(arrived.has_value());
@@ -3473,7 +3473,7 @@ TEST_CASE("a stream handle kept past the connection still answers")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   quic_stream_t survivor;
   std::uint64_t id = 0;
 
@@ -3481,7 +3481,7 @@ TEST_CASE("a stream handle kept past the connection still answers")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, quic_stream_t &survivor, std::uint64_t &id) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, quic_stream_t &survivor, std::uint64_t &id) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
@@ -3527,7 +3527,7 @@ TEST_CASE("stop_sending ends this endpoint's read without waiting a round trip")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   int ending = 0;
   bool stopped_while_parked = false;
 
@@ -3535,7 +3535,7 @@ TEST_CASE("stop_sending ends this endpoint's read without waiting a round trip")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, bool &stopped_while_parked) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, int &ending, bool &stopped_while_parked) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);
@@ -3552,7 +3552,7 @@ TEST_CASE("stop_sending ends this endpoint's read without waiting a round trip")
             // A second coroutine gives up on the read while this one is parked
             // on it. That is the case reader.cancel() cannot serve, because the
             // reader is a local one frame down.
-            auto giving_up = [](event_loop_t &loop, quic_stream_t stream, bool &stopped) -> task_t<void>
+            auto giving_up = [](event_loop_t &loop, quic_stream_t stream, bool &stopped) -> vio::task_t<void>
             {
               (void)co_await sleep(loop, std::chrono::milliseconds(50));
               stopped = true;
@@ -3587,7 +3587,7 @@ TEST_CASE("a second reader on one stream is refused")
   REQUIRE(dialling.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool second_refused = false;
   bool third_allowed = false;
 
@@ -3595,7 +3595,7 @@ TEST_CASE("a second reader on one stream is refused")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &second_refused, bool &third_allowed) -> task_t<void>
+        [](event_loop_t &loop, const vio::quic::tls_context_t &listening, const vio::quic::tls_context_t &dialling, bool &second_refused, bool &third_allowed) -> vio::task_t<void>
         {
           {
             auto pair = make_pair(loop, listening, dialling);

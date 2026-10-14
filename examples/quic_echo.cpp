@@ -82,7 +82,7 @@ int main()
       // The server, as its own coroutine. It is started here and awaited at the
       // bottom; between those two points it runs whenever it has something to
       // do, driven by the endpoint rather than by this function.
-      auto serving = [](quic_endpoint_t &endpoint) -> task_t<void>
+      auto serving = [](quic_endpoint_t &endpoint) -> vio::task_t<void>
       {
         auto connection = co_await quic_endpoint_accept(endpoint);
         if (!connection)

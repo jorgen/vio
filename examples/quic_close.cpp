@@ -160,7 +160,7 @@ int main()
       // comes from: the *code* is the server's, and from_peer is what tells the
       // client it did not close this connection itself.
       {
-        auto serving = [](quic_endpoint_t &endpoint) -> task_t<void>
+        auto serving = [](quic_endpoint_t &endpoint) -> vio::task_t<void>
         {
           auto connection = co_await quic_endpoint_accept(endpoint);
           if (!connection)
@@ -227,7 +227,7 @@ int main()
       // code, the same application flag and the same from_peer as a clean local
       // close, and nothing else separates them.
       {
-        auto serving = [](quic_endpoint_t &endpoint) -> task_t<void>
+        auto serving = [](quic_endpoint_t &endpoint) -> vio::task_t<void>
         {
           auto connection = co_await quic_endpoint_accept(endpoint);
           if (!connection)

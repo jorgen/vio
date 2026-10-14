@@ -122,7 +122,7 @@ int main()
       std::println("server listening on port {}", port);
 
       int received = 0;
-      auto serving = [](quic_endpoint_t &endpoint, event_loop_t &loop, int &received) -> task_t<void>
+      auto serving = [](quic_endpoint_t &endpoint, event_loop_t &loop, int &received) -> vio::task_t<void>
       {
         auto connection = co_await quic_endpoint_accept(endpoint);
         if (!connection)

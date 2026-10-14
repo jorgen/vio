@@ -150,7 +150,7 @@ int main(int argc, char **argv)
   loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &event_loop, const identity_t &pem, int listen_port, const char *protocol, int lifetime, bool retry, const char *qlog_dir, int &handshakes, std::size_t &bytes_read, std::size_t &answered) -> task_t<void>
+      return [](event_loop_t &event_loop, const identity_t &pem, int listen_port, const char *protocol, int lifetime, bool retry, const char *qlog_dir, int &handshakes, std::size_t &bytes_read, std::size_t &answered) -> vio::task_t<void>
       {
         // One register for the whole endpoint, which is what it has to be: a
         // replay is the same ClientHello arriving on a second connection, so a

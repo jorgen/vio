@@ -113,7 +113,7 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, bool &ecn_still_on, std::string &received) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, bool &ecn_still_on, std::string &received) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -249,7 +249,7 @@ TEST_CASE("a Retry is answered without building a connection for it")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, bool &through_retry, std::size_t &accepted_connections) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &handshaken, bool &through_retry, std::size_t &accepted_connections) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -347,7 +347,7 @@ TEST_CASE("one server port keeps two clients apart")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &accepted, std::string &first_message, std::string &second_message) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &accepted, std::string &first_message, std::string &second_message) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -510,7 +510,7 @@ TEST_CASE("a handle stops naming a connection the endpoint has collected")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &before, bool &after) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &before, bool &after) -> vio::task_t<void>
       {
         tls_config_t client_tls;
         client_tls.role = tls_role_t::client;
@@ -574,7 +574,7 @@ TEST_CASE("a resumed connection carries a request in its first flight, over a re
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &resumed, bool &early_accepted, std::string &received) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &resumed, bool &early_accepted, std::string &received) -> vio::task_t<void>
       {
         anti_replay_t strikes;
 
@@ -722,7 +722,7 @@ TEST_CASE("a Version Negotiation packet is never answered with another one")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, int &to_vn, int &to_small, int &to_real) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, int &to_vn, int &to_small, int &to_real) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -779,7 +779,7 @@ TEST_CASE("a Version Negotiation packet is never answered with another one")
         }(*reader, received);
         (void)pump;
 
-        const auto probe_with = [&](std::vector<std::uint8_t> bytes) -> task_t<int>
+        const auto probe_with = [&](std::vector<std::uint8_t> bytes) -> vio::task_t<int>
         {
           received = 0;
           (void)udp_try_send(*probe, bytes, reinterpret_cast<const sockaddr *>(&*target));
@@ -850,7 +850,7 @@ TEST_CASE("an application may dial and flush from inside its connection handler"
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, int &announced, bool &survived) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, int &announced, bool &survived) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -966,7 +966,7 @@ TEST_CASE("a datagram that cannot draw a stateless reset does not spend one")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, int &to_long, int &to_short) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, int &to_long, int &to_short) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -1099,7 +1099,7 @@ TEST_CASE("a connection is not reaped while the endpoint is walking it")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &before, std::size_t &after, bool &seen) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &before, std::size_t &after, bool &seen) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -1213,7 +1213,7 @@ TEST_CASE("concurrent dials on one endpoint each keep their own routes")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &count) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, std::size_t &count) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -1331,7 +1331,7 @@ TEST_CASE("a dialled connection is not routed by the id it invented")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &done, int &to_invented, int &to_real) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &done, int &to_invented, int &to_real) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -1442,7 +1442,7 @@ TEST_CASE("a dialled connection is not routed by the id it invented")
 
         // A short header naming the given connection id. A reset comes back
         // only when the endpoint does not recognise it.
-        const auto probe_with = [&](const connection_id_t &id) -> task_t<int>
+        const auto probe_with = [&](const connection_id_t &id) -> vio::task_t<int>
         {
           received = 0;
           std::vector<std::uint8_t> datagram(100, 0x00);
@@ -1511,7 +1511,7 @@ TEST_CASE("one endpoint both answers and dials on the same port")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &left_ok, bool &right_ok, std::size_t &left_in, std::size_t &right_in, std::size_t &clients, std::size_t &servers) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &left_ok, bool &right_ok, std::size_t &left_in, std::size_t &right_in, std::size_t &clients, std::size_t &servers) -> vio::task_t<void>
       {
         // One description, two contexts. Both peers answer with the same
         // identity and trust it, which is all a two-node demonstration needs.
@@ -1675,7 +1675,7 @@ TEST_CASE("a connection survives its peer's address changing under it")
   REQUIRE(client_context.has_value());
 
   event_loop_t event_loop;
-  std::optional<task_t<void>> task;
+  std::optional<vio::task_t<void>> task;
   bool handshaken = false;
   std::uint64_t migrations = 0;
   std::string before_move;
@@ -1685,7 +1685,7 @@ TEST_CASE("a connection survives its peer's address changing under it")
     [&]
     {
       task.emplace(
-        [](event_loop_t &loop, const tls_context_t &server_ctx, const tls_context_t &client_ctx, bool &handshaken, std::uint64_t &migrations, std::string &before_move, std::string &after_move) -> task_t<void>
+        [](event_loop_t &loop, const tls_context_t &server_ctx, const tls_context_t &client_ctx, bool &handshaken, std::uint64_t &migrations, std::string &before_move, std::string &after_move) -> vio::task_t<void>
         {
           {
             endpoint_config_t server_config;
@@ -1956,7 +1956,7 @@ TEST_CASE("an endpoint refuses the direction it has no context for")
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &refused, bool &unbound, int &answered) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &refused, bool &unbound, int &answered) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
@@ -2099,7 +2099,7 @@ TEST_CASE("an endpoint reaches an IPv6 peer even with run() started first" * doc
   event_loop.run_in_loop(
     [&]
     {
-      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &ok, bool &no_ipv6) -> task_t<void>
+      return [](event_loop_t &loop, const certificate_t &identity_pem, bool &ok, bool &no_ipv6) -> vio::task_t<void>
       {
         tls_config_t server_tls;
         server_tls.role = tls_role_t::server;
