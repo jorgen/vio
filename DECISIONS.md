@@ -29,12 +29,18 @@ enqueue after stop and is often full of CPU work, so it is not used.
 A `getaddrinfo` stuck in the kernel delays exit; detaching threads that may touch freed memory
 at exit is worse.
 
-**D6. Socket operation state lives in the awaiter, inside the coroutine frame.** A TCP or TLS read
-or write, and a datagram receive, allocate nothing per operation once the connection is warm. That
-is the whole claim. These still allocate on every call: `sleep`, every file operation and every DNS
-lookup (each makes one reference-counted state through `future_t`), the owning `send_udp` (a
-`udp_send_op_t`), and every operation of the QUIC coroutine layer (a per-call heap operation, by
-design). `BASELINE.md` counts what that adds up to: 15 to 25 allocations per QUIC request. An
+**D6. Socket operation state lives in the awaiter, inside the coroutine frame.** Once a connection
+is warm, these allocate nothing per operation: `read_into` on TCP, a TLS read into a caller's
+buffer, a borrowed-buffer write on TCP or TLS, `datagram_reader_t` receives, and every send of a
+datagram the kernel accepts at once. That is the whole claim. These allocate on every call:
+- reads that hand out an owned buffer: `co_await` on `tcp_reader_t` or a TLS `stream_reader_t` (one
+  buffer from the allocator callback per read), and `udp_reader_t` (one buffer per datagram, an
+  exact-size copy with the default allocator, none with a `buffer_pool_t`);
+- an owning `write_tcp` or `send_udp` that has to wait (the payload's holder, plus a
+  `udp_send_op_t` for UDP);
+- `sleep`, every file operation and every DNS lookup (one reference-counted state through
+  `future_t`);
+- every operation of the QUIC coroutine layer (a per-call heap operation, by design). `BASELINE.md` counts what that adds up to: 15 to 25 allocations per QUIC request. An
 operation that the kernel still holds when it is destroyed aborts the process with a message, in
 every build.
 
@@ -60,7 +66,19 @@ it to the largest nanosecond count, and clamp `now + delay` to the largest deadl
 fires. So `sleep(loop, std::chrono::milliseconds::max(), &token)` waits until it is cancelled, as it
 did under libuv, whose `uv_timer_start` clamped the same way. Without the clamp the conversion to
 nanoseconds overflowed: that sleep finished at once, and a deadline that wrapped negative made the
-backend wait for about 292 years while every other timer on the loop starved.
+backend wait for about 292 years while every other timer on the loop starved. The wasm `sleep()`
+takes any duration too; browsers and Node treat a timeout above 2^31-1 ms as 1 ms, so it waits in
+chunks of that size.
+
+**D48. epoll watches for writability only while a writer waits.** A socket is registered for
+reading, edge-triggered. When a write would block, the writer parks and the backend adds `EPOLLOUT`
+with `EPOLL_CTL_MOD`, which re-checks readiness, so no edge is lost. A write edge that finds no writer
+parked removes it again. Registering both at once woke the loop after every UDP send, because the
+kernel signals write space each time a sent datagram is freed: two loop turns per datagram on the
+QUIC path. The cost is an `epoll_ctl` to add and another to remove per stalled write. An
+`epoll_ctl` or `epoll_wait` failure other than `EINTR` aborts with a message, because the
+alternative is a loop that silently stops seeing events; an `epoll_pwait2` the kernel or a seccomp
+filter refuses falls back to `epoll_wait` for good.
 
 **D11. Timers with equal deadlines fire in the order they were set.**
 
@@ -149,7 +167,9 @@ arrived in the same wakeup; on Windows it ran. Now it runs everywhere.
 **D33. A sleep with a negative duration returns on the next turn.** Under libuv it never fired.
 
 **D34. The QUIC beat and ticker are internal hooks and timers that never keep the loop alive.**
-They replace a `uv_prepare_t` and a `uv_timer_t` that were `uv_unref`ed.
+The beat replaces a `uv_unref`ed `uv_prepare_t`. The ticker replaces a referenced 2 ms `sleep()` and
+no longer keeps the loop alive, which is safe because the endpoint's reader keeps it alive whenever
+`run()` is active.
 
 **D35. Event pipes unlink themselves when destroyed.** They no longer have to outlive `stop()` and
 `run()`, and `event_loop_t::add_event_pipe` is gone. Destroy a pipe on its loop's thread, or after

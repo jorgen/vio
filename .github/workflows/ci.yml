@@ -192,8 +192,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          boringssl=$(ls -d 3rdparty/boringssl-*)
-          ada=$(ls -d 3rdparty/ada-*)
+          pinned() { sed -n "s/^CmDepFetchPackage($1 \([^ ]*\).*/\1/p" CMake/3rdPartyPackages.cmake; }
+          boringssl=3rdparty/boringssl-$(pinned boringssl)
+          ada=3rdparty/ada-$(pinned ada)
+          test -d "$boringssl" && test -d "$ada"
           cmake -G Ninja -S "$boringssl" -B deps/boringssl -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
             -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$PREFIX"

@@ -9,8 +9,10 @@ made along the way, with the reason, so each one can be reviewed and reversed.
 1. Keep every feature vio has today.
 2. Speed and security come first. Every phase must match or beat the libuv build on the
    benchmarks, and pass the sanitizers, before it lands.
-3. No heap allocation per socket read or write once a connection is warm. Timers, files, DNS and
-   the QUIC coroutine layer still allocate once per call (`DECISIONS.md` D6).
+3. No heap allocation per socket read or write into a caller's buffer once a connection is warm,
+   and none per datagram through `datagram_reader_t`. Reads that hand out an owned buffer, owning
+   writes that have to wait, timers, files, DNS and the QUIC coroutine layer still allocate once
+   per call (`DECISIONS.md` D6 lists them).
 4. Window-system events can join the same loop, so a GUI library can be built on vio.
 5. Linux, macOS and Windows now. Android and iOS should need only a backend and a driver.
    Emscripten gets a small backend with timers and messaging only.
@@ -60,7 +62,7 @@ operation parks on the socket and the backend wakes it when the socket is ready:
 
 | backend  | how it learns a socket is ready                        |
 |----------|--------------------------------------------------------|
-| epoll    | registered once, edge-triggered, with read and write   |
+| epoll    | edge-triggered; write interest only while a writer waits (D48) |
 | kqueue   | registered once, `EV_CLEAR`                            |
 | io_uring | one `POLL_ADD` armed when an operation parks           |
 | iocp     | an AFD poll, the same mechanism libuv, mio and wepoll use |
@@ -80,8 +82,8 @@ shows they win.
 
 | platform | read, write, fsync          | open, stat, rename, unlink, mkdir |
 |----------|-----------------------------|-----------------------------------|
-| io_uring | ring operations             | ring operations                   |
-| Windows  | overlapped I/O through IOCP | blocking pool                     |
+| io_uring | ring operations             | blocking pool                     |
+| Windows  | blocking pool (D17)         | blocking pool                     |
 | epoll    | blocking pool               | blocking pool                     |
 | macOS    | blocking pool               | blocking pool                     |
 
@@ -129,8 +131,8 @@ are pointers, all into the reader's buffers. Whether it came from `receive()`, f
 and copying the `datagram_t` does not copy what it points at. Under ASan the reader poisons the
 buffers a view points into once they are replaced, so a view kept too long fails loudly there;
 without ASan nothing catches it, and the stale view quietly shows the next datagram's bytes and
-sender. The epoll backend fills the batch with `recvmmsg`; others use a `recvmsg` loop until the
-completion paths arrive.
+sender. On Linux, with either backend, the batch is filled with `recvmmsg`; macOS and Windows use a
+`recvmsg` loop until the completion paths arrive.
 
 ### GUI drivers
 
@@ -158,14 +160,14 @@ compiles differently, or not at all, after the change, except where it says it c
 | `event_loop_t::loop()`                   | removed                                            |
 | `event_loop_t::add_event_pipe`, the loop-less `event_pipe_t` constructor | removed; a pipe takes its loop and unlinks itself (D35) |
 | `ref_ptr_t::register_handle`, `inc_ref_and_store_in_handle`, `register_closable_handle` | `ref_ptr_t::register_resource` with a `detail::resource_t` |
-| `sleep()`, `timer_rearm()` taking `std::chrono::milliseconds` | any `std::chrono::duration`, saturated (D45); calls compile unchanged |
+| `sleep()`, `timer_rearm()` taking `std::chrono::milliseconds` | any `std::chrono::duration`, saturated (D45), on the native loop and on wasm; calls compile unchanged |
 | `uv_stat_t`                              | `vio::file_stat_t`                                 |
 | `uv_file`, `uv_os_fd_t`                  | `vio::native_file_t`, `vio::native_socket_t`       |
 | `file_open_flag_t` with `UV_FS_O_*` values | vio's own values, declared in `vio/detail/sys_file.h` |
 | `UV_TCP_REUSEPORT`, `UV_UDP_*` flags     | `vio::tcp_bind_flags`, `vio::udp_bind_flags`; `tcp_bind` no longer takes an integer |
 | `uv_membership`                          | `vio::udp_membership_t`                            |
 | `udp_fileno()` returning `uv_os_fd_t`    | returns `vio::native_socket_t`                     |
-| `datagram_t` owning a `std::vector` and a `sockaddr_storage` | a borrowed view, valid until the next receive (D47); code that keeps one compiles unchanged and then reads another datagram |
+| `datagram_t` owning a `std::vector` and a `sockaddr_storage` | a borrowed view, valid until the next receive (D47); `d.from` becomes `d.peer`, a pointer; code that keeps a `datagram_t` still compiles and then reads another datagram |
 | `*_state_t::uv_handle`, `get_tcp()` etc. | removed; `peer_ip(tcp_t &)` and friends instead   |
 | `tcp_state_t`, `ssl_client_state_t` members | rebuilt around `detail::socket_resource_t`, `tls_stream_t` and `ssl_engine_t`; reach them only through the free functions |
 | `uv_tls_stream_t`                        | `tls_stream_t`                                     |
