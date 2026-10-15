@@ -846,15 +846,6 @@ inline tcp_write_future_t::~tcp_write_future_t()
 
 inline bool tcp_write_future_t::await_ready() noexcept
 {
-  if (cancel && cancel->is_cancelled())
-  {
-    if (id != 0)
-      detail::tcp_write_abandon(handle.data(), id, true);
-    id = 0;
-    done = true;
-    result = std::unexpected(detail::tcp_cancelled_error());
-    return true;
-  }
   if (done)
     return true;
   auto &write = handle->write;
@@ -864,6 +855,15 @@ inline bool tcp_write_future_t::await_ready() noexcept
     if (write.error != 0 && id >= write.failed_from)
       result = std::unexpected(make_error(write.error));
     id = 0;
+    return true;
+  }
+  if (cancel && cancel->is_cancelled())
+  {
+    if (id != 0)
+      detail::tcp_write_abandon(handle.data(), id, true);
+    id = 0;
+    done = true;
+    result = std::unexpected(detail::tcp_cancelled_error());
     return true;
   }
   return false;

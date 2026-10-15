@@ -125,13 +125,38 @@ vio::task_t<void> ordered_writes_scenario(vio::event_loop_t &loop, std::string &
   co_await std::move(reader_task);
 }
 
-vio::task_t<void> dropped_future_scenario(vio::event_loop_t &loop, std::string &received)
+std::size_t stall_writes(vio::tcp_t &client, std::vector<vio::tcp_write_future_t> &fillers)
+{
+  constexpr int max_fillers = 16;
+  fillers.reserve(max_fillers);
+  for (int i = 0; i < max_fillers; ++i)
+  {
+    fillers.push_back(vio::write_tcp(client, std::string(chunk_size, 'f')));
+    if (!fillers.back().await_ready())
+      break;
+  }
+  REQUIRE_FALSE(fillers.back().await_ready());
+  return fillers.size() * chunk_size;
+}
+
+vio::task_t<void> await_fillers(std::vector<vio::tcp_write_future_t> &fillers)
+{
+  for (auto &filler : fillers)
+  {
+    auto written = co_await std::move(filler);
+    REQUIRE_EXPECTED(written);
+  }
+}
+
+vio::task_t<void> dropped_future_scenario(vio::event_loop_t &loop, std::string &received, std::size_t &filled)
 {
   auto pair = co_await connect_pair(loop);
   REQUIRE(pair.has_value());
   auto reader_task = read_all(std::move(pair->server), received);
   {
     auto client = std::move(pair->client);
+    std::vector<vio::tcp_write_future_t> fillers;
+    filled = stall_writes(client, fillers);
     std::string payload(chunk_size, 'd');
     {
       auto dropped = vio::write_tcp(client, reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
@@ -141,17 +166,20 @@ vio::task_t<void> dropped_future_scenario(vio::event_loop_t &loop, std::string &
     const std::string tail = "e";
     auto flushed = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(tail.data()), tail.size());
     REQUIRE_EXPECTED(flushed);
+    co_await await_fillers(fillers);
   }
   co_await std::move(reader_task);
 }
 
-vio::task_t<void> cancelled_unsent_scenario(vio::event_loop_t &loop, std::string &received, int &cancelled_code, bool &others_ok)
+vio::task_t<void> cancelled_unsent_scenario(vio::event_loop_t &loop, std::string &received, std::size_t &filled, int &cancelled_code, bool &others_ok)
 {
   auto pair = co_await connect_pair(loop);
   REQUIRE(pair.has_value());
   auto reader_task = read_all(std::move(pair->server), received);
   {
     auto client = std::move(pair->client);
+    std::vector<vio::tcp_write_future_t> fillers;
+    filled = stall_writes(client, fillers);
     std::string big(chunk_size, 'a');
     auto first = vio::write_tcp(client, reinterpret_cast<const uint8_t *>(big.data()), big.size());
     vio::cancellation_t token;
@@ -164,6 +192,24 @@ vio::task_t<void> cancelled_unsent_scenario(vio::event_loop_t &loop, std::string
     auto first_result = co_await std::move(first);
     auto last_result = co_await std::move(last);
     others_ok = first_result.has_value() && last_result.has_value();
+    co_await await_fillers(fillers);
+  }
+  co_await std::move(reader_task);
+}
+
+vio::task_t<void> finished_then_cancelled_scenario(vio::event_loop_t &loop, std::string &received, bool &finished_at_once, bool &reported_success)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto reader_task = read_all(std::move(pair->server), received);
+  {
+    auto client = std::move(pair->client);
+    vio::cancellation_t token;
+    auto write = vio::write_tcp(client, std::string("sent"), &token);
+    finished_at_once = write.await_ready();
+    token.cancel();
+    auto result = co_await std::move(write);
+    reported_success = result.has_value();
   }
   co_await std::move(reader_task);
 }
@@ -228,20 +274,33 @@ TEST_SUITE("tcp write queue")
   TEST_CASE("a write whose future is dropped still sends the bytes it was given")
   {
     std::string received;
-    run_scenario([&](vio::event_loop_t &loop) { return dropped_future_scenario(loop, received); });
-    REQUIRE(received.size() == chunk_size + 1);
-    CHECK(received == std::string(chunk_size, 'd') + "e");
+    std::size_t filled = 0;
+    run_scenario([&](vio::event_loop_t &loop) { return dropped_future_scenario(loop, received, filled); });
+    REQUIRE(received.size() == filled + chunk_size + 1);
+    CHECK(received == std::string(filled, 'f') + std::string(chunk_size, 'd') + "e");
   }
 
   TEST_CASE("a cancelled write that has not started is never sent")
   {
     std::string received;
+    std::size_t filled = 0;
     int cancelled_code = 0;
     bool others_ok = false;
-    run_scenario([&](vio::event_loop_t &loop) { return cancelled_unsent_scenario(loop, received, cancelled_code, others_ok); });
+    run_scenario([&](vio::event_loop_t &loop) { return cancelled_unsent_scenario(loop, received, filled, cancelled_code, others_ok); });
     CHECK(cancelled_code == vio::vio_cancelled);
     CHECK(others_ok);
-    CHECK(received == std::string(chunk_size, 'a') + "CCCC");
+    CHECK(received == std::string(filled, 'f') + std::string(chunk_size, 'a') + "CCCC");
+  }
+
+  TEST_CASE("a write that already went out is not reported cancelled when its token fires later")
+  {
+    std::string received;
+    bool finished_at_once = false;
+    bool reported_success = false;
+    run_scenario([&](vio::event_loop_t &loop) { return finished_then_cancelled_scenario(loop, received, finished_at_once, reported_success); });
+    REQUIRE(finished_at_once);
+    CHECK(reported_success);
+    CHECK(received == "sent");
   }
 
   TEST_CASE("a write to a vanished peer fails, and later writes fail the same way")
