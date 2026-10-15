@@ -84,9 +84,10 @@ that much between runs.
 Allocations fell with it: 12.5 per datagram over sockets became 3.3 (callback) and 3.6
 (coroutine); 23.1 per request became 15.2 (callback), and 31.7 became 24.5 (coroutine).
 
-io_uring, run separately: the socket rows land within noise of epoll. Sockets are
-readiness-first on both, so io_uring only replaces `epoll_wait`, and that is not where the time
-goes. It stays off by default (D13).
+io_uring, measured in a separate set of runs, came out level with epoll or up to a quarter slower
+on the socket rows (offload on: 225 against 296 MB/s; callback requests: 94k against 113k req/s).
+Sockets are readiness-first on both, so io_uring only replaces `epoll_wait` and adds a `POLL_ADD`
+per park. It stays off by default (D13).
 
 ### vio_udp_bench, epoll
 
