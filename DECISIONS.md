@@ -181,6 +181,24 @@ two assumed a 4 MiB send cannot finish at once, which a Windows non-blocking sen
 use a buffer as large as the length they claim, probe for segmentation, and stall the socket with
 filler writes until one is pending.
 
+## Status
+
+CI run 92 (commit `8dc7ee9`) is green on all nine jobs: Linux debug, ASan, TSan and UBSan, each
+on epoll and on io_uring; macOS debug and ASan on kqueue; Windows debug and ASan on IOCP. Locally,
+739 of 746 test cases pass on both Linux backends; the other seven need outside network or IPv6
+loopback, which this container lacks, and pass in CI.
+
+| backend | sockets | files | state |
+|---------|---------|-------|-------|
+| epoll | readiness, edge-triggered | blocking pool | default on Linux |
+| io_uring | readiness through `POLL_ADD` | ring: read, write, `fsync` | `VIO_BACKEND=io_uring` |
+| kqueue | readiness, `EV_CLEAR` | blocking pool | macOS |
+| IOCP | readiness through AFD | blocking pool (D17) | Windows |
+| wasm | none | none | compiles on the old shape; no CI |
+
+Benchmarks against libuv are in `BASELINE.md`: the socket rows run 1.4 to 2.3 times faster and
+allocate a third to two thirds as much.
+
 ## Open questions
 
 - How clocks treat system sleep, per platform. Windows waits skip time spent suspended, and libuv
