@@ -239,13 +239,11 @@ void loop_core_t::on_stop(posted_t *node)
 
 void loop_core_t::post(posted_t &node)
 {
-  {
-    std::lock_guard lock(_post_mutex);
-    if (node.queued)
-      return;
-    node.queued = true;
-    _posted.push_back(node);
-  }
+  std::lock_guard lock(_post_mutex);
+  if (node.queued)
+    return;
+  node.queued = true;
+  _posted.push_back(node);
   if (!_wake_pending.exchange(true, std::memory_order_acq_rel))
     _backend->wake();
 }

@@ -683,3 +683,35 @@ TEST_CASE("an idle loop blocks instead of turning")
   CHECK(turns >= 1);
   CHECK(turns <= 5);
 }
+
+TEST_CASE("a loop can be destroyed as soon as work posted from another thread has run")
+{
+  struct spinner_t
+  {
+    vio::event_loop_t *loop;
+    void spin()
+    {
+      loop->run_in_loop([this] { spin(); });
+    }
+  };
+  for (int i = 0; i < 2000; ++i)
+  {
+    auto loop = std::make_unique<vio::event_loop_t>();
+    auto *raw = loop.get();
+    spinner_t spinner{raw};
+    std::atomic<bool> go{false};
+    std::thread poster([raw, &go] {
+      while (!go.load())
+      {
+      }
+      raw->stop();
+    });
+    raw->run_in_loop([&] {
+      spinner.spin();
+      go = true;
+    });
+    raw->run();
+    loop.reset();
+    poster.join();
+  }
+}
