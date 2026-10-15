@@ -29,9 +29,14 @@ enqueue after stop and is often full of CPU work, so it is not used.
 A `getaddrinfo` stuck in the kernel delays exit; detaching threads that may touch freed memory
 at exit is worse.
 
-**D6. Operation state lives in the awaiter, inside the coroutine frame.** No allocation per
-operation. An operation that the kernel still holds when it is destroyed aborts the process with a
-message, in every build.
+**D6. Socket operation state lives in the awaiter, inside the coroutine frame.** A TCP or TLS read
+or write, and a datagram receive, allocate nothing per operation once the connection is warm. That
+is the whole claim. These still allocate on every call: `sleep`, every file operation and every DNS
+lookup (each makes one reference-counted state through `future_t`), the owning `send_udp` (a
+`udp_send_op_t`), and every operation of the QUIC coroutine layer (a per-call heap operation, by
+design). `BASELINE.md` counts what that adds up to: 15 to 25 allocations per QUIC request. An
+operation that the kernel still holds when it is destroyed aborts the process with a message, in
+every build.
 
 **D7. Closes finish on a later turn, never inside the call that closed.** libuv works this way and
 vio code depends on it: an object may drop its own last reference inside its own callback.
@@ -49,6 +54,13 @@ listener handle is closed by `stop()`. Adding and removing listeners stays poste
 coarse millisecond clock for timers and a fine one for `loop_now()`. Timers now fire on time instead
 of up to a millisecond early or late. How the clock treats system sleep is unchanged and is listed
 under open questions.
+
+**D45. Deadlines saturate.** `sleep()` and `timer_rearm()` take any `std::chrono::duration`, clamp
+it to the largest nanosecond count, and clamp `now + delay` to the largest deadline, which never
+fires. So `sleep(loop, std::chrono::milliseconds::max(), &token)` waits until it is cancelled, as it
+did under libuv, whose `uv_timer_start` clamped the same way. Without the clamp the conversion to
+nanoseconds overflowed: that sleep finished at once, and a deadline that wrapped negative made the
+backend wait for about 292 years while every other timer on the loop starved.
 
 **D11. Timers with equal deadlines fire in the order they were set.**
 
@@ -115,8 +127,17 @@ That matches libuv, and prism depends on it to decide how many listeners to star
 **D25. The process keeps ignoring `SIGPIPE`.** The event loop constructor did this under libuv, and
 child processes inherit it. Sockets also set `MSG_NOSIGNAL` or `SO_NOSIGPIPE`.
 
-**D26. On Windows vio calls `WSAStartup` once. It does not call `SetErrorMode`.** libuv changed the
-process error mode as a side effect. A library should not, so the test program sets it instead.
+**D26. On Windows vio calls `WSAStartup` once. It changes no process-wide error handling.** libuv's
+`uv__init` did three things for the whole process as a side effect: `SetErrorMode` to suppress the
+critical-error and GP-fault dialogs, a no-op `_set_invalid_parameter_handler`, and in `_DEBUG` builds
+a `_CrtSetReportHook`. vio does none of them, and nothing sets `SetErrorMode` for `vio_tests` either.
+An application that relied on libuv for those must now set them itself.
+The handler mattered for one thing: vio's Windows file API hands out CRT file descriptors (D17), and
+the default CRT handler ends the process when a descriptor it does not know reaches `_get_osfhandle`
+or `_close`, where under libuv the call failed with `EBADF`. vio now installs a no-op handler for
+the current thread only, around exactly those two calls, so a stale or twice-closed descriptor comes
+back as `errc::bad_descriptor` again. A debug CRT still reports the bad parameter through
+`_CrtDbgReport` first, as it does for every invalid parameter in a debug build.
 
 **D31. `stop()` is sticky.** After `stop()`, every later `run()` returns as soon as nothing is in
 flight. Tests rely on calling `run()` again to drain closes they started after the first `run()`
@@ -132,7 +153,10 @@ They replace a `uv_prepare_t` and a `uv_timer_t` that were `uv_unref`ed.
 
 **D35. Event pipes unlink themselves when destroyed.** They no longer have to outlive `stop()` and
 `run()`, and `event_loop_t::add_event_pipe` is gone. Destroy a pipe on its loop's thread, or after
-the loop has stopped.
+the loop has stopped. A pipe may also outlive its loop, as it could under libuv: a class that
+declares its pipes before its `thread_with_event_loop_t` destroys the loop first. The loop owns a
+small shared anchor that each pipe holds; destroying the loop clears it, and a pipe destroyed after
+that touches nothing. Posting to a pipe whose loop is gone is still a bug.
 
 **D36. Destroying a socket that was never closed aborts with a message.** Sockets live in
 reference-counted storage that closes them, so this only fires on a real lifetime bug, and the
@@ -143,9 +167,13 @@ alternative is a backend holding a pointer to freed memory.
 
 **D38. `uv_coro.h` becomes `future.h`.** The old name still forwards, so existing includes build.
 
-**D39. Error codes live in `vio::errc` with values from -3001 down; DNS codes from -3101 down.**
+**D39. Error codes live in `vio::errc` with values from -9001 down; DNS codes from -9101 down.**
 The values are fixed on every platform, so a code compiled into prism means the same thing on
-Linux, macOS and Windows.
+Linux, macOS and Windows. They started at -3001, which is inside libuv's `UV_EAI_*` range
+(-3000 to -3014): `errc::eof` equalled `UV_EAI_AGAIN`, so a downstream that still compared against
+a `UV_*` constant compiled and quietly matched the wrong error. No libuv code is below -4095, and
+none is in -9001 to -9999, so a stale comparison now never matches. Every `UV_*` comparison must
+still be rewritten against `vio::errc`.
 
 **D40. A comparison benchmark project lives in its own repository.** It compares vio with libuv,
 Boost.Asio and Tokio on the same operations. Creating a repository on your account needs your
@@ -156,11 +184,30 @@ went out.** libuv behaved this way and the `tcp write cancel` test holds it. Can
 means "you gave up on this write", not "the peer never saw it"; a caller that cancels a write
 should treat the stream as broken. TLS writes follow the same rule.
 
+**D46. Public headers build with exceptions off.** vio has always promised a build with
+`-fno-exceptions -fno-rtti`. The port added `try`/`catch` around allocations in five headers, which
+GCC and Clang reject outright with exceptions off, so a downstream built that way could not include
+DNS, TLS or HTTP. The headers now write `VIO_TRY` / `VIO_CATCH_ALL` from `vio/detail/exceptions.h`:
+`try`/`catch (...)` with exceptions on, and with them off a block that always runs and a handler
+that never does, which is what a failed allocation does there anyway.
+
+**D47. `datagram_t` is a borrowed view, not an owning value.** Under libuv it held a
+`std::vector<std::uint8_t>` and a `sockaddr_storage`. Now `data` is a span and `peer` and `local`
+are pointers, all into buffers the reader reuses on its next receive. It stays copyable, because
+views are copied freely inside one batch, but a copy does not extend what it points at: code that
+queued `*co_await reader` used to own its bytes and now holds a view that the next receive
+overwrites with another sender's payload and address. Copy `data` and `*peer` out to keep them.
+
 ## Process
 
-**D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan), macos-15
-(debug, ASan) and windows-2025 (debug, ASan). The Linux container runs without Docker's default
-seccomp profile, so io_uring is available to test.
+**D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared
+library build), macos-15 (debug, ASan) and windows-2025 (debug, ASan). The Linux container runs
+without Docker's default seccomp profile, so io_uring is available to test. Two jobs check what the
+test suite cannot: `install` builds BoringSSL, ada and vio into one prefix and compiles a
+`find_package(vio)` consumer against it, and the Linux and macOS debug jobs build
+`vio_header_check`, every public header compiled alone with `-fno-exceptions -fno-rtti`. The CI
+image is pushed under its Dockerfile hash from any branch, but only `master` moves `:latest`, the
+tag `CLAUDE.md` tells people to pull.
 
 **D28. Dependencies stay at their pinned versions, minus libuv.** Nothing needed a newer version.
 
@@ -170,9 +217,13 @@ Orwell's six rules.
 **D30. No attribution lines in commits.**
 
 **D41. Tests for internals may live at the bottom of a `src/*.cpp` file**, inside
-`#if defined(VIO_INTERNAL_TESTS)`. A top-level static build with tests on defines that macro for
-the library and puts the doctest implementation in the library, so the tests run inside
-`vio_tests`. Shared builds and builds where vio is a subproject leave the macro unset.
+`#if defined(VIO_INTERNAL_TESTS)`. A top-level static build with tests on compiles the library
+sources a second time, with that macro and the doctest implementation, into an object library that
+only `vio_tests` links. The first version defined the macro on `libvio` itself, so a default
+`cmake --install` shipped an archive carrying doctest, the internal tests and a send-fault hook in
+the QUIC send path, and a consumer's own doctest suite ran vio's tests. `libvio` is now always the
+library a consumer gets. Shared builds and builds where vio is a subproject leave the macro unset.
+The second compile costs about 40 CPU-seconds in a debug build.
 
 **D43. A test that depends on what a kernel does checks for it instead of assuming it.** Three tests
 passed on Linux only because of Linux behaviour: one passed a length larger than its buffer and
@@ -186,8 +237,10 @@ filler writes until one is pending.
 CI run 93 (commit `4abd446`) is green on all ten jobs: Linux debug, ASan, TSan and UBSan, each
 on epoll and on io_uring; macOS debug and ASan on kqueue; Windows debug and ASan on IOCP; and a
 wasm build whose smoke test runs under Node. Locally,
-739 of 746 test cases pass on both Linux backends; the other seven need outside network or IPv6
-loopback, which this container lacks, and pass in CI.
+every test case passes on both Linux backends except seven that need outside network or IPv6
+loopback, which this container lacks, and which pass in CI. That suite now includes the sixteen
+backend tests of `test/test_backend.cpp`, which sat in the tree without being built and so were
+not part of run 93: kqueue and IOCP have not run them yet.
 
 | backend | sockets | files | state |
 |---------|---------|-------|-------|

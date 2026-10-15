@@ -40,8 +40,8 @@ Copyright (c) 2025 Jørgen Lind
 #include <vector>
 
 #include <poll.h>
-#include <sched.h>
 #include <sys/eventfd.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "vio/detail/sys.h"
@@ -55,6 +55,9 @@ constexpr unsigned submission_entries = 1024;
 constexpr unsigned completion_entries = submission_entries * 4;
 constexpr unsigned completion_batch = 256;
 constexpr std::size_t max_file_transfer = 0x7ffff000;
+constexpr long first_submit_pause_ns = 50000;
+constexpr long last_submit_pause_ns = 10000000;
+constexpr std::int64_t max_submit_stall_ns = std::int64_t{30} * 1000000000;
 
 constexpr std::uint64_t tag_mask = 7;
 constexpr std::uint64_t tag_ignore = 0;
@@ -286,23 +289,30 @@ private:
 
   io_uring_sqe *acquire_sqe()
   {
+    long pause_ns = first_submit_pause_ns;
+    std::int64_t stalled_ns = 0;
     for (int attempt = 0;; ++attempt)
     {
       if (auto *sqe = _ring.get_sqe())
         return sqe;
-      if (attempt >= 1000)
-        fatal("submission queue stays full", EAGAIN);
       int result = _ring.enter(0, 0, nullptr);
+      if (result == -EAGAIN)
+      {
+        if (stalled_ns >= max_submit_stall_ns)
+          fatal("submission queue stays full", EAGAIN);
+        timespec pause{0, pause_ns};
+        ::nanosleep(&pause, nullptr);
+        stalled_ns += pause_ns;
+        pause_ns = pause_ns * 2 < last_submit_pause_ns ? pause_ns * 2 : last_submit_pause_ns;
+        continue;
+      }
+      if (attempt >= 1000)
+        fatal("submission queue stays full", EBUSY);
       if (result >= 0 || result == -EINTR)
         continue;
       if (result == -EBUSY)
       {
         stash();
-        continue;
-      }
-      if (result == -EAGAIN)
-      {
-        ::sched_yield();
         continue;
       }
       fatal("submission failed", -result);

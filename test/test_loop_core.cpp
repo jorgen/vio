@@ -26,6 +26,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
@@ -36,10 +37,28 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
 #include <vio/loop/blocking_pool.h>
+#include <vio/loop/socket.h>
 #include <vio/operation/sleep.h>
 #include <vio/operation/timer.h>
 #include <vio/ref_counted_wrapper.h>
 #include <vio/task.h>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <csignal>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#if defined(__SANITIZE_THREAD__)
+#define VIO_LOOP_TEST_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define VIO_LOOP_TEST_UNDER_TSAN 1
+#endif
+#endif
 
 using namespace std::chrono_literals;
 
@@ -716,3 +735,278 @@ TEST_CASE("a loop can be destroyed as soon as work posted from another thread ha
     poster.join();
   }
 }
+
+TEST_CASE("work dropped with its loop may post more work from a destructor")
+{
+  struct flag_on_drop_t
+  {
+    bool *flag;
+    ~flag_on_drop_t()
+    {
+      *flag = true;
+    }
+  };
+  struct post_on_drop_t
+  {
+    vio::event_loop_t *loop;
+    bool *flag;
+    ~post_on_drop_t()
+    {
+      loop->run_in_loop([inner = std::make_shared<flag_on_drop_t>(flag)] {});
+    }
+  };
+  bool inner_dropped = false;
+  {
+    vio::event_loop_t loop;
+    loop.stop();
+    loop.run();
+    loop.run_in_loop([outer = std::make_shared<post_on_drop_t>(&loop, &inner_dropped)] {});
+  }
+  CHECK(inner_dropped);
+}
+
+namespace
+{
+struct recorded_node_t : vio::detail::posted_t
+{
+  std::vector<char> *order = nullptr;
+  char name = 0;
+  std::function<void()> also;
+
+  recorded_node_t(std::vector<char> &order, char name)
+    : order(&order)
+    , name(name)
+  {
+    owner = this;
+    run = [](vio::detail::posted_t *raw) {
+      auto *self = static_cast<recorded_node_t *>(raw->owner);
+      self->order->push_back(self->name);
+      if (self->also)
+        self->also();
+    };
+  }
+};
+} // namespace
+
+TEST_CASE("unpost takes a node out of deferred work that is being drained")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  std::vector<char> order;
+  recorded_node_t first(order, 'a');
+  recorded_node_t second(order, 'b');
+  recorded_node_t third(order, 'c');
+  bool removed = false;
+  first.also = [&] {
+    removed = core.unpost(second);
+    core.defer(second);
+  };
+  loop.run_in_loop([&] {
+    core.defer(first);
+    core.defer(second);
+    core.defer(third);
+  });
+  loop.stop();
+  loop.run();
+  CHECK(removed);
+  CHECK(order == std::vector<char>{'a', 'c', 'b'});
+  CHECK_FALSE(second.queued);
+  CHECK_FALSE(third.queued);
+}
+
+TEST_CASE("unpost reports only posted work that has not run yet")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  std::vector<char> order;
+  recorded_node_t first(order, 'a');
+  recorded_node_t second(order, 'b');
+  recorded_node_t third(order, 'c');
+  bool removed_ran = true;
+  bool removed_pending = false;
+  second.also = [&] {
+    removed_ran = core.unpost(first);
+    removed_pending = core.unpost(third);
+  };
+  core.post(first);
+  core.post(second);
+  core.post(third);
+  loop.stop();
+  loop.run();
+  CHECK_FALSE(removed_ran);
+  CHECK(removed_pending);
+  CHECK(order == std::vector<char>{'a', 'b'});
+}
+
+#if !defined(_WIN32) && !defined(VIO_LOOP_TEST_UNDER_TSAN)
+namespace
+{
+int wait_for_child(pid_t child, std::chrono::milliseconds limit)
+{
+  const auto give_up = std::chrono::steady_clock::now() + limit;
+  int status = 0;
+  for (;;)
+  {
+    pid_t done = ::waitpid(child, &status, WNOHANG);
+    if (done == child)
+      return status;
+    if (done < 0 && errno != EINTR)
+      return -1;
+    if (std::chrono::steady_clock::now() > give_up)
+    {
+      ::kill(child, SIGKILL);
+      ::waitpid(child, &status, 0);
+      return -1;
+    }
+    std::this_thread::sleep_for(5ms);
+  }
+}
+
+struct pool_probe_t
+{
+  vio::detail::pool_job_t job;
+  bool ran = false;
+  bool finished = false;
+  bool canceled = true;
+
+  pool_probe_t()
+  {
+    job.owner = this;
+    job.work = [](vio::detail::pool_job_t *raw) { static_cast<pool_probe_t *>(raw->owner)->ran = true; };
+    job.done = [](vio::detail::pool_job_t *raw, bool canceled) {
+      auto *self = static_cast<pool_probe_t *>(raw->owner);
+      self->finished = true;
+      self->canceled = canceled;
+      raw->loop->stop();
+    };
+  }
+};
+
+bool run_one_pool_job()
+{
+  vio::event_loop_t loop;
+  pool_probe_t probe;
+  loop.run_in_loop([&] { vio::detail::pool_submit(vio::detail::core(loop), probe.job, vio::detail::pool_queue::file); });
+  loop.run();
+  return probe.ran && probe.finished && !probe.canceled;
+}
+
+struct death_t
+{
+  int status = -1;
+  std::string message;
+};
+
+template <typename F>
+death_t run_in_child(F &&body)
+{
+  death_t result;
+  int pipe_ends[2];
+  if (::pipe(pipe_ends) != 0)
+    return result;
+  pid_t child = ::fork();
+  if (child < 0)
+    return result;
+  if (child == 0)
+  {
+    std::signal(SIGABRT, SIG_DFL);
+    ::dup2(pipe_ends[1], 2);
+    ::close(pipe_ends[0]);
+    body();
+    ::_exit(0);
+  }
+  ::close(pipe_ends[1]);
+  const auto give_up = std::chrono::steady_clock::now() + 20s;
+  char buffer[512];
+  for (;;)
+  {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(give_up - std::chrono::steady_clock::now());
+    if (left.count() <= 0)
+      break;
+    pollfd readable{pipe_ends[0], POLLIN, 0};
+    int ready = ::poll(&readable, 1, static_cast<int>(left.count()));
+    if (ready < 0 && errno == EINTR)
+      continue;
+    if (ready <= 0)
+      break;
+    auto got = ::read(pipe_ends[0], buffer, sizeof(buffer));
+    if (got > 0)
+    {
+      result.message.append(buffer, static_cast<std::size_t>(got));
+      continue;
+    }
+    if (got < 0 && errno == EINTR)
+      continue;
+    break;
+  }
+  ::close(pipe_ends[0]);
+  const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(give_up - std::chrono::steady_clock::now());
+  result.status = wait_for_child(child, left.count() > 0 ? left : 0ms);
+  return result;
+}
+
+bool aborted_with_message(const death_t &death)
+{
+  return death.status != -1 && WIFSIGNALED(death.status) && WTERMSIG(death.status) == SIGABRT &&
+         death.message.find("destroyed while the loop or the kernel still held it") != std::string::npos;
+}
+
+struct parked_probe_t : vio::detail::io_op_t
+{
+  parked_probe_t()
+  {
+    owner = this;
+    complete = [](vio::detail::io_op_t *) {};
+  }
+};
+} // namespace
+
+TEST_CASE("the blocking pool runs work in a process forked after it started")
+{
+  REQUIRE(run_one_pool_job());
+  auto child = run_in_child([] { ::_exit(run_one_pool_job() ? 0 : 1); });
+  REQUIRE(child.status != -1);
+  CHECK(WIFEXITED(child.status));
+  CHECK(WEXITSTATUS(child.status) == 0);
+}
+
+TEST_CASE("destroying an operation the loop or the kernel still holds aborts with a message")
+{
+  SUBCASE("a parked socket operation")
+  {
+    auto death = run_in_child([] {
+      int ends[2];
+      if (::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) != 0)
+        ::_exit(3);
+      vio::event_loop_t loop;
+      vio::detail::socket_resource_t resource(vio::detail::core(loop));
+      if (resource.adopt(ends[0]) != 0)
+        ::_exit(3);
+      auto op = std::make_unique<parked_probe_t>();
+      resource.wait(vio::detail::interest_read, *op);
+      op.reset();
+    });
+    CHECK(aborted_with_message(death));
+  }
+  SUBCASE("a queued blocking pool job")
+  {
+    auto death = run_in_child([] {
+      vio::event_loop_t loop;
+      auto probe = std::make_unique<pool_probe_t>();
+      probe->job.work = [](vio::detail::pool_job_t *) { std::this_thread::sleep_for(200ms); };
+      vio::detail::pool_submit(vio::detail::core(loop), probe->job, vio::detail::pool_queue::file);
+      probe.reset();
+    });
+    CHECK(aborted_with_message(death));
+  }
+  SUBCASE("a file operation in flight")
+  {
+    auto death = run_in_child([] {
+      auto op = std::make_unique<vio::detail::file_op_t>();
+      op->in_flight = true;
+      op.reset();
+    });
+    CHECK(aborted_with_message(death));
+  }
+}
+#endif

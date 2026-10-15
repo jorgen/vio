@@ -509,8 +509,12 @@ std::int64_t socket_sendto(native_socket_t socket, const_bytes_t buffer, const s
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <filesystem>
+#include <span>
 #include <string>
 #include <thread>
+
+#include "vio/detail/sys_file.h"
 
 namespace vio::detail
 {
@@ -756,6 +760,26 @@ TEST_CASE("sys_win: a datagram socket ignores port unreachable reports")
   int from_length = 0;
   CHECK(socket_recvfrom(socket, buffer, &from, &from_length) == errc::again);
   socket_close(socket);
+}
+
+TEST_CASE("sys_win: positional reads and writes leave the file position where it was")
+{
+  std::string path = (std::filesystem::temp_directory_path() / "vio-position-XXXXXX").string();
+  native_file_t file = invalid_native_file;
+  REQUIRE(fs_mkstemp(path, file) == 0);
+  auto text = [](const char *value) { return std::span<const std::byte>(reinterpret_cast<const std::byte *>(value), std::strlen(value)); };
+  std::byte buffer[16] = {};
+  CHECK(fs_write(file, text("0123456789"), -1) == 10);
+  CHECK(fs_read(file, std::span<std::byte>(buffer, 3), 7) == 3);
+  CHECK(fs_read(file, std::span<std::byte>(buffer, 3), 0) == 3);
+  CHECK(fs_write(file, text("AB"), 2) == 2);
+  CHECK(fs_read(file, buffer, -1) == 0);
+  CHECK(fs_write(file, text("Z"), -1) == 1);
+  CHECK(fs_read(file, std::span<std::byte>(buffer, 11), 0) == 11);
+  CHECK(std::string(reinterpret_cast<const char *>(buffer), 11) == "01AB456789Z");
+  CHECK(fs_read(file, buffer, -1) == 0);
+  CHECK(fs_close(file) == 0);
+  CHECK(fs_unlink(path) == 0);
 }
 } // namespace vio::detail
 #endif

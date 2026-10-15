@@ -60,8 +60,15 @@ add_executable(vio_tests
     test_work.cpp
     test_thread_pool.cpp
     test_loop_core.cpp
+    test_backend.cpp
+    test_event_pipe_lifetime.cpp
+    test_file_crt.cpp
+    test_errc_range.cpp
 )
 
+if(TARGET vio_internal_tests)
+    target_link_libraries(vio_tests PRIVATE vio_internal_tests)
+endif()
 CmDepTargetLinkLibrary(vio_tests PRIVATE vio vio_objstore BoringSSL::SSL BoringSSL::Crypto)
 
 if(VIO_USE_SYSTEM_DOCTEST)
@@ -81,6 +88,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME vio_tests_io_uring COMMAND vio_tests)
         set_tests_properties(vio_tests_io_uring PROPERTIES ENVIRONMENT "VIO_BACKEND=io_uring")
     endif()
+endif()
+
+if(NOT MSVC)
+    file(GLOB_RECURSE VIO_PUBLIC_HEADERS CONFIGURE_DEPENDS RELATIVE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/vio/*.h)
+    list(FILTER VIO_PUBLIC_HEADERS EXCLUDE REGEX "^vio/platform/wasm/")
+    set(VIO_HEADER_CHECK_SOURCES)
+    foreach(header ${VIO_PUBLIC_HEADERS})
+        string(MAKE_C_IDENTIFIER ${header} header_id)
+        set(header_source ${CMAKE_CURRENT_BINARY_DIR}/header_check/${header_id}.cpp)
+        file(CONFIGURE OUTPUT ${header_source} CONTENT "#include \"${header}\"\n")
+        list(APPEND VIO_HEADER_CHECK_SOURCES ${header_source})
+    endforeach()
+    add_library(vio_header_check OBJECT EXCLUDE_FROM_ALL ${VIO_HEADER_CHECK_SOURCES})
+    target_link_libraries(vio_header_check PRIVATE vio_objstore)
+    target_compile_options(vio_header_check PRIVATE -fno-exceptions -fno-rtti)
 endif()
 
 # A benchmark, not a test: it replaces global operator new to count

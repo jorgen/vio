@@ -304,8 +304,11 @@ target_link_libraries(my_app PRIVATE vio::vio)
 ```
 
 **Installed / `find_package`**: build vio with `VIO_INSTALL=ON` **and** against
-system deps (`-DVIO_USE_SYSTEM_BORINGSSL=ON …`) — in that configuration it installs a
-relocatable `find_package(vio)` config (`find_dependency`s BoringSSL/ada):
+installed BoringSSL and ada (`-DVIO_USE_SYSTEM_BORINGSSL=ON -DVIO_USE_SYSTEM_ADA=ON`,
+with both on `CMAKE_PREFIX_PATH`). In that configuration it installs a relocatable
+`find_package(vio)` config, which finds BoringSSL through the `OpenSSL` CONFIG
+package BoringSSL installs, and ada through its own. CI builds
+[`test/install_consumer`](test/install_consumer) against exactly that install.
 
 ```cmake
 find_package(vio CONFIG REQUIRED)
@@ -313,7 +316,9 @@ target_link_libraries(my_app PRIVATE vio::vio)
 ```
 
 `VIO_BUILD_TESTS` / `VIO_BUILD_EXAMPLES` (default ON) and `VIO_BUILD_SHARED`
-(default OFF, static) round out the knobs. A consumer that `add_subdirectory`s
+(default OFF, static) round out the knobs. The installed library never contains
+tests: with tests on, vio's tests for its internals are compiled into a separate
+object library that only `vio_tests` links. A consumer that `add_subdirectory`s
 vio should force `VIO_INSTALL OFF`.
 
 ## Examples

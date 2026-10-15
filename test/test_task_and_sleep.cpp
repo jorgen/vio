@@ -199,3 +199,36 @@ TEST_CASE("a sleep never returns before its time")
   event_loop.run();
   CHECK(shortfalls.empty());
 }
+
+TEST_CASE("a sleep with the largest durations waits until it is cancelled")
+{
+  vio::event_loop_t event_loop;
+  std::vector<int> codes;
+  std::vector<std::chrono::nanoseconds> waited;
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace([](vio::event_loop_t &loop, std::vector<int> &codes, std::vector<std::chrono::nanoseconds> &waited) -> vio::task_t<void> {
+      for (int which = 0; which < 3; ++which)
+      {
+        vio::cancellation_t cancel;
+        const auto start = std::chrono::steady_clock::now();
+        auto pending = which == 0   ? vio::sleep(loop, std::chrono::nanoseconds::max(), &cancel)
+                       : which == 1 ? vio::sleep(loop, std::chrono::milliseconds::max(), &cancel)
+                                    : vio::sleep(loop, std::chrono::seconds::max(), &cancel);
+        auto stopper = vio::sleep(loop, std::chrono::milliseconds(30));
+        auto stopped = co_await stopper;
+        CHECK(stopped.has_value());
+        cancel.cancel();
+        auto result = co_await pending;
+        codes.push_back(result.has_value() ? 0 : result.error().code);
+        waited.push_back(std::chrono::steady_clock::now() - start);
+      }
+      loop.stop();
+    }(event_loop, codes, waited));
+  });
+  event_loop.run();
+  CHECK(codes == std::vector<int>(3, vio::vio_cancelled));
+  REQUIRE(waited.size() == 3);
+  for (auto elapsed : waited)
+    CHECK(elapsed >= std::chrono::milliseconds(25));
+}

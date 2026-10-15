@@ -752,6 +752,93 @@ TEST_CASE("receive yields a batch with peer, local address and codepoint")
   CHECK(second_batch == 1);
 }
 
+static int poison_state(const void *address)
+{
+#if defined(VIO_TEST_ASAN)
+  return __asan_address_is_poisoned(address);
+#else
+  (void)address;
+  return -1;
+#endif
+}
+
+TEST_CASE("a view kept past the next receive lands on poisoned memory")
+{
+  vio::event_loop_t event_loop;
+  std::string first_text;
+  std::string second_text;
+  std::string third_text;
+  std::string fourth_text;
+  int stale_single_data = -1;
+  int stale_single_peer = -1;
+  int stale_batch_data = -1;
+  int stale_batch_peer = -1;
+
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &loop, std::string &first_text, std::string &second_text, std::string &third_text, std::string &fourth_text, int &stale_single_data, int &stale_single_peer, int &stale_batch_data,
+              int &stale_batch_peer) -> vio::task_t<void>
+      {
+        {
+          auto receiver_pair = get_udp_ephemeral_port(loop);
+          REQUIRE_EXPECTED(receiver_pair);
+          auto reader_or_err = vio::datagram_reader_t::create(loop, receiver_pair->first);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto sender_pair = get_udp_ephemeral_port(loop);
+          REQUIRE_EXPECTED(sender_pair);
+          auto destination = make_ip4("127.0.0.1", receiver_pair->second);
+          REQUIRE_EXPECTED(destination);
+          const auto *to = reinterpret_cast<const sockaddr *>(&destination.value());
+
+          REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, text_bytes("first-batch"), to));
+          co_await vio::sleep(loop, 20ms);
+          auto first = co_await reader;
+          REQUIRE_EXPECTED(first);
+          const vio::datagram_t kept = *first;
+          first_text.assign(reinterpret_cast<const char *>(kept.data.data()), kept.data.size());
+
+          REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, text_bytes("SECOND-BATCH"), to));
+          co_await vio::sleep(loop, 20ms);
+          auto second = co_await reader;
+          REQUIRE_EXPECTED(second);
+          second_text.assign(reinterpret_cast<const char *>(second->data.data()), second->data.size());
+          stale_single_data = poison_state(kept.data.data());
+          stale_single_peer = poison_state(kept.peer);
+
+          REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, text_bytes("third"), to));
+          co_await vio::sleep(loop, 20ms);
+          auto third = co_await reader.receive();
+          REQUIRE_EXPECTED(third);
+          REQUIRE(third->size() == 1);
+          const vio::datagram_t kept_front = third->front();
+          third_text.assign(reinterpret_cast<const char *>(kept_front.data.data()), kept_front.data.size());
+
+          REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, text_bytes("FOURTH"), to));
+          co_await vio::sleep(loop, 20ms);
+          auto fourth = co_await reader.receive();
+          REQUIRE_EXPECTED(fourth);
+          REQUIRE(fourth->size() == 1);
+          fourth_text.assign(reinterpret_cast<const char *>(fourth->front().data.data()), fourth->front().data.size());
+          stale_batch_data = poison_state(kept_front.data.data());
+          stale_batch_peer = poison_state(kept_front.peer);
+        }
+        loop.stop();
+      }(event_loop, first_text, second_text, third_text, fourth_text, stale_single_data, stale_single_peer, stale_batch_data, stale_batch_peer);
+  });
+
+  event_loop.run();
+  CHECK(first_text == "first-batch");
+  CHECK(second_text == "SECOND-BATCH");
+  CHECK(third_text == "third");
+  CHECK(fourth_text == "FOURTH");
+#if defined(VIO_TEST_ASAN)
+  CHECK(stale_single_data == 1);
+  CHECK(stale_single_peer == 1);
+  CHECK(stale_batch_data == 1);
+  CHECK(stale_batch_peer == 1);
+#endif
+}
+
 TEST_CASE("a datagram larger than the reader's buffer is flagged in a batch and skipped one at a time")
 {
   vio::event_loop_t event_loop;

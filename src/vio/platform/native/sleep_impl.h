@@ -22,7 +22,6 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
-#include <algorithm>
 #include <chrono>
 #include <coroutine>
 #include <expected>
@@ -63,7 +62,8 @@ struct sleep_state_t
   }
 };
 
-inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::nanoseconds duration, cancellation_t *cancel = nullptr)
+template <typename Rep, typename Period>
+inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::duration<Rep, Period> duration, cancellation_t *cancel = nullptr)
 {
   using ret_t = future_t<sleep_state_t>;
   using future_ref_ptr_t = ret_t::future_ref_ptr_t;
@@ -87,8 +87,7 @@ inline future_t<sleep_state_t> sleep(event_loop_t &event_loop, std::chrono::nano
     if (owned->continuation)
       owned->continuation.resume();
   };
-  auto delay = std::max<std::int64_t>(0, duration.count());
-  state.loop->add_timer(state.node, detail::loop_core_t::now() + delay);
+  state.loop->add_timer(state.node, detail::loop_core_t::deadline_after(detail::delay_nanoseconds(duration)));
 
   if (cancel)
   {

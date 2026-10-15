@@ -24,6 +24,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include "dns.h"
 #include "vio/cancellation.h"
+#include "vio/detail/exceptions.h"
 #include "vio/detail/sys.h"
 #include "vio/errc.h"
 #include "vio/error.h"
@@ -106,6 +107,8 @@ struct ssl_client_state_t
     if (resolving)
       detail::pool_cancel(resolve_job);
     abandon_connect();
+    if (engine.initialized())
+      socket_stream.abandon_handshake();
     finish_connect(std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"}));
   }
 
@@ -261,11 +264,11 @@ private:
       self->resolve_status = detail::errc_from_gai(code);
       return;
     }
-    try
+    VIO_TRY
     {
       self->resolved = convert_addrinfo_list(list);
     }
-    catch (...)
+    VIO_CATCH_ALL
     {
       self->resolve_status = errc::dns_memory;
     }
@@ -380,6 +383,11 @@ inline bool ssl_client_begin_connect(ssl_client_t &client, const std::string &ho
   if (state.connected)
   {
     state.connect_result = std::unexpected(make_error(errc::already_connected));
+    return false;
+  }
+  if (state.engine.initialized())
+  {
+    state.connect_result = std::unexpected(error_t{.code = errc::already_connected, .msg = "A TLS client can not connect again once a handshake has started; create a new client"});
     return false;
   }
   state.host = host;

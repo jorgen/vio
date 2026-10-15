@@ -23,6 +23,7 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <tuple>
 #include <type_traits>
@@ -43,6 +44,7 @@ public:
   event_pipe_t(EventLoop &event_loop, std::function<void(ARGS &&...event)> &&event_callback)
     : _event_callback(std::move(event_callback))
     , _core(&detail::core(event_loop))
+    , _anchor(_core->pipe_anchor())
   {
     _node.owner = this;
     _node.run = &event_pipe_t::on_posted;
@@ -55,7 +57,7 @@ public:
 
   ~event_pipe_t()
   {
-    _core->unpost(_node);
+    detail::unpost_anchored(*_anchor, _node);
   }
 
   void post_event(ARGS &&...args)
@@ -98,6 +100,7 @@ private:
 
   std::function<void(ARGS &&...args)> _event_callback;
   detail::loop_core_t *_core;
+  std::shared_ptr<detail::pipe_anchor_t> _anchor;
   detail::posted_t _node;
   std::mutex _mutex;
   std::vector<tuple_t> _events;
@@ -113,6 +116,7 @@ public:
   event_pipe_t(EventLoop &event_loop, std::function<void()> &&event_callback)
     : _event_callback(std::move(event_callback))
     , _core(&detail::core(event_loop))
+    , _anchor(_core->pipe_anchor())
   {
     _node.owner = this;
     _node.run = &event_pipe_t::on_posted;
@@ -125,7 +129,7 @@ public:
 
   ~event_pipe_t()
   {
-    _core->unpost(_node);
+    detail::unpost_anchored(*_anchor, _node);
   }
 
   void post_event()
@@ -146,6 +150,7 @@ private:
 
   std::function<void()> _event_callback;
   detail::loop_core_t *_core;
+  std::shared_ptr<detail::pipe_anchor_t> _anchor;
   detail::posted_t _node;
 };
 } // namespace vio

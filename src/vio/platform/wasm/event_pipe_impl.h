@@ -12,7 +12,7 @@ namespace vio
 class event_loop_t;
 
 // Cross-loop event pipe for the single-threaded WebAssembly runtime. Unlike a naive inline drain, this
-// mirrors the libuv contract the rest of vio/points is written against: post_event returns immediately
+// mirrors the native contract the rest of vio/points is written against: post_event returns immediately
 // and the callback runs LATER on the pipe's *owning* loop (scheduled via run_in_loop, drained on that
 // loop's next cooperative poll) -- never re-entrantly on the poster's stack. That matters when loop A
 // posts to a pipe owned by loop B: B's handler must run in B's turn, not inside A.
@@ -30,7 +30,7 @@ public:
   }
 
   // Loopless pipe (no owning loop): drains inline. Only used by event-loop internals; on wasm this path
-  // is essentially unused, but it is kept for API parity with the libuv implementation.
+  // is essentially unused, but it is kept for API parity with the original native implementation.
   explicit event_pipe_t(std::function<void(ARGS &&...event)> event_callback)
     : _event_callback(std::move(event_callback))
     , _loop(nullptr)
@@ -91,7 +91,7 @@ public:
   {
   }
 
-  // Coalesced, like uv_async_send: any number of posts before the owning loop's next turn results in a
+  // Coalesced, like the native pipe: any number of posts before the owning loop's next turn results in a
   // single callback invocation there.
   void post_event();
 

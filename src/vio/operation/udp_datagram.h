@@ -75,11 +75,19 @@ inline constexpr std::size_t coalesced_capacity = 65536;
 inline constexpr std::size_t datagram_control_capacity = 192;
 inline constexpr std::size_t datagram_error_budget = 32;
 inline constexpr std::size_t datagram_smallest_capacity = 512;
+#if defined(VIO_BUFFER_POOL_ASAN)
+inline constexpr bool datagram_poison_stale = true;
+#else
+inline constexpr bool datagram_poison_stale = false;
+#endif
 
 struct alignas(16) datagram_control_t
 {
   std::byte bytes[datagram_control_capacity];
 };
+
+struct datagram_reader_state_t;
+inline void datagram_unpoison_slabs(datagram_reader_state_t &state) noexcept;
 
 struct datagram_reader_state_t
 {
@@ -95,10 +103,7 @@ struct datagram_reader_state_t
 
   ~datagram_reader_state_t()
   {
-    if (arena)
-    {
-      unpoison_memory(arena.get(), slot_size * slot_count);
-    }
+    datagram_unpoison_slabs(*this);
   }
 
   ref_ptr_t<udp_state_t> udp;
@@ -107,9 +112,13 @@ struct datagram_reader_state_t
   std::coroutine_handle<> continuation;
   std::vector<datagram_t> batch;
   std::size_t cursor = 0;
+  std::size_t released = 0;
   std::unique_ptr<std::byte[]> arena;
   std::unique_ptr<sockaddr_storage[]> names;
   std::unique_ptr<sockaddr_storage[]> locals;
+  std::unique_ptr<std::byte[]> retired_arena;
+  std::unique_ptr<sockaddr_storage[]> retired_names;
+  std::unique_ptr<sockaddr_storage[]> retired_locals;
   std::unique_ptr<datagram_control_t[]> controls;
   std::unique_ptr<udp_message_t[]> messages;
   std::size_t slot_size = 0;
@@ -135,13 +144,31 @@ struct datagram_reader_state_t
   bool want_batch = false;
 };
 
+inline void datagram_unpoison_slabs(datagram_reader_state_t &state) noexcept
+{
+  for (const auto *slab : {state.arena.get(), state.retired_arena.get()})
+  {
+    if (slab != nullptr)
+    {
+      unpoison_memory(slab, state.slot_size * state.slot_count);
+    }
+  }
+  for (const auto *slab : {state.names.get(), state.retired_names.get(), state.locals.get(), state.retired_locals.get()})
+  {
+    if (slab != nullptr)
+    {
+      unpoison_memory(slab, sizeof(sockaddr_storage) * state.slot_count);
+    }
+  }
+}
+
 inline void datagram_allocate(datagram_reader_state_t &state)
 {
-  if (state.arena)
-  {
-    unpoison_memory(state.arena.get(), state.slot_size * state.slot_count);
-  }
+  datagram_unpoison_slabs(state);
   state.arena.reset();
+  state.retired_arena.reset();
+  state.retired_names.reset();
+  state.retired_locals.reset();
   state.slot_size = state.want_slot_size;
   state.slot_count = state.want_slot_count;
   state.arena = std::make_unique_for_overwrite<std::byte[]>(state.slot_size * state.slot_count);
@@ -203,10 +230,50 @@ inline void datagram_split(datagram_reader_state_t &state, std::size_t slot)
   }
 }
 
+inline void datagram_release_consumed(datagram_reader_state_t &state) noexcept
+{
+  if constexpr (datagram_poison_stale)
+  {
+    for (; state.released < state.cursor && state.released < state.batch.size(); ++state.released)
+    {
+      const auto &datagram = state.batch[state.released];
+      poison_memory(datagram.data.data(), datagram.data.size());
+    }
+  }
+}
+
+inline void datagram_retire(datagram_reader_state_t &state)
+{
+  if (!state.arena || state.slot_size != state.want_slot_size || state.slot_count != state.want_slot_count)
+  {
+    return;
+  }
+  const std::size_t addresses = sizeof(sockaddr_storage) * state.slot_count;
+  poison_memory(state.arena.get(), state.slot_size * state.slot_count);
+  poison_memory(state.names.get(), addresses);
+  poison_memory(state.locals.get(), addresses);
+  std::swap(state.arena, state.retired_arena);
+  std::swap(state.names, state.retired_names);
+  std::swap(state.locals, state.retired_locals);
+  if (!state.arena)
+  {
+    state.arena = std::make_unique_for_overwrite<std::byte[]>(state.slot_size * state.slot_count);
+    state.names = std::make_unique<sockaddr_storage[]>(state.slot_count);
+    state.locals = std::make_unique<sockaddr_storage[]>(state.slot_count);
+  }
+  unpoison_memory(state.names.get(), addresses);
+  unpoison_memory(state.locals.get(), addresses);
+}
+
 inline void datagram_refill(datagram_reader_state_t &state)
 {
+  if constexpr (datagram_poison_stale)
+  {
+    datagram_retire(state);
+  }
   state.batch.clear();
   state.cursor = 0;
+  state.released = 0;
   state.drained = false;
   if (!state.arena || state.slot_size != state.want_slot_size || state.slot_count != state.want_slot_count)
   {
@@ -370,6 +437,7 @@ struct datagram_awaiter_t
       return true;
     }
     auto &reader = state.data();
+    datagram_release_consumed(reader);
     if (reader.cancelled || reader.stopped || datagram_has(reader, Batch) || reader.pending_error != 0)
     {
       return true;

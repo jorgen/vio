@@ -220,6 +220,7 @@ struct udp_send_state_t
   std::uint64_t generation = 0;
   bool started = false;
   bool done = false;
+  bool claimed = true;
 };
 
 struct udp_recv_state_t
@@ -227,6 +228,8 @@ struct udp_recv_state_t
   bool active = false;
   bool started = false;
   bool is_cancelled = false;
+  bool stalled = false;
+  bool holding_loop = false;
   detail::fifo_t<std::expected<udp_datagram_t, error_t>> buffer_queue;
   std::size_t recv_queue_limit = udp_default_recv_queue_limit;
   std::uint64_t dropped_datagrams = 0;
@@ -492,7 +495,7 @@ struct udp_future_t
 {
   ref_ptr_t<udp_state_t> handle;
   State *state;
-  std::optional<error_t> rejected;
+  std::optional<std::expected<void, error_t>> outcome;
   std::uint64_t generation = 0;
   bool pending = false;
 
@@ -505,7 +508,14 @@ struct udp_future_t
   udp_future_t(ref_ptr_t<udp_state_t> socket, State &operation_state, error_t error)
     : handle(std::move(socket))
     , state(&operation_state)
-    , rejected(std::move(error))
+    , outcome(std::unexpected(std::move(error)))
+  {
+  }
+
+  udp_future_t(ref_ptr_t<udp_state_t> socket, State &operation_state, std::expected<void, error_t> result)
+    : handle(std::move(socket))
+    , state(&operation_state)
+    , outcome(std::move(result))
   {
   }
 
@@ -516,7 +526,7 @@ struct udp_future_t
   udp_future_t(udp_future_t &&other) noexcept
     : handle(std::move(other.handle))
     , state(other.state)
-    , rejected(std::move(other.rejected))
+    , outcome(std::move(other.outcome))
     , generation(other.generation)
     , pending(std::exchange(other.pending, false))
   {
@@ -532,7 +542,7 @@ struct udp_future_t
 
   bool await_ready() noexcept
   {
-    return rejected.has_value() || state->done;
+    return outcome.has_value() || state->done;
   }
 
   bool await_suspend(std::coroutine_handle<> continuation) noexcept
@@ -547,10 +557,14 @@ struct udp_future_t
 
   std::expected<void, error_t> await_resume() noexcept
   {
-    pending = false;
-    if (rejected.has_value())
+    if (outcome.has_value())
     {
-      return std::unexpected(std::move(*rejected));
+      pending = false;
+      return std::move(*outcome);
+    }
+    if (std::exchange(pending, false) && state->generation == generation)
+    {
+      state->claimed = true;
     }
     return state->result;
   }
@@ -907,7 +921,12 @@ inline void udp_on_send_ready(io_op_t *op)
 inline void udp_abandon_send(udp_state_t &state, std::uint64_t generation)
 {
   auto &send = state.send;
-  if (!send.started || send.done || send.generation != generation)
+  if (send.generation != generation)
+  {
+    return;
+  }
+  send.claimed = true;
+  if (!send.started || send.done)
   {
     return;
   }
@@ -935,15 +954,18 @@ inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t l
     return udp_send_future_t(udp.handle, send, make_error(result));
   }
   const auto sent = detail::socket_sendto(state.socket.native(), std::as_bytes(std::span(data, length)), target.address, target.length);
-  send.continuation = {};
   if (sent != errc::again)
   {
-    send.done = true;
-    send.result = detail::udp_send_result(sent);
-    return udp_send_future_t(udp.handle, send);
+    return udp_send_future_t(udp.handle, send, detail::udp_send_result(sent));
   }
+  if (!send.claimed)
+  {
+    return udp_send_future_t(udp.handle, send, error_t{.code = errc::already_in_progress, .msg = "the previous send's result has not been awaited yet"});
+  }
+  send.continuation = {};
   send.started = true;
   send.done = false;
+  send.claimed = false;
   send.result = {};
   send.data = data;
   send.length = length;
@@ -984,6 +1006,7 @@ struct udp_send_op_t
   registration_t cancel_registration;
   bool completed = false;
   bool detached = false;
+  bool answered = false;
 };
 
 namespace detail
@@ -1019,7 +1042,10 @@ inline void udp_send_op_ready(io_op_t *io)
     delete op;
     return;
   }
-  op->result = udp_send_result(sent);
+  if (!op->answered)
+  {
+    op->result = udp_send_result(sent);
+  }
   if (op->continuation)
   {
     auto continuation = std::exchange(op->continuation, {});
@@ -1029,18 +1055,12 @@ inline void udp_send_op_ready(io_op_t *io)
 
 inline void udp_send_op_cancel(udp_send_op_t *op)
 {
-  if (op->completed)
+  if (op->completed || op->answered || op->detached)
   {
     return;
   }
-  op->socket->socket.cancel(op->io);
-  op->completed = true;
+  op->answered = true;
   op->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-  if (op->detached)
-  {
-    delete op;
-    return;
-  }
   if (op->continuation)
   {
     auto continuation = std::exchange(op->continuation, {});
@@ -1084,7 +1104,7 @@ struct udp_send_awaitable_t
 
   [[nodiscard]] bool await_ready() const noexcept
   {
-    return op == nullptr || op->completed;
+    return op == nullptr || op->completed || op->answered;
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
@@ -1104,6 +1124,36 @@ struct udp_send_awaitable_t
     return result;
   }
 };
+
+namespace detail
+{
+template <typename Bytes>
+  requires owned_byte_range<Bytes>
+udp_send_awaitable_t udp_send_park(udp_t &udp, Bytes &&bytes, const udp_target_t &target, cancellation_t *cancel)
+{
+  using payload_t = std::remove_cvref_t<Bytes>;
+  using value_t = std::ranges::range_value_t<payload_t>;
+  auto *op = new udp_send_op_t();
+  op->socket = udp.handle;
+  auto owned = std::make_unique<owned_payload_impl_t<payload_t>>(std::forward<Bytes>(bytes));
+  op->bytes = std::as_bytes(std::span<const value_t>(std::ranges::data(owned->value), std::ranges::size(owned->value)));
+  op->payload = std::move(owned);
+  op->address_length = target.length;
+  if (target.address != nullptr)
+  {
+    std::memcpy(&op->address, target.address, static_cast<std::size_t>(target.length));
+  }
+  op->io.owner = op;
+  op->io.complete = &udp_send_op_ready;
+  udp.handle->socket.wait(interest_write, op->io);
+
+  if (cancel != nullptr)
+  {
+    op->cancel_registration = cancel->register_callback([op]() { udp_send_op_cancel(op); });
+  }
+  return udp_send_awaitable_t(op);
+}
+} // namespace detail
 
 template <typename Bytes>
   requires owned_byte_range<Bytes>
@@ -1127,26 +1177,7 @@ udp_send_awaitable_t send_udp(udp_t &udp, Bytes &&bytes, const sockaddr *addr, c
   {
     return udp_send_awaitable_t(detail::udp_send_result(sent));
   }
-
-  auto *op = new udp_send_op_t();
-  op->socket = udp.handle;
-  auto owned = std::make_unique<owned_payload_impl_t<payload_t>>(std::forward<Bytes>(bytes));
-  op->bytes = std::as_bytes(std::span<const value_t>(std::ranges::data(owned->value), std::ranges::size(owned->value)));
-  op->payload = std::move(owned);
-  op->address_length = target.length;
-  if (target.address != nullptr)
-  {
-    std::memcpy(&op->address, target.address, static_cast<std::size_t>(target.length));
-  }
-  op->io.owner = op;
-  op->io.complete = &detail::udp_send_op_ready;
-  state.socket.wait(detail::interest_write, op->io);
-
-  if (cancel != nullptr)
-  {
-    op->cancel_registration = cancel->register_callback([op]() { detail::udp_send_op_cancel(op); });
-  }
-  return udp_send_awaitable_t(op);
+  return detail::udp_send_park(udp, std::forward<Bytes>(bytes), target, cancel);
 }
 
 // Synchronous send. Unlike send_udp above there is no operation and no
@@ -1302,12 +1333,25 @@ namespace detail
   return recv.alloc_buffer_cb(recv.alloc_cb_data, udp_receive_buffer_size);
 }
 
+[[nodiscard]] inline unique_buf_t udp_recv_adopt(udp_recv_state_t &recv, std::span<std::byte> block, std::size_t length)
+{
+  if (recv.alloc_buffer_cb == &default_alloc && recv.dealloc_buffer_cb == &default_dealloc && length <= block.size() / 2)
+  {
+    auto exact = default_alloc(nullptr, length);
+    std::memcpy(exact.data(), block.data(), length);
+    recv.spare.push_back(block);
+    return unique_buf_t(exact, &default_dealloc, nullptr);
+  }
+  unique_buf_t buffer(block, recv.dealloc_buffer_cb, recv.alloc_cb_data);
+  buffer.resize(length);
+  return buffer;
+}
+
 inline void udp_recv_fill(udp_state_t &state)
 {
   auto &recv = state.recv;
   const std::size_t limit = recv.recv_queue_limit == 0 ? 1 : recv.recv_queue_limit;
-  const std::size_t queued = recv.buffer_queue.size();
-  std::size_t budget = queued < limit ? std::min(limit - queued, udp_recv_burst) : 0;
+  std::size_t budget = udp_recv_burst;
   recv.drained = false;
   const native_socket_t native = state.socket.native();
   std::size_t errors = 0;
@@ -1331,6 +1375,7 @@ inline void udp_recv_fill(udp_state_t &state)
     }
     if (prepared == 0)
     {
+      recv.stalled = true;
       recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = errc::no_buffer_space, .msg = "the receive allocator returned no buffer"}));
       return;
     }
@@ -1350,6 +1395,7 @@ inline void udp_recv_fill(udp_state_t &state)
       }
       if (udp_is_terminal_receive_error(received))
       {
+        recv.stalled = true;
         recv.buffer_queue.emplace_back(std::unexpected(make_error(static_cast<int>(received))));
         return;
       }
@@ -1375,9 +1421,14 @@ inline void udp_recv_fill(udp_state_t &state)
         recv.spare.push_back(buffers[i]);
         continue;
       }
+      if (recv.buffer_queue.size() >= limit)
+      {
+        ++recv.dropped_datagrams;
+        recv.spare.push_back(buffers[i]);
+        continue;
+      }
       udp_datagram_t datagram;
-      datagram.data = unique_buf_t(buffers[i], recv.dealloc_buffer_cb, recv.alloc_cb_data);
-      datagram.data.resize(message.length);
+      datagram.data = udp_recv_adopt(recv, buffers[i], message.length);
       if (message.name_length > 0)
       {
         std::memcpy(&datagram.sender_addr, &names[i], std::min(static_cast<std::size_t>(message.name_length), sizeof(sockaddr_storage)));
@@ -1389,50 +1440,41 @@ inline void udp_recv_fill(udp_state_t &state)
   }
 }
 
-inline void udp_recv_park(udp_state_t &state);
-
-inline void udp_recv_wake(udp_state_t &state)
+inline void udp_recv_hold(udp_state_t &state, std::coroutine_handle<> continuation)
 {
   auto &recv = state.recv;
-  if (!recv.continuation)
+  recv.continuation = continuation;
+  if (!recv.holding_loop)
+  {
+    recv.holding_loop = true;
+    core(state.event_loop).retain();
+  }
+}
+
+[[nodiscard]] inline std::coroutine_handle<> udp_recv_take_waiter(udp_state_t &state) noexcept
+{
+  auto &recv = state.recv;
+  if (recv.holding_loop)
+  {
+    recv.holding_loop = false;
+    core(state.event_loop).release();
+  }
+  return std::exchange(recv.continuation, {});
+}
+
+inline void udp_recv_arm(udp_state_t &state)
+{
+  auto &recv = state.recv;
+  if (!recv.started || recv.is_cancelled || recv.stalled)
   {
     return;
   }
-  if (recv.started && !recv.is_cancelled)
-  {
-    udp_recv_fill(state);
-    if (recv.buffer_queue.empty())
-    {
-      udp_recv_park(state);
-      return;
-    }
-  }
-  auto continuation = std::exchange(recv.continuation, {});
-  continuation.resume();
-}
-
-inline void udp_recv_on_readable(io_op_t *op)
-{
-  udp_recv_wake(*static_cast<udp_state_t *>(op->owner));
-}
-
-inline void udp_recv_on_retry(posted_t *node)
-{
-  auto owned = ref_ptr_t<udp_state_t>::from_raw(node->owner);
-  udp_recv_wake(owned.data());
-}
-
-inline void udp_recv_on_discard(posted_t *node)
-{
-  ref_ptr_t<udp_state_t>::from_raw(node->owner);
-}
-
-inline void udp_recv_park(udp_state_t &state)
-{
-  auto &recv = state.recv;
   if (recv.drained)
   {
-    state.socket.wait(interest_read, recv.op);
+    if (!recv.op.parked)
+    {
+      state.socket.wait(interest_read, recv.op);
+    }
     return;
   }
   if (recv.retry.queued)
@@ -1443,18 +1485,60 @@ inline void udp_recv_park(udp_state_t &state)
   core(state.event_loop).defer(recv.retry);
 }
 
-[[nodiscard]] inline bool udp_recv_try(udp_state_t &state)
+inline void udp_recv_service(udp_state_t &state)
 {
   auto &recv = state.recv;
-  if (!recv.drained)
+  if (!recv.started || recv.is_cancelled)
   {
-    return false;
+    return;
   }
-  if (recv.drained_known && state.socket.watch.epoch == recv.drained_epoch)
+  if (!recv.stalled)
+  {
+    udp_recv_fill(state);
+  }
+  udp_recv_arm(state);
+  if (recv.continuation && !recv.buffer_queue.empty())
+  {
+    udp_recv_take_waiter(state).resume();
+  }
+}
+
+inline void udp_recv_on_readable(io_op_t *op)
+{
+  udp_recv_service(*static_cast<udp_state_t *>(op->owner));
+}
+
+inline void udp_recv_on_retry(posted_t *node)
+{
+  auto owned = ref_ptr_t<udp_state_t>::from_raw(node->owner);
+  udp_recv_service(owned.data());
+}
+
+inline void udp_recv_on_discard(posted_t *node)
+{
+  ref_ptr_t<udp_state_t>::from_raw(node->owner);
+}
+
+[[nodiscard]] inline bool udp_recv_try(udp_state_t &state, bool eager)
+{
+  auto &recv = state.recv;
+  if (recv.stalled)
+  {
+    recv.stalled = false;
+  }
+  else if (!recv.drained)
+  {
+    if (!eager)
+    {
+      return false;
+    }
+  }
+  else if (recv.drained_known && state.socket.watch.epoch == recv.drained_epoch)
   {
     return false;
   }
   udp_recv_fill(state);
+  udp_recv_arm(state);
   return !recv.buffer_queue.empty();
 }
 
@@ -1513,8 +1597,7 @@ public:
     recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = errc::canceled, .msg = "Operation was cancelled"}));
     if (recv.continuation)
     {
-      auto continuation = std::exchange(recv.continuation, {});
-      continuation.resume();
+      detail::udp_recv_take_waiter(handle.data()).resume();
     }
   }
 
@@ -1541,11 +1624,7 @@ public:
     {
       if (waiting && state->recv.continuation == waiting)
       {
-        state->recv.continuation = {};
-        if (state->recv.op.parked)
-        {
-          state->socket.cancel(state->recv.op);
-        }
+        (void)detail::udp_recv_take_waiter(state.data());
       }
     }
 
@@ -1561,14 +1640,14 @@ public:
         busy = true;
         return true;
       }
-      return detail::udp_recv_try(state.data());
+      return detail::udp_recv_try(state.data(), false);
     }
 
     void await_suspend(std::coroutine_handle<> h)
     {
       waiting = h;
-      state->recv.continuation = h;
-      detail::udp_recv_park(state.data());
+      detail::udp_recv_hold(state.data(), h);
+      detail::udp_recv_arm(state.data());
     }
 
     std::expected<udp_datagram_t, error_t> await_resume()
@@ -1614,7 +1693,7 @@ private:
     if (handle->recv.started)
     {
       detail::udp_recv_stop(handle.data());
-      handle->recv.continuation = {};
+      (void)detail::udp_recv_take_waiter(handle.data());
     }
   }
 
@@ -1631,10 +1710,7 @@ inline std::size_t udp_reader_take_batch(udp_reader_t &reader, std::span<std::ex
   auto &recv = state.recv;
   if (recv.buffer_queue.empty() && recv.started && !recv.is_cancelled && !recv.continuation)
   {
-    if (!recv.drained || !recv.drained_known || state.socket.watch.epoch != recv.drained_epoch)
-    {
-      detail::udp_recv_fill(state);
-    }
+    (void)detail::udp_recv_try(state, true);
   }
   auto &queue = recv.buffer_queue;
   std::size_t taken = 0;
@@ -1671,14 +1747,18 @@ inline std::expected<udp_reader_t, error_t> udp_create_reader(udp_t &udp)
   recv.active = true;
   recv.started = true;
   recv.is_cancelled = false;
+  recv.stalled = false;
   recv.drained = true;
   recv.drained_known = false;
-  recv.continuation = {};
+  (void)detail::udp_recv_take_waiter(state);
   recv.op.owner = &state;
   recv.op.complete = &detail::udp_recv_on_readable;
+  recv.op.keeps_alive = false;
   recv.retry.run = &detail::udp_recv_on_retry;
   recv.retry.discard = &detail::udp_recv_on_discard;
   recv.spare.reserve(udp_recvmmsg_batch);
+  detail::udp_recv_fill(state);
+  detail::udp_recv_arm(state);
   return udp_reader_t{udp};
 }
 

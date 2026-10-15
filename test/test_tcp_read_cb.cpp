@@ -161,6 +161,120 @@ vio::task_t<void> cancel_releases_scenario(vio::event_loop_t &loop, alloc_counts
   co_await std::move(read_task);
   CHECK(counts.deallocs == counts.allocs);
 }
+
+vio::task_t<void> paced_reads_scenario(vio::event_loop_t &loop, alloc_counts_t &counts, std::size_t messages, std::string &received, std::size_t &reads)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  pair->server.handle->read.alloc_buffer_cb = counting_alloc;
+  pair->server.handle->read.dealloc_buffer_cb = counting_dealloc;
+  pair->server.handle->read.alloc_cb_data = &counts;
+  auto reader = vio::tcp_create_reader(pair->server);
+  REQUIRE_EXPECTED(reader);
+  auto read_task = [](vio::tcp_reader_t &reader, std::size_t messages, std::string &received, std::size_t &reads) -> vio::task_t<void> {
+    while (received.size() < messages)
+    {
+      auto chunk = co_await reader;
+      REQUIRE_EXPECTED(chunk);
+      received.append(chunk->chars(), chunk->size());
+      ++reads;
+    }
+  }(reader.value(), messages, received, reads);
+  for (std::size_t i = 0; i < messages; ++i)
+  {
+    [[maybe_unused]] auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(2));
+    const auto byte = static_cast<uint8_t>('a' + i);
+    auto written = co_await vio::write_tcp(pair->client, &byte, 1);
+    REQUIRE_EXPECTED(written);
+  }
+  co_await std::move(read_task);
+}
+
+vio::task_t<void> data_then_close_scenario(vio::event_loop_t &loop, std::string &received, int &first_end, int &second_end, std::size_t &into_bytes)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  {
+    auto client = std::move(pair->client);
+    const std::string payload = "abc";
+    auto written = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
+    REQUIRE_EXPECTED(written);
+  }
+  [[maybe_unused]] auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(20));
+  auto reader = vio::tcp_create_reader(pair->server);
+  REQUIRE_EXPECTED(reader);
+  auto chunk = co_await reader.value();
+  REQUIRE_EXPECTED(chunk);
+  received.assign(chunk->chars(), chunk->size());
+  auto end = co_await reader.value();
+  REQUIRE_FALSE(end.has_value());
+  first_end = end.error().code;
+  auto again = co_await reader.value();
+  REQUIRE_FALSE(again.has_value());
+  second_end = again.error().code;
+  std::array<std::byte, 8> buffer{};
+  auto into = co_await reader->read_into(std::span<std::byte>(buffer.data(), buffer.size()));
+  REQUIRE_EXPECTED(into);
+  into_bytes = into.value();
+}
+
+vio::task_t<void> replace_cancelled_reader_scenario(vio::event_loop_t &loop, int &replace_code, std::string &first, int &stale_code, bool &stale_cancelled, std::string &second)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto created = vio::tcp_create_reader(pair->server);
+  REQUIRE_EXPECTED(created);
+  vio::tcp_reader_t reader = std::move(created.value());
+  reader.cancel();
+  {
+    auto again = vio::tcp_create_reader(pair->server);
+    replace_code = again.has_value() ? 0 : again.error().code;
+    REQUIRE_EXPECTED(again);
+    reader = std::move(again.value());
+  }
+  const std::string one = "one";
+  auto wrote_one = co_await vio::write_tcp(pair->client, reinterpret_cast<const uint8_t *>(one.data()), one.size());
+  REQUIRE_EXPECTED(wrote_one);
+  auto chunk = co_await reader;
+  REQUIRE_EXPECTED(chunk);
+  first.assign(chunk->chars(), chunk->size());
+
+  auto stale = std::move(reader);
+  stale.cancel();
+  auto fresh_or = vio::tcp_create_reader(pair->server);
+  REQUIRE_EXPECTED(fresh_or);
+  auto fresh = std::move(fresh_or.value());
+  stale_cancelled = stale.is_cancelled();
+  auto stale_read = co_await stale;
+  REQUIRE_FALSE(stale_read.has_value());
+  stale_code = stale_read.error().code;
+  auto read_task = [](vio::tcp_reader_t &reader, std::string &out) -> vio::task_t<void> {
+    auto chunk = co_await reader;
+    REQUIRE_EXPECTED(chunk);
+    out.assign(chunk->chars(), chunk->size());
+  }(fresh, second);
+  {
+    auto drop = std::move(stale);
+  }
+  [[maybe_unused]] auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(5));
+  const std::string two = "two";
+  auto wrote_two = co_await vio::write_tcp(pair->client, reinterpret_cast<const uint8_t *>(two.data()), two.size());
+  REQUIRE_EXPECTED(wrote_two);
+  co_await std::move(read_task);
+}
+
+template <typename Scenario>
+void run_read_scenario(Scenario &&scenario)
+{
+  vio::event_loop_t loop;
+  loop.run_in_loop([&] {
+    return [](vio::event_loop_t &loop, Scenario &scenario) -> vio::task_t<void> {
+      co_await scenario(loop);
+      loop.stop();
+    }(loop, scenario);
+  });
+  loop.run();
+}
 } // namespace
 
 TEST_SUITE("tcp read readiness")
@@ -218,5 +332,46 @@ TEST_SUITE("tcp read readiness")
     loop.run();
     CHECK(code == vio::errc::canceled);
     CHECK(counts.deallocs == counts.allocs);
+  }
+
+  TEST_CASE("queued reads allocate a buffer only when there is data to take")
+  {
+    alloc_counts_t counts;
+    constexpr std::size_t messages = 10;
+    std::string received;
+    std::size_t reads = 0;
+    run_read_scenario([&](vio::event_loop_t &loop) { return paced_reads_scenario(loop, counts, messages, received, reads); });
+    CHECK(received == "abcdefghij");
+    CHECK(reads > 0);
+    CHECK(counts.allocs <= static_cast<int>(reads) + 1);
+    CHECK(counts.deallocs == counts.allocs);
+  }
+
+  TEST_CASE("data followed by the peer closing reads as the data, then eof")
+  {
+    std::string received;
+    int first_end = 0;
+    int second_end = 0;
+    std::size_t into_bytes = 99;
+    run_read_scenario([&](vio::event_loop_t &loop) { return data_then_close_scenario(loop, received, first_end, second_end, into_bytes); });
+    CHECK(received == "abc");
+    CHECK(first_end == vio::errc::eof);
+    CHECK(second_end == vio::errc::eof);
+    CHECK(into_bytes == 0);
+  }
+
+  TEST_CASE("a cancelled reader can be replaced while it still exists")
+  {
+    int replace_code = -1;
+    std::string first;
+    int stale_code = 0;
+    bool stale_cancelled = false;
+    std::string second;
+    run_read_scenario([&](vio::event_loop_t &loop) { return replace_cancelled_reader_scenario(loop, replace_code, first, stale_code, stale_cancelled, second); });
+    CHECK(replace_code == 0);
+    CHECK(first == "one");
+    CHECK(stale_cancelled);
+    CHECK(stale_code == vio::errc::canceled);
+    CHECK(second == "two");
   }
 }

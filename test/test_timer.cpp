@@ -1,9 +1,12 @@
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
+#include <vio/loop/loop_core.h>
 #include <vio/operation/timer.h>
 #include <vio/tick.h>
 
@@ -370,4 +373,57 @@ TEST_CASE("a timer that does not keep the loop alive does not hold run open afte
   timer.reset();
   event_loop.run();
   CHECK(vio::detail::core(event_loop).open_resources() == 0);
+}
+
+TEST_CASE("a timer rearmed with the largest delays never fires")
+{
+  vio::event_loop_t event_loop;
+  std::optional<vio::timer_t> nanoseconds_max;
+  std::optional<vio::timer_t> milliseconds_max;
+  std::optional<vio::timer_t> millennium;
+  std::optional<vio::timer_t> stopper;
+  int fired = 0;
+  bool armed_at_stop = false;
+  nanoseconds_max.emplace(make_timer(event_loop));
+  milliseconds_max.emplace(make_timer(event_loop));
+  millennium.emplace(make_timer(event_loop));
+  stopper.emplace(make_timer(event_loop));
+  vio::timer_on_fire(*nanoseconds_max, [&] { ++fired; });
+  vio::timer_on_fire(*milliseconds_max, [&] { ++fired; });
+  vio::timer_on_fire(*millennium, [&] { ++fired; });
+  vio::timer_on_fire(*stopper, [&] {
+    armed_at_stop = vio::timer_is_armed(*nanoseconds_max) && vio::timer_is_armed(*milliseconds_max) && vio::timer_is_armed(*millennium);
+    nanoseconds_max.reset();
+    milliseconds_max.reset();
+    millennium.reset();
+    stopper.reset();
+    event_loop.stop();
+  });
+  REQUIRE(vio::timer_rearm(*nanoseconds_max, std::chrono::nanoseconds::max()).has_value());
+  REQUIRE(vio::timer_rearm(*milliseconds_max, std::chrono::milliseconds::max()).has_value());
+  REQUIRE(vio::timer_rearm(*millennium, std::chrono::hours(24 * 365 * 1000)).has_value());
+  REQUIRE(vio::timer_rearm(*stopper, std::chrono::milliseconds(50)).has_value());
+  event_loop.run();
+
+  CHECK(fired == 0);
+  CHECK(armed_at_stop);
+}
+
+TEST_CASE("delays convert to nanoseconds without overflowing")
+{
+  constexpr auto most = std::numeric_limits<std::int64_t>::max();
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::nanoseconds::max()) == most);
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::milliseconds::max()) == most);
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::seconds::max()) == most);
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::hours(24 * 365 * 1000)) == most);
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::milliseconds(1500)) == 1500000000);
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::microseconds(7)) == 7000);
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::milliseconds(-5)) == 0);
+  CHECK(vio::detail::delay_nanoseconds(std::chrono::nanoseconds::min()) == 0);
+  CHECK(vio::detail::loop_core_t::deadline_after(most) == most);
+  CHECK(vio::detail::loop_core_t::deadline_after(most - 1) == most);
+  const auto before = vio::detail::loop_core_t::now();
+  const auto deadline = vio::detail::loop_core_t::deadline_after(1000000);
+  CHECK(deadline >= before + 1000000);
+  CHECK(deadline < most);
 }

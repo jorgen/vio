@@ -22,6 +22,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -29,6 +30,17 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio::detail
 {
+template <typename Rep, typename Period>
+[[nodiscard]] std::int64_t delay_nanoseconds(std::chrono::duration<Rep, Period> delay) noexcept
+{
+  constexpr double saturation = 9.2e18;
+  if (!(delay > std::chrono::duration<Rep, Period>::zero()))
+    return 0;
+  if (!(std::chrono::duration<double, std::nano>(delay).count() < saturation))
+    return std::numeric_limits<std::int64_t>::max();
+  return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(delay).count());
+}
+
 struct timer_node_t
 {
   using fire_fn_t = void (*)(timer_node_t *node);

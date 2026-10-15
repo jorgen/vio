@@ -25,18 +25,18 @@ Copyright (c) 2025 Jørgen Lind
 // ---------------------------------------------------------------------------
 // vio SSL backend seam.
 //
-// vio speaks the OpenSSL SSL_*/BIO_* API and does its own socket I/O over
-// libuv, so the SSL library only performs crypto through memory BIOs. That
-// makes the library pluggable at COMPILE TIME: the same source builds against
-// the bundled LibreSSL (its OpenSSL-compat layer), system OpenSSL 3.x, or
-// BoringSSL/AWS-LC, which all expose the same symbol names. This header is the
-// single seam that (a) includes the OpenSSL headers, (b) selects the backend,
-// (c) exposes constexpr feature flags, and (d) provides inline shims for the
-// handful of genuinely divergent operations plus the portable in-memory
-// cert/key/CA loading helpers the rest of the TLS code uses.
+// vio speaks the OpenSSL SSL_*/BIO_* API and does its own socket I/O, so the
+// SSL library only performs crypto through a BIO that vio feeds and drains.
+// That makes the library pluggable at COMPILE TIME: the same source builds
+// against BoringSSL, system OpenSSL 3.x or LibreSSL's OpenSSL-compat layer,
+// which all expose the same symbol names. This header is the single seam that
+// (a) includes the OpenSSL headers, (b) selects the backend, (c) exposes
+// constexpr feature flags, and (d) provides inline shims for the handful of
+// genuinely divergent operations plus the portable in-memory cert/key/CA
+// loading helpers the rest of the TLS code uses.
 //
-// Only the bundled LibreSSL backend is wired & tested today; OpenSSL/BoringSSL
-// are drop-in behind this seam.
+// Only the bundled BoringSSL backend is wired and tested; the build refuses
+// the OpenSSL and LibreSSL arms.
 // ---------------------------------------------------------------------------
 
 // <wincrypt.h> defines object-identifier constants whose names are also X.509

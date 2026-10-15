@@ -103,11 +103,11 @@ inline void timer_set_keeps_loop_alive(timer_t &timer, bool keeps_alive)
     core.add_timer(state.node, deadline);
 }
 
-inline std::expected<void, error_t> timer_rearm(timer_t &timer, std::chrono::nanoseconds delay)
+template <typename Rep, typename Period>
+inline std::expected<void, error_t> timer_rearm(timer_t &timer, std::chrono::duration<Rep, Period> delay)
 {
   auto &state = timer.handle.data();
-  auto offset = delay.count() <= 0 ? std::int64_t{0} : static_cast<std::int64_t>(delay.count());
-  detail::core(state.event_loop).add_timer(state.node, detail::loop_core_t::now() + offset);
+  detail::core(state.event_loop).add_timer(state.node, detail::loop_core_t::deadline_after(detail::delay_nanoseconds(delay)));
   return {};
 }
 

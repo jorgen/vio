@@ -39,7 +39,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/event_loop.h>
 #include <vio/task.h>
 
-// The native transport is libuv TCP + LibreSSL TLS (with ada for URL parsing). In the browser build
+// The native transport is vio's TCP + BoringSSL TLS (with ada for URL parsing). In the browser build
 // these are unavailable and unwanted; the transport is provided by emscripten_fetch instead (see the
 // #ifdef __EMSCRIPTEN__ block at the bottom of this header).
 #ifndef __EMSCRIPTEN__

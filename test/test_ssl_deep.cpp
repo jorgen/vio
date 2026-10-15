@@ -153,6 +153,51 @@ tls_pair_config_t make_pair_config()
   return out;
 }
 
+vio::task_t<void> watchdog(vio::event_loop_t &el, vio::cancellation_t &target, vio::cancellation_t &stop)
+{
+  auto slept = co_await vio::sleep(el, std::chrono::seconds(3), &stop);
+  if (slept.has_value())
+    target.cancel();
+}
+
+vio::task_t<void> hold_until_closed(vio::tcp_server_t s)
+{
+  auto server = std::move(s);
+  auto listened = co_await vio::tcp_listen(server, 4);
+  REQUIRE_EXPECTED(listened);
+  auto accepted = vio::tcp_accept(server);
+  REQUIRE_EXPECTED(accepted);
+  auto connection = std::move(accepted.value());
+  auto reader = vio::tcp_create_reader(connection);
+  REQUIRE_EXPECTED(reader);
+  for (;;)
+  {
+    auto chunk = co_await reader.value();
+    if (!chunk.has_value())
+      break;
+  }
+}
+
+bool pump_handshake(vio::ssl_engine_t &client, vio::ssl_engine_t &server)
+{
+  for (int round = 0; round < 16; ++round)
+  {
+    client.do_handshake();
+    auto to_server = client.pending_output();
+    if (!server.feed_ciphertext(reinterpret_cast<const char *>(to_server.data()), to_server.size()))
+      return false;
+    client.consume_output(to_server.size());
+    server.do_handshake();
+    auto to_client = server.pending_output();
+    if (!client.feed_ciphertext(reinterpret_cast<const char *>(to_client.data()), to_client.size()))
+      return false;
+    server.consume_output(to_client.size());
+    if (client.is_init_finished() && server.is_init_finished())
+      return true;
+  }
+  return false;
+}
+
 TEST_SUITE("TLS deep verification")
 {
 TEST_CASE("rejects a server certificate signed by an untrusted CA")
@@ -1096,6 +1141,215 @@ TEST_CASE("connecting to a closed port fails with connection_refused")
       el.stop();
     });
   REQUIRE(code == vio::errc::connection_refused);
+}
+
+TEST_CASE("a client whose handshake failed refuses to connect again instead of hanging")
+{
+  auto config = make_pair_config();
+  int first_code = 0;
+  int retry_code = 0;
+  std::chrono::steady_clock::duration retry_time{};
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+      {
+        auto server = std::move(s);
+        auto listened = co_await vio::tcp_listen(server, 4);
+        REQUIRE_EXPECTED(listened);
+        auto accepted = vio::tcp_accept(server);
+        REQUIRE_EXPECTED(accepted);
+      }(std::move(pair->first));
+      {
+        auto c = vio::ssl_client_create(el, config.client);
+        REQUIRE_EXPECTED(c);
+        auto client = std::move(c.value());
+        auto first = co_await vio::ssl_client_connect(client, "localhost", static_cast<uint16_t>(port), "127.0.0.1");
+        REQUIRE_FALSE(first.has_value());
+        first_code = first.error().code;
+        vio::cancellation_t guard;
+        vio::cancellation_t stop;
+        auto dog = watchdog(el, guard, stop);
+        auto started = std::chrono::steady_clock::now();
+        auto retry = co_await vio::ssl_client_connect(client, "localhost", static_cast<uint16_t>(port), "127.0.0.1", &guard);
+        retry_time = std::chrono::steady_clock::now() - started;
+        stop.cancel();
+        co_await std::move(dog);
+        REQUIRE_FALSE(retry.has_value());
+        retry_code = retry.error().code;
+      }
+      co_await std::move(server_task);
+      el.stop();
+    });
+  CHECK(first_code != 0);
+  CHECK(retry_code == vio::errc::already_connected);
+  CHECK(retry_time < std::chrono::seconds(1));
+}
+
+TEST_CASE("a client cancelled mid-handshake stops the handshake and refuses to connect again")
+{
+  auto config = make_pair_config();
+  int first_code = 0;
+  int pending_code = -1;
+  int retry_code = 0;
+  int write_code = 0;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = hold_until_closed(std::move(pair->first));
+      {
+        auto c = vio::ssl_client_create(el, config.client);
+        REQUIRE_EXPECTED(c);
+        auto client = std::move(c.value());
+        vio::cancellation_t cancel;
+        vio::cancellation_t guard;
+        vio::cancellation_t stop;
+        auto dog = watchdog(el, guard, stop);
+        auto connecting = vio::ssl_client_connect(client, "localhost", static_cast<uint16_t>(port), "127.0.0.1", &cancel);
+        auto canceller = [](vio::event_loop_t &el, vio::ssl_client_t &client, vio::cancellation_t &cancel, vio::cancellation_t &guard, int &pending_code) -> vio::task_t<void>
+        {
+          co_await vio::sleep(el, std::chrono::milliseconds(50));
+          const std::string early = "early";
+          auto writer = [](vio::tls_client_write_awaitable_t write, int &code) -> vio::task_t<void>
+          {
+            auto result = co_await std::move(write);
+            code = result.has_value() ? 0 : result.error().code;
+          }(vio::ssl_client_write(client, std::as_bytes(std::span(early)), &guard), pending_code);
+          cancel.cancel();
+          co_await std::move(writer);
+        }(el, client, cancel, guard, pending_code);
+        auto first = co_await std::move(connecting);
+        co_await std::move(canceller);
+        REQUIRE_FALSE(first.has_value());
+        first_code = first.error().code;
+
+        auto retry = co_await vio::ssl_client_connect(client, "localhost", static_cast<uint16_t>(port), "127.0.0.1", &guard);
+        REQUIRE_FALSE(retry.has_value());
+        retry_code = retry.error().code;
+        std::string msg = "x";
+        auto written = co_await vio::ssl_client_write(client, std::as_bytes(std::span(msg)), &guard);
+        REQUIRE_FALSE(written.has_value());
+        write_code = written.error().code;
+        stop.cancel();
+        co_await std::move(dog);
+      }
+      co_await std::move(server_task);
+      el.stop();
+    });
+  CHECK(first_code == vio::vio_cancelled);
+  CHECK(pending_code == vio::errc::not_connected);
+  CHECK(retry_code == vio::errc::already_connected);
+  CHECK(write_code == vio::errc::not_connected);
+}
+
+TEST_CASE("a write that finished while awaited keeps its result when its token fires before it resumes")
+{
+  auto config = make_pair_config();
+  sink_result_t sink;
+  bool first_ok = false;
+  int second_code = -1;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = sink_server(el, std::move(pair->first), config.server, port, sink);
+      {
+        auto tcp = vio::tcp_create(el);
+        REQUIRE_EXPECTED(tcp);
+        auto address = vio::ip4_addr("127.0.0.1", port);
+        REQUIRE_EXPECTED(address);
+        auto connected_tcp = co_await vio::tcp_connect(tcp.value(), reinterpret_cast<const sockaddr *>(&address.value()));
+        REQUIRE_EXPECTED(connected_tcp);
+        const std::string first_text = "bbb";
+        const std::string second_text = "aaa";
+        auto upgrade = vio::ssl_client_upgrade(std::move(tcp.value()), config.client, "localhost");
+        auto first = vio::ssl_client_write(upgrade.client, std::as_bytes(std::span(first_text)));
+        vio::cancellation_t token;
+        auto second = vio::ssl_client_write(upgrade.client, std::as_bytes(std::span(second_text)), &token);
+        auto canceller = [](vio::tls_client_write_awaitable_t write, vio::cancellation_t &token, bool &ok) -> vio::task_t<void>
+        {
+          auto result = co_await std::move(write);
+          ok = result.has_value();
+          token.cancel();
+        }(std::move(first), token, first_ok);
+        auto victim = [](vio::tls_client_write_awaitable_t write, int &code) -> vio::task_t<void>
+        {
+          auto result = co_await std::move(write);
+          code = result.has_value() ? 0 : result.error().code;
+        }(std::move(second), second_code);
+        auto connected = co_await std::move(upgrade);
+        REQUIRE_EXPECTED(connected);
+        co_await std::move(canceller);
+        co_await std::move(victim);
+        auto client = std::move(connected.value());
+        auto closed = co_await vio::ssl_client_shutdown(client);
+        REQUIRE_EXPECTED(closed);
+      }
+      co_await std::move(server_task);
+      el.stop();
+    });
+  CHECK(first_ok);
+  CHECK(second_code == 0);
+  CHECK(sink.data == "bbbaaa");
+}
+
+TEST_CASE("an emptied inbound buffer is kept for the next read instead of freed")
+{
+  auto &pool = vio::detail::ssl_inbound_pool();
+  while (pool.size() > 0)
+  {
+    [[maybe_unused]] auto dropped = pool.take();
+  }
+  vio::ssl_engine_t engine;
+  auto space = engine.inbound_space(vio::ssl_engine_t::inbound_capacity);
+  REQUIRE(space.size() == vio::ssl_engine_t::inbound_capacity);
+  auto *buffer = space.data();
+  auto pooled = pool.size();
+  engine.release_inbound_if_empty();
+  CHECK(pool.size() == pooled + 1);
+  vio::ssl_engine_t next;
+  auto reused = next.inbound_space(vio::ssl_engine_t::inbound_capacity);
+  CHECK(reused.data() == buffer);
+}
+
+TEST_CASE("a drained output buffer large enough for one write slice is kept")
+{
+  auto config = make_pair_config();
+  vio::ssl_context_t server_context;
+  REQUIRE(server_context.init(true, config.server, std::string{}).code == 0);
+  vio::ssl_context_t client_context;
+  REQUIRE(client_context.init(false, config.client, std::string{}).code == 0);
+  vio::ssl_engine_t server;
+  REQUIRE(server.init(server_context, true, std::string{}).code == 0);
+  vio::ssl_engine_t client;
+  REQUIRE(client.init(client_context, false, "localhost").code == 0);
+  REQUIRE(pump_handshake(client, server));
+
+  const std::string slice(vio::tls_stream_t::write_slice, 's');
+  auto write_slice = [&] {
+    client.reserve_output(slice.size() + slice.size() / 16 + 1024);
+    int written = 0;
+    REQUIRE(client.write_plaintext(slice.data(), static_cast<int>(slice.size()), written) == vio::ssl_status::ok);
+    REQUIRE(written == static_cast<int>(slice.size()));
+    return client.pending_output().data();
+  };
+  auto *first = write_slice();
+  client.consume_output(client.output_size());
+  std::vector<std::byte> other(vio::ssl_engine_t::output_retain);
+  auto *second = write_slice();
+  CHECK(first == second);
+  CHECK(other.size() == vio::ssl_engine_t::output_retain);
 }
 
 TEST_CASE("upgrading a socket that is not connected fails")

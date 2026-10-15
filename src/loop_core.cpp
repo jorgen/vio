@@ -27,6 +27,8 @@ Copyright (c) 2025 Jørgen Lind
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <utility>
 
 #include "backends.h"
 #include "vio/about_to_block.h"
@@ -34,6 +36,12 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio::detail
 {
+void abort_destroyed_in_flight(const char *what) noexcept
+{
+  std::fprintf(stderr, "vio: a %s was destroyed while the loop or the kernel still held it\n", what);
+  std::abort();
+}
+
 resource_t::resource_t(loop_core_t &loop, const char *kind) noexcept
   : _loop(&loop)
   , _kind(kind)
@@ -181,17 +189,35 @@ loop_core_t::~loop_core_t()
       head = next;
     }
   };
+  for (;;)
   {
-    std::lock_guard lock(_post_mutex);
-    discard_all(_posted.take_all());
+    posted_t *posted;
+    {
+      std::lock_guard lock(_post_mutex);
+      posted = _posted.take_all();
+    }
+    auto *deferred = _deferred.take_all();
+    if (!posted && !deferred)
+      break;
+    discard_all(posted);
+    discard_all(deferred);
   }
-  discard_all(_deferred.take_all());
   _backend.reset();
 }
 
 std::int64_t loop_core_t::now() noexcept
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::int64_t loop_core_t::deadline_after(std::int64_t delay) noexcept
+{
+  auto current = now();
+  if (delay <= 0)
+    return current;
+  if (delay > std::numeric_limits<std::int64_t>::max() - current)
+    return std::numeric_limits<std::int64_t>::max();
+  return current + delay;
 }
 
 const char *loop_core_t::backend_name() const noexcept
@@ -266,6 +292,16 @@ bool loop_core_t::unpost(posted_t &node) noexcept
       node.queued = false;
       removed = true;
     }
+    for (posted_t **link = &_deferred_draining; *link; link = &(*link)->next)
+    {
+      if (*link != &node)
+        continue;
+      *link = node.next;
+      node.next = nullptr;
+      node.queued = false;
+      removed = true;
+      break;
+    }
   }
   std::lock_guard lock(_post_mutex);
   if (!node.queued)
@@ -300,8 +336,7 @@ void loop_core_t::drain_posted()
   }
   for (std::size_t i = 0; i < _draining.size(); ++i)
   {
-    auto *node = _draining[i];
-    if (node)
+    if (auto *node = std::exchange(_draining[i], nullptr))
       node->run(node);
   }
   _draining.clear();
@@ -309,14 +344,13 @@ void loop_core_t::drain_posted()
 
 void loop_core_t::drain_deferred()
 {
-  auto *head = _deferred.take_all();
-  while (head)
+  _deferred_draining = _deferred.take_all();
+  while (auto *node = _deferred_draining)
   {
-    auto *next = head->next;
-    head->next = nullptr;
-    head->queued = false;
-    head->run(head);
-    head = next;
+    _deferred_draining = node->next;
+    node->next = nullptr;
+    node->queued = false;
+    node->run(node);
   }
 }
 

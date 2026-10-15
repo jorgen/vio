@@ -47,9 +47,14 @@ jobs:
         with:
           context: .
           push: true
-          tags: |
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+
+      - name: Move latest to this image
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
   linux:
     needs: docker
@@ -67,6 +72,16 @@ jobs:
             c_flags: ""
             cxx_flags: ""
             linker_flags: ""
+            options: ""
+            header_check: true
+          - name: linux-shared
+            cc: gcc-14
+            cxx: g++-14
+            c_flags: ""
+            cxx_flags: ""
+            linker_flags: ""
+            options: -DVIO_BUILD_SHARED=ON
+            tests: build/bin/vio_tests
           - name: asan
             cc: gcc-14
             cxx: g++-14
@@ -117,7 +132,8 @@ jobs:
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
             -DCMAKE_C_FLAGS="${{ matrix.c_flags }}" \
             -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
-            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}"
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}" \
+            ${{ matrix.options }}
 
       - name: Build
         env:
@@ -126,13 +142,19 @@ jobs:
           cmake --build build
           ccache --show-stats
 
+      - name: Compile every public header without exceptions or RTTI
+        if: matrix.header_check
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: cmake --build build --target vio_header_check
+
       - name: Test on epoll
         env:
           VIO_BACKEND: epoll
         shell: bash
         run: |
           set -o pipefail
-          ./build/test/vio_tests 2>&1 | tee test-epoll.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-epoll.log | head -400; exit 1; }
+          ./${{ matrix.tests || 'build/test/vio_tests' }} 2>&1 | tee test-epoll.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-epoll.log | head -400; exit 1; }
 
       - name: Test on io_uring
         env:
@@ -140,7 +162,67 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./build/test/vio_tests 2>&1 | tee test-io_uring.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-io_uring.log | head -400; exit 1; }
+          ./${{ matrix.tests || 'build/test/vio_tests' }} 2>&1 | tee test-io_uring.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-io_uring.log | head -400; exit 1; }
+
+  install:
+    needs: docker
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/jorgen/vio-ci:${{ needs.docker.outputs.image-tag }}
+    name: install-and-consume
+    env:
+      PREFIX: /tmp/vio-prefix
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache 3rdparty dependencies
+        uses: actions/cache@v4
+        with:
+          path: 3rdparty
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          restore-keys: 3rdparty-${{ runner.os }}-
+
+      - name: Fetch the pinned dependency sources
+        run: |
+          cmake -G Ninja -B fetch -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DVIO_BUILD_TESTS=OFF -DVIO_BUILD_EXAMPLES=OFF
+
+      - name: Install BoringSSL and ada
+        shell: bash
+        run: |
+          set -e
+          boringssl=$(ls -d 3rdparty/boringssl-*)
+          ada=$(ls -d 3rdparty/ada-*)
+          cmake -G Ninja -S "$boringssl" -B deps/boringssl -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build deps/boringssl --target crypto ssl bssl
+          cmake --install deps/boringssl
+          cmake -G Ninja -S "$ada" -B deps/ada -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DADA_TESTING=OFF -DADA_TOOLS=OFF -DADA_BENCHMARKS=OFF -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build deps/ada
+          cmake --install deps/ada
+
+      - name: Build and install vio against them
+        run: |
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DVIO_USE_SYSTEM_BORINGSSL=ON -DVIO_USE_SYSTEM_ADA=ON \
+            -DVIO_BUILD_TESTS=OFF -DVIO_BUILD_EXAMPLES=OFF \
+            -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build build
+          cmake --install build
+          test -f "$PREFIX/lib/cmake/vio/vioConfig.cmake"
+
+      - name: Build and run a find_package(vio) consumer
+        run: |
+          cmake -G Ninja -S test/install_consumer -B consumer -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_PREFIX_PATH="$PREFIX"
+          cmake --build consumer
+          ctest --test-dir consumer --output-on-failure
 
   wasm:
     runs-on: ubuntu-24.04
@@ -177,6 +259,7 @@ jobs:
           - name: macos-debug
             cxx_flags: ""
             linker_flags: ""
+            header_check: true
           - name: macos-asan
             cxx_flags: -fsanitize=address -fno-omit-frame-pointer
             linker_flags: -fsanitize=address
@@ -222,6 +305,12 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: cmake --build build
+
+      - name: Compile every public header without exceptions or RTTI
+        if: matrix.header_check
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: cmake --build build --target vio_header_check
 
       - name: Test
         shell: bash
@@ -270,4 +359,4 @@ jobs:
           call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           cmake --preset ${{ matrix.preset }} || exit /b 1
           cmake --build --preset ${{ matrix.preset }} || exit /b 1
-          ctest --preset ${{ matrix.preset }} --output-on-failure > test.log 2>&1 || (findstr /n /c:"ERROR" /c:"FATAL" /c:"CRASHED" test.log & exit /b 1)
+          ctest --preset ${{ matrix.preset }} --output-on-failure > test.log 2>&1 || (findstr /n /c:"ERROR" /c:"FATAL" /c:"CRASHED" test.log & powershell -NoProfile -Command "Get-Content test.log -Tail 300" & exit /b 1)

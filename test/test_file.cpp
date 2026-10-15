@@ -23,7 +23,21 @@
 #if defined(_WIN32)
 #include <vio/detail/native.h>
 #else
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <pthread.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#if defined(__SANITIZE_THREAD__)
+#define VIO_FILE_TEST_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define VIO_FILE_TEST_UNDER_TSAN 1
+#endif
 #endif
 
 namespace
@@ -130,6 +144,67 @@ void close_now(vio::auto_close_file_t &file, vio::event_loop_t &event_loop)
 {
   file = vio::make_auto_close_file({.event_loop = &event_loop, .handle = -1});
 }
+
+#if !defined(_WIN32) && !defined(VIO_FILE_TEST_UNDER_TSAN)
+int copy_through_the_pool()
+{
+  vio::event_loop_t event_loop;
+  int outcome = 1;
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &ev, int &outcome) -> vio::task_t<void> {
+      auto source = vio::mkstemp_file(ev, "test_file_fork_src_XXXXXX");
+      auto dest = vio::mkstemp_file(ev, "test_file_fork_dst_XXXXXX");
+      if (source)
+        (void)vio::unlink_file(ev, source->second);
+      if (dest)
+        (void)vio::unlink_file(ev, dest->second);
+      if (!source || !dest)
+      {
+        outcome = 2;
+        ev.stop();
+        co_return;
+      }
+      const std::string text = "fork";
+      auto wrote = vio::write_file_sync(*source->first, bytes_of(text), text.size(), 0);
+      auto sent = co_await vio::send_file(ev, *dest->first, *source->first, 0, text.size());
+      auto synced = co_await vio::fsync_file(ev, *dest->first);
+      std::string back(text.size(), '\0');
+      auto read = co_await vio::read_file(ev, *dest->first, bytes_of(back), back.size(), 0);
+      const bool copied = wrote && sent && sent.value() == text.size() && synced && read && read.value() == text.size() && back == text;
+      outcome = copied ? 0 : 3;
+      close_now(source->first, ev);
+      close_now(dest->first, ev);
+      ev.stop();
+    }(event_loop, outcome);
+  });
+  event_loop.run();
+  return outcome;
+}
+
+int status_of_forked(int (*body)())
+{
+  const pid_t child = ::fork();
+  if (child < 0)
+    return -1;
+  if (child == 0)
+  {
+    sigset_t alarm_only;
+    sigemptyset(&alarm_only);
+    sigaddset(&alarm_only, SIGALRM);
+    ::pthread_sigmask(SIG_UNBLOCK, &alarm_only, nullptr);
+    std::signal(SIGALRM, SIG_DFL);
+    ::alarm(10);
+    ::_exit(body());
+  }
+  int status = 0;
+  while (::waitpid(child, &status, 0) < 0)
+  {
+    if (errno != EINTR)
+      return -1;
+  }
+  return status;
+}
+#endif
 } // namespace
 
 static vio::task_t<void> write_a_test_file(vio::event_loop_t &event_loop)
@@ -561,6 +636,66 @@ TEST_CASE("a negative offset reads and writes at the current position")
   event_loop.run();
 }
 
+TEST_CASE("a positional read or write leaves the current position where it was")
+{
+  vio::event_loop_t event_loop;
+  bool completed = false;
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &ev, bool &completed) -> vio::task_t<void> {
+      auto tmp = vio::mkstemp_file(ev, "test_file_keep_position_XXXXXX");
+      REQUIRE(tmp.has_value());
+      auto file = std::move(tmp->first);
+      auto path = std::move(tmp->second);
+      const std::string abcd = "abcd";
+      const std::string ef = "ef";
+      const std::string z = "Z";
+      const std::string gh = "gh";
+      const std::string ij = "ij";
+      const std::string y = "Y";
+      const std::string kl = "kl";
+      std::string two(2, '\0');
+
+      auto wrote_abcd = co_await vio::write_file(ev, *file, bytes_of(abcd), abcd.size(), -1);
+      REQUIRE_EXPECTED(wrote_abcd);
+      auto read_front = co_await vio::read_file(ev, *file, bytes_of(two), two.size(), 0);
+      REQUIRE_EXPECTED(read_front);
+      CHECK(read_front.value() == 2);
+      CHECK(two == "ab");
+      auto wrote_ef = co_await vio::write_file(ev, *file, bytes_of(ef), ef.size(), -1);
+      REQUIRE_EXPECTED(wrote_ef);
+      auto wrote_z = co_await vio::write_file(ev, *file, bytes_of(z), z.size(), 1);
+      REQUIRE_EXPECTED(wrote_z);
+      auto wrote_gh = co_await vio::write_file(ev, *file, bytes_of(gh), gh.size(), -1);
+      REQUIRE_EXPECTED(wrote_gh);
+
+      auto read_sync = vio::read_file_sync(*file, bytes_of(two), 1, 0);
+      REQUIRE_EXPECTED(read_sync);
+      CHECK(read_sync.value() == 1);
+      auto wrote_ij = vio::write_file_sync(*file, bytes_of(ij), ij.size(), -1);
+      REQUIRE_EXPECTED(wrote_ij);
+      auto wrote_y = vio::write_file_sync(*file, bytes_of(y), y.size(), 0);
+      REQUIRE_EXPECTED(wrote_y);
+      auto wrote_kl = vio::write_file_sync(*file, bytes_of(kl), kl.size(), -1);
+      REQUIRE_EXPECTED(wrote_kl);
+
+      auto at_end = co_await vio::read_file(ev, *file, bytes_of(two), two.size(), -1);
+      REQUIRE_EXPECTED(at_end);
+      CHECK(at_end.value() == 0);
+      std::string whole(16, '\0');
+      auto read_whole = vio::read_file_sync(*file, bytes_of(whole), whole.size(), 0);
+      REQUIRE_EXPECTED(read_whole);
+      CHECK(whole.substr(0, read_whole.value()) == "YZcdefghijkl");
+
+      close_now(file, ev);
+      CHECK(vio::unlink_file(ev, path).has_value());
+      completed = true;
+      ev.stop();
+    }(event_loop, completed);
+  });
+  event_loop.run();
+  CHECK(completed);
+}
+
 TEST_CASE("send_file starts at the input offset and stops at the length")
 {
   vio::event_loop_t event_loop;
@@ -640,6 +775,37 @@ TEST_CASE("a read still queued when cancelled ends with errc::canceled and leave
   CHECK(finished);
   CHECK(gate.finished == static_cast<int>(more_than_any_pool));
 }
+
+#if !defined(_WIN32)
+TEST_CASE("files vio opens are closed on exec")
+{
+  vio::event_loop_t event_loop;
+  auto tmp = vio::mkstemp_file(event_loop, "test_file_cloexec_XXXXXX");
+  REQUIRE(tmp.has_value());
+  const int temporary_flags = ::fcntl(tmp->first->handle, F_GETFD);
+  REQUIRE(temporary_flags != -1);
+  CHECK((temporary_flags & FD_CLOEXEC) != 0);
+  auto opened = vio::open_file(event_loop, tmp->second, vio::file_open_flag_t::rdonly, 0);
+  REQUIRE_EXPECTED(opened);
+  const int opened_flags = ::fcntl(opened.value()->handle, F_GETFD);
+  REQUIRE(opened_flags != -1);
+  CHECK((opened_flags & FD_CLOEXEC) != 0);
+  close_now(opened.value(), event_loop);
+  close_now(tmp->first, event_loop);
+  CHECK(vio::unlink_file(event_loop, tmp->second).has_value());
+}
+#endif
+
+#if !defined(_WIN32) && !defined(VIO_FILE_TEST_UNDER_TSAN)
+TEST_CASE("file work runs in a process forked after the file pool started")
+{
+  REQUIRE(copy_through_the_pool() == 0);
+  const int status = status_of_forked(&copy_through_the_pool);
+  REQUIRE(status != -1);
+  CHECK_MESSAGE(WIFEXITED(status), "the child was killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
+  CHECK(WEXITSTATUS(status) == 0);
+}
+#endif
 
 TEST_CASE("cancelling a read that already completed changes nothing")
 {

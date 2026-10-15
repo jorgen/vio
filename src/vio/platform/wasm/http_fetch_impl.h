@@ -23,7 +23,7 @@
 
 // WebAssembly/Emscripten transport for vio::http::fetch, backed by the browser Fetch API via
 // emscripten_fetch. This provides the SAME vio::http::fetch / fetch_once signatures as the native
-// libuv+LibreSSL implementation in http_client.h, so the object-store layer (http_object_store.h,
+// TCP+BoringSSL implementation in http_client.h, so the object-store layer (http_object_store.h,
 // s3_object_store.h) compiles and runs unchanged. Included by http_client.h under #ifdef __EMSCRIPTEN__.
 //
 // Semantics match the native transport: any completed HTTP response (including 4xx/5xx) is returned as

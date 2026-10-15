@@ -27,7 +27,7 @@
 #include <vio/objstore/object_store.h>
 #include <vio/objstore/s3_object_store.h>
 #ifndef __EMSCRIPTEN__
-// The directory and Azure backends reach libuv (file I/O); exclude them from the browser build, which
+// The directory and Azure backends need native file I/O; exclude them from the browser build, which
 // has no POSIX filesystem and talks to S3 over emscripten_fetch. aws_config supplies the native ~/.aws
 // credential provider chain (also unavailable in the browser).
 #include <vio/objstore/aws_config.h>

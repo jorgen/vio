@@ -38,6 +38,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <vector>
 
 #include <vio/cancellation.h>
+#include <vio/detail/exceptions.h>
 #include <vio/detail/sys.h>
 #include <vio/errc.h>
 #include <vio/error.h>
@@ -291,6 +292,7 @@ struct tls_stream_t
   static constexpr size_t write_slice = 65536;
   static constexpr int read_budget = 16;
   static constexpr std::int64_t teardown_linger_ns = 10'000'000'000;
+  static_assert(ssl_engine_t::output_retain >= write_slice + write_slice / 16 + 1024);
 
   ssl_engine_t &engine;
   alloc_cb_t alloc_cb;
@@ -532,7 +534,20 @@ struct tls_stream_t
     }
     _lingering = true;
     rc->inc();
-    _core->add_timer(_linger, detail::loop_core_t::now() + teardown_linger_ns);
+    _core->add_timer(_linger, detail::loop_core_t::deadline_after(teardown_linger_ns));
+  }
+
+  void abandon_handshake()
+  {
+    if (closed)
+      return;
+    handshaking = false;
+    on_handshake_complete = nullptr;
+    _handshake_notify = false;
+    if (_write_error == 0)
+      on_write_failure(errc::not_connected);
+    set_read_error(make_error(errc::not_connected));
+    after_user_call();
   }
 
   void begin_write(size_t idx)
@@ -603,6 +618,8 @@ struct tls_stream_t
     {
       auto &ws = write_queue[idx];
       ws.cancel_registration.reset();
+      if (ws.done && ws.continuation)
+        return;
       if (ws.error_code == 0)
       {
         ws.error_code = vio_cancelled;
@@ -653,7 +670,7 @@ struct tls_stream_t
     ws.cancel_registration.reset();
     if (!ws.done && ws.kind == stream_write_kind::data && ws.bytes_written < ws.size && (ws.owned_plain.empty() || ws.data != ws.owned_plain.data()))
     {
-      try
+      VIO_TRY
       {
         std::vector<std::byte> copy(ws.data + ws.bytes_written, ws.data + ws.size);
         ws.owned_plain = std::move(copy);
@@ -661,7 +678,7 @@ struct tls_stream_t
         ws.size = ws.owned_plain.size();
         ws.bytes_written = 0;
       }
-      catch (...)
+      VIO_CATCH_ALL
       {
         _backlog.remove(idx);
         ws.done = true;

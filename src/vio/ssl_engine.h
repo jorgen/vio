@@ -23,6 +23,7 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <string>
 #include <vector>
 
+#include <vio/detail/exceptions.h>
 #include <vio/detail/native.h>
 #include <vio/detail/sys.h>
 #include <vio/error.h>
@@ -85,12 +87,46 @@ inline BIO_METHOD *ssl_engine_bio_method()
   }();
   return method;
 }
+
+class ssl_inbound_pool_t
+{
+public:
+  static constexpr std::size_t limit = 4;
+
+  [[nodiscard]] std::unique_ptr<std::byte[]> take() noexcept
+  {
+    if (_count == 0)
+      return nullptr;
+    return std::move(_buffers[--_count]);
+  }
+
+  void give(std::unique_ptr<std::byte[]> buffer) noexcept
+  {
+    if (_count < limit)
+      _buffers[_count++] = std::move(buffer);
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept
+  {
+    return _count;
+  }
+
+private:
+  std::array<std::unique_ptr<std::byte[]>, limit> _buffers;
+  std::size_t _count = 0;
+};
+
+inline ssl_inbound_pool_t &ssl_inbound_pool() noexcept
+{
+  thread_local ssl_inbound_pool_t pool;
+  return pool;
+}
 } // namespace detail
 
 struct ssl_engine_t
 {
   static constexpr std::size_t inbound_capacity = 65536;
-  static constexpr std::size_t output_retain = 32768;
+  static constexpr std::size_t output_retain = 65536 + 65536 / 16 + 1024;
 
   SSL *ssl = nullptr;
   BIO *rbio = nullptr;
@@ -207,7 +243,10 @@ struct ssl_engine_t
   {
     if (!_in)
     {
-      _in.reset(new (std::nothrow) std::byte[capacity]);
+      if (capacity == inbound_capacity)
+        _in = detail::ssl_inbound_pool().take();
+      if (!_in)
+        _in.reset(new (std::nothrow) std::byte[capacity]);
       if (!_in)
         return {};
       _in_capacity = capacity;
@@ -242,6 +281,8 @@ struct ssl_engine_t
   {
     if (_in_head != _in_tail)
       return;
+    if (_in && _in_capacity == inbound_capacity)
+      detail::ssl_inbound_pool().give(std::move(_in));
     _in.reset();
     _in_capacity = 0;
     _in_head = 0;
@@ -310,7 +351,7 @@ struct ssl_engine_t
   {
     compact_output();
     if (_out.capacity() - _out.size() < additional)
-      _out.reserve(_out.size() + additional);
+      _out.reserve((std::max)(_out.size() + additional, _out.capacity() * 2));
   }
 
   void consume_output(std::size_t length) noexcept
@@ -496,11 +537,11 @@ private:
       return true;
     compact_output();
     auto *first = reinterpret_cast<const std::byte *>(in);
-    try
+    VIO_TRY
     {
       _out.insert(_out.end(), first, first + length);
     }
-    catch (...)
+    VIO_CATCH_ALL
     {
       return false;
     }

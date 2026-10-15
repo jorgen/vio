@@ -30,6 +30,7 @@
 #include <string_view>
 
 #include "vio/tick.h"
+#include "vio/vio_export.h"
 
 namespace vio::quic
 {
@@ -46,7 +47,7 @@ namespace vio::quic
 // if the process exits cleanly is no use then. The cost is that the closing
 // brackets are written by the destructor, so a hard kill leaves the JSON
 // unterminated -- close_trace() early if that matters.
-class qlog_writer_t
+class VIO_EXPORT qlog_writer_t
 {
 public:
   static std::unique_ptr<qlog_writer_t> create(const std::string &path, std::string_view vantage_point, std::span<const std::uint8_t> odcid, tick_t reference);

@@ -36,6 +36,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <sys/types.h>
 
 #include "vio/bit_mask.h"
+#include "vio/detail/exceptions.h"
 #include "vio/detail/native.h"
 #include "vio/detail/sys.h"
 #include "vio/errc.h"
@@ -152,6 +153,43 @@ inline constexpr int max_temp_attempts = 128;
 }
 
 #if defined(_WIN32)
+#if defined(_MSC_VER)
+class fs_crt_quiet_t
+{
+public:
+  fs_crt_quiet_t() noexcept
+    : _previous(::_set_thread_local_invalid_parameter_handler(&fs_crt_quiet_t::ignore))
+  {
+  }
+  fs_crt_quiet_t(const fs_crt_quiet_t &) = delete;
+  fs_crt_quiet_t &operator=(const fs_crt_quiet_t &) = delete;
+  ~fs_crt_quiet_t()
+  {
+    ::_set_thread_local_invalid_parameter_handler(_previous);
+  }
+
+private:
+  static void __cdecl ignore(const wchar_t *, const wchar_t *, const wchar_t *, unsigned int, std::uintptr_t) noexcept
+  {
+  }
+
+  _invalid_parameter_handler _previous;
+};
+#else
+class fs_crt_quiet_t
+{
+public:
+  fs_crt_quiet_t() noexcept
+  {
+  }
+  fs_crt_quiet_t(const fs_crt_quiet_t &) = delete;
+  fs_crt_quiet_t &operator=(const fs_crt_quiet_t &) = delete;
+  ~fs_crt_quiet_t()
+  {
+  }
+};
+#endif
+
 [[nodiscard]] inline int fs_wide(const std::string &text, std::wstring &out) noexcept
 {
   out.clear();
@@ -165,11 +203,11 @@ inline constexpr int max_temp_attempts = 128;
   const int needed = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), length, nullptr, 0);
   if (needed <= 0)
     return errc::invalid_argument;
-  try
+  VIO_TRY
   {
     out.resize(static_cast<std::size_t>(needed));
   }
-  catch (...)
+  VIO_CATCH_ALL
   {
     return errc::out_of_memory;
   }
@@ -182,8 +220,33 @@ inline constexpr int max_temp_attempts = 128;
 {
   if (file < 0)
     return INVALID_HANDLE_VALUE;
+  fs_crt_quiet_t quiet;
   return reinterpret_cast<HANDLE>(::_get_osfhandle(file));
 }
+
+class fs_position_keeper_t
+{
+public:
+  fs_position_keeper_t(HANDLE handle, bool positional) noexcept
+    : _handle(handle)
+  {
+    LARGE_INTEGER zero{};
+    _restore = positional && ::SetFilePointerEx(handle, zero, &_position, FILE_CURRENT) != 0;
+  }
+  fs_position_keeper_t(const fs_position_keeper_t &) = delete;
+  fs_position_keeper_t &operator=(const fs_position_keeper_t &) = delete;
+
+  ~fs_position_keeper_t()
+  {
+    if (_restore)
+      ::SetFilePointerEx(_handle, _position, nullptr, FILE_BEGIN);
+  }
+
+private:
+  HANDLE _handle;
+  LARGE_INTEGER _position{};
+  bool _restore = false;
+};
 
 [[nodiscard]] inline file_timespec_t fs_from_filetime(const FILETIME &time) noexcept
 {
@@ -248,13 +311,13 @@ inline void fs_fill_stat(const BY_HANDLE_FILE_INFORMATION &info, file_stat_t &ou
 [[nodiscard]] inline int fs_randomize(std::string &path) noexcept
 {
   static constexpr char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  try
+  VIO_TRY
   {
     std::random_device device;
     for (std::size_t i = path.size() - 6; i < path.size(); ++i)
       path[i] = alphabet[device() % (sizeof(alphabet) - 1)];
   }
-  catch (...)
+  VIO_CATCH_ALL
   {
     return errc::io_error;
   }
@@ -532,6 +595,7 @@ inline int fs_close(native_file_t file) noexcept
   if (file < 0)
     return errc::bad_descriptor;
 #if defined(_WIN32)
+  fs_crt_quiet_t quiet;
   if (::_close(file) != 0)
     return errc_from_errno(errno);
 #else
@@ -557,9 +621,14 @@ inline int fs_close(native_file_t file) noexcept
     position = &overlapped;
   }
   DWORD transferred = 0;
-  if (::ReadFile(handle, buffer.data(), static_cast<DWORD>(length), &transferred, position))
+  DWORD error = 0;
+  {
+    fs_position_keeper_t keeper(handle, position != nullptr);
+    if (!::ReadFile(handle, buffer.data(), static_cast<DWORD>(length), &transferred, position))
+      error = ::GetLastError();
+  }
+  if (error == 0)
     return transferred;
-  const DWORD error = ::GetLastError();
   if (error == ERROR_HANDLE_EOF || error == ERROR_BROKEN_PIPE)
     return 0;
   if (error == ERROR_ACCESS_DENIED)
@@ -593,9 +662,14 @@ inline int fs_close(native_file_t file) noexcept
     position = &overlapped;
   }
   DWORD transferred = 0;
-  if (::WriteFile(handle, buffer.data(), static_cast<DWORD>(length), &transferred, position))
+  DWORD error = 0;
+  {
+    fs_position_keeper_t keeper(handle, position != nullptr);
+    if (!::WriteFile(handle, buffer.data(), static_cast<DWORD>(length), &transferred, position))
+      error = ::GetLastError();
+  }
+  if (error == 0)
     return transferred;
-  const DWORD error = ::GetLastError();
   if (error == ERROR_ACCESS_DENIED)
     return errc::bad_descriptor;
   return errc_from_win32(error);

@@ -69,6 +69,12 @@ struct file_op_t
 {
   using complete_fn_t = void (*)(file_op_t *op);
 
+  ~file_op_t()
+  {
+    if (in_flight)
+      abort_destroyed_in_flight("file operation");
+  }
+
   complete_fn_t complete = nullptr;
   void *owner = nullptr;
   file_op_kind kind = file_op_kind::read;

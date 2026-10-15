@@ -24,11 +24,21 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <cstdint>
 
+#include "vio/vio_export.h"
+
 namespace vio::detail
 {
+[[noreturn]] VIO_EXPORT void abort_destroyed_in_flight(const char *what) noexcept;
+
 struct io_op_t
 {
   using complete_fn_t = void (*)(io_op_t *op);
+
+  ~io_op_t()
+  {
+    if (parked)
+      abort_destroyed_in_flight("socket operation");
+  }
 
   complete_fn_t complete = nullptr;
   void *owner = nullptr;

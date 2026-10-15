@@ -3,6 +3,14 @@
 include(CMakeFindDependencyMacro)
 
 @VIO_CONFIG_DEPS@
+foreach(_vio_ssl_component IN ITEMS Crypto SSL)
+    if(NOT TARGET BoringSSL::${_vio_ssl_component})
+        add_library(BoringSSL::${_vio_ssl_component} INTERFACE IMPORTED)
+        set_target_properties(BoringSSL::${_vio_ssl_component} PROPERTIES INTERFACE_LINK_LIBRARIES OpenSSL::${_vio_ssl_component})
+    endif()
+endforeach()
+unset(_vio_ssl_component)
+
 include("${CMAKE_CURRENT_LIST_DIR}/vioTargets.cmake")
 
 check_required_components(vio)

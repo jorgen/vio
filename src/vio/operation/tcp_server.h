@@ -65,10 +65,10 @@ inline std::expected<tcp_server_t, error_t> tcp_create_server(event_loop_t &even
   return ret;
 }
 
-inline std::expected<void, error_t> tcp_bind(tcp_server_t &server, const sockaddr *addr, tcp_bind_flags flags = tcp_bind_flags::none)
+namespace detail
 {
-  if (!server.tcp.handle)
-    return std::unexpected(make_error(errc::bad_descriptor));
+inline std::expected<void, error_t> tcp_bind_socket(tcp_state_t &state, const sockaddr *addr, tcp_bind_flags flags)
+{
   constexpr auto known = static_cast<unsigned int>(tcp_bind_flags::ipv6_only | tcp_bind_flags::reuse_port);
   if ((static_cast<unsigned int>(flags) & ~known) != 0)
     return std::unexpected(make_error(errc::invalid_argument));
@@ -84,7 +84,6 @@ inline std::expected<void, error_t> tcp_bind(tcp_server_t &server, const sockadd
     return std::unexpected(make_error(errc::not_supported));
 #endif
 
-  auto &state = server.tcp.handle.data();
   if (!state.socket.is_open())
   {
     if (int result = state.socket.open(addr->sa_family, SOCK_STREAM, IPPROTO_TCP); result < 0)
@@ -120,6 +119,17 @@ inline std::expected<void, error_t> tcp_bind(tcp_server_t &server, const sockadd
   if (int result = detail::socket_bind(socket, addr, length); result < 0)
     return std::unexpected(make_error(result));
   return {};
+}
+} // namespace detail
+
+inline std::expected<void, error_t> tcp_bind(tcp_server_t &server, const sockaddr *addr, tcp_bind_flags flags = tcp_bind_flags::none)
+{
+  if (!server.tcp.handle)
+    return std::unexpected(make_error(errc::bad_descriptor));
+  auto &state = server.tcp.handle.data();
+  auto bound = detail::tcp_bind_socket(state, addr, flags);
+  state.bind_error = bound.has_value() ? 0 : bound.error().code;
+  return bound;
 }
 
 struct tcp_listen_future_t
@@ -374,6 +384,12 @@ inline tcp_listen_future_t tcp_listen(tcp_server_t &server, int backlog, cancell
   state.listen.op.complete = &detail::tcp_on_listen_ready;
   if (!state.listen.listening)
   {
+    if (state.bind_error != 0)
+    {
+      ret.done = true;
+      ret.result = std::unexpected(make_error(state.bind_error));
+      return ret;
+    }
     if (!state.socket.is_open())
     {
       if (int result = state.socket.open(AF_INET, SOCK_STREAM, IPPROTO_TCP); result < 0)

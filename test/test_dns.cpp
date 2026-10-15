@@ -10,7 +10,23 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <csignal>
+#include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include "require_expected.h"
+
+#if defined(__SANITIZE_THREAD__)
+#define VIO_DNS_TEST_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define VIO_DNS_TEST_UNDER_TSAN 1
+#endif
+#endif
 
 namespace
 {
@@ -67,6 +83,53 @@ vio::address_info_t ipv4_loopback(std::uint16_t port)
   std::memcpy(info.addr.data(), &address, sizeof(address));
   return info;
 }
+
+#if !defined(_WIN32) && !defined(VIO_DNS_TEST_UNDER_TSAN)
+int numeric_lookups_in_a_new_loop()
+{
+  vio::event_loop_t event_loop;
+  int outcome = 1;
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &ev, int &outcome) -> vio::task_t<void> {
+      auto named = co_await vio::get_nameinfo(ev, ipv4_loopback(8443));
+      vio::address_info_t hints;
+      hints.family = AF_INET;
+      hints.flags = AI_NUMERICHOST;
+      auto resolved = co_await vio::get_addrinfo(ev, "127.0.0.1", hints);
+      const bool named_right = named && named->host == "127.0.0.1" && named->service == "8443";
+      const bool resolved_right = resolved && !resolved->empty() && resolved->front().family == AF_INET;
+      outcome = named_right && resolved_right ? 0 : 2;
+      ev.stop();
+    }(event_loop, outcome);
+  });
+  event_loop.run();
+  return outcome;
+}
+
+int status_of_forked(int (*body)())
+{
+  const pid_t child = ::fork();
+  if (child < 0)
+    return -1;
+  if (child == 0)
+  {
+    sigset_t alarm_only;
+    sigemptyset(&alarm_only);
+    sigaddset(&alarm_only, SIGALRM);
+    ::pthread_sigmask(SIG_UNBLOCK, &alarm_only, nullptr);
+    std::signal(SIGALRM, SIG_DFL);
+    ::alarm(10);
+    ::_exit(body());
+  }
+  int status = 0;
+  while (::waitpid(child, &status, 0) < 0)
+  {
+    if (errno != EINTR)
+      return -1;
+  }
+  return status;
+}
+#endif
 
 auto dns_lookup_localhost(vio::event_loop_t &event_loop, bool &test_completed) -> vio::task_t<void>
 {
@@ -360,6 +423,17 @@ TEST_CASE("a lookup whose future is dropped still finishes before run returns")
   event_loop.run();
   CHECK(vio::detail::core(event_loop).in_flight() == 0);
 }
+
+#if !defined(_WIN32) && !defined(VIO_DNS_TEST_UNDER_TSAN)
+TEST_CASE("a lookup completes in a process forked after the resolver pool started")
+{
+  REQUIRE(numeric_lookups_in_a_new_loop() == 0);
+  const int status = status_of_forked(&numeric_lookups_in_a_new_loop);
+  REQUIRE(status != -1);
+  CHECK_MESSAGE(WIFEXITED(status), "the child was killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
+  CHECK(WEXITSTATUS(status) == 0);
+}
+#endif
 } // TEST_SUITE
 
 } // namespace

@@ -25,8 +25,13 @@ Copyright (c) 2025 Jørgen Lind
 #include <condition_variable>
 #include <cstdlib>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 #include "vio/loop/loop_core.h"
 
@@ -34,10 +39,6 @@ namespace vio::detail
 {
 namespace
 {
-constexpr int job_queued = 0;
-constexpr int job_running = 1;
-constexpr int job_finished = 2;
-
 class job_queue_t
 {
 public:
@@ -100,6 +101,16 @@ public:
       thread.join();
   }
 
+  void forget_after_fork() noexcept
+  {
+    new (&_mutex) std::mutex();
+    new (&_ready) std::condition_variable();
+    new (&_threads) std::vector<std::thread>();
+    _head = nullptr;
+    _tail = nullptr;
+    _stopped = false;
+  }
+
 private:
   void start()
   {
@@ -123,10 +134,10 @@ private:
         if (!_head)
           _tail = nullptr;
         job->next = nullptr;
-        job->state.store(job_running, std::memory_order_relaxed);
+        job->state.store(pool_job_running, std::memory_order_relaxed);
       }
       job->work(job);
-      job->state.store(job_finished, std::memory_order_release);
+      job->state.store(pool_job_finished, std::memory_order_release);
       job->loop->post(job->finished);
     }
   }
@@ -151,11 +162,39 @@ unsigned threads_from_environment(const char *name, unsigned fallback) noexcept
   return static_cast<unsigned>(parsed);
 }
 
+struct pools_t
+{
+  pools_t()
+  {
+#if !defined(_WIN32)
+    current = this;
+    if (::pthread_atfork(nullptr, nullptr, &pools_t::after_fork_in_child) != 0)
+      std::abort();
+#endif
+  }
+
+  ~pools_t()
+  {
+    current = nullptr;
+  }
+
+  static void after_fork_in_child() noexcept
+  {
+    if (!current)
+      return;
+    current->file.forget_after_fork();
+    current->dns.forget_after_fork();
+  }
+
+  static inline pools_t *current = nullptr;
+  job_queue_t file{threads_from_environment("VIO_FILE_THREADS", 4)};
+  job_queue_t dns{threads_from_environment("VIO_DNS_THREADS", 2)};
+};
+
 job_queue_t &queue_for(pool_queue queue)
 {
-  static job_queue_t file_queue(threads_from_environment("VIO_FILE_THREADS", 4));
-  static job_queue_t dns_queue(threads_from_environment("VIO_DNS_THREADS", 2));
-  return queue == pool_queue::dns ? dns_queue : file_queue;
+  static pools_t pools;
+  return queue == pool_queue::dns ? pools.dns : pools.file;
 }
 
 void on_finished(posted_t *node)
@@ -174,7 +213,7 @@ void pool_submit(loop_core_t &loop, pool_job_t &job, pool_queue queue)
   job.finished.run = &on_finished;
   job.finished.owner = &job;
   job.queue = queue;
-  job.state.store(job_queued, std::memory_order_relaxed);
+  job.state.store(pool_job_queued, std::memory_order_relaxed);
   loop.retain();
   queue_for(queue).push(job);
 }
@@ -182,11 +221,11 @@ void pool_submit(loop_core_t &loop, pool_job_t &job, pool_queue queue)
 bool pool_cancel(pool_job_t &job) noexcept
 {
   job.canceled = true;
-  if (job.state.load(std::memory_order_acquire) != job_queued)
+  if (job.state.load(std::memory_order_acquire) != pool_job_queued)
     return false;
   if (!queue_for(job.queue).remove(job))
     return false;
-  job.state.store(job_finished, std::memory_order_relaxed);
+  job.state.store(pool_job_finished, std::memory_order_relaxed);
   job.loop->defer(job.finished);
   return true;
 }

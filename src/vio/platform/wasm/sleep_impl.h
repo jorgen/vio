@@ -4,7 +4,7 @@
 #include "vio/error.h"
 #include "vio/event_loop.h"
 #include "vio/ref_counted_wrapper.h"
-#include "vio/uv_coro.h"
+#include "vio/future.h"
 
 #include <chrono>
 #include <coroutine>

@@ -222,6 +222,56 @@ vio::task_t<void> sticky_error_scenario(vio::event_loop_t &loop, int &first_erro
     second_error = again.error().code;
 }
 
+std::string make_pattern(std::size_t size)
+{
+  std::string out(size, '\0');
+  for (std::size_t i = 0; i < size; ++i)
+    out[i] = static_cast<char>((i * 131 + (i >> 13)) & 0xff);
+  return out;
+}
+
+vio::task_t<void> dropped_connection_scenario(vio::event_loop_t &loop, const std::string &expected, bool owned, std::string &received, std::size_t &filled, std::size_t &queued_at_drop)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto reader_task = read_all(std::move(pair->server), received);
+  std::string source = expected;
+  {
+    auto client = std::move(pair->client);
+    std::vector<vio::tcp_write_future_t> fillers;
+    filled = stall_writes(client, fillers);
+    if (owned)
+    {
+      auto bytes = std::as_bytes(std::span(source));
+      auto dropped = vio::write_tcp(client, std::vector<std::byte>(bytes.begin(), bytes.end()));
+      queued_at_drop = vio::tcp_write_queue_size(client);
+    }
+    else
+    {
+      auto dropped = vio::write_tcp(client, std::as_bytes(std::span(source)));
+      queued_at_drop = vio::tcp_write_queue_size(client);
+    }
+  }
+  source.assign(source.size(), 'z');
+  co_await std::move(reader_task);
+}
+
+vio::task_t<void> dropped_connection_peer_gone_scenario(vio::event_loop_t &loop, std::size_t &queued_at_drop)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  {
+    auto client = std::move(pair->client);
+    std::vector<vio::tcp_write_future_t> fillers;
+    stall_writes(client, fillers);
+    queued_at_drop = vio::tcp_write_queue_size(client);
+  }
+  [[maybe_unused]] auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(20));
+  {
+    auto peer = std::move(pair->server);
+  }
+}
+
 template <typename Scenario>
 void run_scenario(Scenario &&scenario)
 {
@@ -273,6 +323,33 @@ TEST_SUITE("tcp write queue")
     CHECK(cancelled_code == vio::vio_cancelled);
     CHECK(others_ok);
     CHECK(received == std::string(filled, 'f') + std::string(chunk_size, 'a') + "CCCC");
+  }
+
+  TEST_CASE("a connection dropped with megabytes still queued delivers them before the peer sees eof")
+  {
+    const std::string expected = make_pattern(chunk_size + 7);
+    for (bool owned : {true, false})
+    {
+      CAPTURE(owned);
+      std::string received;
+      std::size_t filled = 0;
+      std::size_t queued_at_drop = 0;
+      run_scenario([&](vio::event_loop_t &loop) { return dropped_connection_scenario(loop, expected, owned, received, filled, queued_at_drop); });
+      CHECK(queued_at_drop > expected.size());
+      REQUIRE(received.size() == filled + expected.size());
+      CHECK(received.compare(0, filled, std::string(filled, 'f')) == 0);
+      CHECK(received.compare(filled, expected.size(), expected) == 0);
+    }
+  }
+
+  TEST_CASE("a dropped connection stops lingering as soon as its peer goes away")
+  {
+    std::size_t queued_at_drop = 0;
+    auto started = std::chrono::steady_clock::now();
+    run_scenario([&](vio::event_loop_t &loop) { return dropped_connection_peer_gone_scenario(loop, queued_at_drop); });
+    auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(queued_at_drop > 0);
+    CHECK(elapsed < std::chrono::seconds(5));
   }
 
   TEST_CASE("a write to a vanished peer fails, and later writes fail the same way")

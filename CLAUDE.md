@@ -21,8 +21,15 @@ VIO_BACKEND=io_uring ./cmake-build-debug/test/vio_tests
 ```
 
 Tests for internals live at the bottom of their `src/*.cpp` file inside
-`#if defined(VIO_INTERNAL_TESTS)`. A top-level static build with tests defines that macro and puts
-the doctest implementation in the library, so those tests run inside `vio_tests` too.
+`#if defined(VIO_INTERNAL_TESTS)`. A top-level static build with tests compiles the library sources
+a second time, with that macro and the doctest implementation, into the `vio_internal_tests`
+object library, which only `vio_tests` links. `libvio` itself, which is what gets installed and
+what the examples and benchmarks link, never carries doctest or a test registration.
+
+`cmake --build <dir> --target vio_header_check` compiles every public header on its own with
+`-fno-exceptions -fno-rtti` (GCC and Clang). A `try` in a header breaks that build for every
+downstream that turns exceptions off, so headers spell it `VIO_TRY` / `VIO_CATCH_ALL` from
+`vio/detail/exceptions.h`.
 
 ### Windows
 #### On Windows with MSVC (CLion/Claude Code)
@@ -243,16 +250,20 @@ which is where an encrypted transport's time belongs.
 
 It also prices the **coroutine API against the callback one**, and for that it has to be
 I/O: each shape runs twice over the same real socket, and only the difference between the
-pair means anything. Bulk is free -- the rows are inside each other's noise and the
-coroutine layer adds 0.2 allocations per datagram, which is what you would hope for when
-80% of the profile is AES-GCM. Pipelined request/response is ~1.5x *faster* through the
-coroutine API (34.5k against 23k req/s) at the price of 8.6 more allocations per request,
-and the reason is not coroutines: `readable_streams()` is a level, so it walks every
-stream, sorts and allocates a vector on every call, and a callback server calls it once
-per arriving datagram. The layer buys a per-operation allocation and sells an O(n log n)
-sweep per datagram. That shape is also what found the stream-accept-backlog defect -- a
-burst of 500 streams was queued by one drain and the overflow reset inside that same
-drain, before the application could accept any of it.
+pair means anything. The current numbers are the "After" rows of `BASELINE.md` (native loop,
+epoll, Release). Bulk favours the coroutine API: 303 and 315 MB/s against 222 MB/s for the
+callback server, at 0.3 more allocations per datagram. Pipelined request/response favours the
+callback API by about 1.5x: 77.5k against 50.9k req/s, with 9.3 more allocations per request
+(24.5 against 15.2). A later set of seven runs on the same tree gave medians near 120k against
+73k, so the gap is not noise. On the libuv build (`8e33e02`, MSVC) the request rows ran the
+other way, 34.5k through coroutines against 23k through callbacks, and the explanation given
+then was the callback server's sweep: `readable_streams()` is a level, so it walks every
+stream, sorts and allocates a vector on every call, once per arriving datagram. The callback
+server in `bench_quic.cpp` still makes that call per datagram and now wins anyway, so the sweep
+no longer decides the result; what does has not been profiled. Choose the API for its shape,
+not for these numbers. The request shape is also what found the stream-accept-backlog defect --
+a burst of 500 streams was queued by one drain and the overflow reset inside that same drain,
+before the application could accept any of it.
 
 `loss_recovery.h` is RFC 9002 sections 5 and 6 (RTT estimation, packet- and
   time-threshold loss detection, PTO with backoff and the anti-deadlock probe),
@@ -531,26 +542,33 @@ drain, before the application could accept any of it.
 ## Verification
 
 What has actually been run against the QUIC stack, so the next person knows what
-a green Windows build does and does not cover.
+a green build does and does not cover.
 
-**Platforms.** MSVC release and MSVC ASan on Windows; GCC 14 on Ubuntu 24.04
-under ASan, UBSan and TSan, through `ghcr.io/jorgen/vio-ci`. All clean. Two
-things only the Linux run can tell you: MSVC's ASan has **no LeakSanitizer**, so
-leaks are invisible on Windows -- one in the coroutine layer's pre-resolved
-operations survived a full ASan run there and was caught the first time
-LeakSanitizer saw it -- and glibc declares `error_t`, so `using namespace vio`
-in a test that is only ever built on Windows will not compile on Linux.
+**On the native event loop.** CI run 93 (commit `4abd446`) is green on all ten jobs: Linux
+debug, ASan, TSan and UBSan, each on epoll and on io_uring; macOS debug and ASan on kqueue;
+Windows debug and ASan on IOCP; and the wasm smoke test under Node. `DECISIONS.md` keeps that
+status current. Interop with picoquic has **not** been rerun since the move off libuv, although
+`src/quic_endpoint.cpp` and `operation/quic_endpoint.h` were rewritten for the native loop; treat
+the interop results below as history until it is.
+
+**Measured on the libuv build at `8e33e02`**, before the native loop. Platforms: MSVC release
+and MSVC ASan on Windows; GCC 14 on Ubuntu 24.04 under ASan, UBSan and TSan, through
+`ghcr.io/jorgen/vio-ci`. All clean. Two things only the Linux run can tell you, and both still
+hold: MSVC's ASan has **no LeakSanitizer**, so leaks are invisible on Windows -- one in the
+coroutine layer's pre-resolved operations survived a full ASan run there and was caught the
+first time LeakSanitizer saw it -- and glibc declares `error_t`, so `using namespace vio` in a
+test that is only ever built on Windows will not compile on Linux.
 
 TSan needs ASLR off on a modern kernel or it aborts with "unexpected memory
 mapping" before running a line: `docker run --privileged ... setarch $(uname -m)
 -R ./build/test/vio_tests`.
 
-**Interop with picoquic** (`3rdparty/interop/picoquic`, v1.1.52). Both
+**Interop with picoquic, also at `8e33e02`** (`3rdparty/interop/picoquic`, v1.1.52). Both
 directions, byte-exact: picoquicdemo client to `vio_interop_server` over three
 concurrent streams, and `vio_interop_endpoint` as a client against picoquicdemo's
 server. Retry with vio minting and validating the token, QUIC version 2
 (`picoquicdemo -v 6b3343cf`), session resumption, and 0-RTT reporting "early data
-accepted" all pass. One gap: `picoquicdemo -r` does not start a server in this
+accepted" all passed. One gap: `picoquicdemo -r` does not start a server in this
 build -- it prints its token-file line and exits -- so picoquic *sending* a Retry
 to a vio client is untested. vio sending one is covered, which is the direction
 that exercises vio's own `retry_token.h`.
@@ -579,11 +597,15 @@ configure stops rather than handing back a build with no AES-NI, which is the tr
 LibreSSL fell into and the reason for the move.
 
 `VIO_INSTALL` (default `ON`) installs headers + the `vio` lib and, **when built
-against system deps**, a relocatable `find_package(vio)` package config
-(`vio::vio`, from `CMake/vioConfig.cmake.in`, which `find_dependency`s
-BoringSSL/ada and exports the bundled `cmrc-base`/`vio_default_certs`). A
-bundled-deps build vendors targets that aren't installed, so it installs lib +
-headers only (no config). `vio::vio` is aliased in-tree so consumers use one name
+with `VIO_USE_SYSTEM_BORINGSSL=ON` and `VIO_USE_SYSTEM_ADA=ON`**, a relocatable
+`find_package(vio)` package config (`vio::vio`, from `CMake/vioConfig.cmake.in`).
+That config `find_dependency`s BoringSSL through the `OpenSSL` CONFIG package it
+installs, recreates the `BoringSSL::SSL`/`::Crypto` names vio links against, finds
+ada, and exports the bundled `cmrc-base`/`vio_default_certs`. CI's `install` job
+installs BoringSSL, ada and vio into one prefix and builds `test/install_consumer`
+against it, so a broken config fails a job instead of a downstream. A bundled-deps
+build vendors targets that aren't installed, so it installs lib + headers only (no
+config). `vio::vio` is aliased in-tree so consumers use one name
 either way. A downstream that `add_subdirectory`s vio (e.g. prism) should force
 `VIO_INSTALL OFF`.
 

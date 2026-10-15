@@ -1391,6 +1391,50 @@ TEST_CASE("tcp bind flags")
   event_loop.run();
 }
 
+TEST_CASE("tcp listen refuses a socket whose bind failed")
+{
+  vio::event_loop_t event_loop;
+  int bind_code = 0;
+  bool listen_done = false;
+  int listen_code = 0;
+  {
+    auto any = vio::ip4_addr("127.0.0.1", 0);
+    REQUIRE_EXPECTED(any);
+    auto first = vio::tcp_create_server(event_loop);
+    REQUIRE_EXPECTED(first);
+    REQUIRE_EXPECTED(vio::tcp_bind(first.value(), reinterpret_cast<const sockaddr *>(&any.value())));
+    auto name = vio::sockname(first->tcp);
+    REQUIRE_EXPECTED(name);
+    auto port = ntohs(reinterpret_cast<const sockaddr_in *>(&name.value())->sin_port);
+    auto same = vio::ip4_addr("127.0.0.1", port);
+    REQUIRE_EXPECTED(same);
+    auto first_listen = vio::tcp_listen(first.value(), 4);
+    CHECK_FALSE(first_listen.done);
+
+    auto second = vio::tcp_create_server(event_loop);
+    REQUIRE_EXPECTED(second);
+    auto refused = vio::tcp_bind(second.value(), reinterpret_cast<const sockaddr *>(&same.value()));
+    REQUIRE_FALSE(refused.has_value());
+    bind_code = refused.error().code;
+    auto second_listen = vio::tcp_listen(second.value(), 4);
+    listen_done = second_listen.done;
+    if (listen_done && !second_listen.result.has_value())
+      listen_code = second_listen.result.error().code;
+
+    auto third = vio::tcp_create_server(event_loop);
+    REQUIRE_EXPECTED(third);
+    REQUIRE_FALSE(vio::tcp_bind(third.value(), reinterpret_cast<const sockaddr *>(&same.value())).has_value());
+    REQUIRE_EXPECTED(vio::tcp_bind(third.value(), reinterpret_cast<const sockaddr *>(&any.value())));
+    auto third_listen = vio::tcp_listen(third.value(), 4);
+    CHECK_FALSE(third_listen.done);
+  }
+  event_loop.stop();
+  event_loop.run();
+  CHECK(bind_code == vio::errc::address_in_use);
+  CHECK(listen_done);
+  CHECK(listen_code == vio::errc::address_in_use);
+}
+
 TEST_CASE("tcp writes issued while connecting are sent once connected")
 {
   std::string received;

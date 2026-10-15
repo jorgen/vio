@@ -95,6 +95,37 @@ private:
   bool _tracked = false;
 };
 
+struct pipe_anchor_t
+{
+  std::mutex mutex;
+  loop_core_t *core = nullptr;
+};
+
+class pipe_anchor_owner_t
+{
+public:
+  explicit pipe_anchor_owner_t(loop_core_t *core)
+    : _anchor(std::make_shared<pipe_anchor_t>())
+  {
+    _anchor->core = core;
+  }
+  pipe_anchor_owner_t(const pipe_anchor_owner_t &) = delete;
+  pipe_anchor_owner_t &operator=(const pipe_anchor_owner_t &) = delete;
+  ~pipe_anchor_owner_t()
+  {
+    std::lock_guard lock(_anchor->mutex);
+    _anchor->core = nullptr;
+  }
+
+  [[nodiscard]] const std::shared_ptr<pipe_anchor_t> &anchor() const noexcept
+  {
+    return _anchor;
+  }
+
+private:
+  std::shared_ptr<pipe_anchor_t> _anchor;
+};
+
 class VIO_EXPORT loop_core_t
 {
 public:
@@ -151,8 +182,13 @@ public:
     return _alive;
   }
   void set_thread(std::thread::id id) noexcept;
+  [[nodiscard]] const std::shared_ptr<pipe_anchor_t> &pipe_anchor() const noexcept
+  {
+    return _pipe_anchor.anchor();
+  }
 
   [[nodiscard]] static std::int64_t now() noexcept;
+  [[nodiscard]] static std::int64_t deadline_after(std::int64_t delay) noexcept;
 
 private:
   static void on_stop(posted_t *node);
@@ -174,6 +210,7 @@ private:
   std::atomic<bool> _wake_pending{false};
 
   posted_list_t _deferred;
+  posted_t *_deferred_draining = nullptr;
   std::vector<about_to_block_t *> _listeners;
   std::vector<hook_t *> _hooks;
   std::size_t _alive = 0;
@@ -185,5 +222,13 @@ private:
   std::atomic<std::thread::id> _thread_id;
   bool _stopping = false;
   bool _running = false;
+  pipe_anchor_owner_t _pipe_anchor{this};
 };
+
+inline void unpost_anchored(pipe_anchor_t &anchor, posted_t &node) noexcept
+{
+  std::lock_guard lock(anchor.mutex);
+  if (anchor.core)
+    anchor.core->unpost(node);
+}
 } // namespace vio::detail

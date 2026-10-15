@@ -37,10 +37,20 @@ enum class pool_queue
   dns
 };
 
+inline constexpr int pool_job_queued = 0;
+inline constexpr int pool_job_running = 1;
+inline constexpr int pool_job_finished = 2;
+
 struct pool_job_t
 {
   using work_fn_t = void (*)(pool_job_t *job);
   using done_fn_t = void (*)(pool_job_t *job, bool canceled);
+
+  ~pool_job_t()
+  {
+    if (state.load(std::memory_order_acquire) != pool_job_finished || finished.queued)
+      abort_destroyed_in_flight("blocking pool job");
+  }
 
   work_fn_t work = nullptr;
   done_fn_t done = nullptr;
@@ -48,7 +58,7 @@ struct pool_job_t
   loop_core_t *loop = nullptr;
   pool_job_t *next = nullptr;
   posted_t finished;
-  std::atomic<int> state{0};
+  std::atomic<int> state{pool_job_finished};
   pool_queue queue = pool_queue::file;
   bool canceled = false;
 };

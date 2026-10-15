@@ -9,7 +9,8 @@ made along the way, with the reason, so each one can be reviewed and reversed.
 1. Keep every feature vio has today.
 2. Speed and security come first. Every phase must match or beat the libuv build on the
    benchmarks, and pass the sanitizers, before it lands.
-3. No heap allocation per I/O operation once a connection is warm.
+3. No heap allocation per socket read or write once a connection is warm. Timers, files, DNS and
+   the QUIC coroutine layer still allocate once per call (`DECISIONS.md` D6).
 4. Window-system events can join the same loop, so a GUI library can be built on vio.
 5. Linux, macOS and Windows now. Android and iOS should need only a backend and a driver.
    Emscripten gets a small backend with timers and messaging only.
@@ -122,9 +123,14 @@ for (const vio::datagram_t &d : *batch)
   handle(d.data, d.peer, d.local, d.ecn, d.segment_size);
 ```
 
-The socket lends the buffers. They stay valid until the next `receive()`. Under ASan they are
-poisoned when returned, so a view kept too long fails loudly. The epoll backend fills the batch
-with `recvmmsg`; others use a `recvmsg` loop until the completion paths arrive.
+The socket lends the buffers. A `datagram_t` is a view: `data` is a span and `peer` and `local`
+are pointers, all into the reader's buffers. Whether it came from `receive()`, from
+`co_await reader` or from `try_next()`, it stays valid only until the next receive on that reader,
+and copying the `datagram_t` does not copy what it points at. Under ASan the reader poisons the
+buffers a view points into once they are replaced, so a view kept too long fails loudly there;
+without ASan nothing catches it, and the stale view quietly shows the next datagram's bytes and
+sender. The epoll backend fills the batch with `recvmmsg`; others use a `recvmsg` loop until the
+completion paths arrive.
 
 ### GUI drivers
 
@@ -135,19 +141,38 @@ display fd in the same epoll set.
 
 ## Public API changes
 
+This is the full list of what prism, points and any other downstream must change. Each row
+compiles differently, or not at all, after the change, except where it says it compiles unchanged.
+
 | before                                   | after                                              |
 |------------------------------------------|----------------------------------------------------|
 | `uv_buf_t`                               | `std::span<std::byte>` / `std::span<const std::byte>` |
 | `unique_buf_t::buf.base`, `.len`         | `unique_buf_t::data()`, `size()`, `span()`         |
-| `UV_EOF`, `UV_ECANCELED`, other `UV_E*`  | `vio::errc::eof`, `vio::errc::canceled`, ...       |
+| `alloc_cb_t`, `dealloc_cb_t` built on `uv_buf_t` | `std::span<std::byte> (*)(void *, std::size_t)` and `void (*)(void *, std::span<std::byte>)` |
+| `buffer_pool_t` acquire and release on `uv_buf_t` | `acquire()` returns, and `release()` takes, a `std::span<std::byte>` |
+| `ssl_*_write`, `ssl_*_writev` on `uv_buf_t` | `std::span<const std::byte>`, and a span of spans for `writev` |
+| `stream_reader_t::read(uv_buf_t)`        | `read(std::span<std::byte>)`                       |
+| `UV_EOF`, `UV_ECANCELED`, other `UV_E*`  | `vio::errc::eof`, `vio::errc::canceled`, ...; values from -9001 down (D39), so no `UV_*` constant compares equal |
+| `vio_uv_ecanceled`                       | removed; `vio::errc::canceled`                     |
 | `uv_strerror(code)`                      | `vio::error_message(code)`                         |
 | `event_loop_t::loop()`                   | removed                                            |
+| `event_loop_t::add_event_pipe`, the loop-less `event_pipe_t` constructor | removed; a pipe takes its loop and unlinks itself (D35) |
+| `ref_ptr_t::register_handle`, `inc_ref_and_store_in_handle`, `register_closable_handle` | `ref_ptr_t::register_resource` with a `detail::resource_t` |
+| `sleep()`, `timer_rearm()` taking `std::chrono::milliseconds` | any `std::chrono::duration`, saturated (D45); calls compile unchanged |
 | `uv_stat_t`                              | `vio::file_stat_t`                                 |
 | `uv_file`, `uv_os_fd_t`                  | `vio::native_file_t`, `vio::native_socket_t`       |
-| `UV_TCP_REUSEPORT`, `UV_UDP_*` flags     | `vio::tcp_bind_flags`, `vio::udp_bind_flags`       |
+| `file_open_flag_t` with `UV_FS_O_*` values | vio's own values, declared in `vio/detail/sys_file.h` |
+| `UV_TCP_REUSEPORT`, `UV_UDP_*` flags     | `vio::tcp_bind_flags`, `vio::udp_bind_flags`; `tcp_bind` no longer takes an integer |
+| `uv_membership`                          | `vio::udp_membership_t`                            |
+| `udp_fileno()` returning `uv_os_fd_t`    | returns `vio::native_socket_t`                     |
+| `datagram_t` owning a `std::vector` and a `sockaddr_storage` | a borrowed view, valid until the next receive (D47); code that keeps one compiles unchanged and then reads another datagram |
 | `*_state_t::uv_handle`, `get_tcp()` etc. | removed; `peer_ip(tcp_t &)` and friends instead   |
+| `tcp_state_t`, `ssl_client_state_t` members | rebuilt around `detail::socket_resource_t`, `tls_stream_t` and `ssl_engine_t`; reach them only through the free functions |
 | `uv_tls_stream_t`                        | `tls_stream_t`                                     |
 | `uv_coro.h`                              | `future.h`                                         |
+| `event_loop.h` including `thread_pool.h` | include `vio/thread_pool.h` yourself               |
+| `UV_THREADPOOL_SIZE`                     | `VIO_FILE_THREADS` and `VIO_DNS_THREADS` (D37)     |
+| libuv's process-wide CRT invalid-parameter handler and `SetErrorMode` on Windows | not installed (D26) |
 
 `error_t` keeps its shape (`int code`, `std::string msg`). The codes become vio's own fixed
 numbers, the same on every platform.

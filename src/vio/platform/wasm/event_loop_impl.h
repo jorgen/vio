@@ -260,7 +260,7 @@ inline void install_main_loop()
 }
 } // namespace wasm
 
-// Same public surface as the libuv thread_with_event_loop_t, but it spawns no thread: the loop is
+// Same public surface as the native thread_with_event_loop_t, but it spawns no thread: the loop is
 // registered with the cooperative driver above and pumped on the single browser main loop. So
 // processor_t / storage_handler_t / tree_handler_t construct it exactly as on native.
 class thread_with_event_loop_t
@@ -282,7 +282,7 @@ public:
     stop_and_join();
   }
 
-  // Idempotent, mirrors the libuv version's name so shared code can call it unconditionally.
+  // Idempotent, mirrors the native version's name so shared code can call it unconditionally.
   void stop_and_join()
   {
     if (!_deregistered)

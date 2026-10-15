@@ -35,6 +35,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <ada/ada_idna.h>
 
 #include "vio/cancellation.h"
+#include "vio/detail/exceptions.h"
 #include "vio/detail/native.h"
 #include "vio/detail/sys.h"
 #include "vio/errc.h"
@@ -276,11 +277,11 @@ inline void get_addrinfo_work(pool_job_t *job)
     state->status = errc_from_gai(code);
     return;
   }
-  try
+  VIO_TRY
   {
     state->addresses = convert_addrinfo_list(list);
   }
-  catch (...)
+  VIO_CATCH_ALL
   {
     state->status = errc::dns_memory;
   }
@@ -317,12 +318,12 @@ inline void get_nameinfo_work(pool_job_t *job)
     state->status = errc_from_gai(code);
     return;
   }
-  try
+  VIO_TRY
   {
     state->names.host = host;
     state->names.service = service;
   }
-  catch (...)
+  VIO_CATCH_ALL
   {
     state->status = errc::dns_memory;
   }

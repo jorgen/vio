@@ -59,6 +59,7 @@ struct tcp_write_future_t;
 struct tcp_listen_future_t;
 
 inline constexpr std::size_t tcp_read_buffer_size = 65536;
+inline constexpr std::int64_t tcp_teardown_linger_ns = 10'000'000'000;
 
 namespace detail
 {
@@ -67,7 +68,9 @@ inline void tcp_on_read_kick(posted_t *node);
 inline void tcp_on_read_kick_discard(posted_t *node);
 inline void tcp_on_write_ready(io_op_t *op);
 inline void tcp_on_connect_ready(io_op_t *op);
+inline void tcp_on_linger(timer_node_t *node);
 inline void tcp_shutdown(tcp_state_t &state) noexcept;
+inline void tcp_begin_teardown(tcp_state_t &state);
 
 inline int tcp_address_length(const sockaddr *address) noexcept
 {
@@ -109,6 +112,10 @@ struct tcp_read_state_t
   alloc_cb_t alloc_buffer_cb = default_alloc;
   dealloc_cb_t dealloc_buffer_cb = default_dealloc;
   void *alloc_cb_data = nullptr;
+  std::uint64_t generation = 0;
+  std::uint32_t drained_epoch = 0;
+  int pending = 0;
+  bool drained = false;
   bool active = false;
   bool started = false;
   bool paused = false;
@@ -244,6 +251,8 @@ struct tcp_state_t
     connect.op.owner = this;
     connect.op.complete = &detail::tcp_on_connect_ready;
     listen.op.owner = this;
+    linger.owner = this;
+    linger.fire = &detail::tcp_on_linger;
   }
 
   tcp_state_t(const tcp_state_t &) = delete;
@@ -262,9 +271,12 @@ struct tcp_state_t
   tcp_connect_state_t connect;
   tcp_write_state_t write;
   tcp_read_state_t read;
+  detail::timer_node_t linger;
   void *storage = nullptr;
+  int bind_error = 0;
   bool connected = false;
   bool closed = false;
+  bool lingering = false;
 };
 
 namespace detail
@@ -272,6 +284,9 @@ namespace detail
 inline void tcp_shutdown(tcp_state_t &state) noexcept
 {
   state.closed = true;
+  state.lingering = false;
+  if (state.linger.armed())
+    state.socket.loop().remove_timer(state.linger);
   for (auto *op : {&state.read.op, &state.write.op, &state.connect.op, &state.listen.op})
   {
     if (op->parked)
@@ -294,6 +309,32 @@ inline ref_ptr_t<tcp_state_t> tcp_state_ref(tcp_state_t &state)
   auto strong = adopted;
   adopted.release_to_raw();
   return strong;
+}
+
+inline void tcp_discard_inbound(tcp_state_t &state) noexcept
+{
+  if (!state.socket.is_open())
+    return;
+  std::array<std::byte, 4096> scratch;
+  for (int i = 0; i < 64; ++i)
+  {
+    if (socket_recv(state.socket.native(), scratch) <= 0)
+      return;
+  }
+}
+
+inline void tcp_end_linger(tcp_state_t &state) noexcept
+{
+  if (!state.lingering)
+    return;
+  tcp_discard_inbound(state);
+  tcp_shutdown(state);
+  auto released = ref_ptr_t<tcp_state_t>::from_raw(state.storage);
+}
+
+inline void tcp_on_linger(timer_node_t *node)
+{
+  tcp_end_linger(*static_cast<tcp_state_t *>(node->owner));
 }
 } // namespace detail
 
@@ -378,7 +419,7 @@ inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
     state.storage = parked.release_to_raw();
     auto balance = ref_ptr_t<tcp_state_t>::from_raw(state.storage);
   }
-  tcp.handle.on_destroy([raw = &state] { detail::tcp_shutdown(*raw); });
+  tcp.handle.on_destroy([raw = &state] { detail::tcp_begin_teardown(*raw); });
   return tcp;
 }
 
@@ -657,6 +698,7 @@ inline void tcp_write_fail(tcp_state_t &state, int code)
   }
   if (write.op.parked)
     state.socket.cancel(write.op);
+  tcp_end_linger(state);
 }
 
 inline void tcp_write_trim(tcp_state_t &state) noexcept
@@ -726,6 +768,7 @@ inline void tcp_write_drain(tcp_state_t &state)
     {
       if (write.op.parked)
         state.socket.cancel(write.op);
+      tcp_end_linger(state);
       return;
     }
     if (state.connect.in_progress)
@@ -761,6 +804,27 @@ inline void tcp_write_drain(tcp_state_t &state)
 inline void tcp_on_write_ready(io_op_t *op)
 {
   tcp_write_drain(*static_cast<tcp_state_t *>(op->owner));
+}
+
+inline void tcp_begin_teardown(tcp_state_t &state)
+{
+  if (state.closed || state.lingering)
+    return;
+  tcp_write_trim(state);
+  auto &write = state.write;
+  if (write.count == 0 || write.error != 0 || !state.socket.is_open() || (!state.connected && !state.connect.in_progress))
+  {
+    tcp_shutdown(state);
+    return;
+  }
+  if (state.read.op.parked)
+    state.socket.cancel(state.read.op);
+  state.read.waiter = nullptr;
+  state.lingering = true;
+  tcp_state_ref(state).release_to_raw();
+  state.socket.loop().add_timer(state.linger, loop_core_t::deadline_after(tcp_teardown_linger_ns));
+  if (!write.op.parked)
+    tcp_write_drain(state);
 }
 
 inline bool tcp_write_begin(tcp_write_future_t &ret, std::size_t length)
@@ -1010,6 +1074,7 @@ public:
 
   tcp_reader_t(tcp_reader_t &&other) noexcept
     : handle(std::move(other.handle))
+    , _generation(other._generation)
     , _is_valid(std::exchange(other._is_valid, false))
   {
   }
@@ -1020,6 +1085,7 @@ public:
     {
       stop();
       handle = std::move(other.handle);
+      _generation = other._generation;
       _is_valid = std::exchange(other._is_valid, false);
     }
     return *this;
@@ -1032,13 +1098,14 @@ public:
 
   void cancel()
   {
-    if (!_is_valid || !handle)
+    if (!owns())
       return;
     auto &read = handle->read;
     if (read.is_cancelled)
       return;
     read.is_cancelled = true;
     read.started = false;
+    read.active = false;
     if (read.op.parked)
       handle->socket.cancel(read.op);
     auto *waiter = read.waiter;
@@ -1051,19 +1118,21 @@ public:
 
   [[nodiscard]] bool is_cancelled() const
   {
-    return handle && handle->read.is_cancelled;
+    return handle && (handle->read.is_cancelled || handle->read.generation != _generation);
   }
 
   struct awaiter_t final : tcp_read_waiter_t
   {
-    explicit awaiter_t(ref_ptr_t<tcp_state_t> state) noexcept
+    awaiter_t(ref_ptr_t<tcp_state_t> state, std::uint64_t generation) noexcept
       : state(std::move(state))
+      , generation(generation)
     {
     }
 
     awaiter_t(awaiter_t &&other) noexcept
       : tcp_read_waiter_t(other)
       , state(std::move(other.state))
+      , generation(other.generation)
       , result(std::move(other.result))
     {
     }
@@ -1085,7 +1154,7 @@ public:
         return true;
       }
       auto &read = state->read;
-      if (read.is_cancelled || !read.active)
+      if (read.is_cancelled || !read.active || read.generation != generation)
       {
         fail(errc::canceled);
         return true;
@@ -1116,6 +1185,15 @@ public:
     bool attempt(tcp_state_t &socket_state) override
     {
       auto &read = socket_state.read;
+      if (read.pending != 0)
+      {
+        fail(std::exchange(read.pending, 0));
+        return true;
+      }
+      auto epoch = socket_state.socket.watch.epoch;
+      if (read.drained && read.drained_epoch == epoch)
+        return false;
+      read.drained = false;
       auto memory = read.alloc_buffer_cb(read.alloc_cb_data, tcp_read_buffer_size);
       if (memory.empty())
       {
@@ -1125,16 +1203,38 @@ public:
         return true;
       }
       unique_buf_t buffer(memory, read.dealloc_buffer_cb, read.alloc_cb_data);
-      auto received = detail::socket_recv(socket_state.socket.native(), memory);
+      auto native = socket_state.socket.native();
+      auto received = detail::socket_recv(native, memory);
       if (received == errc::again)
-        return false;
-      if (received > 0)
       {
-        buffer.resize(static_cast<std::size_t>(received));
-        result = std::move(buffer);
+        read.drained = true;
+        read.drained_epoch = epoch;
+        return false;
+      }
+      if (received <= 0)
+      {
+        fail(received == 0 ? errc::eof : static_cast<int>(received));
         return true;
       }
-      fail(received == 0 ? errc::eof : static_cast<int>(received));
+      auto filled = static_cast<std::size_t>(received);
+      while (filled < memory.size())
+      {
+        auto more = detail::socket_recv(native, memory.subspan(filled));
+        if (more == errc::again)
+        {
+          read.drained = true;
+          read.drained_epoch = epoch;
+          break;
+        }
+        if (more <= 0)
+        {
+          read.pending = more == 0 ? errc::eof : static_cast<int>(more);
+          break;
+        }
+        filled += static_cast<std::size_t>(more);
+      }
+      buffer.resize(filled);
+      result = std::move(buffer);
       return true;
     }
 
@@ -1144,12 +1244,13 @@ public:
     }
 
     ref_ptr_t<tcp_state_t> state;
+    std::uint64_t generation = 0;
     std::expected<unique_buf_t, error_t> result;
   };
 
   auto operator co_await()
   {
-    return awaiter_t{_is_valid ? handle : ref_ptr_t<tcp_state_t>::null()};
+    return awaiter_t{_is_valid ? handle : ref_ptr_t<tcp_state_t>::null(), _generation};
   }
 
   static void pause_reading(ref_ptr_t<tcp_state_t> &handle)
@@ -1174,21 +1275,22 @@ public:
 
   void pause()
   {
-    if (_is_valid && handle)
+    if (owns())
       pause_reading(handle);
   }
 
   void resume()
   {
-    if (_is_valid && handle)
+    if (owns())
       resume_reading(handle);
   }
 
   struct read_into_awaiter_t final : tcp_read_waiter_t
   {
-    read_into_awaiter_t(ref_ptr_t<tcp_state_t> state, std::span<std::byte> dst) noexcept
+    read_into_awaiter_t(ref_ptr_t<tcp_state_t> state, std::span<std::byte> dst, std::uint64_t generation) noexcept
       : state(std::move(state))
       , dst(dst)
+      , generation(generation)
     {
       into = true;
     }
@@ -1197,6 +1299,7 @@ public:
       : tcp_read_waiter_t(other)
       , state(std::move(other.state))
       , dst(other.dst)
+      , generation(other.generation)
       , result(std::move(other.result))
     {
     }
@@ -1223,7 +1326,7 @@ public:
         return true;
       }
       auto &read = state->read;
-      if (read.is_cancelled || !read.active)
+      if (read.is_cancelled || !read.active || read.generation != generation)
       {
         fail(errc::canceled);
         return true;
@@ -1250,9 +1353,24 @@ public:
 
     bool attempt(tcp_state_t &socket_state) override
     {
+      auto &read = socket_state.read;
+      if (read.pending != 0)
+      {
+        auto code = std::exchange(read.pending, 0);
+        if (code == errc::eof)
+          result = std::size_t{0};
+        else
+          fail(code);
+        return true;
+      }
       auto received = detail::socket_recv(socket_state.socket.native(), dst);
       if (received == errc::again)
+      {
+        read.drained = true;
+        read.drained_epoch = socket_state.socket.watch.epoch;
         return false;
+      }
+      read.drained = false;
       if (received >= 0)
       {
         result = static_cast<std::size_t>(received);
@@ -1269,12 +1387,13 @@ public:
 
     ref_ptr_t<tcp_state_t> state;
     std::span<std::byte> dst;
+    std::uint64_t generation = 0;
     std::expected<std::size_t, error_t> result = std::size_t{0};
   };
 
   read_into_awaiter_t read_into(std::span<std::byte> dst)
   {
-    return read_into_awaiter_t{_is_valid ? handle : ref_ptr_t<tcp_state_t>::null(), dst};
+    return read_into_awaiter_t{_is_valid ? handle : ref_ptr_t<tcp_state_t>::null(), dst, _generation};
   }
 
   ref_ptr_t<tcp_state_t> handle;
@@ -1283,14 +1402,23 @@ public:
 private:
   explicit tcp_reader_t(const tcp_t &tcp)
     : handle(tcp.handle)
+    , _generation(tcp.handle->read.generation)
     , _is_valid(true)
   {
   }
 
+  [[nodiscard]] bool owns() const noexcept
+  {
+    return _is_valid && handle && handle->read.generation == _generation;
+  }
+
   void stop() noexcept
   {
-    if (!_is_valid || !handle)
+    if (!owns())
+    {
+      _is_valid = false;
       return;
+    }
     _is_valid = false;
     auto &read = handle->read;
     read.active = false;
@@ -1301,6 +1429,7 @@ private:
       detail::tcp_read_kick(handle.data());
   }
 
+  std::uint64_t _generation = 0;
   bool _is_valid = false;
 };
 
@@ -1317,6 +1446,7 @@ inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
   read.started = true;
   read.paused = false;
   read.is_cancelled = false;
+  ++read.generation;
   return tcp_reader_t{tcp};
 }
 } // namespace vio
