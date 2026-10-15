@@ -272,6 +272,39 @@ vio::task_t<void> dropped_connection_peer_gone_scenario(vio::event_loop_t &loop,
   }
 }
 
+vio::task_t<void> mutual_linger_scenario(vio::event_loop_t &loop, std::size_t &queued_client, std::size_t &queued_server)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  {
+    auto client = std::move(pair->client);
+    auto server = std::move(pair->server);
+    std::vector<vio::tcp_write_future_t> client_fillers;
+    std::vector<vio::tcp_write_future_t> server_fillers;
+    stall_writes(client, client_fillers);
+    stall_writes(server, server_fillers);
+    queued_client = vio::tcp_write_queue_size(client);
+    queued_server = vio::tcp_write_queue_size(server);
+  }
+}
+
+vio::task_t<void> upload_then_read_scenario(vio::event_loop_t &loop, const std::string &response, std::size_t &filled, std::size_t &queued_at_drop, bool &uploaded, std::string &received)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto peer = std::move(pair->client);
+  {
+    auto server = std::move(pair->server);
+    std::vector<vio::tcp_write_future_t> fillers;
+    filled = stall_writes(server, fillers);
+    auto dropped = vio::write_tcp(server, std::string(response));
+    queued_at_drop = vio::tcp_write_queue_size(server);
+  }
+  auto upload = co_await vio::write_tcp(peer, std::string(chunk_size, 'u'));
+  uploaded = upload.has_value();
+  co_await read_all(std::move(peer), received);
+}
+
 template <typename Scenario>
 void run_scenario(Scenario &&scenario)
 {
@@ -349,6 +382,36 @@ TEST_SUITE("tcp write queue")
     run_scenario([&](vio::event_loop_t &loop) { return dropped_connection_peer_gone_scenario(loop, queued_at_drop); });
     auto elapsed = std::chrono::steady_clock::now() - started;
     CHECK(queued_at_drop > 0);
+    CHECK(elapsed < std::chrono::seconds(5));
+  }
+
+  TEST_CASE("two dropped ends that both linger drain each other instead of waiting out the linger")
+  {
+    std::size_t queued_client = 0;
+    std::size_t queued_server = 0;
+    auto started = std::chrono::steady_clock::now();
+    run_scenario([&](vio::event_loop_t &loop) { return mutual_linger_scenario(loop, queued_client, queued_server); });
+    auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(queued_client > 0);
+    CHECK(queued_server > 0);
+    CHECK(elapsed < std::chrono::seconds(5));
+  }
+
+  TEST_CASE("a lingering connection keeps reading, so a peer that uploads before it reads gets the whole response")
+  {
+    const std::string response = make_pattern(chunk_size + 3);
+    std::size_t filled = 0;
+    std::size_t queued_at_drop = 0;
+    bool uploaded = false;
+    std::string received;
+    auto started = std::chrono::steady_clock::now();
+    run_scenario([&](vio::event_loop_t &loop) { return upload_then_read_scenario(loop, response, filled, queued_at_drop, uploaded, received); });
+    auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(queued_at_drop > response.size());
+    CHECK(uploaded);
+    REQUIRE(received.size() == filled + response.size());
+    CHECK(received.compare(0, filled, std::string(filled, 'f')) == 0);
+    CHECK(received.compare(filled, response.size(), response) == 0);
     CHECK(elapsed < std::chrono::seconds(5));
   }
 

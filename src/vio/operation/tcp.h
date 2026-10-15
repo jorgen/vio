@@ -60,6 +60,8 @@ struct tcp_listen_future_t;
 
 inline constexpr std::size_t tcp_read_buffer_size = 65536;
 inline constexpr std::int64_t tcp_teardown_linger_ns = 10'000'000'000;
+inline constexpr std::size_t tcp_linger_discard_chunk = 16384;
+inline constexpr int tcp_linger_discard_budget = 64;
 
 namespace detail
 {
@@ -336,6 +338,27 @@ inline void tcp_on_linger(timer_node_t *node)
 {
   tcp_end_linger(*static_cast<tcp_state_t *>(node->owner));
 }
+
+inline void tcp_read_kick(tcp_state_t &state);
+
+inline void tcp_linger_discard(tcp_state_t &state)
+{
+  if (!state.lingering || state.closed || state.read.op.parked)
+    return;
+  std::array<std::byte, tcp_linger_discard_chunk> scratch;
+  for (int i = 0; i < tcp_linger_discard_budget; ++i)
+  {
+    auto received = socket_recv(state.socket.native(), scratch);
+    if (received == errc::again)
+    {
+      state.socket.wait(interest_read, state.read.op);
+      return;
+    }
+    if (received <= 0)
+      return;
+  }
+  tcp_read_kick(state);
+}
 } // namespace detail
 
 struct tcp_t
@@ -482,8 +505,6 @@ private:
 
 namespace detail
 {
-inline void tcp_read_kick(tcp_state_t &state);
-
 inline void tcp_read_rearm(tcp_state_t &state)
 {
   auto &read = state.read;
@@ -521,6 +542,8 @@ inline void tcp_on_connect_ready(io_op_t *op)
   state.connect.in_progress = false;
   state.connect.result = code;
   state.connected = code == 0;
+  if (state.connected && state.lingering)
+    tcp_linger_discard(state);
   tcp_read_rearm(state);
   auto *waiter = state.connect.waiter;
   if (waiter == nullptr)
@@ -820,9 +843,12 @@ inline void tcp_begin_teardown(tcp_state_t &state)
   if (state.read.op.parked)
     state.socket.cancel(state.read.op);
   state.read.waiter = nullptr;
+  state.read.op.keeps_alive = false;
   state.lingering = true;
   tcp_state_ref(state).release_to_raw();
   state.socket.loop().add_timer(state.linger, loop_core_t::deadline_after(tcp_teardown_linger_ns));
+  if (!state.connect.in_progress)
+    tcp_linger_discard(state);
   if (!write.op.parked)
     tcp_write_drain(state);
 }
@@ -1037,7 +1063,13 @@ inline void tcp_read_progress(tcp_state_t &state)
 
 inline void tcp_on_read_ready(io_op_t *op)
 {
-  tcp_read_progress(*static_cast<tcp_state_t *>(op->owner));
+  auto &state = *static_cast<tcp_state_t *>(op->owner);
+  if (state.lingering)
+  {
+    tcp_linger_discard(state);
+    return;
+  }
+  tcp_read_progress(state);
 }
 
 inline void tcp_read_kick(tcp_state_t &state)
@@ -1056,6 +1088,11 @@ inline void tcp_on_read_kick(posted_t *node)
 {
   auto state = ref_ptr_t<tcp_state_t>::from_raw(node->owner);
   node->owner = nullptr;
+  if (state->lingering)
+  {
+    tcp_linger_discard(state.data());
+    return;
+  }
   tcp_read_progress(state.data());
 }
 

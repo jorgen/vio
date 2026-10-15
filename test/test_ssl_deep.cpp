@@ -882,6 +882,65 @@ TEST_CASE("a client dropped right after a write sends close_notify")
   REQUIRE(sink.end_code == vio::vio_tls_clean_shutdown);
 }
 
+namespace
+{
+void shrink_socket_buffers(vio::detail::socket_resource_t &socket)
+{
+  int size = 64 * 1024;
+  REQUIRE(vio::detail::socket_set_option(socket.native(), SOL_SOCKET, SO_SNDBUF, &size, static_cast<int>(sizeof(size))) == 0);
+  REQUIRE(vio::detail::socket_set_option(socket.native(), SOL_SOCKET, SO_RCVBUF, &size, static_cast<int>(sizeof(size))) == 0);
+}
+
+vio::task_t<void> lingering_tls_server(vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t cfg, int port, const std::string &payload)
+{
+  auto server = vio::ssl_server_create(el, std::move(s), "localhost", cfg);
+  REQUIRE_EXPECTED(server);
+  auto srv = std::move(server.value());
+  auto listened = co_await vio::ssl_server_listen(srv, port);
+  REQUIRE_EXPECTED(listened);
+  auto accepted = vio::ssl_server_accept(srv);
+  REQUIRE_EXPECTED(accepted);
+  auto client = std::move(accepted.value());
+  auto handshake = co_await vio::ssl_server_client_handshake(client);
+  REQUIRE_EXPECTED(handshake);
+  shrink_socket_buffers(client.handle->tcp.handle->socket);
+  auto dropped = vio::ssl_server_client_write(client, std::as_bytes(std::span(payload)));
+}
+
+vio::task_t<void> lingering_tls_client(vio::event_loop_t &el, vio::ssl_config_t cc, int port, const std::string &payload)
+{
+  auto created = vio::ssl_client_create(el, cc);
+  REQUIRE_EXPECTED(created);
+  auto client = std::move(created.value());
+  auto connected = co_await vio::ssl_client_connect(client, "localhost", port, "127.0.0.1");
+  REQUIRE_EXPECTED(connected);
+  shrink_socket_buffers(client.state->tcp.handle->socket);
+  auto dropped = vio::ssl_client_write(client, std::as_bytes(std::span(payload)));
+}
+} // namespace
+
+TEST_CASE("two TLS ends dropped with writes queued drain each other instead of waiting out the linger")
+{
+  auto config = make_pair_config();
+  const std::string payload = make_pattern(4 * 1024 * 1024, 23);
+  auto started = std::chrono::steady_clock::now();
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = lingering_tls_server(el, std::move(pair->first), config.server, port, payload);
+      auto client_task = lingering_tls_client(el, config.client, port, payload);
+      co_await std::move(client_task);
+      co_await std::move(server_task);
+      el.stop();
+    });
+  auto elapsed = std::chrono::steady_clock::now() - started;
+  CHECK(elapsed < std::chrono::seconds(5));
+}
+
 TEST_CASE("a zero-length write resolves at once")
 {
   auto config = make_pair_config();
@@ -1323,8 +1382,13 @@ TEST_CASE("an emptied inbound buffer is kept for the next read instead of freed"
   CHECK(reused.data() == buffer);
 }
 
-TEST_CASE("a drained output buffer large enough for one write slice is kept")
+TEST_CASE("a drained output buffer leaves the idle connection and is reused for the next write slice")
 {
+  auto &pool = vio::detail::ssl_output_pool();
+  while (pool.size() > 0)
+  {
+    [[maybe_unused]] auto dropped = pool.take();
+  }
   auto config = make_pair_config();
   vio::ssl_context_t server_context;
   REQUIRE(server_context.init(true, config.server, std::string{}).code == 0);
@@ -1335,6 +1399,12 @@ TEST_CASE("a drained output buffer large enough for one write slice is kept")
   vio::ssl_engine_t client;
   REQUIRE(client.init(client_context, false, "localhost").code == 0);
   REQUIRE(pump_handshake(client, server));
+  CHECK(client.output_capacity() == 0);
+  CHECK(server.output_capacity() == 0);
+  while (pool.size() > 0)
+  {
+    [[maybe_unused]] auto dropped = pool.take();
+  }
 
   const std::string slice(vio::tls_stream_t::write_slice, 's');
   auto write_slice = [&] {
@@ -1346,10 +1416,24 @@ TEST_CASE("a drained output buffer large enough for one write slice is kept")
   };
   auto *first = write_slice();
   client.consume_output(client.output_size());
+  CHECK(client.output_capacity() == 0);
+  CHECK(pool.size() == 1);
   std::vector<std::byte> other(vio::ssl_engine_t::output_retain);
   auto *second = write_slice();
   CHECK(first == second);
+  CHECK(pool.size() == 0);
   CHECK(other.size() == vio::ssl_engine_t::output_retain);
+  client.consume_output(client.output_size());
+  CHECK(pool.size() == 1);
+
+  const std::string small = "a short response";
+  client.reserve_output(small.size() + small.size() / 16 + 1024);
+  int written = 0;
+  REQUIRE(client.write_plaintext(small.data(), static_cast<int>(small.size()), written) == vio::ssl_status::ok);
+  CHECK(client.pending_output().data() == first);
+  client.consume_output(client.output_size());
+  CHECK(client.output_capacity() == 0);
+  CHECK(pool.size() == 1);
 }
 
 TEST_CASE("upgrading a socket that is not connected fails")

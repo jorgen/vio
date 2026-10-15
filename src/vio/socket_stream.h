@@ -292,6 +292,8 @@ struct tls_stream_t
   static constexpr size_t write_slice = 65536;
   static constexpr int read_budget = 16;
   static constexpr std::int64_t teardown_linger_ns = 10'000'000'000;
+  static constexpr size_t linger_discard_chunk = 16384;
+  static constexpr int linger_discard_budget = 64;
   static_assert(ssl_engine_t::output_retain >= write_slice + write_slice / 16 + 1024);
 
   ssl_engine_t &engine;
@@ -535,6 +537,7 @@ struct tls_stream_t
     _lingering = true;
     rc->inc();
     _core->add_timer(_linger, detail::loop_core_t::deadline_after(teardown_linger_ns));
+    linger_read();
   }
 
   void abandon_handshake()
@@ -782,6 +785,7 @@ private:
   {
     if (closed)
     {
+      linger_read();
       flush_out();
       pump_writes();
       if (_lingering && teardown_settled())
@@ -1155,10 +1159,35 @@ private:
     _lingering = false;
     if (_linger.armed())
       _core->remove_timer(_linger);
+    if (socket != nullptr && _read_op.parked)
+      socket->cancel(_read_op);
     drop_writes();
     engine.discard_output();
     discard_inbound();
     rc->dec();
+  }
+
+  void linger_read()
+  {
+    if (!_lingering || _read_eof || _read_op.parked || socket == nullptr || !socket->is_open())
+      return;
+    std::byte scratch[linger_discard_chunk];
+    for (int i = 0; i < linger_discard_budget; ++i)
+    {
+      auto received = detail::socket_recv(socket->native(), std::span<std::byte>(scratch));
+      if (received == errc::again)
+      {
+        _read_op.keeps_alive = false;
+        socket->wait(detail::interest_read, _read_op);
+        return;
+      }
+      if (received <= 0)
+      {
+        _read_eof = true;
+        return;
+      }
+    }
+    schedule();
   }
 
   void discard_inbound() noexcept

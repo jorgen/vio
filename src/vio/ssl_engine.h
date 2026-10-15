@@ -88,19 +88,20 @@ inline BIO_METHOD *ssl_engine_bio_method()
   return method;
 }
 
-class ssl_inbound_pool_t
+template <typename Buffer>
+class ssl_spare_pool_t
 {
 public:
   static constexpr std::size_t limit = 4;
 
-  [[nodiscard]] std::unique_ptr<std::byte[]> take() noexcept
+  [[nodiscard]] Buffer take() noexcept
   {
     if (_count == 0)
-      return nullptr;
+      return Buffer{};
     return std::move(_buffers[--_count]);
   }
 
-  void give(std::unique_ptr<std::byte[]> buffer) noexcept
+  void give(Buffer buffer) noexcept
   {
     if (_count < limit)
       _buffers[_count++] = std::move(buffer);
@@ -112,13 +113,19 @@ public:
   }
 
 private:
-  std::array<std::unique_ptr<std::byte[]>, limit> _buffers;
+  std::array<Buffer, limit> _buffers;
   std::size_t _count = 0;
 };
 
-inline ssl_inbound_pool_t &ssl_inbound_pool() noexcept
+inline ssl_spare_pool_t<std::unique_ptr<std::byte[]>> &ssl_inbound_pool() noexcept
 {
-  thread_local ssl_inbound_pool_t pool;
+  thread_local ssl_spare_pool_t<std::unique_ptr<std::byte[]>> pool;
+  return pool;
+}
+
+inline ssl_spare_pool_t<std::vector<std::byte>> &ssl_output_pool() noexcept
+{
+  thread_local ssl_spare_pool_t<std::vector<std::byte>> pool;
   return pool;
 }
 } // namespace detail
@@ -332,6 +339,11 @@ struct ssl_engine_t
     return _out.size() - _out_head;
   }
 
+  [[nodiscard]] std::size_t output_capacity() const noexcept
+  {
+    return _out.capacity();
+  }
+
   [[nodiscard]] std::span<const std::byte> pending_output() const noexcept
   {
     return {_out.data() + _out_head, _out.size() - _out_head};
@@ -350,6 +362,7 @@ struct ssl_engine_t
   void reserve_output(std::size_t additional)
   {
     compact_output();
+    adopt_pooled_output();
     if (_out.capacity() - _out.size() < additional)
       _out.reserve((std::max)(_out.size() + additional, _out.capacity() * 2));
   }
@@ -539,6 +552,7 @@ private:
     auto *first = reinterpret_cast<const std::byte *>(in);
     VIO_TRY
     {
+      adopt_pooled_output();
       _out.insert(_out.end(), first, first + length);
     }
     VIO_CATCH_ALL
@@ -566,13 +580,22 @@ private:
     }
   }
 
+  void adopt_pooled_output()
+  {
+    if (_out.capacity() != 0)
+      return;
+    _out = detail::ssl_output_pool().take();
+    if (_out.capacity() == 0)
+      _out.reserve(output_retain);
+  }
+
   void reset_output() noexcept
   {
     _out_head = 0;
-    if (_out.capacity() > output_retain)
-      std::vector<std::byte>().swap(_out);
-    else
-      _out.clear();
+    _out.clear();
+    if (_out.capacity() == output_retain)
+      detail::ssl_output_pool().give(std::move(_out));
+    std::vector<std::byte>().swap(_out);
   }
 
   std::unique_ptr<std::byte[]> _in;

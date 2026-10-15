@@ -136,53 +136,88 @@ class fifo_t
 public:
   [[nodiscard]] bool empty() const noexcept
   {
-    return _head == _items.size();
+    return _count == 0;
   }
 
   [[nodiscard]] std::size_t size() const noexcept
   {
-    return _items.size() - _head;
+    return _count;
+  }
+
+  [[nodiscard]] std::size_t capacity() const noexcept
+  {
+    return _slots.size();
   }
 
   T &front() noexcept
   {
-    return _items[_head];
+    return *_slots[_head];
   }
 
   void pop_front()
   {
-    ++_head;
-    if (_head == _items.size())
-    {
-      _items.clear();
-      _head = 0;
-    }
+    _slots[_head].reset();
+    --_count;
+    _head = _count == 0 ? 0 : wrap(_head + 1);
   }
 
   template <typename... Args>
   void emplace_back(Args &&...args)
   {
-    _items.emplace_back(std::forward<Args>(args)...);
+    if (_count == _slots.size())
+    {
+      grow();
+    }
+    _slots[wrap(_head + _count)].emplace(std::forward<Args>(args)...);
+    ++_count;
   }
 
   template <typename Predicate>
   void erase_if(Predicate predicate)
   {
-    std::vector<T> kept;
-    for (std::size_t i = _head; i < _items.size(); ++i)
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < _count; ++i)
     {
-      if (!predicate(_items[i]))
+      auto &slot = _slots[wrap(_head + i)];
+      if (predicate(*slot))
       {
-        kept.push_back(std::move(_items[i]));
+        slot.reset();
+        continue;
       }
+      if (kept != i)
+      {
+        _slots[wrap(_head + kept)] = std::move(slot);
+        slot.reset();
+      }
+      ++kept;
     }
-    _items = std::move(kept);
-    _head = 0;
+    _count = kept;
+    if (_count == 0)
+    {
+      _head = 0;
+    }
   }
 
 private:
-  std::vector<T> _items;
+  [[nodiscard]] std::size_t wrap(std::size_t index) const noexcept
+  {
+    return index >= _slots.size() ? index - _slots.size() : index;
+  }
+
+  void grow()
+  {
+    std::vector<std::optional<T>> larger(_slots.empty() ? 8 : _slots.size() * 2);
+    for (std::size_t i = 0; i < _count; ++i)
+    {
+      larger[i] = std::move(_slots[wrap(_head + i)]);
+    }
+    _slots = std::move(larger);
+    _head = 0;
+  }
+
+  std::vector<std::optional<T>> _slots;
   std::size_t _head = 0;
+  std::size_t _count = 0;
 };
 
 template <typename T>
@@ -218,6 +253,7 @@ struct udp_send_state_t
   sockaddr_storage address = {};
   int address_length = 0;
   std::uint64_t generation = 0;
+  std::uint64_t connect_generation = 0;
   bool started = false;
   bool done = false;
   bool claimed = true;
@@ -282,6 +318,7 @@ struct udp_state_t
   udp_send_state_t send;
   udp_recv_state_t recv;
   void *self = nullptr;
+  std::uint64_t connect_generation = 0;
   int family = AF_UNSPEC;
   bool connected = false;
   bool use_recvmmsg = false;
@@ -486,6 +523,16 @@ inline void udp_map_ipv4(const sockaddr *address, sockaddr_in6 &mapped) noexcept
   return {};
 }
 
+[[nodiscard]] inline std::int64_t udp_send_parked(udp_state_t &state, std::span<const std::byte> bytes, const sockaddr_storage &address, int address_length, std::uint64_t connect_generation) noexcept
+{
+  if (address_length == 0 && connect_generation != state.connect_generation)
+  {
+    return errc::not_connected;
+  }
+  const auto *to = address_length > 0 ? reinterpret_cast<const sockaddr *>(&address) : nullptr;
+  return socket_sendto(state.socket.native(), bytes, to, address_length);
+}
+
 inline void udp_on_send_ready(io_op_t *op);
 inline void udp_abandon_send(udp_state_t &state, std::uint64_t generation);
 } // namespace detail
@@ -627,6 +674,7 @@ inline std::expected<void, error_t> udp_disconnect(udp_t &udp)
     return std::unexpected(make_error(result));
   }
   state.connected = false;
+  ++state.connect_generation;
   return {};
 }
 
@@ -663,6 +711,7 @@ inline std::expected<void, error_t> udp_connect(udp_t &udp, const sockaddr *addr
     return std::unexpected(make_error(result));
   }
   state.connected = true;
+  ++state.connect_generation;
   return {};
 }
 
@@ -900,8 +949,7 @@ inline void udp_on_send_ready(io_op_t *op)
   auto owned = ref_ptr_t<udp_state_t>::from_raw(op->owner);
   auto &state = owned.data();
   auto &send = state.send;
-  const auto *to = send.address_length > 0 ? reinterpret_cast<const sockaddr *>(&send.address) : nullptr;
-  const auto sent = socket_sendto(state.socket.native(), std::as_bytes(std::span(send.data, send.length)), to, send.address_length);
+  const auto sent = udp_send_parked(state, std::as_bytes(std::span(send.data, send.length)), send.address, send.address_length, send.connect_generation);
   if (sent == errc::again)
   {
     op->owner = owned.release_to_raw();
@@ -940,6 +988,47 @@ inline void udp_abandon_send(udp_state_t &state, std::uint64_t generation)
 } // namespace detail
 
 using udp_send_future_t = udp_future_t<udp_send_state_t>;
+
+namespace detail
+{
+inline udp_send_future_t udp_send_borrowed_park(udp_t &udp, const uint8_t *data, std::size_t length, const udp_target_t &target)
+{
+  auto &state = udp.handle.data();
+  auto &send = state.send;
+  if (send.started)
+  {
+    return udp_send_future_t(udp.handle, send, error_t{.code = errc::already_in_progress, .msg = "It's an error to have more than one send in flight at a time"});
+  }
+  if (!send.claimed)
+  {
+    return udp_send_future_t(udp.handle, send, error_t{.code = errc::already_in_progress, .msg = "the previous send's result has not been awaited yet"});
+  }
+  send.continuation = {};
+  send.started = true;
+  send.done = false;
+  send.claimed = false;
+  send.result = {};
+  send.data = data;
+  send.length = length;
+  send.address = {};
+  send.address_length = target.length;
+  send.connect_generation = state.connect_generation;
+  if (target.address != nullptr)
+  {
+    std::memcpy(&send.address, target.address, static_cast<std::size_t>(target.length));
+  }
+  ++send.generation;
+  auto parked = udp.handle;
+  send.op.owner = parked.release_to_raw();
+  send.op.complete = &udp_on_send_ready;
+  state.socket.wait(interest_write, send.op);
+  udp_send_future_t future(udp.handle, send);
+  future.generation = send.generation;
+  future.pending = true;
+  return future;
+}
+} // namespace detail
+
 inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t length, const sockaddr *addr)
 {
   auto &state = udp.handle.data();
@@ -958,32 +1047,7 @@ inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t l
   {
     return udp_send_future_t(udp.handle, send, detail::udp_send_result(sent));
   }
-  if (!send.claimed)
-  {
-    return udp_send_future_t(udp.handle, send, error_t{.code = errc::already_in_progress, .msg = "the previous send's result has not been awaited yet"});
-  }
-  send.continuation = {};
-  send.started = true;
-  send.done = false;
-  send.claimed = false;
-  send.result = {};
-  send.data = data;
-  send.length = length;
-  send.address = {};
-  send.address_length = target.length;
-  if (target.address != nullptr)
-  {
-    std::memcpy(&send.address, target.address, static_cast<std::size_t>(target.length));
-  }
-  ++send.generation;
-  auto parked = udp.handle;
-  send.op.owner = parked.release_to_raw();
-  send.op.complete = &detail::udp_on_send_ready;
-  state.socket.wait(detail::interest_write, send.op);
-  udp_send_future_t future(udp.handle, send);
-  future.generation = send.generation;
-  future.pending = true;
-  return future;
+  return detail::udp_send_borrowed_park(udp, data, length, target);
 }
 
 inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t length)
@@ -1001,6 +1065,7 @@ struct udp_send_op_t
   std::span<const std::byte> bytes;
   sockaddr_storage address = {};
   int address_length = 0;
+  std::uint64_t connect_generation = 0;
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
   registration_t cancel_registration;
@@ -1021,6 +1086,7 @@ inline void udp_send_release(udp_send_op_t *op)
     delete op;
     return;
   }
+  op->cancel_registration.reset();
   op->detached = true;
 }
 
@@ -1028,15 +1094,13 @@ inline void udp_send_op_ready(io_op_t *io)
 {
   auto *op = static_cast<udp_send_op_t *>(io->owner);
   auto &state = op->socket.data();
-  const auto *to = op->address_length > 0 ? reinterpret_cast<const sockaddr *>(&op->address) : nullptr;
-  const auto sent = socket_sendto(state.socket.native(), op->bytes, to, op->address_length);
+  const auto sent = udp_send_parked(state, op->bytes, op->address, op->address_length, op->connect_generation);
   if (sent == errc::again)
   {
     state.socket.wait(interest_write, *io);
     return;
   }
   op->completed = true;
-  op->cancel_registration.reset();
   if (op->detached)
   {
     delete op;
@@ -1048,6 +1112,7 @@ inline void udp_send_op_ready(io_op_t *io)
   }
   if (op->continuation)
   {
+    op->cancel_registration.reset();
     auto continuation = std::exchange(op->continuation, {});
     continuation.resume();
   }
@@ -1055,7 +1120,7 @@ inline void udp_send_op_ready(io_op_t *io)
 
 inline void udp_send_op_cancel(udp_send_op_t *op)
 {
-  if (op->completed || op->answered || op->detached)
+  if (op->answered || op->detached)
   {
     return;
   }
@@ -1073,6 +1138,7 @@ inline void udp_send_op_cancel(udp_send_op_t *op)
 struct udp_send_awaitable_t
 {
   udp_send_op_t *op = nullptr;
+  cancellation_t *cancel = nullptr;
   std::expected<void, error_t> immediate;
 
   explicit udp_send_awaitable_t(udp_send_op_t *operation)
@@ -1080,8 +1146,9 @@ struct udp_send_awaitable_t
   {
   }
 
-  explicit udp_send_awaitable_t(std::expected<void, error_t> result)
-    : immediate(std::move(result))
+  explicit udp_send_awaitable_t(std::expected<void, error_t> result, cancellation_t *token = nullptr)
+    : cancel(token)
+    , immediate(std::move(result))
   {
   }
 
@@ -1090,6 +1157,7 @@ struct udp_send_awaitable_t
 
   udp_send_awaitable_t(udp_send_awaitable_t &&other) noexcept
     : op(std::exchange(other.op, nullptr))
+    , cancel(std::exchange(other.cancel, nullptr))
     , immediate(std::move(other.immediate))
   {
   }
@@ -1102,9 +1170,17 @@ struct udp_send_awaitable_t
     }
   }
 
-  [[nodiscard]] bool await_ready() const noexcept
+  [[nodiscard]] bool await_ready() noexcept
   {
-    return op == nullptr || op->completed || op->answered;
+    if (op != nullptr)
+    {
+      return op->completed || op->answered;
+    }
+    if (cancel != nullptr && cancel->is_cancelled())
+    {
+      immediate = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    }
+    return true;
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
@@ -1139,6 +1215,7 @@ udp_send_awaitable_t udp_send_park(udp_t &udp, Bytes &&bytes, const udp_target_t
   op->bytes = std::as_bytes(std::span<const value_t>(std::ranges::data(owned->value), std::ranges::size(owned->value)));
   op->payload = std::move(owned);
   op->address_length = target.length;
+  op->connect_generation = udp.handle->connect_generation;
   if (target.address != nullptr)
   {
     std::memcpy(&op->address, target.address, static_cast<std::size_t>(target.length));
@@ -1175,7 +1252,7 @@ udp_send_awaitable_t send_udp(udp_t &udp, Bytes &&bytes, const sockaddr *addr, c
   const auto sent = detail::socket_sendto(state.socket.native(), view, target.address, target.length);
   if (sent != errc::again)
   {
-    return udp_send_awaitable_t(detail::udp_send_result(sent));
+    return udp_send_awaitable_t(detail::udp_send_result(sent), cancel);
   }
   return detail::udp_send_park(udp, std::forward<Bytes>(bytes), target, cancel);
 }
