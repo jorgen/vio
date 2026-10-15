@@ -252,11 +252,28 @@ void loop_core_t::post(posted_t &node)
 
 bool loop_core_t::unpost(posted_t &node) noexcept
 {
+  bool removed = false;
+  if (in_loop_thread())
+  {
+    for (auto &pending : _draining)
+    {
+      if (pending == &node)
+      {
+        pending = nullptr;
+        removed = true;
+      }
+    }
+    if (_deferred.remove(node))
+    {
+      node.queued = false;
+      removed = true;
+    }
+  }
   std::lock_guard lock(_post_mutex);
   if (!node.queued)
-    return false;
+    return removed;
   node.queued = false;
-  return _posted.remove(node);
+  return _posted.remove(node) || removed;
 }
 
 void loop_core_t::defer(posted_t &node) noexcept
@@ -283,8 +300,13 @@ void loop_core_t::drain_posted()
       head = next;
     }
   }
-  for (auto *node : _draining)
-    node->run(node);
+  for (std::size_t i = 0; i < _draining.size(); ++i)
+  {
+    auto *node = _draining[i];
+    if (node)
+      node->run(node);
+  }
+  _draining.clear();
 }
 
 void loop_core_t::drain_deferred()
