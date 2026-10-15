@@ -88,7 +88,10 @@ forces one. A test asserts which backend ran, so a CI job cannot quietly test th
 **D13. epoll is the default on Linux until io_uring beats it on the benchmarks.** io_uring is
 built, tested in CI and selectable. Making it the default is a one-line change once the numbers
 justify it. Some deployments forbid io_uring (Android, Docker's default seccomp profile, the
-`kernel.io_uring_disabled` sysctl), so epoll must be complete either way.
+`kernel.io_uring_disabled` sysctl), so epoll must be complete either way. Measured in alternated
+runs, the two are level within 3%: with readiness-first sockets io_uring only replaces
+`epoll_wait`, which is about 0.1% of the CPU. `BASELINE.md` has the numbers, why, and the
+prototypes that did not help.
 
 **D14. io_uring needs Linux 6.1 or newer, and vio talks to it through raw system calls.** 6.1 brings
 everything vio wants. Older kernels use epoll. vio carries a small ring class instead of depending

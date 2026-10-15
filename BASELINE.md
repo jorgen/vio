@@ -84,10 +84,45 @@ that much between runs.
 Allocations fell with it: 12.5 per datagram over sockets became 3.3 (callback) and 3.6
 (coroutine); 23.1 per request became 15.2 (callback), and 31.7 became 24.5 (coroutine).
 
-io_uring, measured in a separate set of runs, came out level with epoll or up to a quarter slower
-on the socket rows (offload on: 225 against 296 MB/s; callback requests: 94k against 113k req/s).
-Sockets are readiness-first on both, so io_uring only replaces `epoll_wait` and adds a `POLL_ADD`
-per park. It stays off by default (D13).
+io_uring first came out level with epoll or up to a quarter slower on the socket rows, but those
+runs were separate, not alternated, on a loaded machine. Alternated, nine rounds each at commit
+`cff2a05` with the load average at 1 to 2.5, the two are level within 3% on every socket row, and
+no difference is significant:
+
+| row | epoll | io_uring | io_uring CPU against epoll |
+|-----|-------|----------|----------------------------|
+| socket, offload on | 305 MB/s | 298 MB/s | 1.03x |
+| socket, offload off | | | 1.01x |
+| bulk, callback api | | | 1.00x |
+| requests, callback api | | | 1.03x |
+
+### Why io_uring does not win
+
+Sockets are readiness-first on both backends (D1), so every call that moves data (`recv`, `send`,
+`recvmmsg`, `sendmsg`) is the same; io_uring only replaces `epoll_wait`. Per MB on the offload row,
+epoll makes 98.7 system calls and io_uring 88.3, and the waits they differ in cost about 3 µs of
+the 3,400 µs that AES-GCM and the kernel's UDP path take.
+
+Where io_uring loses, it loses to the scheduler. epoll passes on the socket's synchronous wake-up
+hint, which keeps two threads that ping-pong on one CPU; io_uring wakes the waiter through task
+work and drops the hint. On this machine, a Firecracker VM, a wake-up that crosses vCPUs costs
+about 25 µs, so a two-thread 64-byte TCP ping-pong does 98k round trips a second on one CPU and
+17k on two, on either backend. Under load epoll kept the threads together more often, which is
+where the early quarter came from. Two-thread benchmarks on this machine must pin their threads
+or report where they ran.
+
+Prototypes that did not help, each measured against epoll in alternated runs:
+- multishot poll kept armed per socket: no gain, and more `recvmmsg` calls from extra wake-ups;
+- a single-issuer ring with deferred task work, enabled on the thread that runs it: within noise,
+  and a loop could no longer move to another thread during its life;
+- receiving through the ring (multishot `recvmsg` into provided buffers): 7% to 65% more CPU per
+  datagram, despite four times fewer system calls.
+
+io_uring is already ahead in small ways: a turn with nothing ready costs 21 ns against 177 ns, a
+cross-thread post takes two system calls against three, and timers fire on time rather than up to
+50 µs late. The next thing to try is sending through the ring, with a benchmark of many small
+requests on many connections, because only there do the saved system calls add up; that change
+would make cancelling a send asynchronous (D1). It stays off by default (D13).
 
 ### vio_udp_bench, epoll
 
