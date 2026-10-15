@@ -288,16 +288,17 @@ inline void get_addrinfo_work(pool_job_t *job)
   ::freeaddrinfo(list);
 }
 
-inline void get_addrinfo_done(pool_job_t *job, bool)
+inline void get_addrinfo_done(pool_job_t *job, bool canceled)
 {
   auto *state = static_cast<get_addrinfo_state_t *>(job->owner);
   auto owned = ref_ptr_t<get_addrinfo_state_t>::from_raw(std::exchange(state->parked, nullptr));
-  if (state->done)
-  {
+  if (state->done || canceled)
     address_info_list_t().swap(state->addresses);
+  if (state->done)
     return;
-  }
-  if (state->status < 0)
+  if (canceled)
+    state->result = std::unexpected(make_error(errc::canceled));
+  else if (state->status < 0)
     state->result = std::unexpected(make_error(state->status));
   else
     state->result = std::move(state->addresses);
@@ -329,13 +330,15 @@ inline void get_nameinfo_work(pool_job_t *job)
   }
 }
 
-inline void get_nameinfo_done(pool_job_t *job, bool)
+inline void get_nameinfo_done(pool_job_t *job, bool canceled)
 {
   auto *state = static_cast<getnameinfo_state_t *>(job->owner);
   auto owned = ref_ptr_t<getnameinfo_state_t>::from_raw(std::exchange(state->parked, nullptr));
   if (state->done)
     return;
-  if (state->status < 0)
+  if (canceled)
+    state->result = std::unexpected(make_error(errc::canceled));
+  else if (state->status < 0)
     state->result = std::unexpected(make_error(state->status));
   else
     state->result = std::move(state->names);

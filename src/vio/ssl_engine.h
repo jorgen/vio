@@ -123,9 +123,97 @@ inline ssl_spare_pool_t<std::unique_ptr<std::byte[]>> &ssl_inbound_pool() noexce
   return pool;
 }
 
-inline ssl_spare_pool_t<std::vector<std::byte>> &ssl_output_pool() noexcept
+class ssl_output_pool_t
 {
-  thread_local ssl_spare_pool_t<std::vector<std::byte>> pool;
+public:
+  static constexpr std::size_t spare_floor = 4;
+
+  [[nodiscard]] std::vector<std::byte> take() noexcept
+  {
+    if (_spares.empty())
+      return {};
+    auto buffer = std::move(_spares.back());
+    _spares.pop_back();
+    _untouched = (std::min)(_untouched, _spares.size());
+    return buffer;
+  }
+
+  void give(std::vector<std::byte> buffer) noexcept
+  {
+    VIO_TRY
+    {
+      _spares.push_back(std::move(buffer));
+    }
+    VIO_CATCH_ALL
+    {
+    }
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept
+  {
+    return _spares.size();
+  }
+
+  [[nodiscard]] std::size_t surplus() const noexcept
+  {
+    return _spares.size() > spare_floor ? _spares.size() - spare_floor : 0;
+  }
+
+  void trim() noexcept
+  {
+    drop_oldest((std::min)(_untouched, surplus()));
+  }
+
+  [[nodiscard]] bool claim_trim(const void *owner) noexcept
+  {
+    if (_trimmer != nullptr || surplus() == 0)
+      return false;
+    _trimmer = owner;
+    return true;
+  }
+
+  bool release_trim(const void *owner) noexcept
+  {
+    if (_trimmer != owner)
+      return false;
+    _trimmer = nullptr;
+    return true;
+  }
+
+  [[nodiscard]] bool trim_claimed() const noexcept
+  {
+    return _trimmer != nullptr;
+  }
+
+  void attach() noexcept
+  {
+    ++_users;
+  }
+
+  void detach() noexcept
+  {
+    if (--_users > 0)
+      return;
+    _users = 0;
+    drop_oldest(surplus());
+  }
+
+private:
+  void drop_oldest(std::size_t count) noexcept
+  {
+    _spares.erase(_spares.begin(), _spares.begin() + static_cast<std::ptrdiff_t>(count));
+    _untouched = _spares.size();
+  }
+
+  std::vector<std::vector<std::byte>> _spares;
+  std::size_t _untouched = 0;
+  std::ptrdiff_t _users = 0;
+  const void *_trimmer = nullptr;
+};
+
+inline ssl_output_pool_t &ssl_output_pool() noexcept
+{
+  thread_local ssl_output_pool_t pool;
   return pool;
 }
 } // namespace detail

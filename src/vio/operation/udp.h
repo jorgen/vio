@@ -1068,6 +1068,7 @@ struct udp_send_op_t
   std::uint64_t connect_generation = 0;
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
+  cancellation_t *cancel = nullptr;
   registration_t cancel_registration;
   bool completed = false;
   bool detached = false;
@@ -1101,6 +1102,7 @@ inline void udp_send_op_ready(io_op_t *io)
     return;
   }
   op->completed = true;
+  op->cancel_registration.reset();
   if (op->detached)
   {
     delete op;
@@ -1112,7 +1114,6 @@ inline void udp_send_op_ready(io_op_t *io)
   }
   if (op->continuation)
   {
-    op->cancel_registration.reset();
     auto continuation = std::exchange(op->continuation, {});
     continuation.resume();
   }
@@ -1120,7 +1121,7 @@ inline void udp_send_op_ready(io_op_t *io)
 
 inline void udp_send_op_cancel(udp_send_op_t *op)
 {
-  if (op->answered || op->detached)
+  if (op->completed || op->answered || op->detached)
   {
     return;
   }
@@ -1174,6 +1175,11 @@ struct udp_send_awaitable_t
   {
     if (op != nullptr)
     {
+      if (op->completed && !op->answered && op->cancel != nullptr && op->cancel->is_cancelled())
+      {
+        op->answered = true;
+        op->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+      }
       return op->completed || op->answered;
     }
     if (cancel != nullptr && cancel->is_cancelled())
@@ -1224,6 +1230,7 @@ udp_send_awaitable_t udp_send_park(udp_t &udp, Bytes &&bytes, const udp_target_t
   op->io.complete = &udp_send_op_ready;
   udp.handle->socket.wait(interest_write, op->io);
 
+  op->cancel = cancel;
   if (cancel != nullptr)
   {
     op->cancel_registration = cancel->register_callback([op]() { udp_send_op_cancel(op); });
@@ -1546,7 +1553,7 @@ inline void udp_recv_arm(udp_state_t &state)
   {
     return;
   }
-  if (recv.drained)
+  if (recv.drained || !recv.continuation)
   {
     if (!recv.op.parked)
     {

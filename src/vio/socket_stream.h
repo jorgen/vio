@@ -295,6 +295,7 @@ struct tls_stream_t
   static constexpr std::int64_t linger_after_fin_ns = 2'000'000'000;
   static constexpr size_t linger_discard_chunk = 16384;
   static constexpr int linger_discard_budget = 64;
+  static constexpr std::int64_t output_trim_ns = 1'000'000'000;
   static_assert(ssl_engine_t::output_retain >= write_slice + write_slice / 16 + 1024);
 
   ssl_engine_t &engine;
@@ -336,6 +337,9 @@ struct tls_stream_t
     _kick.discard = &tls_stream_t::on_kick_discard;
     _linger.owner = this;
     _linger.fire = &tls_stream_t::on_linger;
+    _output_trim.owner = this;
+    _output_trim.fire = &tls_stream_t::on_output_trim;
+    _output_trim.keeps_alive = false;
   }
   tls_stream_t(const tls_stream_t &) = delete;
   tls_stream_t &operator=(const tls_stream_t &) = delete;
@@ -353,6 +357,15 @@ struct tls_stream_t
     }
     if (_core != nullptr && _linger.armed())
       _core->remove_timer(_linger);
+    if (_core != nullptr && _output_trim.armed())
+      _core->remove_timer(_output_trim);
+    if (_pooled)
+    {
+      auto &pool = detail::ssl_output_pool();
+      if (pool.release_trim(this))
+        pool.trim();
+      pool.detach();
+    }
   }
 
   void bind(detail::socket_resource_t &resource, reference_counted_t *ref_count)
@@ -360,6 +373,11 @@ struct tls_stream_t
     socket = &resource;
     rc = ref_count;
     _core = &resource.loop();
+    if (!_pooled)
+    {
+      _pooled = true;
+      detail::ssl_output_pool().attach();
+    }
   }
 
   [[nodiscard]] bool has_front_data() const
@@ -1043,6 +1061,7 @@ private:
     if (_write_error != 0)
     {
       engine.discard_output();
+      arm_output_trim();
       return;
     }
     if (socket != nullptr && socket->is_open() && !_write_op.parked)
@@ -1063,7 +1082,16 @@ private:
         engine.consume_output(static_cast<size_t>(sent));
       }
     }
+    if (!engine.has_output())
+      arm_output_trim();
     complete_inflight();
+  }
+
+  void arm_output_trim()
+  {
+    if (_core == nullptr || !detail::ssl_output_pool().claim_trim(this))
+      return;
+    _core->add_timer(_output_trim, detail::loop_core_t::deadline_after(output_trim_ns));
   }
 
   void complete_inflight()
@@ -1311,11 +1339,21 @@ private:
       self->finish_linger();
   }
 
+  static void on_output_trim(detail::timer_node_t *node)
+  {
+    auto *self = static_cast<tls_stream_t *>(node->owner);
+    auto &pool = detail::ssl_output_pool();
+    pool.release_trim(self);
+    pool.trim();
+    self->arm_output_trim();
+  }
+
   detail::loop_core_t *_core = nullptr;
   detail::io_op_t _read_op;
   detail::io_op_t _write_op;
   detail::posted_t _kick;
   detail::timer_node_t _linger;
+  detail::timer_node_t _output_trim;
   stream_index_fifo_t _backlog;
   stream_index_fifo_t _inflight;
   stream_index_fifo_t _completed;
@@ -1328,6 +1366,7 @@ private:
   bool _lingering = false;
   bool _linger_fin_sent = false;
   bool _notifying = false;
+  bool _pooled = false;
 };
 
 template <typename REF_PTR_T, typename STREAM>

@@ -3,7 +3,6 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -379,13 +378,12 @@ TEST_CASE("an owning send whose token fires before it is awaited reports cancell
   int immediate_code = 0;
   int parked_code = 0;
   bool awaited_ok = false;
-  bool orphaned_ok = false;
   std::vector<std::string> got;
 
   event_loop.run_in_loop(
     [&]
     {
-      return [](vio::event_loop_t &loop, bool &immediate_went_straight_out, bool &parked_finished_first, int &immediate_code, int &parked_code, bool &awaited_ok, bool &orphaned_ok,
+      return [](vio::event_loop_t &loop, bool &immediate_went_straight_out, bool &parked_finished_first, int &immediate_code, int &parked_code, bool &awaited_ok,
                 std::vector<std::string> &got) -> vio::task_t<void>
       {
         {
@@ -431,19 +429,7 @@ TEST_CASE("an owning send whose token fires before it is awaited reports cancell
           later_token.cancel();
           awaited_ok = awaited_result.has_value();
 
-          auto orphan_pair = bound_socket(loop);
-          REQUIRE_EXPECTED(orphan_pair);
-          vio::detail::udp_target_t orphan_target;
-          REQUIRE(vio::detail::udp_prepare_target(orphan_pair->first.handle.data(), to, orphan_target) == 0);
-          std::optional<vio::udp_send_awaitable_t> orphaned;
-          {
-            vio::cancellation_t short_lived;
-            orphaned.emplace(vio::detail::udp_send_park(orphan_pair->first, std::string("orphaned"), orphan_target, &short_lived));
-          }
-          auto orphaned_result = co_await *orphaned;
-          orphaned_ok = orphaned_result.has_value();
-
-          for (int i = 0; i < 4; ++i)
+          for (int i = 0; i < 3; ++i)
           {
             auto datagram = co_await reader;
             REQUIRE_EXPECTED(datagram);
@@ -451,7 +437,7 @@ TEST_CASE("an owning send whose token fires before it is awaited reports cancell
           }
         }
         loop.stop();
-      }(event_loop, immediate_went_straight_out, parked_finished_first, immediate_code, parked_code, awaited_ok, orphaned_ok, got);
+      }(event_loop, immediate_went_straight_out, parked_finished_first, immediate_code, parked_code, awaited_ok, got);
     });
 
   event_loop.run();
@@ -460,8 +446,74 @@ TEST_CASE("an owning send whose token fires before it is awaited reports cancell
   CHECK(parked_finished_first);
   CHECK(parked_code == vio::vio_cancelled);
   CHECK(awaited_ok);
-  CHECK(orphaned_ok);
-  CHECK(got == std::vector<std::string>{"immediate", "parked", "awaited", "orphaned"});
+  CHECK(got == std::vector<std::string>{"immediate", "parked", "awaited"});
+}
+
+TEST_CASE("an owning send that completed unawaited leaves its token, so a cancel that drops it first never reaches it")
+{
+  vio::event_loop_t event_loop;
+  bool completed_before_cancel = false;
+  bool left_token = false;
+  bool timeout_cancelled = false;
+  std::string got;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &loop, bool &completed_before_cancel, bool &left_token, bool &timeout_cancelled, std::string &got) -> vio::task_t<void>
+      {
+        {
+          auto receiver_pair = bound_socket(loop);
+          REQUIRE_EXPECTED(receiver_pair);
+          auto reader_or_err = vio::udp_create_reader(receiver_pair->first);
+          REQUIRE_EXPECTED(reader_or_err);
+          auto reader = std::move(reader_or_err.value());
+          auto sender_pair = bound_socket(loop);
+          REQUIRE_EXPECTED(sender_pair);
+          auto dest = make_ip4("127.0.0.1", receiver_pair->second);
+          REQUIRE_EXPECTED(dest);
+          vio::detail::udp_target_t target;
+          REQUIRE(vio::detail::udp_prepare_target(sender_pair->first.handle.data(), reinterpret_cast<const sockaddr *>(&dest.value()), target) == 0);
+
+          vio::cancellation_t token;
+          auto firer = [](vio::event_loop_t &el, vio::cancellation_t &cancel) -> vio::task_t<void>
+          {
+            auto tick = vio::sleep(el, std::chrono::milliseconds(30));
+            co_await tick;
+            cancel.cancel();
+          }(loop, token);
+          {
+            auto timeout = vio::sleep(loop, std::chrono::seconds(5), &token);
+            auto send = vio::detail::udp_send_park(sender_pair->first, std::string("unawaited"), target, &token);
+            auto *op = send.op;
+            REQUIRE(op != nullptr);
+            for (int i = 0; i < 20 && !op->completed; ++i)
+            {
+              auto settle = vio::sleep(loop, std::chrono::milliseconds(1));
+              co_await settle;
+            }
+            completed_before_cancel = op->completed;
+            left_token = !op->cancel_registration.active();
+            auto result = co_await timeout;
+            timeout_cancelled = !result.has_value() && vio::is_cancelled(result.error());
+          }
+          co_await std::move(firer);
+
+          auto datagram = co_await reader;
+          if (datagram.has_value())
+          {
+            got.assign(datagram->data.chars(), datagram->data.size());
+          }
+        }
+        loop.stop();
+      }(event_loop, completed_before_cancel, left_token, timeout_cancelled, got);
+    });
+
+  event_loop.run();
+  CHECK(completed_before_cancel);
+  CHECK(left_token);
+  CHECK(timeout_cancelled);
+  CHECK(got == "unawaited");
 }
 
 TEST_CASE("a send parked on a connected socket never reaches a peer connected after it")

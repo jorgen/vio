@@ -29,10 +29,12 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1499,6 +1501,352 @@ TEST_CASE("a drained output buffer leaves the idle connection and is reused for 
   client.consume_output(client.output_size());
   CHECK(client.output_capacity() == 0);
   CHECK(pool.size() == 1);
+}
+
+namespace
+{
+std::vector<std::byte> output_sized_buffer()
+{
+  std::vector<std::byte> buffer;
+  buffer.reserve(vio::ssl_engine_t::output_retain);
+  return buffer;
+}
+
+void seed_output_pool(std::size_t count)
+{
+  auto &pool = vio::detail::ssl_output_pool();
+  while (pool.size() > 0)
+  {
+    [[maybe_unused]] auto dropped = pool.take();
+  }
+  for (std::size_t i = 0; i < count; ++i)
+  {
+    pool.give(output_sized_buffer());
+  }
+  pool.trim();
+}
+} // namespace
+
+TEST_CASE("warm writes on more than four connections at once take every output buffer from the pool")
+{
+  auto &pool = vio::detail::ssl_output_pool();
+  while (pool.size() > 0)
+  {
+    [[maybe_unused]] auto dropped = pool.take();
+  }
+  auto config = make_pair_config();
+  vio::ssl_context_t server_context;
+  REQUIRE(server_context.init(true, config.server, std::string{}).code == 0);
+  vio::ssl_context_t client_context;
+  REQUIRE(client_context.init(false, config.client, std::string{}).code == 0);
+  constexpr std::size_t connections = 3 * vio::detail::ssl_output_pool_t::spare_floor;
+  std::vector<std::unique_ptr<vio::ssl_engine_t>> clients;
+  std::vector<std::unique_ptr<vio::ssl_engine_t>> servers;
+  for (std::size_t i = 0; i < connections; ++i)
+  {
+    clients.push_back(std::make_unique<vio::ssl_engine_t>());
+    servers.push_back(std::make_unique<vio::ssl_engine_t>());
+    REQUIRE(clients.back()->init(client_context, false, "localhost").code == 0);
+    REQUIRE(servers.back()->init(server_context, true, std::string{}).code == 0);
+    REQUIRE(pump_handshake(*clients.back(), *servers.back()));
+  }
+  auto write_all = [&](const std::string &bytes) {
+    for (auto &client : clients)
+    {
+      client->reserve_output(bytes.size() + bytes.size() / 16 + 1024);
+      int written = 0;
+      REQUIRE(client->write_plaintext(bytes.data(), static_cast<int>(bytes.size()), written) == vio::ssl_status::ok);
+    }
+  };
+  auto drain_all = [&] {
+    for (auto &client : clients)
+    {
+      client->consume_output(client->output_size());
+    }
+  };
+
+  const std::string slice(vio::tls_stream_t::write_slice, 's');
+  write_all(slice);
+  drain_all();
+  const auto pooled = pool.size();
+  REQUIRE(pooled >= connections);
+
+  const std::string small = "a short response";
+  for (int round = 0; round < 3; ++round)
+  {
+    CAPTURE(round);
+    write_all(round == 0 ? small : slice);
+    CHECK(pool.size() == pooled - connections);
+    drain_all();
+    CHECK(pool.size() == pooled);
+    for (auto &client : clients)
+    {
+      CHECK(client->output_capacity() == 0);
+    }
+  }
+}
+
+TEST_CASE("the output pool frees only buffers untouched for a whole period, never below its floor")
+{
+  constexpr auto kept = vio::detail::ssl_output_pool_t::spare_floor;
+  vio::detail::ssl_output_pool_t pool;
+  for (std::size_t i = 0; i < 3 * kept; ++i)
+  {
+    pool.give(output_sized_buffer());
+  }
+  pool.trim();
+  REQUIRE(pool.size() == 3 * kept);
+
+  std::vector<std::vector<std::byte>> lent;
+  for (std::size_t i = 0; i < 3 * kept; ++i)
+  {
+    lent.push_back(pool.take());
+  }
+  for (auto &buffer : lent)
+  {
+    pool.give(std::move(buffer));
+  }
+  lent.clear();
+  pool.trim();
+  CHECK(pool.size() == 3 * kept);
+
+  std::vector<const std::byte *> recent;
+  for (std::size_t i = 0; i < kept + 2; ++i)
+  {
+    lent.push_back(pool.take());
+    recent.push_back(lent.back().data());
+  }
+  for (auto &buffer : lent)
+  {
+    pool.give(std::move(buffer));
+  }
+  lent.clear();
+  pool.trim();
+  CHECK(pool.size() == kept + 2);
+  std::vector<const std::byte *> survivors;
+  for (std::size_t i = 0; i < kept + 2; ++i)
+  {
+    lent.push_back(pool.take());
+    survivors.push_back(lent.back().data());
+  }
+  std::sort(recent.begin(), recent.end());
+  std::sort(survivors.begin(), survivors.end());
+  CHECK(survivors == recent);
+  for (auto &buffer : lent)
+  {
+    pool.give(std::move(buffer));
+  }
+  lent.clear();
+  pool.trim();
+  CHECK(pool.size() == kept + 2);
+  pool.trim();
+  CHECK(pool.size() == kept);
+  pool.trim();
+  CHECK(pool.size() == kept);
+
+  int first = 0;
+  int second = 0;
+  CHECK_FALSE(pool.claim_trim(&first));
+  pool.give(output_sized_buffer());
+  CHECK(pool.claim_trim(&first));
+  CHECK(pool.trim_claimed());
+  CHECK_FALSE(pool.claim_trim(&second));
+  CHECK_FALSE(pool.release_trim(&second));
+  CHECK(pool.release_trim(&first));
+  CHECK_FALSE(pool.trim_claimed());
+
+  pool.attach();
+  pool.attach();
+  for (std::size_t i = 0; i < kept; ++i)
+  {
+    pool.give(output_sized_buffer());
+  }
+  pool.detach();
+  CHECK(pool.size() == 2 * kept + 1);
+  pool.detach();
+  CHECK(pool.size() == kept);
+}
+
+TEST_CASE("an idle TLS connection holds no output buffer and the pool returns to its floor once writes stop")
+{
+  constexpr auto kept = vio::detail::ssl_output_pool_t::spare_floor;
+  auto config = make_pair_config();
+  seed_output_pool(3 * kept);
+  REQUIRE_FALSE(vio::detail::ssl_output_pool().trim_claimed());
+  bool claimed_after_exchange = false;
+  std::size_t client_capacity = 1;
+  std::size_t pooled_when_idle = 0;
+  bool claimed_when_idle = true;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = echo_server(el, std::move(pair->first), config.server, port, true);
+      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, bool &claimed_after_exchange, std::size_t &client_capacity, std::size_t &pooled_when_idle,
+                            bool &claimed_when_idle) -> vio::task_t<void>
+      {
+        auto c = vio::ssl_client_create(el, cc);
+        REQUIRE_EXPECTED(c);
+        auto client = std::move(c.value());
+        auto cr = co_await vio::ssl_client_connect(client, "localhost", static_cast<uint16_t>(p), "127.0.0.1");
+        REQUIRE_EXPECTED(cr);
+        auto reader = vio::ssl_client_create_reader(client);
+        REQUIRE_EXPECTED(reader);
+        std::string msg = "ping";
+        auto wr = co_await vio::ssl_client_write(client, std::as_bytes(std::span(msg)));
+        REQUIRE_EXPECTED(wr);
+        auto echoed = co_await reader.value();
+        REQUIRE_EXPECTED(echoed);
+        auto &pool = vio::detail::ssl_output_pool();
+        claimed_after_exchange = pool.trim_claimed();
+        client_capacity = client.state->engine.output_capacity();
+        for (int i = 0; i < 60 && pool.size() > vio::detail::ssl_output_pool_t::spare_floor; ++i)
+        {
+          auto tick = vio::sleep(el, std::chrono::milliseconds(50));
+          co_await tick;
+        }
+        pooled_when_idle = pool.size();
+        claimed_when_idle = pool.trim_claimed();
+        auto sh = co_await vio::ssl_client_shutdown(client);
+        REQUIRE_EXPECTED(sh);
+      }(el, config.client, port, claimed_after_exchange, client_capacity, pooled_when_idle, claimed_when_idle);
+      co_await std::move(client_task);
+      { auto destroy = std::move(client_task); }
+      co_await std::move(server_task);
+      el.stop();
+    });
+  CHECK(claimed_after_exchange);
+  CHECK(client_capacity == 0);
+  CHECK(pooled_when_idle == kept);
+  CHECK_FALSE(claimed_when_idle);
+}
+
+TEST_CASE("closing the connection that holds the output trim frees what went untouched while another stays open")
+{
+  constexpr auto kept = vio::detail::ssl_output_pool_t::spare_floor;
+  auto config = make_pair_config();
+  seed_output_pool(3 * kept);
+  REQUIRE_FALSE(vio::detail::ssl_output_pool().trim_claimed());
+  bool claimed_by_first = false;
+  std::size_t pooled_after_first = 0;
+  bool claimed_after_first = true;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto first_pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(first_pair);
+      const int first_port = first_pair->second;
+      auto second_pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(second_pair);
+      const int second_port = second_pair->second;
+      auto first_server = echo_server(el, std::move(first_pair->first), config.server, first_port, true);
+      auto second_server = echo_server(el, std::move(second_pair->first), config.server, second_port, true);
+
+      auto exchange = [](vio::event_loop_t &el, vio::ssl_config_t cc, int port, vio::ssl_client_t &client) -> vio::task_t<void>
+      {
+        auto created = vio::ssl_client_create(el, cc);
+        REQUIRE_EXPECTED(created);
+        client = std::move(created.value());
+        auto connected = co_await vio::ssl_client_connect(client, "localhost", static_cast<uint16_t>(port), "127.0.0.1");
+        REQUIRE_EXPECTED(connected);
+        auto reader = vio::ssl_client_create_reader(client);
+        REQUIRE_EXPECTED(reader);
+        std::string msg = "ping";
+        auto written = co_await vio::ssl_client_write(client, std::as_bytes(std::span(msg)));
+        REQUIRE_EXPECTED(written);
+        auto echoed = co_await reader.value();
+        REQUIRE_EXPECTED(echoed);
+      };
+
+      vio::ssl_client_t second_client{vio::ref_ptr_t<vio::ssl_client_state_t>::null()};
+      {
+        vio::ssl_client_t first_client{vio::ref_ptr_t<vio::ssl_client_state_t>::null()};
+        co_await exchange(el, config.client, first_port, first_client);
+        claimed_by_first = vio::detail::ssl_output_pool().trim_claimed();
+        co_await exchange(el, config.client, second_port, second_client);
+        auto closed = co_await vio::ssl_client_shutdown(first_client);
+        REQUIRE_EXPECTED(closed);
+      }
+      co_await std::move(first_server);
+      for (int i = 0; i < 20; ++i)
+      {
+        auto tick = vio::sleep(el, std::chrono::milliseconds(5));
+        co_await tick;
+      }
+      pooled_after_first = vio::detail::ssl_output_pool().size();
+      claimed_after_first = vio::detail::ssl_output_pool().trim_claimed();
+      auto closed = co_await vio::ssl_client_shutdown(second_client);
+      REQUIRE_EXPECTED(closed);
+      { auto drop = std::move(second_client); }
+      co_await std::move(second_server);
+      el.stop();
+    });
+  CHECK(claimed_by_first);
+  CHECK(pooled_after_first == kept);
+  CHECK_FALSE(claimed_after_first);
+}
+
+TEST_CASE("an armed output trim does not keep run() going after stop()")
+{
+  constexpr auto kept = vio::detail::ssl_output_pool_t::spare_floor;
+  auto config = make_pair_config();
+  seed_output_pool(3 * kept);
+  vio::event_loop_t event_loop;
+  std::optional<vio::ssl_server_t> server;
+  std::optional<vio::ssl_server_client_t> accepted;
+  std::optional<vio::ssl_client_t> client;
+  bool claimed = false;
+  std::chrono::steady_clock::time_point stopped_at;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &el, vio::ssl_config_t server_config, vio::ssl_config_t client_config, std::optional<vio::ssl_server_t> &server,
+                std::optional<vio::ssl_server_client_t> &accepted, std::optional<vio::ssl_client_t> &client, bool &claimed,
+                std::chrono::steady_clock::time_point &stopped_at) -> vio::task_t<void>
+      {
+        auto pair = get_ephemeral_port(el);
+        REQUIRE_EXPECTED(pair);
+        const int port = pair->second;
+        auto created_server = vio::ssl_server_create(el, std::move(pair->first), "localhost", server_config);
+        REQUIRE_EXPECTED(created_server);
+        server.emplace(std::move(created_server.value()));
+        auto listening = vio::ssl_server_listen(*server, 4);
+        auto created_client = vio::ssl_client_create(el, client_config);
+        REQUIRE_EXPECTED(created_client);
+        client.emplace(std::move(created_client.value()));
+        auto connecting = vio::ssl_client_connect(*client, "localhost", static_cast<uint16_t>(port), "127.0.0.1");
+        auto listened = co_await listening;
+        REQUIRE_EXPECTED(listened);
+        auto incoming = vio::ssl_server_accept(*server);
+        REQUIRE_EXPECTED(incoming);
+        accepted.emplace(std::move(incoming.value()));
+        auto handshake = co_await vio::ssl_server_client_handshake(*accepted);
+        REQUIRE_EXPECTED(handshake);
+        auto connected = co_await connecting;
+        REQUIRE_EXPECTED(connected);
+        std::string msg = "ping";
+        auto wr = co_await vio::ssl_client_write(*client, std::as_bytes(std::span(msg)));
+        REQUIRE_EXPECTED(wr);
+        claimed = vio::detail::ssl_output_pool().trim_claimed();
+        stopped_at = std::chrono::steady_clock::now();
+        el.stop();
+      }(event_loop, config.server, config.client, server, accepted, client, claimed, stopped_at);
+    });
+  event_loop.run();
+  const auto stopped_for = std::chrono::steady_clock::now() - stopped_at;
+  client.reset();
+  accepted.reset();
+  server.reset();
+  event_loop.run();
+  CHECK(claimed);
+  CHECK(stopped_for < std::chrono::milliseconds(500));
+  CHECK(vio::detail::ssl_output_pool().size() == kept);
+  CHECK_FALSE(vio::detail::ssl_output_pool().trim_claimed());
 }
 
 TEST_CASE("upgrading a socket that is not connected fails")

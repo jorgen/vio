@@ -112,6 +112,11 @@ struct ssl_client_state_t
     finish_connect(std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"}));
   }
 
+  [[nodiscard]] bool lookup_running() const noexcept
+  {
+    return resolving;
+  }
+
   void abandon_connect() noexcept
   {
     if (connect_op.parked && tcp.handle)
@@ -275,15 +280,19 @@ private:
     ::freeaddrinfo(list);
   }
 
-  static void resolve_done(detail::pool_job_t *job, bool)
+  static void resolve_done(detail::pool_job_t *job, bool canceled)
   {
     auto *self = static_cast<ssl_client_state_t *>(job->owner);
     auto owned = ref_ptr_t<ssl_client_state_t>::from_raw(std::exchange(self->resolve_parked, nullptr));
     self->resolving = false;
     self->resolved_done = true;
-    if (!self->connecting)
-    {
+    if (!self->connecting || canceled)
       address_info_list_t().swap(self->resolved);
+    if (!self->connecting)
+      return;
+    if (canceled)
+    {
+      self->finish_connect(std::unexpected(make_error(errc::canceled)));
       return;
     }
     if (self->resolve_status < 0)
@@ -388,6 +397,11 @@ inline bool ssl_client_begin_connect(ssl_client_t &client, const std::string &ho
   if (state.engine.initialized())
   {
     state.connect_result = std::unexpected(error_t{.code = errc::already_connected, .msg = "A TLS client can not connect again once a handshake has started; create a new client"});
+    return false;
+  }
+  if (state.lookup_running())
+  {
+    state.connect_result = std::unexpected(error_t{.code = errc::already_in_progress, .msg = "A TLS client can not connect again while the lookup of a cancelled connect is still running"});
     return false;
   }
   state.host = host;

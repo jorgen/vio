@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <doctest/doctest.h>
@@ -1176,6 +1179,141 @@ TEST_CASE("a reader that stays behind its sender keeps its queue within the limi
     CHECK(result.stats.dropped_datagrams > 0);
     CHECK(result.stats.recv_errors == 0);
     CHECK(result.received + result.stats.dropped_datagrams + result.stats.queued == static_cast<std::uint64_t>(result.sent));
+  }
+}
+
+namespace
+{
+struct flood_t
+{
+  std::atomic<bool> running{true};
+  std::vector<std::thread> threads;
+
+  flood_t() = default;
+  flood_t(const flood_t &) = delete;
+  flood_t &operator=(const flood_t &) = delete;
+
+  ~flood_t()
+  {
+    stop();
+  }
+
+  void start(int port, int count)
+  {
+    for (int i = 0; i < count; ++i)
+    {
+      threads.emplace_back(
+        [this, port]
+        {
+          vio::native_socket_t socket = vio::invalid_native_socket;
+          auto dest = make_ip4("127.0.0.1", port);
+          if (!dest.has_value() || vio::detail::socket_open(AF_INET, SOCK_DGRAM, 0, socket) < 0)
+          {
+            return;
+          }
+          const std::byte payload[1] = {std::byte{0x46}};
+          std::array<vio::detail::udp_out_message_t, vio::detail::udp_message_batch_limit> batch;
+          for (auto &message : batch)
+          {
+            message = vio::detail::udp_out_message_t{.bytes = vio::detail::const_bytes_t(payload, 1), .to = reinterpret_cast<const sockaddr *>(&dest.value()), .to_length = static_cast<int>(sizeof(sockaddr_in))};
+          }
+          const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          while (running.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < give_up)
+          {
+            (void)vio::detail::udp_send_many(socket, batch.data(), batch.size());
+          }
+          (void)vio::detail::socket_close(socket);
+        });
+    }
+  }
+
+  void stop()
+  {
+    running = false;
+    for (auto &thread : threads)
+    {
+      thread.join();
+    }
+    threads.clear();
+  }
+};
+
+struct unawaited_flood_result_t
+{
+  bool retry_queued = true;
+  bool parked = false;
+  bool parked_keeps_alive = true;
+  std::uint64_t taken = 0;
+  std::chrono::steady_clock::time_point stopped_at;
+};
+
+vio::task_t<void> flood_an_unawaited_reader(vio::event_loop_t &loop, vio::udp_recvmmsg_t mode, std::optional<vio::udp_t> &receiver, std::optional<vio::udp_reader_t> &reader, flood_t &flood,
+                                            unawaited_flood_result_t &result)
+{
+  constexpr std::size_t backlog = 4 * vio::udp_recv_burst;
+  auto created = vio::udp_create(loop, mode);
+  REQUIRE_EXPECTED(created);
+  receiver.emplace(std::move(created.value()));
+  auto any = make_ip4("127.0.0.1", 0);
+  REQUIRE_EXPECTED(any);
+  REQUIRE_EXPECTED(vio::udp_bind(*receiver, reinterpret_cast<const sockaddr *>(&any.value())));
+  auto name = vio::udp_sockname(*receiver);
+  REQUIRE_EXPECTED(name);
+  const int port = ntohs(reinterpret_cast<const sockaddr_in *>(&name.value())->sin_port);
+  (void)vio::udp_set_recv_buffer_size(*receiver, 1 << 22);
+  {
+    auto sender_pair = bound_socket(loop);
+    REQUIRE_EXPECTED(sender_pair);
+    auto dest = make_ip4("127.0.0.1", port);
+    REQUIRE_EXPECTED(dest);
+    for (std::size_t i = 0; i < backlog; ++i)
+    {
+      REQUIRE_EXPECTED(vio::udp_try_send(sender_pair->first, as_bytes("backlog"), reinterpret_cast<const sockaddr *>(&dest.value())));
+    }
+    auto settle = vio::sleep(loop, std::chrono::milliseconds(20));
+    co_await settle;
+  }
+
+  auto reader_or_err = vio::udp_create_reader(*receiver);
+  REQUIRE_EXPECTED(reader_or_err);
+  reader.emplace(std::move(reader_or_err.value()));
+  const auto &recv = reader->handle->recv;
+  result.retry_queued = recv.retry.queued;
+  result.parked = recv.op.parked;
+  result.parked_keeps_alive = recv.op.keeps_alive;
+
+  flood.start(port, 2);
+  auto flooding = vio::sleep(loop, std::chrono::milliseconds(50));
+  co_await flooding;
+  auto stats = vio::udp_recv_stats(*receiver);
+  result.taken = stats.queued + stats.dropped_datagrams;
+  result.stopped_at = std::chrono::steady_clock::now();
+  loop.stop();
+}
+} // namespace
+
+TEST_CASE("a reader nobody awaits keeps reading under a flood but does not keep run() going after stop()")
+{
+  for (auto mode : {vio::udp_recvmmsg_t::off, vio::udp_recvmmsg_t::on})
+  {
+    CAPTURE(static_cast<int>(mode));
+    vio::event_loop_t event_loop;
+    std::optional<vio::udp_t> receiver;
+    std::optional<vio::udp_reader_t> reader;
+    flood_t flood;
+    unawaited_flood_result_t result;
+    event_loop.run_in_loop([&] { return flood_an_unawaited_reader(event_loop, mode, receiver, reader, flood, result); });
+    event_loop.run();
+    const auto stopped_for = std::chrono::steady_clock::now() - result.stopped_at;
+    flood.stop();
+    reader.reset();
+    receiver.reset();
+    event_loop.run();
+    CHECK_FALSE(result.retry_queued);
+    CHECK(result.parked);
+    CHECK_FALSE(result.parked_keeps_alive);
+    CHECK(result.taken > 4 * vio::udp_recv_burst);
+    CHECK(stopped_for < std::chrono::seconds(1));
   }
 }
 }

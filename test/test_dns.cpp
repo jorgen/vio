@@ -2,6 +2,8 @@
 #include <vio/event_loop.h>
 #include <vio/loop/blocking_pool.h>
 #include <vio/operation/dns.h>
+#include <vio/operation/sleep.h>
+#include <vio/operation/tls_client.h>
 #include <vio/task.h>
 
 #include <condition_variable>
@@ -106,7 +108,8 @@ int numeric_lookups_in_a_new_loop()
   return outcome;
 }
 
-int status_of_forked(int (*body)())
+template <typename Body>
+int status_of_forked(Body &&body)
 {
   const pid_t child = ::fork();
   if (child < 0)
@@ -412,6 +415,79 @@ TEST_CASE("a lookup cancelled while queued resumes at once with errc::canceled")
   CHECK(gate.finished == static_cast<int>(more_than_any_pool));
 }
 
+TEST_CASE("a lookup whose queued job the pool cancels resolves with errc::canceled, not an empty success")
+{
+  vio::event_loop_t event_loop;
+  dns_gate_t gate(more_than_any_pool);
+  bool completed = false;
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &ev, dns_gate_t &gate, bool &completed) -> vio::task_t<void> {
+      gate.block(ev);
+      auto resolved = vio::get_addrinfo(ev, "localhost");
+      auto named = vio::get_nameinfo(ev, ipv4_loopback(80));
+      CHECK(vio::detail::pool_cancel(resolved.state_ptr->job));
+      CHECK(vio::detail::pool_cancel(named.state_ptr->job));
+      auto resolved_result = co_await resolved;
+      auto named_result = co_await named;
+      CHECK_FALSE(resolved_result.has_value());
+      if (!resolved_result.has_value())
+        CHECK(resolved_result.error().code == vio::errc::canceled);
+      CHECK_FALSE(named_result.has_value());
+      if (!named_result.has_value())
+        CHECK(named_result.error().code == vio::errc::canceled);
+      gate.release();
+      completed = true;
+      ev.stop();
+    }(event_loop, gate, completed);
+  });
+  event_loop.run();
+  CHECK(completed);
+  CHECK(gate.finished == static_cast<int>(more_than_any_pool));
+}
+
+TEST_CASE("a TLS client refuses to connect again while the lookup of a cancelled connect still holds the resolver job")
+{
+  vio::event_loop_t event_loop;
+  dns_gate_t gate(more_than_any_pool);
+  int first_code = 0;
+  int refused_code = 0;
+  bool lookup_finished = false;
+  int later_code = 0;
+  event_loop.run_in_loop([&] {
+    return [](vio::event_loop_t &ev, dns_gate_t &gate, int &first_code, int &refused_code, bool &lookup_finished, int &later_code) -> vio::task_t<void> {
+      gate.block(ev);
+      auto created = vio::ssl_client_create(ev);
+      REQUIRE_EXPECTED(created);
+      auto client = std::move(created.value());
+      {
+        vio::cancellation_t abandon;
+        auto first = vio::ssl_client_connect(client, "localhost", 9, &abandon);
+        abandon.cancel();
+        auto first_result = co_await first;
+        first_code = first_result.has_value() ? 0 : first_result.error().code;
+      }
+      auto refused = co_await vio::ssl_client_connect(client, "localhost", 9);
+      refused_code = refused.has_value() ? 0 : refused.error().code;
+      gate.release();
+      for (int i = 0; i < 400 && client.state->lookup_running(); ++i)
+      {
+        auto tick = vio::sleep(ev, std::chrono::milliseconds(5));
+        co_await tick;
+      }
+      lookup_finished = !client.state->lookup_running();
+      auto later = co_await vio::ssl_client_connect(client, "localhost", 9);
+      later_code = later.has_value() ? 0 : later.error().code;
+      ev.stop();
+    }(event_loop, gate, first_code, refused_code, lookup_finished, later_code);
+  });
+  event_loop.run();
+  CHECK(first_code == vio::vio_cancelled);
+  CHECK(refused_code == vio::errc::already_in_progress);
+  CHECK(lookup_finished);
+  CHECK(later_code != vio::errc::already_in_progress);
+  CHECK(gate.finished == static_cast<int>(more_than_any_pool));
+}
+
 TEST_CASE("a lookup whose future is dropped still finishes before run returns")
 {
   vio::event_loop_t event_loop;
@@ -432,6 +508,39 @@ TEST_CASE("a lookup completes in a process forked after the resolver pool starte
   REQUIRE(status != -1);
   CHECK_MESSAGE(WIFEXITED(status), "the child was killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
   CHECK(WEXITSTATUS(status) == 0);
+}
+
+TEST_CASE("a TLS connect and a lookup queued at a fork fail with errc::canceled in the child")
+{
+  vio::event_loop_t event_loop;
+  dns_gate_t gate(more_than_any_pool);
+  int status = -1;
+  {
+    gate.block(event_loop);
+    auto created = vio::ssl_client_create(event_loop);
+    REQUIRE_EXPECTED(created);
+    auto client = std::move(created.value());
+    vio::cancellation_t abandon;
+    auto connecting = vio::ssl_client_connect(client, "localhost", 9, &abandon);
+    auto lookup = vio::get_addrinfo(event_loop, "localhost");
+    status = status_of_forked([&] {
+      event_loop.stop();
+      event_loop.run();
+      const auto &connected = client.state->connect_result;
+      const auto &looked_up = lookup.state_ptr->result;
+      const bool connect_canceled = !client.state->connecting && !connected.has_value() && connected.error().code == vio::errc::canceled;
+      const bool lookup_canceled = lookup.state_ptr->done && !looked_up.has_value() && looked_up.error().code == vio::errc::canceled;
+      return (connect_canceled ? 0 : 1) | (lookup_canceled ? 0 : 2);
+    });
+    abandon.cancel();
+    gate.release();
+  }
+  event_loop.stop();
+  event_loop.run();
+  REQUIRE(status != -1);
+  CHECK_MESSAGE(WIFEXITED(status), "the child was killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
+  CHECK(WEXITSTATUS(status) == 0);
+  CHECK(gate.finished == static_cast<int>(more_than_any_pool));
 }
 #endif
 } // TEST_SUITE
