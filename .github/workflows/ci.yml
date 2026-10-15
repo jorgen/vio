@@ -129,12 +129,18 @@ jobs:
       - name: Test on epoll
         env:
           VIO_BACKEND: epoll
-        run: ./build/test/vio_tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ./build/test/vio_tests 2>&1 | tee test-epoll.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-epoll.log | head -400; exit 1; }
 
       - name: Test on io_uring
         env:
           VIO_BACKEND: io_uring
-        run: ./build/test/vio_tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ./build/test/vio_tests 2>&1 | tee test-io_uring.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-io_uring.log | head -400; exit 1; }
 
   macos:
     runs-on: macos-15
@@ -192,7 +198,10 @@ jobs:
         run: cmake --build build
 
       - name: Test
-        run: ./build/test/vio_tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ./build/test/vio_tests 2>&1 | tee test.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|AddressSanitizer" test.log | head -400; exit 1; }
 
   windows-msvc:
     runs-on: windows-2025
@@ -235,4 +244,4 @@ jobs:
           call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           cmake --preset ${{ matrix.preset }} || exit /b 1
           cmake --build --preset ${{ matrix.preset }} || exit /b 1
-          ctest --preset ${{ matrix.preset }} --output-on-failure || exit /b 1
+          ctest --preset ${{ matrix.preset }} --output-on-failure > test.log 2>&1 || (findstr /n /c:"ERROR" /c:"FATAL" /c:"CRASHED" test.log & exit /b 1)

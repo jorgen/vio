@@ -691,7 +691,8 @@ TEST_CASE("a loop can be destroyed as soon as work posted from another thread ha
     vio::event_loop_t *loop;
     void spin()
     {
-      loop->run_in_loop([this] { spin(); });
+      if (!vio::detail::core(*loop).stopping())
+        loop->run_in_loop([this] { spin(); });
     }
   };
   for (int i = 0; i < 2000; ++i)
