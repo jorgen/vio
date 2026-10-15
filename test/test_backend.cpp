@@ -67,12 +67,14 @@ struct probe_op_t : detail::io_op_t
   }
 };
 
+class harness_t;
+
 struct test_socket_t
 {
-  explicit test_socket_t(detail::loop_core_t &core)
-    : resource(core)
-  {
-  }
+  explicit test_socket_t(harness_t &harness);
+  test_socket_t(const test_socket_t &) = delete;
+  test_socket_t &operator=(const test_socket_t &) = delete;
+  ~test_socket_t();
 
   void close()
   {
@@ -87,11 +89,23 @@ struct test_socket_t
       this);
   }
 
+  void release() noexcept
+  {
+    while (auto *op = resource.watch.readers.front())
+      resource.cancel(*op);
+    while (auto *op = resource.watch.writers.front())
+      resource.cancel(*op);
+    on_closed = nullptr;
+    if (!resource.closing())
+      close();
+  }
+
   [[nodiscard]] vio::native_socket_t native() const
   {
     return resource.native();
   }
 
+  harness_t &harness;
   detail::socket_resource_t resource;
   bool closed = false;
   std::function<void()> on_closed;
@@ -111,21 +125,162 @@ struct turn_counter_t
 
 struct alarm_t
 {
+  explicit alarm_t(harness_t &harness);
+  alarm_t(const alarm_t &) = delete;
+  alarm_t &operator=(const alarm_t &) = delete;
+  ~alarm_t();
+
+  void arm(std::chrono::nanoseconds delay, std::function<void()> callback);
+
+  harness_t &harness;
   detail::timer_node_t node;
   std::function<void()> fire;
-
-  alarm_t()
-  {
-    node.owner = this;
-    node.fire = [](detail::timer_node_t *raw) { static_cast<alarm_t *>(raw->owner)->fire(); };
-  }
-
-  void arm(detail::loop_core_t &core, std::chrono::nanoseconds delay, std::function<void()> callback)
-  {
-    fire = std::move(callback);
-    core.add_timer(node, detail::loop_core_t::now() + delay.count());
-  }
 };
+
+class harness_t
+{
+public:
+  explicit harness_t(vio::event_loop_t &loop, std::chrono::nanoseconds deadline = 60s)
+    : core(detail::core(loop))
+    , _loop(loop)
+    , _deadline(deadline)
+  {
+    _watchdog.owner = this;
+    _watchdog.keeps_alive = false;
+    _watchdog.fire = [](detail::timer_node_t *raw) { static_cast<harness_t *>(raw->owner)->expire(); };
+  }
+  harness_t(const harness_t &) = delete;
+  harness_t &operator=(const harness_t &) = delete;
+  ~harness_t()
+  {
+    core.remove_timer(_watchdog);
+  }
+
+  bool run()
+  {
+    core.add_timer(_watchdog, detail::loop_core_t::now() + _deadline.count());
+    try
+    {
+      _loop.run();
+    }
+    catch (...)
+    {
+      abandon();
+      throw;
+    }
+    core.remove_timer(_watchdog);
+    return !_timed_out;
+  }
+
+  void abandon() noexcept
+  {
+    _abandoning = true;
+    _loop.stop();
+    for (int round = 0; round < 100; ++round)
+    {
+      try
+      {
+        release();
+        core.add_timer(_watchdog, detail::loop_core_t::now() + sweep_interval.count());
+        _loop.run();
+        release();
+        break;
+      }
+      catch (...)
+      {
+      }
+    }
+    core.remove_timer(_watchdog);
+  }
+
+  [[nodiscard]] bool timed_out() const noexcept
+  {
+    return _timed_out;
+  }
+
+  void enroll(test_socket_t &socket)
+  {
+    _sockets.push_back(&socket);
+  }
+  void withdraw(test_socket_t &socket) noexcept
+  {
+    _sockets.erase(std::remove(_sockets.begin(), _sockets.end(), &socket), _sockets.end());
+  }
+  void enroll(alarm_t &alarm)
+  {
+    _alarms.push_back(&alarm);
+  }
+  void withdraw(alarm_t &alarm) noexcept
+  {
+    _alarms.erase(std::remove(_alarms.begin(), _alarms.end(), &alarm), _alarms.end());
+  }
+
+  detail::loop_core_t &core;
+
+private:
+  static constexpr std::chrono::nanoseconds sweep_interval = 10ms;
+
+  void release() noexcept
+  {
+    for (auto *alarm : _alarms)
+      core.remove_timer(alarm->node);
+    for (auto *socket : _sockets)
+      socket->release();
+  }
+
+  void expire()
+  {
+    if (!_abandoning)
+      _timed_out = true;
+    release();
+    _loop.stop();
+    core.add_timer(_watchdog, detail::loop_core_t::now() + sweep_interval.count());
+  }
+
+  vio::event_loop_t &_loop;
+  std::chrono::nanoseconds _deadline;
+  detail::timer_node_t _watchdog;
+  std::vector<test_socket_t *> _sockets;
+  std::vector<alarm_t *> _alarms;
+  bool _timed_out = false;
+  bool _abandoning = false;
+};
+
+test_socket_t::test_socket_t(harness_t &harness)
+  : harness(harness)
+  , resource(harness.core)
+{
+  harness.enroll(*this);
+}
+
+test_socket_t::~test_socket_t()
+{
+  harness.withdraw(*this);
+  if (resource.closing())
+    return;
+  release();
+  harness.abandon();
+}
+
+alarm_t::alarm_t(harness_t &harness)
+  : harness(harness)
+{
+  node.owner = this;
+  node.fire = [](detail::timer_node_t *raw) { static_cast<alarm_t *>(raw->owner)->fire(); };
+  harness.enroll(*this);
+}
+
+alarm_t::~alarm_t()
+{
+  harness.core.remove_timer(node);
+  harness.withdraw(*this);
+}
+
+void alarm_t::arm(std::chrono::nanoseconds delay, std::function<void()> callback)
+{
+  fire = std::move(callback);
+  harness.core.add_timer(node, detail::loop_core_t::now() + delay.count());
+}
 
 struct tcp_pair_t
 {
@@ -223,10 +378,11 @@ TEST_CASE("backend: a parked reader wakes when the peer writes")
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   MESSAGE("backend: " << std::string(loop.backend_name()));
   auto pair = make_tcp_pair();
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
@@ -253,7 +409,7 @@ TEST_CASE("backend: a parked reader wakes when the peer writes")
     CHECK(core.in_flight() == 1);
     loop.run_in_loop([&] { CHECK(detail::socket_send(client.native(), bytes("ping")) == 4); });
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK(received == "ping");
   CHECK(reader.completions >= 1);
   CHECK(server.closed);
@@ -266,11 +422,12 @@ TEST_CASE("backend: a parked writer wakes when the peer drains")
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   auto pair = make_tcp_pair();
   set_buffer_sizes(pair.client, 8192);
   set_buffer_sizes(pair.server, 8192);
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
@@ -308,7 +465,7 @@ TEST_CASE("backend: a parked writer wakes when the peer drains")
     CHECK(writer.parked);
     loop.run_in_loop([&] { drain_some(); });
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK(wrote_after_wake);
   CHECK(drained > 0);
   CHECK_FALSE(drainer.parked);
@@ -320,14 +477,15 @@ TEST_CASE("backend: cancel_wait detaches a parked op at once and it never comple
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   auto pair = make_tcp_pair();
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
   probe_op_t reader;
-  alarm_t alarm;
+  alarm_t alarm(harness);
   bool data_still_there = false;
   loop.run_in_loop([&] {
     REQUIRE(would_block_reading(server.native()));
@@ -340,7 +498,7 @@ TEST_CASE("backend: cancel_wait detaches a parked op at once and it never comple
       CHECK_FALSE(reader.parked);
       CHECK(core.in_flight() == before_cancel - 1);
       CHECK(detail::socket_send(client.native(), bytes("late")) == 4);
-      alarm.arm(core, 30ms, [&] {
+      alarm.arm(30ms, [&] {
         std::byte buffer[16];
         data_still_there = detail::socket_recv(server.native(), buffer) == 4;
         server.close();
@@ -349,7 +507,7 @@ TEST_CASE("backend: cancel_wait detaches a parked op at once and it never comple
       });
     });
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK(reader.completions == 0);
   CHECK(data_still_there);
   CHECK(core.in_flight() == 0);
@@ -359,9 +517,10 @@ TEST_CASE("backend: two ops parked on one interest both wake")
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   auto pair = make_tcp_pair();
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
@@ -383,7 +542,7 @@ TEST_CASE("backend: two ops parked on one interest both wake")
     server.resource.wait(detail::interest_read, second);
     loop.run_in_loop([&] { CHECK(detail::socket_send(client.native(), bytes("x")) == 1); });
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK(first.completions == 1);
   CHECK(second.completions == 1);
   CHECK(core.in_flight() == 0);
@@ -432,9 +591,10 @@ TEST_CASE("backend: closing a watch with a parked op neither completes the op no
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   auto pair = make_tcp_pair();
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
@@ -456,7 +616,7 @@ TEST_CASE("backend: closing a watch with a parked op neither completes the op no
       closed_synchronously = server.closed;
     });
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK_FALSE(closed_synchronously);
   CHECK(server.closed);
   CHECK(parked_at_close);
@@ -470,11 +630,12 @@ TEST_CASE("backend: remove_watch finishes on a later turn, also with a poll alre
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   turn_counter_t counter;
   core.add_hook(counter.hook);
   auto pair = make_tcp_pair();
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
@@ -496,7 +657,7 @@ TEST_CASE("backend: remove_watch finishes on a later turn, also with a poll alre
       CHECK_FALSE(server.closed);
     });
   });
-  loop.run();
+  CHECK(harness.run());
   core.remove_hook(counter.hook);
   CHECK(server.closed);
   CHECK(finished_on > closed_on);
@@ -508,9 +669,10 @@ TEST_CASE("backend: readiness that races a close is dropped")
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   auto pair = make_tcp_pair();
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
@@ -529,7 +691,7 @@ TEST_CASE("backend: readiness that races a close is dropped")
       server.close();
     });
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK(server.closed);
   CHECK(reader.completions == 0);
   CHECK(core.in_flight() == 0);
@@ -539,9 +701,10 @@ TEST_CASE("backend: a socket closed after its loop moved to another thread is fr
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   auto pair = make_tcp_pair();
-  auto *server = new test_socket_t(core);
-  test_socket_t client(core);
+  auto *server = new test_socket_t(harness);
+  test_socket_t client(harness);
   REQUIRE(server->resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
@@ -579,7 +742,7 @@ TEST_CASE("backend: a socket closed after its loop moved to another thread is fr
     server->close();
   });
   const auto start = std::chrono::steady_clock::now();
-  loop.run();
+  CHECK(harness.run());
   const auto waited = std::chrono::steady_clock::now() - start;
   keep_spinning = false;
   first.join();
@@ -594,20 +757,21 @@ TEST_CASE("backend: a writer facing a half-closed peer with a full buffer does n
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   turn_counter_t counter;
   core.add_hook(counter.hook);
   auto pair = make_tcp_pair();
   set_buffer_sizes(pair.client, 8192);
   set_buffer_sizes(pair.server, 8192);
-  test_socket_t server(core);
-  test_socket_t client(core);
+  test_socket_t server(harness);
+  test_socket_t client(harness);
   REQUIRE(server.resource.adopt(pair.server) == 0);
   REQUIRE(client.resource.adopt(pair.client) == 0);
 
   probe_op_t writer;
   probe_op_t drainer;
-  alarm_t settle;
-  alarm_t observe;
+  alarm_t settle(harness);
+  alarm_t observe(harness);
   std::int64_t turns_at_park = 0;
   std::int64_t turns_while_parked = -1;
   bool wrote = false;
@@ -634,17 +798,17 @@ TEST_CASE("backend: a writer facing a half-closed peer with a full buffer does n
   loop.run_in_loop([&] {
     REQUIRE(fill(client.native()) > 0);
     REQUIRE(detail::socket_shutdown_write(server.native()) == 0);
-    settle.arm(core, 20ms, [&] {
+    settle.arm(20ms, [&] {
       REQUIRE(detail::socket_send(client.native(), bytes("x")) == vio::errc::again);
       client.resource.wait(detail::interest_write, writer);
       turns_at_park = counter.turns;
-      observe.arm(core, 200ms, [&] {
+      observe.arm(200ms, [&] {
         turns_while_parked = counter.turns - turns_at_park;
         drain_some();
       });
     });
   });
-  loop.run();
+  CHECK(harness.run());
   core.remove_hook(counter.hook);
   MESSAGE("turns while a writer waited on a half-closed peer: " << turns_while_parked);
   CHECK(wrote);
@@ -657,14 +821,15 @@ TEST_CASE("backend: many sockets exchange messages without a lost wake")
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   constexpr int pairs = 24;
   constexpr int rounds = 40;
 
   struct lane_t
   {
-    explicit lane_t(detail::loop_core_t &core)
-      : server(core)
-      , client(core)
+    explicit lane_t(harness_t &harness)
+      : server(harness)
+      , client(harness)
     {
     }
     test_socket_t server;
@@ -678,7 +843,7 @@ TEST_CASE("backend: many sockets exchange messages without a lost wake")
   for (int i = 0; i < pairs; ++i)
   {
     auto pair = make_tcp_pair();
-    auto lane = std::make_unique<lane_t>(core);
+    auto lane = std::make_unique<lane_t>(harness);
     REQUIRE(lane->server.resource.adopt(pair.server) == 0);
     REQUIRE(lane->client.resource.adopt(pair.client) == 0);
     lanes.push_back(std::move(lane));
@@ -728,7 +893,7 @@ TEST_CASE("backend: many sockets exchange messages without a lost wake")
       lane->client.resource.wait(detail::interest_read, lane->client_reader);
     }
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK(finished == pairs);
   for (auto &lane : lanes)
   {
@@ -740,6 +905,79 @@ TEST_CASE("backend: many sockets exchange messages without a lost wake")
   CHECK(core.open_resources() == 0);
 }
 
+namespace
+{
+struct deliberate_failure_t
+{
+};
+} // namespace
+
+TEST_CASE("backend: a callback that throws ends the test with its sockets closed and its operations released")
+{
+  vio::event_loop_t loop;
+  auto &core = detail::core(loop);
+  harness_t harness(loop);
+  auto pair = make_tcp_pair();
+  test_socket_t server(harness);
+  test_socket_t client(harness);
+  REQUIRE(server.resource.adopt(pair.server) == 0);
+  REQUIRE(client.resource.adopt(pair.client) == 0);
+
+  probe_op_t woken;
+  probe_op_t idle;
+  alarm_t never(harness);
+  woken.on_complete = [](probe_op_t &) { throw deliberate_failure_t{}; };
+  loop.run_in_loop([&] {
+    REQUIRE(would_block_reading(server.native()));
+    REQUIRE(would_block_reading(client.native()));
+    server.resource.wait(detail::interest_read, woken);
+    client.resource.wait(detail::interest_read, idle);
+    never.arm(3600s, [] {});
+    CHECK(detail::socket_send(client.native(), bytes("go")) == 2);
+  });
+  CHECK_THROWS_AS(harness.run(), deliberate_failure_t);
+  CHECK(woken.completions == 1);
+  CHECK_FALSE(woken.parked);
+  CHECK_FALSE(idle.parked);
+  CHECK(idle.completions == 0);
+  CHECK_FALSE(never.node.armed());
+  CHECK(server.closed);
+  CHECK(client.closed);
+  CHECK(core.in_flight() == 0);
+  CHECK(core.open_resources() == 0);
+}
+
+TEST_CASE("backend: a test that outlives its deadline ends with its sockets closed and its operations released")
+{
+  vio::event_loop_t loop;
+  auto &core = detail::core(loop);
+  harness_t harness(loop, 100ms);
+  auto pair = make_tcp_pair();
+  test_socket_t server(harness);
+  test_socket_t client(harness);
+  REQUIRE(server.resource.adopt(pair.server) == 0);
+  REQUIRE(client.resource.adopt(pair.client) == 0);
+
+  probe_op_t reader;
+  bool closed_callback_ran = false;
+  server.on_closed = [&] { closed_callback_ran = true; };
+  loop.run_in_loop([&] {
+    REQUIRE(would_block_reading(server.native()));
+    server.resource.wait(detail::interest_read, reader);
+  });
+  const auto start = std::chrono::steady_clock::now();
+  CHECK_FALSE(harness.run());
+  CHECK(std::chrono::steady_clock::now() - start < 30s);
+  CHECK(harness.timed_out());
+  CHECK_FALSE(reader.parked);
+  CHECK(reader.completions == 0);
+  CHECK_FALSE(closed_callback_ran);
+  CHECK(server.closed);
+  CHECK(client.closed);
+  CHECK(core.in_flight() == 0);
+  CHECK(core.open_resources() == 0);
+}
+
 #if !defined(_WIN32)
 namespace
 {
@@ -747,12 +985,13 @@ void reuse_descriptor_after_close(bool submitted_first)
 {
   vio::event_loop_t loop;
   auto &core = detail::core(loop);
+  harness_t harness(loop);
   auto first = make_tcp_pair();
   auto second = make_tcp_pair();
-  test_socket_t old_server(core);
-  test_socket_t old_client(core);
-  test_socket_t new_server(core);
-  test_socket_t new_client(core);
+  test_socket_t old_server(harness);
+  test_socket_t old_client(harness);
+  test_socket_t new_server(harness);
+  test_socket_t new_client(harness);
   REQUIRE(old_server.resource.adopt(first.server) == 0);
   REQUIRE(old_client.resource.adopt(first.client) == 0);
   REQUIRE(new_client.resource.adopt(second.client) == 0);
@@ -805,7 +1044,7 @@ void reuse_descriptor_after_close(bool submitted_first)
     else
       swap_sockets();
   });
-  loop.run();
+  CHECK(harness.run());
   CHECK(old_reader.completions == 0);
   CHECK(new_reader.completions >= 1);
   CHECK(core.in_flight() == 0);

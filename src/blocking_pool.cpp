@@ -22,11 +22,13 @@ Copyright (c) 2025 Jørgen Lind
 
 #include "vio/loop/blocking_pool.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <mutex>
 #include <new>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -39,6 +41,58 @@ namespace vio::detail
 {
 namespace
 {
+struct job_list_t
+{
+  pool_job_t *head = nullptr;
+  pool_job_t *tail = nullptr;
+
+  [[nodiscard]] bool empty() const noexcept
+  {
+    return head == nullptr;
+  }
+
+  void push_back(pool_job_t &job) noexcept
+  {
+    job.next = nullptr;
+    if (tail)
+      tail->next = &job;
+    else
+      head = &job;
+    tail = &job;
+  }
+
+  pool_job_t *pop_front() noexcept
+  {
+    auto *job = head;
+    if (!job)
+      return nullptr;
+    head = job->next;
+    if (!head)
+      tail = nullptr;
+    job->next = nullptr;
+    return job;
+  }
+
+  bool remove(pool_job_t &job) noexcept
+  {
+    pool_job_t *previous = nullptr;
+    for (auto *it = head; it; previous = it, it = it->next)
+    {
+      if (it != &job)
+        continue;
+      if (previous)
+        previous->next = it->next;
+      else
+        head = it->next;
+      if (tail == it)
+        tail = previous;
+      it->next = nullptr;
+      return true;
+    }
+    return false;
+  }
+};
+
 class job_queue_t
 {
 public:
@@ -58,12 +112,7 @@ public:
       std::lock_guard lock(_mutex);
       if (_threads.empty() && !_stopped)
         start();
-      job.next = nullptr;
-      if (_tail)
-        _tail->next = &job;
-      else
-        _head = &job;
-      _tail = &job;
+      _queued.push_back(job);
     }
     _ready.notify_one();
   }
@@ -71,21 +120,7 @@ public:
   bool remove(pool_job_t &job) noexcept
   {
     std::lock_guard lock(_mutex);
-    pool_job_t *previous = nullptr;
-    for (auto *it = _head; it; previous = it, it = it->next)
-    {
-      if (it != &job)
-        continue;
-      if (previous)
-        previous->next = it->next;
-      else
-        _head = it->next;
-      if (_tail == it)
-        _tail = previous;
-      it->next = nullptr;
-      return true;
-    }
-    return false;
+    return _queued.remove(job) || _orphaned.remove(job);
   }
 
   void shutdown() noexcept
@@ -101,14 +136,47 @@ public:
       thread.join();
   }
 
-  void forget_after_fork() noexcept
+  void lock_for_fork() noexcept
+  {
+    _mutex.lock();
+  }
+
+  void unlock_after_fork() noexcept
+  {
+    _mutex.unlock();
+  }
+
+  void orphan_after_fork() noexcept
   {
     new (&_mutex) std::mutex();
     new (&_ready) std::condition_variable();
     new (&_threads) std::vector<std::thread>();
-    _head = nullptr;
-    _tail = nullptr;
+    while (auto *job = _running.pop_front())
+    {
+      job->state.store(pool_job_queued, std::memory_order_relaxed);
+      _orphaned.push_back(*job);
+    }
+    while (auto *job = _queued.pop_front())
+      _orphaned.push_back(*job);
     _stopped = false;
+  }
+
+  void reclaim(loop_core_t &loop) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    job_list_t kept;
+    while (auto *job = _orphaned.pop_front())
+    {
+      if (job->loop != &loop)
+      {
+        kept.push_back(*job);
+        continue;
+      }
+      job->canceled = true;
+      job->state.store(pool_job_finished, std::memory_order_relaxed);
+      loop.defer(job->finished);
+    }
+    _orphaned = kept;
   }
 
 private:
@@ -126,17 +194,17 @@ private:
       pool_job_t *job;
       {
         std::unique_lock lock(_mutex);
-        _ready.wait(lock, [this] { return _stopped || _head; });
-        if (!_head)
+        _ready.wait(lock, [this] { return _stopped || !_queued.empty(); });
+        job = _queued.pop_front();
+        if (!job)
           return;
-        job = _head;
-        _head = job->next;
-        if (!_head)
-          _tail = nullptr;
-        job->next = nullptr;
         job->state.store(pool_job_running, std::memory_order_relaxed);
+        _running.push_back(*job);
       }
       job->work(job);
+      std::lock_guard lock(_mutex);
+      if (!_running.remove(*job))
+        continue;
       job->state.store(pool_job_finished, std::memory_order_release);
       job->loop->post(job->finished);
     }
@@ -146,8 +214,9 @@ private:
   std::mutex _mutex;
   std::condition_variable _ready;
   std::vector<std::thread> _threads;
-  pool_job_t *_head = nullptr;
-  pool_job_t *_tail = nullptr;
+  job_list_t _queued;
+  job_list_t _running;
+  job_list_t _orphaned;
   bool _stopped = false;
 };
 
@@ -167,26 +236,47 @@ struct pools_t
   pools_t()
   {
 #if !defined(_WIN32)
-    current = this;
-    if (::pthread_atfork(nullptr, nullptr, &pools_t::after_fork_in_child) != 0)
+    current.store(this, std::memory_order_release);
+    if (::pthread_atfork(&pools_t::before_fork, &pools_t::after_fork_in_parent, &pools_t::after_fork_in_child) != 0)
       std::abort();
 #endif
   }
 
   ~pools_t()
   {
-    current = nullptr;
+    current.store(nullptr, std::memory_order_release);
+  }
+
+  static void before_fork() noexcept
+  {
+    forking = current.load(std::memory_order_acquire);
+    if (!forking)
+      return;
+    forking->file.lock_for_fork();
+    forking->dns.lock_for_fork();
+  }
+
+  static void after_fork_in_parent() noexcept
+  {
+    auto *pools = std::exchange(forking, nullptr);
+    if (!pools)
+      return;
+    pools->dns.unlock_after_fork();
+    pools->file.unlock_after_fork();
   }
 
   static void after_fork_in_child() noexcept
   {
-    if (!current)
+    auto *pools = std::exchange(forking, nullptr);
+    if (!pools)
       return;
-    current->file.forget_after_fork();
-    current->dns.forget_after_fork();
+    pools->file.orphan_after_fork();
+    pools->dns.orphan_after_fork();
+    loop_core_t::note_fork_in_child();
   }
 
-  static inline pools_t *current = nullptr;
+  static inline std::atomic<pools_t *> current{nullptr};
+  static inline pools_t *forking = nullptr;
   job_queue_t file{threads_from_environment("VIO_FILE_THREADS", 4)};
   job_queue_t dns{threads_from_environment("VIO_DNS_THREADS", 2)};
 };
@@ -234,5 +324,14 @@ void pool_shutdown() noexcept
 {
   queue_for(pool_queue::file).shutdown();
   queue_for(pool_queue::dns).shutdown();
+}
+
+void pool_reclaim_after_fork(loop_core_t &loop) noexcept
+{
+  auto *pools = pools_t::current.load(std::memory_order_acquire);
+  if (!pools)
+    return;
+  pools->file.reclaim(loop);
+  pools->dns.reclaim(loop);
 }
 } // namespace vio::detail

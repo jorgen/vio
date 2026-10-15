@@ -189,12 +189,15 @@ public:
 
   [[nodiscard]] static std::int64_t now() noexcept;
   [[nodiscard]] static std::int64_t deadline_after(std::int64_t delay) noexcept;
+  static void note_fork_in_child() noexcept;
 
 private:
   static void on_stop(posted_t *node);
 
+  void reclaim_after_fork() noexcept;
   void run_timers();
   void drain_posted();
+  void requeue_draining(std::size_t from) noexcept;
   void drain_deferred();
   void run_before_block();
   [[nodiscard]] std::int64_t wait_timeout() noexcept;
@@ -220,6 +223,7 @@ private:
 
   posted_t _stop_node;
   std::atomic<std::thread::id> _thread_id;
+  unsigned _fork_epoch = 0;
   bool _stopping = false;
   bool _running = false;
   pipe_anchor_owner_t _pipe_anchor{this};

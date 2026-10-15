@@ -838,6 +838,77 @@ TEST_CASE("unpost reports only posted work that has not run yet")
   CHECK(order == std::vector<char>{'a', 'b'});
 }
 
+namespace
+{
+struct callback_failed_t
+{
+};
+} // namespace
+
+TEST_CASE("deferred work queued behind a callback that throws stays queued and runs on the next run")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  std::vector<char> order;
+  recorded_node_t first(order, 'a');
+  recorded_node_t second(order, 'b');
+  recorded_node_t third(order, 'c');
+  recorded_node_t fourth(order, 'd');
+  first.also = [&] {
+    core.defer(fourth);
+    throw callback_failed_t{};
+  };
+  loop.run_in_loop([&] {
+    core.defer(first);
+    core.defer(second);
+    core.defer(third);
+  });
+  loop.stop();
+  CHECK_THROWS_AS(loop.run(), callback_failed_t);
+  CHECK(order == std::vector<char>{'a'});
+  CHECK(second.queued);
+  CHECK(third.queued);
+  CHECK(core.unpost(second));
+  CHECK_FALSE(second.queued);
+  loop.run();
+  CHECK(order == std::vector<char>{'a', 'c', 'd'});
+  CHECK_FALSE(third.queued);
+  CHECK_FALSE(fourth.queued);
+}
+
+TEST_CASE("posted work queued behind a callback that throws stays queued and runs on the next run")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  std::vector<char> order;
+  recorded_node_t first(order, 'a');
+  recorded_node_t second(order, 'b');
+  recorded_node_t third(order, 'c');
+  recorded_node_t fourth(order, 'd');
+  auto closure_alive = std::make_shared<int>(0);
+  std::weak_ptr<int> closure_watch = closure_alive;
+  first.also = [&] {
+    core.post(fourth);
+    core.post(third);
+    throw callback_failed_t{};
+  };
+  core.post(first);
+  loop.run_in_loop([&order, held = std::move(closure_alive)] { order.push_back('x'); });
+  core.post(second);
+  core.post(third);
+  CHECK_THROWS_AS(loop.run(), callback_failed_t);
+  CHECK(order == std::vector<char>{'a'});
+  CHECK(second.queued);
+  CHECK(third.queued);
+  CHECK_FALSE(closure_watch.expired());
+  loop.stop();
+  loop.run();
+  CHECK(order == std::vector<char>{'a', 'x', 'b', 'c', 'd'});
+  CHECK(closure_watch.expired());
+  CHECK_FALSE(second.queued);
+  CHECK_FALSE(third.queued);
+}
+
 #if !defined(_WIN32) && !defined(VIO_LOOP_TEST_UNDER_TSAN)
 namespace
 {
@@ -961,13 +1032,128 @@ struct parked_probe_t : vio::detail::io_op_t
 };
 } // namespace
 
+namespace
+{
+struct gated_job_t
+{
+  vio::detail::pool_job_t job;
+  std::atomic<bool> *gate = nullptr;
+  std::atomic<int> *started = nullptr;
+  bool ran = false;
+  bool finished = false;
+  bool canceled = false;
+
+  gated_job_t(std::atomic<bool> &gate, std::atomic<int> &started)
+    : gate(&gate)
+    , started(&started)
+  {
+    job.owner = this;
+    job.work = [](vio::detail::pool_job_t *raw) {
+      auto *self = static_cast<gated_job_t *>(raw->owner);
+      self->started->fetch_add(1);
+      while (!self->gate->load())
+        std::this_thread::sleep_for(1ms);
+      self->ran = true;
+    };
+    job.done = [](vio::detail::pool_job_t *raw, bool canceled) {
+      auto *self = static_cast<gated_job_t *>(raw->owner);
+      self->finished = true;
+      self->canceled = canceled;
+    };
+  }
+};
+
+int file_pool_threads()
+{
+  const char *value = std::getenv("VIO_FILE_THREADS");
+  if (!value)
+    return 4;
+  auto parsed = std::strtoul(value, nullptr, 10);
+  return parsed == 0 || parsed > 1024 ? 4 : static_cast<int>(parsed);
+}
+
+void wait_for_started(std::atomic<int> &started, int wanted)
+{
+  const auto give_up = std::chrono::steady_clock::now() + 10s;
+  while (started.load() < wanted && std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(1ms);
+}
+
+void settle_file_pool()
+{
+  vio::event_loop_t loop;
+  std::atomic<bool> gate{false};
+  std::atomic<int> started{0};
+  const int count = file_pool_threads();
+  std::vector<std::unique_ptr<gated_job_t>> jobs;
+  for (int i = 0; i < count; ++i)
+  {
+    jobs.push_back(std::make_unique<gated_job_t>(gate, started));
+    vio::detail::pool_submit(vio::detail::core(loop), jobs.back()->job, vio::detail::pool_queue::file);
+  }
+  wait_for_started(started, count);
+  gate = true;
+  loop.stop();
+  loop.run();
+}
+} // namespace
+
 TEST_CASE("the blocking pool runs work in a process forked after it started")
 {
+  settle_file_pool();
   REQUIRE(run_one_pool_job());
   auto child = run_in_child([] { ::_exit(run_one_pool_job() ? 0 : 1); });
   REQUIRE(child.status != -1);
   CHECK(WIFEXITED(child.status));
   CHECK(WEXITSTATUS(child.status) == 0);
+}
+
+TEST_CASE("pool work in flight at a fork finishes as cancelled in the child and runs once, in the parent")
+{
+  settle_file_pool();
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  std::atomic<bool> gate{false};
+  std::atomic<int> started{0};
+  const int count = file_pool_threads() + 8;
+  std::vector<std::unique_ptr<gated_job_t>> jobs;
+  for (int i = 0; i < count; ++i)
+  {
+    jobs.push_back(std::make_unique<gated_job_t>(gate, started));
+    vio::detail::pool_submit(core, jobs.back()->job, vio::detail::pool_queue::file);
+  }
+  wait_for_started(started, file_pool_threads());
+  REQUIRE(started.load() == file_pool_threads());
+
+  auto child = run_in_child([&] {
+    const int started_at_fork = started.load();
+    loop.stop();
+    loop.run();
+    for (auto &job : jobs)
+    {
+      if (!job->finished || !job->canceled || job->ran)
+        ::_exit(1);
+    }
+    if (core.in_flight() != 0)
+      ::_exit(2);
+    if (!run_one_pool_job())
+      ::_exit(3);
+    ::_exit(started.load() == started_at_fork ? 0 : 4);
+  });
+  gate = true;
+  loop.stop();
+  loop.run();
+  REQUIRE(child.status != -1);
+  CHECK(WIFEXITED(child.status));
+  CHECK(WEXITSTATUS(child.status) == 0);
+  CHECK(started.load() == count);
+  for (auto &job : jobs)
+  {
+    CHECK(job->finished);
+    CHECK_FALSE(job->canceled);
+    CHECK(job->ran);
+  }
+  CHECK(core.in_flight() == 0);
 }
 
 TEST_CASE("destroying an operation the loop or the kernel still holds aborts with a message")

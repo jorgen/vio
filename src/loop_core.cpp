@@ -33,9 +33,15 @@ Copyright (c) 2025 Jørgen Lind
 #include "backends.h"
 #include "vio/about_to_block.h"
 #include "vio/errc.h"
+#include "vio/loop/blocking_pool.h"
 
 namespace vio::detail
 {
+namespace
+{
+std::atomic<unsigned> fork_epoch{0};
+}
+
 void abort_destroyed_in_flight(const char *what) noexcept
 {
   std::fprintf(stderr, "vio: a %s was destroyed while the loop or the kernel still held it\n", what);
@@ -156,6 +162,7 @@ void backend_t::dispatch(io_watch_t &watch, bool readable, bool writable)
 
 loop_core_t::loop_core_t(backend_kind kind)
   : _thread_id(std::this_thread::get_id())
+  , _fork_epoch(fork_epoch.load(std::memory_order_relaxed))
 {
   _stop_node.run = &loop_core_t::on_stop;
   _stop_node.owner = this;
@@ -178,31 +185,41 @@ loop_core_t::~loop_core_t()
                          "owning it inside a coroutine that completes, or in a scope that ends, before stop() is the usual fix.\n");
     assert(_resource_count == 0 && _alive == 0);
   }
-  auto discard_all = [](posted_t *head) {
-    while (head)
-    {
-      auto *next = head->next;
-      head->next = nullptr;
-      head->queued = false;
-      if (head->discard)
-        head->discard(head);
-      head = next;
-    }
-  };
+  {
+    std::lock_guard lock(_post_mutex);
+    set_thread(std::this_thread::get_id());
+  }
+  if (_fork_epoch != fork_epoch.load(std::memory_order_relaxed))
+    reclaim_after_fork();
   for (;;)
   {
-    posted_t *posted;
+    posted_t *node;
+    posted_t::run_fn_t discard;
     {
       std::lock_guard lock(_post_mutex);
-      posted = _posted.take_all();
+      node = _posted.pop_front();
+      if (!node)
+        node = _deferred.pop_front();
+      if (!node)
+        break;
+      node->queued = false;
+      discard = node->discard;
     }
-    auto *deferred = _deferred.take_all();
-    if (!posted && !deferred)
-      break;
-    discard_all(posted);
-    discard_all(deferred);
+    if (discard)
+      discard(node);
   }
   _backend.reset();
+}
+
+void loop_core_t::note_fork_in_child() noexcept
+{
+  fork_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+void loop_core_t::reclaim_after_fork() noexcept
+{
+  _fork_epoch = fork_epoch.load(std::memory_order_relaxed);
+  pool_reclaim_after_fork(*this);
 }
 
 std::int64_t loop_core_t::now() noexcept
@@ -241,6 +258,8 @@ int loop_core_t::run()
   _running = true;
   for (;;)
   {
+    if (_fork_epoch != fork_epoch.load(std::memory_order_relaxed)) [[unlikely]]
+      reclaim_after_fork();
     run_timers();
     drain_posted();
     drain_deferred();
@@ -277,6 +296,7 @@ void loop_core_t::post(posted_t &node)
 bool loop_core_t::unpost(posted_t &node) noexcept
 {
   bool removed = false;
+  std::lock_guard lock(_post_mutex);
   if (in_loop_thread())
   {
     for (auto &pending : _draining)
@@ -303,7 +323,6 @@ bool loop_core_t::unpost(posted_t &node) noexcept
       break;
     }
   }
-  std::lock_guard lock(_post_mutex);
   if (!node.queued)
     return removed;
   node.queued = false;
@@ -334,16 +353,53 @@ void loop_core_t::drain_posted()
       head = next;
     }
   }
-  for (std::size_t i = 0; i < _draining.size(); ++i)
+  struct interrupted_t
   {
-    if (auto *node = std::exchange(_draining[i], nullptr))
+    loop_core_t &core;
+    std::size_t next = 0;
+    ~interrupted_t()
+    {
+      if (next < core._draining.size())
+        core.requeue_draining(next);
+    }
+  } drain{*this};
+  for (; drain.next < _draining.size(); ++drain.next)
+  {
+    if (auto *node = std::exchange(_draining[drain.next], nullptr))
       node->run(node);
   }
   _draining.clear();
 }
 
+void loop_core_t::requeue_draining(std::size_t from) noexcept
+{
+  std::lock_guard lock(_post_mutex);
+  posted_t *head = nullptr;
+  posted_t **link = &head;
+  for (auto i = from; i < _draining.size(); ++i)
+  {
+    auto *node = std::exchange(_draining[i], nullptr);
+    if (!node || (node->queued && !_posted.remove(*node)))
+      continue;
+    node->queued = true;
+    node->next = nullptr;
+    *link = node;
+    link = &node->next;
+  }
+  _posted.prepend(head);
+  _draining.clear();
+}
+
 void loop_core_t::drain_deferred()
 {
+  struct interrupted_t
+  {
+    loop_core_t &core;
+    ~interrupted_t()
+    {
+      core._deferred.prepend(std::exchange(core._deferred_draining, nullptr));
+    }
+  } drain{*this};
   _deferred_draining = _deferred.take_all();
   while (auto *node = _deferred_draining)
   {

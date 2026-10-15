@@ -58,6 +58,17 @@ constexpr std::size_t max_file_transfer = 0x7ffff000;
 constexpr long first_submit_pause_ns = 50000;
 constexpr long last_submit_pause_ns = 10000000;
 constexpr std::int64_t max_submit_stall_ns = std::int64_t{30} * 1000000000;
+constexpr int max_futile_submits = 1000;
+
+#if defined(VIO_INTERNAL_TESTS)
+struct uring_submit_fault_t
+{
+  unsigned refusals = 0;
+  unsigned refused = 0;
+  std::int64_t paused_ns = 0;
+};
+uring_submit_fault_t *uring_submit_fault = nullptr;
+#endif
 
 constexpr std::uint64_t tag_mask = 7;
 constexpr std::uint64_t tag_ignore = 0;
@@ -291,32 +302,55 @@ private:
   {
     long pause_ns = first_submit_pause_ns;
     std::int64_t stalled_ns = 0;
-    for (int attempt = 0;; ++attempt)
+    int futile = 0;
+    for (;;)
     {
       if (auto *sqe = _ring.get_sqe())
         return sqe;
-      int result = _ring.enter(0, 0, nullptr);
+      int result = enter_for_space();
+      if (result > 0)
+        continue;
       if (result == -EAGAIN)
       {
         if (stalled_ns >= max_submit_stall_ns)
           fatal("submission queue stays full", EAGAIN);
-        timespec pause{0, pause_ns};
-        ::nanosleep(&pause, nullptr);
+        pause_for_space(pause_ns);
         stalled_ns += pause_ns;
         pause_ns = pause_ns * 2 < last_submit_pause_ns ? pause_ns * 2 : last_submit_pause_ns;
         continue;
       }
-      if (attempt >= 1000)
-        fatal("submission queue stays full", EBUSY);
-      if (result >= 0 || result == -EINTR)
-        continue;
+      if (result < 0 && result != -EINTR && result != -EBUSY)
+        fatal("submission failed", -result);
+      if (++futile >= max_futile_submits)
+        fatal("submission queue stays full", result < 0 ? -result : EBUSY);
       if (result == -EBUSY)
-      {
         stash();
-        continue;
-      }
-      fatal("submission failed", -result);
     }
+  }
+
+  int enter_for_space() noexcept
+  {
+#if defined(VIO_INTERNAL_TESTS)
+    if (uring_submit_fault && uring_submit_fault->refused < uring_submit_fault->refusals)
+    {
+      ++uring_submit_fault->refused;
+      return -EAGAIN;
+    }
+#endif
+    return _ring.enter(0, 0, nullptr);
+  }
+
+  static void pause_for_space(long pause_ns) noexcept
+  {
+#if defined(VIO_INTERNAL_TESTS)
+    if (uring_submit_fault)
+    {
+      uring_submit_fault->paused_ns += pause_ns;
+      return;
+    }
+#endif
+    timespec pause{0, pause_ns};
+    ::nanosleep(&pause, nullptr);
   }
 
   void stash()
@@ -548,6 +582,211 @@ std::unique_ptr<backend_t> make_uring_backend(loop_core_t &loop, int &error)
   return backend;
 }
 } // namespace vio::detail
+
+#if defined(VIO_INTERNAL_TESTS)
+#include <doctest/doctest.h>
+
+#include <chrono>
+#include <csignal>
+#include <string>
+#include <thread>
+
+#include <fcntl.h>
+#include <sys/wait.h>
+
+#if defined(__SANITIZE_THREAD__)
+#define VIO_URING_TEST_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define VIO_URING_TEST_UNDER_TSAN 1
+#endif
+#endif
+
+#if !defined(VIO_URING_TEST_UNDER_TSAN)
+namespace vio::detail
+{
+namespace
+{
+constexpr int uring_test_skipped = 77;
+constexpr std::size_t uring_test_read_size = 8;
+
+struct uring_test_child_t
+{
+  int status = -1;
+  std::string message;
+};
+
+template <typename Body>
+uring_test_child_t uring_test_in_child(Body body)
+{
+  uring_test_child_t result;
+  int ends[2];
+  if (::pipe(ends) != 0)
+    return result;
+  pid_t child = ::fork();
+  if (child < 0)
+  {
+    ::close(ends[0]);
+    ::close(ends[1]);
+    return result;
+  }
+  if (child == 0)
+  {
+    std::signal(SIGABRT, SIG_DFL);
+    ::dup2(ends[1], 2);
+    ::close(ends[0]);
+    ::_exit(body());
+  }
+  ::close(ends[1]);
+  const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  char buffer[512];
+  for (;;)
+  {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(give_up - std::chrono::steady_clock::now()).count();
+    if (left <= 0)
+      break;
+    pollfd readable{ends[0], POLLIN, 0};
+    int ready = ::poll(&readable, 1, static_cast<int>(left));
+    if (ready < 0 && errno == EINTR)
+      continue;
+    if (ready <= 0)
+      break;
+    auto got = ::read(ends[0], buffer, sizeof(buffer));
+    if (got > 0)
+    {
+      result.message.append(buffer, static_cast<std::size_t>(got));
+      continue;
+    }
+    if (got < 0 && errno == EINTR)
+      continue;
+    break;
+  }
+  ::close(ends[0]);
+  int status = 0;
+  for (;;)
+  {
+    pid_t done = ::waitpid(child, &status, WNOHANG);
+    if (done == child)
+    {
+      result.status = status;
+      return result;
+    }
+    if (done < 0 && errno != EINTR)
+      return result;
+    if (std::chrono::steady_clock::now() > give_up)
+    {
+      ::kill(child, SIGKILL);
+      ::waitpid(child, &status, 0);
+      return result;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
+struct uring_test_batch_t
+{
+  uring_test_batch_t(loop_core_t &loop, int file, std::size_t count)
+    : loop(loop)
+    , file(file)
+    , ops(count)
+    , bytes(count * uring_test_read_size)
+  {
+    start.owner = this;
+    start.run = [](posted_t *node) { static_cast<uring_test_batch_t *>(node->owner)->submit(); };
+  }
+
+  void submit()
+  {
+    for (std::size_t i = 0; i < ops.size(); ++i)
+    {
+      auto &op = ops[i];
+      op.owner = this;
+      op.complete = [](file_op_t *done) {
+        auto *self = static_cast<uring_test_batch_t *>(done->owner);
+        if (done->result != static_cast<std::int64_t>(uring_test_read_size))
+          ++self->failed;
+        if (++self->completed == self->ops.size())
+          self->loop.stop();
+      };
+      op.kind = file_op_kind::read;
+      op.file = file;
+      op.offset = 0;
+      op.data = bytes.data() + i * uring_test_read_size;
+      op.size = uring_test_read_size;
+      loop.backend().submit_file(op);
+    }
+  }
+
+  loop_core_t &loop;
+  int file;
+  std::vector<file_op_t> ops;
+  std::vector<std::byte> bytes;
+  std::size_t completed = 0;
+  std::size_t failed = 0;
+  posted_t start;
+};
+
+int uring_test_submit_through_refusals(unsigned refusals)
+{
+  loop_core_t loop(backend_kind::io_uring);
+  if (std::string(loop.backend_name()) != "io_uring" || !loop.backend().supports_async_files())
+    return uring_test_skipped;
+  int file = ::open("/dev/zero", O_RDONLY | O_CLOEXEC);
+  if (file < 0)
+    return uring_test_skipped;
+  uring_test_batch_t batch(loop, file, submission_entries + submission_entries / 4);
+  uring_submit_fault_t fault;
+  fault.refusals = refusals;
+  uring_submit_fault = &fault;
+  loop.post(batch.start);
+  loop.run();
+  uring_submit_fault = nullptr;
+  ::close(file);
+  if (fault.refused != refusals)
+    return 3;
+  if (batch.completed != batch.ops.size() || batch.failed != 0)
+    return 4;
+  if (fault.paused_ns <= std::int64_t{10} * 1000000000)
+    return 5;
+  return 0;
+}
+
+bool uring_test_skipped_in(const uring_test_child_t &child)
+{
+  return child.status != -1 && WIFEXITED(child.status) && WEXITSTATUS(child.status) == uring_test_skipped;
+}
+} // namespace
+
+TEST_CASE("io_uring: a submission queue the kernel refuses for over a thousand pauses still submits once it recovers")
+{
+  auto child = uring_test_in_child([] { return uring_test_submit_through_refusals(1500); });
+  REQUIRE(child.status != -1);
+  if (uring_test_skipped_in(child))
+  {
+    MESSAGE("io_uring with file operations is not available here; skipped");
+    return;
+  }
+  CHECK(WIFEXITED(child.status));
+  CHECK(WEXITSTATUS(child.status) == 0);
+  CHECK(child.message.find("stays full") == std::string::npos);
+}
+
+TEST_CASE("io_uring: a submission queue the kernel refuses past the stall budget aborts naming the refusal")
+{
+  auto child = uring_test_in_child([] { return uring_test_submit_through_refusals(4000); });
+  REQUIRE(child.status != -1);
+  if (uring_test_skipped_in(child))
+  {
+    MESSAGE("io_uring with file operations is not available here; skipped");
+    return;
+  }
+  CHECK(WIFSIGNALED(child.status));
+  CHECK(WTERMSIG(child.status) == SIGABRT);
+  CHECK(child.message.find(std::string("submission queue stays full (") + std::strerror(EAGAIN) + ")") != std::string::npos);
+}
+} // namespace vio::detail
+#endif
+#endif
 
 #else
 

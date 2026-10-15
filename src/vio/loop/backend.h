@@ -52,7 +52,7 @@ struct io_watch_t
   op_list_t readers;
   op_list_t writers;
   std::uint32_t epoch = 0;
-  bool closed = false;
+  bool closed = true;
   std::uint8_t armed = 0;
   void *backend_state = nullptr;
 };

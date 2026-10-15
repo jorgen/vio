@@ -352,17 +352,26 @@ socket_resource_t *adopt_test_socket(loop_core_t &loop, int fd)
   return resource;
 }
 
+void release_parked(socket_resource_t &resource) noexcept
+{
+  while (auto *op = resource.watch.readers.front())
+    resource.cancel(*op);
+  while (auto *op = resource.watch.writers.front())
+    resource.cancel(*op);
+}
+
 void close_test_socket(socket_resource_t *&resource)
 {
   if (!resource)
     return;
-  resource->close([](void *raw) { delete static_cast<socket_resource_t *>(raw); }, resource);
+  resource->close(
+    [](void *raw) {
+      auto *closed = static_cast<socket_resource_t *>(raw);
+      release_parked(*closed);
+      delete closed;
+    },
+    resource);
   resource = nullptr;
-}
-
-void make_test_pair(int (&fds)[2])
-{
-  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 }
 
 std::int64_t send_byte(socket_resource_t *resource, unsigned char value)
@@ -385,7 +394,7 @@ struct kqueue_fixture_t
   posted_t start;
   bool timed_out = false;
 
-  kqueue_fixture_t()
+  explicit kqueue_fixture_t(std::int64_t deadline_ns = kqueue_test_deadline_ns)
   {
     watchdog.owner = this;
     watchdog.keeps_alive = false;
@@ -394,18 +403,33 @@ struct kqueue_fixture_t
       self.timed_out = true;
       self.finish();
     };
-    loop.add_timer(watchdog, loop_core_t::now() + kqueue_test_deadline_ns);
+    loop.add_timer(watchdog, loop_core_t::now() + deadline_ns);
   }
 
   kqueue_fixture_t(const kqueue_fixture_t &) = delete;
   kqueue_fixture_t &operator=(const kqueue_fixture_t &) = delete;
 
-  void adopt_pair(int first, int second)
+  ~kqueue_fixture_t()
+  {
+    loop.remove_timer(watchdog);
+    for (auto *socket : sockets)
+    {
+      if (!socket)
+        continue;
+      finish();
+      loop.run();
+      return;
+    }
+  }
+
+  bool adopt_pair(int first, int second)
   {
     int fds[2] = {-1, -1};
-    make_test_pair(fds);
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+      return false;
     sockets[first] = adopt_test_socket(loop, fds[0]);
     sockets[second] = adopt_test_socket(loop, fds[1]);
+    return true;
   }
 
   void prepare(io_op_t &op, void *owner, io_op_t::complete_fn_t complete)
@@ -415,12 +439,17 @@ struct kqueue_fixture_t
     op.keeps_alive = false;
   }
 
-  void run(void *owner, posted_t::run_fn_t first)
+  void start_and_run(void *owner, posted_t::run_fn_t first)
   {
     start.owner = owner;
     start.run = first;
     loop.post(start);
     loop.run();
+  }
+
+  void run(void *owner, posted_t::run_fn_t first)
+  {
+    start_and_run(owner, first);
     CHECK_FALSE(timed_out);
     CHECK(loop.open_resources() == 0);
   }
@@ -444,7 +473,7 @@ TEST_CASE("kqueue backend: a parked reader wakes on every new edge")
     std::int64_t received = 0;
   } context;
   CHECK(std::string(context.loop.backend_name()) == "kqueue");
-  context.adopt_pair(0, 1);
+  REQUIRE(context.adopt_pair(0, 1));
   context.prepare(context.reader, &context, [](io_op_t *op) {
     auto &self = *static_cast<context_t *>(op->owner);
     auto got = receive_some(self.sockets[0]);
@@ -485,7 +514,7 @@ TEST_CASE("kqueue backend: a writer parked on a full socket wakes when the peer 
     std::int64_t drained = 0;
     bool wrote = false;
   } context;
-  context.adopt_pair(0, 1);
+  REQUIRE(context.adopt_pair(0, 1));
   context.prepare(context.writer, &context, [](io_op_t *op) {
     auto &self = *static_cast<context_t *>(op->owner);
     auto sent = send_byte(self.sockets[0], 7);
@@ -534,7 +563,7 @@ TEST_CASE("kqueue backend: a peer that closes wakes a parked reader with end of 
     io_op_t reader;
     std::int64_t outcome = 1;
   } context;
-  context.adopt_pair(0, 1);
+  REQUIRE(context.adopt_pair(0, 1));
   context.prepare(context.reader, &context, [](io_op_t *op) {
     auto &self = *static_cast<context_t *>(op->owner);
     auto got = receive_some(self.sockets[0]);
@@ -562,8 +591,8 @@ TEST_CASE("kqueue backend: a socket closed earlier in the same batch is not disp
     io_op_t readers[2];
     int completions[2] = {};
   } context;
-  context.adopt_pair(0, 1);
-  context.adopt_pair(2, 3);
+  REQUIRE(context.adopt_pair(0, 1));
+  REQUIRE(context.adopt_pair(2, 3));
   auto complete = [](io_op_t *op) {
     auto &self = *static_cast<context_t *>(op->owner);
     int index = op == &self.readers[0] ? 0 : 1;
@@ -586,6 +615,36 @@ TEST_CASE("kqueue backend: a socket closed earlier in the same batch is not disp
   CHECK(context.completions[0] + context.completions[1] == 1);
 }
 
+TEST_CASE("kqueue backend: a test that outlives its deadline ends with its operations released")
+{
+  struct context_t : kqueue_fixture_t
+  {
+    context_t()
+      : kqueue_fixture_t(std::int64_t{100} * 1000000)
+    {
+    }
+    io_op_t reader;
+    io_op_t writer;
+  } context;
+  REQUIRE(context.adopt_pair(0, 1));
+  context.prepare(context.reader, &context, [](io_op_t *) {});
+  context.prepare(context.writer, &context, [](io_op_t *) {});
+  context.start_and_run(&context, [](posted_t *node) {
+    auto &self = *static_cast<context_t *>(node->owner);
+    CHECK(receive_some(self.sockets[0]) == errc::again);
+    self.sockets[0]->wait(interest_read, self.reader);
+    std::byte chunk[4096] = {};
+    for (int i = 0; i < 1 << 16 && socket_send(self.sockets[0]->native(), chunk) > 0; ++i)
+    {
+    }
+    self.sockets[0]->wait(interest_write, self.writer);
+  });
+  CHECK(context.timed_out);
+  CHECK_FALSE(context.reader.parked);
+  CHECK_FALSE(context.writer.parked);
+  CHECK(context.loop.open_resources() == 0);
+}
+
 TEST_CASE("kqueue backend: registering and removing watches does not swallow pending readiness")
 {
   struct context_t : kqueue_fixture_t
@@ -594,7 +653,7 @@ TEST_CASE("kqueue backend: registering and removing watches does not swallow pen
     posted_t stage;
     bool woke = false;
   } context;
-  context.adopt_pair(0, 1);
+  REQUIRE(context.adopt_pair(0, 1));
   context.prepare(context.reader, &context, [](io_op_t *op) {
     auto &self = *static_cast<context_t *>(op->owner);
     auto got = receive_some(self.sockets[0]);
@@ -613,8 +672,8 @@ TEST_CASE("kqueue backend: registering and removing watches does not swallow pen
     CHECK(receive_some(self.sockets[0]) == errc::again);
     self.sockets[0]->wait(interest_read, self.reader);
     CHECK(send_byte(self.sockets[1], 1) == 1);
-    self.adopt_pair(2, 3);
-    self.adopt_pair(4, 5);
+    CHECK(self.adopt_pair(2, 3));
+    CHECK(self.adopt_pair(4, 5));
     close_test_socket(self.sockets[4]);
   };
   context.run(&context, [](posted_t *node) {

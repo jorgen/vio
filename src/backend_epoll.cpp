@@ -471,7 +471,7 @@ TEST_CASE("epoll: write interest is dropped while no writer waits and restored w
   CHECK(loop.open_resources() == 0);
 }
 
-#if defined(SYS_epoll_pwait2) && !defined(VIO_EPOLL_TEST_UNDER_TSAN)
+#if !defined(VIO_EPOLL_TEST_UNDER_TSAN)
 namespace
 {
 int epoll_test_wait_for_child(pid_t child, std::chrono::milliseconds limit)
@@ -495,6 +495,73 @@ int epoll_test_wait_for_child(pid_t child, std::chrono::milliseconds limit)
   }
 }
 
+int epoll_test_refusing_registration()
+{
+  if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+    return 77;
+  loop_core_t loop(backend_kind::epoll);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  constexpr std::uint32_t operation = offsetof(seccomp_data, args) + sizeof(std::uint64_t) + sizeof(std::uint32_t);
+#else
+  constexpr std::uint32_t operation = offsetof(seccomp_data, args) + sizeof(std::uint64_t);
+#endif
+  sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_epoll_ctl, 0, 3),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, operation),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, EPOLL_CTL_ADD, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (ENOSPC & SECCOMP_RET_DATA)),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  sock_fprog program{static_cast<unsigned short>(std::size(filter)), filter};
+  if (::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0, 0) != 0)
+    return 77;
+
+  socket_resource_t opened(loop, "epoll test opened");
+  if (opened.open(AF_INET, SOCK_STREAM, 0) != errc_from_errno(ENOSPC))
+    return 3;
+  if (opened.is_open() || opened.native() != invalid_native_socket)
+    return 4;
+
+  int ends[2];
+  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) != 0)
+    return 5;
+  socket_resource_t adopted(loop, "epoll test adopted");
+  if (adopted.adopt(ends[0]) != errc_from_errno(ENOSPC))
+    return 6;
+  epoll_test_op_t writer;
+  writer.on_complete = [](epoll_test_op_t &) {};
+  adopted.wait(interest_write, writer);
+  adopted.cancel(writer);
+  epoll_test_close(opened);
+  epoll_test_close(adopted);
+  loop.stop();
+  loop.run();
+  ::close(ends[1]);
+  return loop.open_resources() == 0 ? 0 : 7;
+}
+} // namespace
+
+TEST_CASE("epoll: a socket whose registration is refused is left closed and a waiter on it never re-arms it")
+{
+  pid_t child = ::fork();
+  REQUIRE(child >= 0);
+  if (child == 0)
+    ::_exit(epoll_test_refusing_registration());
+  int status = epoll_test_wait_for_child(child, std::chrono::seconds(20));
+  REQUIRE(status != -1);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 77)
+  {
+    MESSAGE("seccomp filters are not available here; skipped");
+    return;
+  }
+  CHECK(WIFEXITED(status));
+  CHECK(WEXITSTATUS(status) == 0);
+}
+
+#if defined(SYS_epoll_pwait2)
+namespace
+{
 int epoll_test_without_pwait2(int server_end, int client_end)
 {
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
@@ -579,6 +646,7 @@ TEST_CASE("epoll: a sandbox that refuses epoll_pwait2 falls back to epoll_wait")
   }
   CHECK(WEXITSTATUS(status) == 0);
 }
+#endif
 #endif
 } // namespace vio::detail
 #endif

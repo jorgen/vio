@@ -138,6 +138,31 @@ public:
     return head;
   }
 
+  posted_t *pop_front() noexcept
+  {
+    auto *head = _head;
+    if (!head)
+      return nullptr;
+    _head = head->next;
+    if (!_head)
+      _tail = nullptr;
+    head->next = nullptr;
+    return head;
+  }
+
+  void prepend(posted_t *head) noexcept
+  {
+    if (!head)
+      return;
+    auto *last = head;
+    while (last->next)
+      last = last->next;
+    last->next = _head;
+    if (!_tail)
+      _tail = last;
+    _head = head;
+  }
+
   bool remove(posted_t &node) noexcept
   {
     posted_t *previous = nullptr;

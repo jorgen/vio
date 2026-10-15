@@ -871,9 +871,11 @@ struct iocp_fixture_t
   std::vector<socket_resource_t *> sockets;
   timer_node_t watchdog;
   iocp_step_t start;
+  std::int64_t deadline_ns;
   bool timed_out = false;
 
-  iocp_fixture_t()
+  explicit iocp_fixture_t(std::int64_t deadline = iocp_test_deadline_ns)
+    : deadline_ns(deadline)
   {
     watchdog.owner = this;
     watchdog.keeps_alive = false;
@@ -890,23 +892,46 @@ struct iocp_fixture_t
   ~iocp_fixture_t()
   {
     loop.remove_timer(watchdog);
+    for (auto *resource : sockets)
+    {
+      if (!resource)
+        continue;
+      finish();
+      loop.run();
+      return;
+    }
   }
 
   socket_resource_t *adopt(SOCKET socket)
   {
     auto *resource = new socket_resource_t(loop, "iocp test socket");
-    REQUIRE(resource->adopt(socket) == 0);
     sockets.push_back(resource);
+    REQUIRE(resource->adopt(socket) == 0);
     return resource;
+  }
+
+  static void release_parked(socket_resource_t &resource) noexcept
+  {
+    while (auto *op = resource.watch.readers.front())
+      resource.cancel(*op);
+    while (auto *op = resource.watch.writers.front())
+      resource.cancel(*op);
   }
 
   void finish()
   {
+    loop.remove_timer(watchdog);
     for (auto *&resource : sockets)
     {
       if (!resource)
         continue;
-      resource->close([](void *raw) { delete static_cast<socket_resource_t *>(raw); }, resource);
+      resource->close(
+        [](void *raw) {
+          auto *closed = static_cast<socket_resource_t *>(raw);
+          release_parked(*closed);
+          delete closed;
+        },
+        resource);
       resource = nullptr;
     }
     loop.stop();
@@ -916,7 +941,7 @@ struct iocp_fixture_t
   {
     REQUIRE(std::string(loop.backend_name()) == "iocp");
     start.body = std::move(body);
-    loop.add_timer(watchdog, loop_core_t::now() + iocp_test_deadline_ns);
+    loop.add_timer(watchdog, loop_core_t::now() + deadline_ns);
     loop.post(start.node);
     loop.run();
     CHECK(loop.open_resources() == 0);
@@ -960,12 +985,35 @@ TEST_CASE("iocp: a writer parked behind a pending read poll still wakes")
   second.body = [&] { server->wait(interest_write, writer); };
   fixture.run([&] {
     std::byte buffer[1];
-    REQUIRE(socket_recv(server->native(), buffer) == errc::again);
+    const bool would_block = socket_recv(server->native(), buffer) == errc::again;
+    CHECK(would_block);
+    if (!would_block)
+    {
+      fixture.finish();
+      return;
+    }
     server->wait(interest_read, reader);
     fixture.loop.post(second.node);
   });
   CHECK_FALSE(fixture.timed_out);
   CHECK(writer.completions == 1);
+  CHECK(reader.completions == 0);
+}
+
+TEST_CASE("iocp: a test that outlives its deadline ends with its operations released")
+{
+  iocp_fixture_t fixture(std::int64_t{100} * 1000000);
+  auto pair = iocp_test_pair();
+  auto *server = fixture.adopt(pair.server);
+  fixture.adopt(pair.client);
+  iocp_probe_t reader;
+  fixture.run([&] {
+    std::byte buffer[1];
+    CHECK(socket_recv(server->native(), buffer) == errc::again);
+    server->wait(interest_read, reader);
+  });
+  CHECK(fixture.timed_out);
+  CHECK_FALSE(reader.parked);
   CHECK(reader.completions == 0);
 }
 
@@ -1061,7 +1109,12 @@ TEST_CASE("iocp: a refused connect wakes the writer and reports the refusal")
   };
   fixture.run([&] {
     const int connected = socket_connect(connecting->native(), reinterpret_cast<const sockaddr *>(&bound), bound_length);
-    REQUIRE(connected == errc::in_progress);
+    CHECK(connected == errc::in_progress);
+    if (connected != errc::in_progress)
+    {
+      fixture.finish();
+      return;
+    }
     connecting->wait(interest_write, writer);
   });
   CHECK_FALSE(fixture.timed_out);

@@ -59,7 +59,13 @@ public:
     native_socket_t socket = invalid_native_socket;
     if (int result = socket_open(family, type, protocol, socket); result < 0)
       return result;
-    return adopt(socket);
+    if (int result = adopt(socket); result < 0)
+    {
+      watch.socket = invalid_native_socket;
+      socket_close(socket);
+      return result;
+    }
+    return 0;
   }
 
   [[nodiscard]] int adopt(native_socket_t socket) noexcept
@@ -105,7 +111,8 @@ private:
     {
       loop().defer(_removed);
     }
-    socket_close(watch.socket);
+    if (watch.socket != invalid_native_socket)
+      socket_close(watch.socket);
   }
 
   static void on_removed(posted_t *node)

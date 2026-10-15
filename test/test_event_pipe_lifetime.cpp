@@ -2,9 +2,12 @@
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
 
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <thread>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -109,5 +112,79 @@ TEST_CASE("an event pipe declared before the thread that runs its loop is destro
     holder.thread.stop_and_join();
     holder.pipe->post_event(7);
   }
+  CHECK(delivered == 0);
+}
+
+TEST_CASE("work dropped with its loop may destroy a pipe whose wakeup is queued behind it")
+{
+  int delivered = 0;
+  bool dropped = false;
+  {
+    vio::event_loop_t loop;
+    loop.stop();
+    loop.run();
+    struct owner_t
+    {
+      vio::event_pipe_t<int> pipe;
+      bool *dropped;
+      owner_t(vio::event_loop_t &loop, int &delivered, bool &dropped)
+        : pipe(loop, [&delivered](int &&value) { delivered += value; })
+        , dropped(&dropped)
+      {
+      }
+      ~owner_t()
+      {
+        *dropped = true;
+      }
+    };
+    auto owner = std::make_shared<owner_t>(loop, delivered, dropped);
+    auto *raw = owner.get();
+    loop.run_in_loop([held = std::move(owner)] {});
+    raw->pipe.post_event(1);
+    raw->pipe.post_event(2);
+  }
+  CHECK(dropped);
+  CHECK(delivered == 0);
+}
+
+TEST_CASE("work dropped with its loop may wait for a pipe destroyed on another thread")
+{
+  struct gate_t
+  {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool discarding = false;
+    bool pipe_gone = false;
+  };
+  struct blocker_t
+  {
+    gate_t *gate;
+    ~blocker_t()
+    {
+      std::unique_lock lock(gate->mutex);
+      gate->discarding = true;
+      gate->changed.notify_all();
+      gate->changed.wait(lock, [this] { return gate->pipe_gone; });
+    }
+  };
+  gate_t gate;
+  int delivered = 0;
+  std::thread destroyer;
+  {
+    vio::thread_with_event_loop_t thread;
+    auto pipe = std::make_unique<vio::event_pipe_t<int>>(thread.event_loop(), [&delivered](int &&value) { delivered += value; });
+    thread.stop_and_join();
+    thread.event_loop().run_in_loop([blocker = std::make_shared<blocker_t>(&gate)] {});
+    pipe->post_event(1);
+    destroyer = std::thread([&gate, owned = std::move(pipe)]() mutable {
+      std::unique_lock lock(gate.mutex);
+      gate.changed.wait(lock, [&gate] { return gate.discarding; });
+      owned.reset();
+      gate.pipe_gone = true;
+      gate.changed.notify_all();
+    });
+  }
+  destroyer.join();
+  CHECK(gate.pipe_gone);
   CHECK(delivered == 0);
 }
