@@ -194,7 +194,7 @@ loopback, which this container lacks, and pass in CI.
 | io_uring | readiness through `POLL_ADD` | ring: read, write, `fsync` | `VIO_BACKEND=io_uring` |
 | kqueue | readiness, `EV_CLEAR` | blocking pool | macOS |
 | IOCP | readiness through AFD | blocking pool (D17) | Windows |
-| wasm | none | none | not built since the change: no Emscripten here, no CI |
+| wasm | none | none | its own small loop; builds, and a smoke test runs under Node in CI |
 
 Benchmarks against libuv are in `BASELINE.md`: the socket rows run 1.4 to 2.3 times faster and
 allocate a third to two thirds as much.
@@ -204,7 +204,10 @@ allocate a third to two thirds as much.
 - How clocks treat system sleep, per platform. Windows waits skip time spent suspended, and libuv
   woke every loop on resume. That wake is not reproduced yet.
 - When io_uring becomes the default on Linux (see D13).
-- The wasm backend moves onto the shared core in a later phase. It has not been built since this
-  change: this container has no Emscripten and CI has no wasm job, so expect it to need fixes.
+- The wasm backend moves onto the shared core in a later phase. Until then it keeps its own small
+  loop. Building it after the change found two breaks: the HTTP client called the native-only
+  `loop_now`, and the wasm library did not compile `errc.cpp`, so nothing that built an error
+  linked. Both are fixed, and CI now builds the wasm library and runs `test/wasm_smoke.cpp` under
+  Node, so the next break shows up at once.
 - Whether application coroutines should run inside Win32 modal loops and Cocoa tracking loops. This
   belongs to the GUI driver work.

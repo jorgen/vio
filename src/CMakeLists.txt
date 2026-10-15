@@ -1,6 +1,7 @@
 if(EMSCRIPTEN)
     add_library(vio STATIC
         library_wasm.cpp
+        errc.cpp
         crypto_encoding.cpp
         crypto_sha256.cpp
     )

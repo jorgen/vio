@@ -142,6 +142,32 @@ jobs:
           set -o pipefail
           ./build/test/vio_tests 2>&1 | tee test-io_uring.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-io_uring.log | head -400; exit 1; }
 
+  wasm:
+    runs-on: ubuntu-24.04
+    name: wasm
+    env:
+      EMSDK_VERSION: 6.0.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install emsdk
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install "$EMSDK_VERSION"
+          ./emsdk/emsdk activate "$EMSDK_VERSION"
+
+      - name: Build
+        run: |
+          sudo apt-get install -y ninja-build
+          source ./emsdk/emsdk_env.sh
+          emcmake cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build
+
+      - name: Test
+        run: |
+          source ./emsdk/emsdk_env.sh
+          node build/vio_wasm_smoke.js
+
   macos:
     runs-on: macos-15
     strategy:

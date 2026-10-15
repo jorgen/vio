@@ -61,11 +61,6 @@ struct header_t
 
 namespace detail
 {
-inline std::uint64_t monotonic_ms(event_loop_t &loop)
-{
-  return static_cast<std::uint64_t>(vio::loop_now(loop).since_origin().count() / 1000000);
-}
-
 inline bool header_name_equals(std::string_view a, std::string_view b)
 {
   if (a.size() != b.size())
@@ -114,6 +109,11 @@ struct response_t
 #ifndef __EMSCRIPTEN__
 namespace detail
 {
+inline std::uint64_t monotonic_ms(event_loop_t &loop)
+{
+  return static_cast<std::uint64_t>(vio::loop_now(loop).since_origin().count() / 1000000);
+}
+
 inline std::expected<response_t, error_t> parse_response(const std::string &raw)
 {
   auto header_end = raw.find("\r\n\r\n");

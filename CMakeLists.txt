@@ -52,6 +52,12 @@ if (VIO_BUILD_TESTS AND NOT EMSCRIPTEN)
     add_subdirectory(test)
 endif ()
 
+if (VIO_BUILD_TESTS AND EMSCRIPTEN)
+    add_executable(vio_wasm_smoke test/wasm_smoke.cpp)
+    target_link_libraries(vio_wasm_smoke PRIVATE vio)
+    target_link_options(vio_wasm_smoke PRIVATE -sEXIT_RUNTIME=1)
+endif ()
+
 if (VIO_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
     add_subdirectory(examples)
 endif ()
