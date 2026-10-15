@@ -92,9 +92,12 @@ no difference is significant:
 | row | epoll | io_uring | io_uring CPU against epoll |
 |-----|-------|----------|----------------------------|
 | socket, offload on | 305 MB/s | 298 MB/s | 1.03x |
-| socket, offload off | | | 1.01x |
-| bulk, callback api | | | 1.00x |
-| requests, callback api | | | 1.03x |
+| socket, offload off | 183 MB/s | 192 MB/s | 1.01x |
+| bulk, callback api | 301 MB/s | 296 MB/s | 1.00x |
+| requests, callback api | 20.2k req/s | 19.6k req/s | 1.03x |
+
+These runs also counted system calls, which slows the request row, so its absolute rate is lower
+than above; the comparison between the two backends still holds.
 
 ### Why io_uring does not win
 
