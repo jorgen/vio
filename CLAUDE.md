@@ -557,7 +557,9 @@ and MSVC ASan on Windows; GCC 14 on Ubuntu 24.04 under ASan, UBSan and TSan, thr
 hold: MSVC's ASan has **no LeakSanitizer**, so leaks are invisible on Windows -- one in the
 coroutine layer's pre-resolved operations survived a full ASan run there and was caught the
 first time LeakSanitizer saw it -- and glibc declares `error_t`, so `using namespace vio` in a
-test that is only ever built on Windows will not compile on Linux.
+test that is only ever built on Windows will not compile on Linux. The reverse trap: Windows
+headers define `small` as a macro, so a variable named `small` builds everywhere except MSVC. It
+has broken the Windows build twice.
 
 TSan needs ASLR off on a modern kernel or it aborts with "unexpected memory
 mapping" before running a line: `docker run --privileged ... setarch $(uname -m)

@@ -1426,10 +1426,10 @@ TEST_CASE("a drained output buffer leaves the idle connection and is reused for 
   client.consume_output(client.output_size());
   CHECK(pool.size() == 1);
 
-  const std::string small = "a short response";
-  client.reserve_output(small.size() + small.size() / 16 + 1024);
+  const std::string brief = "a short response";
+  client.reserve_output(brief.size() + brief.size() / 16 + 1024);
   int written = 0;
-  REQUIRE(client.write_plaintext(small.data(), static_cast<int>(small.size()), written) == vio::ssl_status::ok);
+  REQUIRE(client.write_plaintext(brief.data(), static_cast<int>(brief.size()), written) == vio::ssl_status::ok);
   CHECK(client.pending_output().data() == first);
   client.consume_output(client.output_size());
   CHECK(client.output_capacity() == 0);
