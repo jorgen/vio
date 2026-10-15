@@ -1,6 +1,8 @@
 # VIO Project
 
-C++ async I/O library built on libuv with C++20 coroutines and BoringSSL for TLS.
+C++ async I/O library with its own event loop over epoll, io_uring, kqueue and IOCP, C++20
+coroutines, and BoringSSL for TLS. libuv was removed in October 2026; `EVENT_LOOP_PLAN.md` is the
+design and `DECISIONS.md` records every choice made on the way, with its reason.
 
 ## Build
 
@@ -13,7 +15,14 @@ cmake --build cmake-build-debug
 
 # Run tests
 ./cmake-build-debug/test/vio_tests
+
+# Run them on io_uring instead of epoll (Linux)
+VIO_BACKEND=io_uring ./cmake-build-debug/test/vio_tests
 ```
+
+Tests for internals live at the bottom of their `src/*.cpp` file inside
+`#if defined(VIO_INTERNAL_TESTS)`. A top-level static build with tests defines that macro and puts
+the doctest implementation in the library, so those tests run inside `vio_tests` too.
 
 ### Windows
 #### On Windows with MSVC (CLion/Claude Code)
@@ -104,6 +113,8 @@ Configuration is in `.clang-tidy` at the project root.
 ## Project Structure
 
 - `src/vio/` - Library headers and source (most code is in headers)
+- `src/vio/loop/`, `src/loop_core.cpp`, `src/backend_*.cpp` - the event loop core and its backends
+  (epoll, io_uring, kqueue, IOCP); `src/blocking_pool.cpp`; `src/sys_posix.cpp`, `src/sys_win.cpp`
 - `src/vio/operation/` - Async operation implementations (tcp, tls, dns, file, sleep, udp, timer)
 - `src/vio/quic/` - QUIC wire primitives, sans-I/O and dependency-free: `varint.h`,
   `packet_number.h`, `connection_id.h`, `frame.h` (the RFC 9000 section 12.4 frame
@@ -461,21 +472,20 @@ drain, before the application could accept any of it.
   `_shutdown`, and `quic_connection_close` / `_closed` / `_ready` plus accessors.
 
   The organising idea is the **loop turn**. The transport's three hooks
-  (`on_connection`, `on_activity`, `on_connection_gone`) only *record*; a `uv_prepare_t`
-  -- the beat -- resumes everything that became runnable and flushes what it wrote, in
-  the same turn. That separation is not stylistic. `endpoint_impl_t` holds connections
+  (`on_connection`, `on_activity`, `on_connection_gone`) only *record*; the beat, a
+  before-block hook on the loop, resumes everything that became runnable and flushes what
+  it wrote, in the same turn. That separation is not stylistic. `endpoint_impl_t` holds connections
   as `unique_ptr` and brackets its walk, so dialling from a callback is already safe;
   what is not safe is what a coroutine may do that a callback may not -- drop the last
   `quic_endpoint_t`, destroying `endpoint_impl_t`, `run()`'s frame, the datagram reader
   inside it and the vector being walked, from a stack several calls deep inside all of
-  them. Prepare rather than check because the endpoint's 2 ms ticker fires in the timer
-  phase; never idle, because `uv__backend_timeout` returns zero while an idle handle is
-  active and the loop stops sleeping. The beat is `uv_unref`ed, so an endpoint that was
-  never bound owns no handle that stops `run()` returning.
+  them. The beat runs after the turn's timers, so the endpoint's 2 ms ticker has already
+  fired when it runs. Neither the beat nor the ticker keeps the loop alive, so an endpoint
+  that was never bound does not stop `run()` returning.
 
   **No awaitable holds a strong reference to the endpoint.** A suspended accept that did
   would take the count 2->1 on release, `on_destroy` would never run, nothing would
-  resolve it, and the socket's `uv_close` would never be issued -- so `run()` would never
+  resolve it, and the socket's close would never start -- so `run()` would never
   return. That is the second, non-obvious face of the handle-lifetime failure below.
   Operations are per-call heap allocations with a two-hold protocol, so concurrent
   accepts are served FIFO rather than refused.
@@ -546,22 +556,21 @@ to a vio client is untested. vio sending one is covered, which is the direction
 that exercises vio's own `retry_token.h`.
 
 - `test/` - Tests using doctest
-- `3rdparty/` - libuv, boringssl, doctest, cmakerc, ada (fetched via cmake-dep)
+- `3rdparty/` - boringssl, ada, structify, doctest, cmakerc (fetched via cmake-dep)
 
 ## Dependencies (toggles & install)
 
 Every dependency is togglable between the bundled fetch and a pre-installed copy.
 The knobs are **auto-declared by cmake-dep** from each `CmDepFetchPackage` call in
 `CMake/3rdPartyPackages.cmake`, prefixed by the project name (uppercased
-`PROJECT_NAME` → `VIO`): `VIO_USE_SYSTEM_{LIBUV,BORINGSSL,ADA,DOCTEST,CMAKERC}`
+`PROJECT_NAME` → `VIO`): `VIO_USE_SYSTEM_{BORINGSSL,ADA,STRUCTIFY,DOCTEST,CMAKERC}`
 (default `OFF`) and `VIO_<DEP>_{VERSION,URL,SHA256}` overrides to fetch a different
 version/URL/hash without editing the packages file. BoringSSL has no releases and
 no stable ABI, so it is pinned by commit and `VIO_BORINGSSL_URL`/`SHA256` are the
 overrides that matter. When a toggle is `ON`, cmake-dep skips the fetch;
-`CMake/Build3rdParty.cmake` then drives libuv/ada/doctest/boringssl through
+`CMake/Build3rdParty.cmake` then drives ada/doctest/boringssl through
 `CmDepAddPackage` (which owns the find-vs-build branch), while cmakerc
-(`include()`-based) branches by hand on the `${name}_USE_SYSTEM` signal, and
-`src/CMakeLists.txt` handles the system-libuv link (`libuv::uv_a`). BoringSSL
+(`include()`-based) branches by hand on the `${name}_USE_SYSTEM` signal. BoringSSL
 builds in-tree (SYSTEM EXCLUDE_FROM_ALL, so none of its install rules or extra
 targets reach this project) and publishes plain `crypto`/`ssl` targets, aliased to
 `BoringSSL::Crypto`/`BoringSSL::SSL` so the link line reads the same either way.
@@ -572,13 +581,41 @@ LibreSSL fell into and the reason for the move.
 `VIO_INSTALL` (default `ON`) installs headers + the `vio` lib and, **when built
 against system deps**, a relocatable `find_package(vio)` package config
 (`vio::vio`, from `CMake/vioConfig.cmake.in`, which `find_dependency`s
-libuv/BoringSSL/ada and exports the bundled `cmrc-base`/`vio_default_certs`). A
+BoringSSL/ada and exports the bundled `cmrc-base`/`vio_default_certs`). A
 bundled-deps build vendors targets that aren't installed, so it installs lib +
 headers only (no config). `vio::vio` is aliased in-tree so consumers use one name
 either way. A downstream that `add_subdirectory`s vio (e.g. prism) should force
 `VIO_INSTALL OFF`.
 
 ## Key Architecture
+
+### The event loop core
+
+`src/vio/loop/` holds the pieces; `event_loop_t` (`src/vio/platform/native/event_loop_impl.h`) is a
+thin face over `loop_core_t` (`src/loop_core.cpp`). One loop per thread. It owns a backend, a timer
+heap, a posted queue other threads may push to, a deferred queue for work the loop schedules for
+itself, before-block hooks, and a registry of open resources so its destructor can name a leak.
+
+One turn: run due timers; drain posted work; drain deferred work; return if `stop()` was called and
+nothing is in flight; run the before-block listeners and hooks; wait in the backend.
+
+Backends (`src/backend_*.cpp`) are readiness-first for sockets on every platform: an operation
+tries the system call and parks on the socket's `io_watch_t` only on `errc::again`. epoll is
+edge-triggered, kqueue uses `EV_CLEAR`, io_uring arms a one-shot `POLL_ADD`, and IOCP polls through
+AFD. On Linux `VIO_BACKEND=epoll|io_uring` picks one at run time; epoll is the default, and
+`backend_name()` reports which ran. io_uring also runs file reads, writes and `fsync` on the ring.
+Everything else that blocks -- other file work, `getaddrinfo` -- runs on the blocking pool
+(`src/blocking_pool.cpp`), which has separate file and DNS queues (4 and 2 threads,
+`VIO_FILE_THREADS` and `VIO_DNS_THREADS` to change them).
+
+The system calls live in `src/sys_posix.cpp`, `src/sys_win.cpp` and `src/vio/detail/sys_file.h`.
+They return a byte count or a negative `vio::errc` code (`src/vio/errc.h`), the same numbers on
+every platform.
+
+Two rules that cost a sanitizer run each to learn. A thread that posts wakes the loop **before** it
+releases the post lock: otherwise the loop can drain the post, finish and be destroyed while the
+poster is still about to touch it. And `unpost` on the loop thread also clears the node from the
+batch being drained, because work earlier in the same batch may have destroyed its owner.
 
 ### task_t coroutine lifecycle
 
@@ -601,20 +638,19 @@ continuation (the caller that `co_await`ed). The destructor only destroys the fr
 `ref_ptr_t<T>` is a ref-counted smart pointer. When the last reference is released (`dec()`):
 
 1. `on_destroy` callbacks fire (in reverse registration order)
-2. `uv_close` is called on all registered closable handles
-3. Storage is freed only after all close callbacks have fired (via `close_pending` counter)
+2. every resource registered with `register_resource` starts its close
+3. Storage is freed only after every close has finished, on a later turn (via `close_pending`)
 
-The `on_destroy` callbacks may register additional closable handles (e.g. the `uv_tcp_t` for a
-TLS connection). The `in_destroy_sequence` flag prevents re-entrant destruction if callbacks
-temporarily increment/decrement the ref count. A parked ref that a callback holds (e.g. an
-in-flight `uv_write` during teardown, see `begin_teardown`) defers the final destruction until
-that callback releases it — which is how a best-effort close_notify write is flushed on close.
+The `on_destroy` callbacks may register more resources (e.g. the socket of a TLS connection). The
+`in_destroy_sequence` flag prevents re-entrant destruction if callbacks temporarily increment and
+decrement the ref count. A ref that pending work holds (e.g. the linger timer `begin_teardown` arms
+while a close_notify is still being written) defers the final destruction until that work releases
+it — which is how a best-effort close_notify is flushed on close.
 
-### TLS transport: uv_tls_stream_t + ssl_engine_t (memory BIOs)
+### TLS transport: tls_stream_t + ssl_engine_t
 
-TLS rides libuv's **stream API** (`uv_read_start` / `uv_write` on the `uv_tcp_t`), not `uv_poll`.
-vio issues no raw `recv`/`send`, so libuv's backend (io_uring/IOCP) is invisible to the crypto
-layer. The pieces (all in `src/vio/`):
+TLS reads and writes the socket itself: it parks on readiness, calls `recv`/`send` when the
+socket is ready, and feeds the bytes through the engine. The pieces (all in `src/vio/`):
 
 - `ssl_backend.h` — compile-time backend seam (`VIO_SSL_BACKEND`); only bundled BoringSSL is
   wired, and selecting another value is a configure error rather than a compile-for-one-link-to-
@@ -627,41 +663,42 @@ layer. The pieces (all in `src/vio/`):
 - `ssl_context.h` — `ssl_context_t`: a shared `SSL_CTX` built once from `ssl_config_t` (verify,
   ALPN, keylog, session cache). Server ALPN selection is hand-rolled (server preference, empty-list
   CVE-2024-5535 guard, `NOACK` on no overlap).
-- `ssl_engine.h` — `ssl_engine_t`: a per-connection **socket-free** codec (`SSL*` + rbio/wbio
-  `BIO_s_mem`). `feed_ciphertext`→rbio, `SSL_read`→plaintext; `SSL_write`→drain wbio→ciphertext.
-- `socket_stream.h` — `uv_tls_stream_t`: the driver. `read_cb` feeds rbio then `pump()`s;
-  `pump()` is **handshake-then-fall-through** (a segment carrying Finished + app data decrypts
-  both in one pass). After every SSL op it drains wbio (so KeyUpdate/alert control records are
-  sent). Writes are producer-throttled: over the write high-water mark, `SSL_write` is deferred and
-  the awaitable stays suspended (natural backpressure); a bounded `buffer_queue` + `uv_read_stop`
-  applies read backpressure. The handshake is driven to completion at connect/accept.
+- `ssl_engine.h` — `ssl_engine_t`: a per-connection **socket-free** codec (`SSL*` plus a custom
+  BIO over the engine's own inbound and outbound buffers). The socket is read straight into
+  `inbound_space()`; `SSL_read` yields plaintext; `SSL_write` fills `pending_output()`.
+- `socket_stream.h` — `tls_stream_t`: the driver. `service()` flushes output, pumps writes, reads
+  the socket (up to `read_budget` reads per turn) and notifies waiters. Processing inbound bytes is
+  **handshake-then-fall-through** (a segment carrying Finished + app data decrypts both in one
+  pass). After every SSL op it flushes output, so KeyUpdate and alert records are sent. Writes are
+  producer-throttled: over `write_high_water`, `SSL_write` is deferred and the awaitable stays
+  suspended (natural backpressure); a reader nobody awaits stops reading the socket. The handshake
+  is driven to completion at connect/accept.
 
-Reentrancy: `read_cb`/`write_cb` hold a callback-duration ref (`rc->inc()/dec()`) so a resumed
-coroutine that drops the last user ref cannot free the state mid-callback; each in-flight
-`uv_write` parks a ref released in `write_cb`. Never hold a `write_queue[idx]` reference across a
-`continuation.resume()` (the vector may reallocate) — re-index after resuming.
+Reentrancy: work scheduled for a later turn holds a ref (`rc->inc()/dec()`) so a resumed coroutine
+that drops the last user ref cannot free the state under it. Never hold a `write_queue[idx]`
+reference across a `continuation.resume()` (the vector may reallocate) — re-index after resuming.
 
 ### event_loop_t
 
-The event loop has always-active internal handles (async, prepare, event pipes).
-`event_loop.run()` (i.e. `uv_run(UV_RUN_DEFAULT)`) will never return on its own — `stop()` must
-be called, which sends an async signal that closes all internal handles. Tests that don't use
-coroutines still need `event_loop.stop()` before `event_loop.run()` for cleanup.
+`event_loop.run()` returns only after `stop()`, and then only once nothing is in flight: a parked
+operation, a timer that keeps the loop alive, a blocking-pool job or an unfinished close. `stop()`
+is sticky; a later `run()` drains and returns. Tests that don't use coroutines still call
+`event_loop.stop()` before `event_loop.run()` so closes finish.
 
 ### Handle lifetime vs loop teardown
 
 **A vio handle must be released while the loop can still run.** Dropping the last reference to a
-`udp_t`, `timer_t`, `tcp_server_t` … only *requests* `uv_close`; the close callback runs on a later
-loop iteration, and the ref-counted storage is freed only once it has. So a handle still alive when
-`run()` returns leaves its `uv_close` unfinished, `uv_loop_close()` fails with `EBUSY`, and
-`~event_loop_t` reports every handle still open and then aborts on its `assert` (in a debug build —
-under `NDEBUG` it used to be silent, which is why the destructor prints regardless of build type).
+`udp_t`, `timer_t`, `tcp_server_t` … only *starts* its close; the close finishes on a later turn,
+and the ref-counted storage is freed only once it has. So a handle still alive when `run()` returns
+leaves its close unfinished, and `~event_loop_t` names every resource still open and then asserts.
+It prints in every build type, because under `NDEBUG` the assert is gone.
 
 The symptom has two faces, and the second one does not look like a lifetime problem at all:
 
-- `Assertion failed: close_result == 0` at the end of a test, *after* every assertion passed.
-- **`run()` never returns.** `stop()` closes vio's internal handles, but `uv_run` keeps going while a
-  user handle is open. A test that calls `loop.stop()` while still holding a socket hangs rather
+- `vio: ~event_loop_t: ... still open` and an assertion at the end of a test, *after* every
+  assertion passed.
+- **`run()` never returns.** An operation still parked on a handle keeps the loop alive after
+  `stop()`. A test that calls `loop.stop()` while a read or accept is still waiting hangs rather
   than aborting.
 
 The fix is always to shorten the handle's life, not to lengthen the loop's:
@@ -676,38 +713,34 @@ loop.stop();
 {
   auto socket = …;
   auto reader = …;
-}                 // uv_close requested here
-loop.stop();      // and drained by the run() that is still in progress
+}                 // close started here
+loop.stop();      // and finished by the run() that is still in progress
 ```
 
 Handles are deliberately **not** force-closed in `~event_loop_t`: they live in reference-counted
-storage their owner still holds, and that owner will `uv_close` them when it is destroyed. Closing
-them twice is worse than leaking them.
+storage their owner still holds, and that owner closes them when it is destroyed. Closing them
+twice is worse than leaking them. A socket whose storage is destroyed without being closed aborts
+with a message, because the backend may still hold a pointer to it.
 
 ### Socket reads: queue, read_into (zero-copy), pause/resume
 
-`tcp_reader_t` (`operation/tcp.h`) supports three modes over one persistent
-`uv_read_start`:
-- `co_await reader` — the queue path: libuv allocs a buffer, `read_cb` enqueues an
-  owned `unique_buf_t`, the awaiter hands it over by move.
-- `reader.read_into(std::span<std::byte> dst)` — **true zero-copy** scatter read:
-  the alloc callback hands libuv the caller's `dst` (with a no-op deallocator) so
-  bytes land directly in `dst`; resolves to `std::expected<std::size_t, error_t>`
-  (0 = EOF). If bytes are already queued it copies from the front buffer
-  (partial-consume tracked via `read.front_consumed`) instead. After a direct
-  read it leaves the reader **paused**, so libuv doesn't buffer ahead — the pull
-  cadence is the backpressure.
-- `reader.pause()` / `reader.resume()` — transient `uv_read_stop`/`uv_read_start`.
-  Critical: these must **not** reclaim the ref parked in `stream->data` by
-  `tcp_create_reader` (only teardown — dtor/`cancel()`, gated on `read.started` —
-  does), so `read.started` stays true across pause; a separate `read.paused`
-  flag tracks the armed state. The alloc trampoline + `read_cb` are hoisted to
-  static members so `resume()` re-arms with the same callbacks.
+`tcp_reader_t` (`operation/tcp.h`) supports three modes over one reader:
+- `co_await reader` — the queue path: the reader takes a buffer from its alloc callback, calls
+  `recv` into it and hands the owned `unique_buf_t` over by move. If the socket has nothing, the
+  awaiter parks on readiness and tries again when it is woken.
+- `reader.read_into(std::span<std::byte> dst)` — **true zero-copy**: `recv` writes straight into
+  `dst`; resolves to `std::expected<std::size_t, error_t>` (0 = EOF). Nothing is read between
+  calls, so the pull cadence is the backpressure.
+- `reader.pause()` / `reader.resume()` — stop and restart delivery. A pause cancels a parked
+  queue read; `read.started` stays true across a pause and `read.paused` tracks the armed state.
 
-TLS (`stream_reader_t`, `socket_stream.h`) already had exact-fill decrypt-into-
-caller-buffer (`read(uv_buf_t)`) and automatic ring-buffer backpressure
-(`arm_reads`/`disarm_reads`); it cannot be truly zero-copy since libuv only sees
-ciphertext. (These vio APIs back prism's streaming request bodies.)
+Because the kernel never holds a caller's buffer, `cancel()` on a `read_into` is synchronous:
+prism cancels one and reuses the buffer at once.
+
+TLS (`stream_reader_t`, `socket_stream.h`) decrypts directly into a caller buffer
+(`read(std::span<std::byte>)`) and stops reading the socket when nobody waits; it cannot be truly
+zero-copy since the socket only carries ciphertext. (These vio APIs back prism's streaming request
+bodies.)
 
 ## Writing Tests
 
@@ -763,15 +796,15 @@ simply creates and co_awaits sub-tasks that follow the parameter pattern.
 
 ### TLS disconnect detection
 
-Because vio now owns the TCP read (`uv_read_start`), disconnects are detected directly — the old
+vio reads the socket itself, so disconnects are detected directly — the old
 `recv(..., MSG_PEEK)` probe is gone. Distinct, stable `error_t` codes let a downstream (HTTP/2)
 branch on the kind of close (defined in `ssl_engine.h`):
 
 1. **Clean shutdown (`vio_tls_clean_shutdown`):** the peer sent `close_notify`, so `SSL_read`
-   returns `SSL_ERROR_ZERO_RETURN` (or the read callback delivers `UV_EOF` after `close_notify`).
-2. **Unclean truncation (`vio_tls_truncated`):** the read callback delivers `UV_EOF` before any
+   returns `SSL_ERROR_ZERO_RETURN` (or `recv` returns 0 after `close_notify`).
+2. **Unclean truncation (`vio_tls_truncated`):** `recv` returns 0 before any
    `close_notify` — the connection was cut mid-stream.
-3. **Transport error:** any other negative `nread` maps to the libuv error code.
+3. **Transport error:** any other failed `recv` maps to its `vio::errc` code.
 
 ### TLS extras: OCSP stapling, session resumption, writev backpressure
 
@@ -799,10 +832,11 @@ branch on the kind of close (defined in `ssl_engine.h`):
 
 ### on_destroy teardown (begin_teardown)
 
-`tls_client.h` and `tls_server.h` `on_destroy` callbacks call `uv_tls_stream_t::begin_teardown()`:
-best-effort one-way `close_notify` (its fire-and-forget `uv_write` parks a ref, deferring final
-destruction until the flush completes), then `uv_read_stop`. The `SSL*`/BIOs are freed by the
-`ssl_engine_t` destructor when the state's storage is deleted — after the close_notify ciphertext
-has already been copied out of `wbio`. Guarded to be a no-op when the engine was never initialized
-(e.g. a client dropped before connecting). `ssl_server_create`'s `on_destroy` additionally cancels
-a pending listen and consumes the raw ref `tcp_listen` parked in `stream->data`.
+`tls_client.h` and `tls_server.h` `on_destroy` callbacks call `tls_stream_t::begin_teardown()`:
+it cancels a parked read and sends a best-effort one-way `close_notify`. If the socket cannot take
+it all at once, the stream holds a ref and arms a linger timer (`teardown_linger_ns`, 10 s) that
+defers final destruction until the flush completes or the timer gives up. The `SSL*` and its BIOs
+are freed by the `ssl_engine_t` destructor when the state's storage is deleted — after the
+close_notify has left the engine. Guarded to be a no-op when the engine was never initialized
+(e.g. a client dropped before connecting). `ssl_server_create`'s `on_destroy` aborts a pending
+listen with `errc::canceled`.

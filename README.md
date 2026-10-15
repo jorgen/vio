@@ -4,11 +4,11 @@
 
 # vio
 
-**vio** is a lean C++23 async I/O library: [libuv](https://libuv.org) for the
-event loop, **C++20 coroutines** for the programming model, and
-[BoringSSL](https://boringssl.googlesource.com/boringssl) for TLS. You write straight-line
-`co_await` code; vio drives it on a single-threaded event loop without callbacks
-or blocking.
+**vio** is a lean C++23 async I/O library. It runs its own event loop on each
+operating system's native mechanism, uses **C++20 coroutines** for the programming
+model, and [BoringSSL](https://boringssl.googlesource.com/boringssl) for TLS. You
+write straight-line `co_await` code; vio drives it on a single-threaded event loop
+without callbacks or blocking.
 
 ```cpp
 #include <vio/operation/tls_client.h>
@@ -25,15 +25,14 @@ int main()
       co_return 1;
 
     std::string req = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-    uv_buf_t buf{.base = req.data(), .len = req.size()};
-    co_await vio::ssl_client_write(client.value(), buf);
+    co_await vio::ssl_client_write(client.value(), std::as_bytes(std::span(req)));
 
     auto reader = vio::ssl_client_create_reader(client.value()).value();
     for (;;)
     {
       auto chunk = co_await reader;              // std::expected<unique_buf_t, error_t>
       if (!chunk) break;                          // EOF or error
-      std::fwrite(chunk->buf.base, 1, chunk->buf.len, stdout);
+      std::fwrite(chunk->data(), 1, chunk->size(), stdout);
     }
     co_return 0;
   });
@@ -50,8 +49,11 @@ REST service library), but stands alone as a general-purpose networking toolkit.
   machines. Errors are values, so vio builds cleanly with **`-fno-exceptions`
   `-fno-rtti`** (its `task_t` calls `std::terminate` on an unhandled exception
   rather than propagating).
+- **Native event loops.** epoll or io_uring on Linux, kqueue on macOS, IOCP on
+  Windows. On Linux, `VIO_BACKEND=epoll` or `VIO_BACKEND=io_uring` picks one at
+  run time; epoll is the default.
 - **TCP, TLS, UDP, DNS, files, timers, a thread pool, and event pipes** — one
-  uniform coroutine surface over libuv.
+  uniform coroutine surface on every platform.
 - **TLS** via BoringSSL through a compile-time SSL-backend seam (LibreSSL and
   OpenSSL arms exist in the seam), with ALPN, SNI, OCSP stapling, and session
   resumption.
@@ -113,8 +115,8 @@ See [`examples/hello_timer.cpp`](examples/hello_timer.cpp).
 
 ### `event_loop_t`
 
-The libuv loop. Created once (by `vio::run`, or directly); `run()` blocks until
-`stop()`. Operations take it (or reach it through their handle) to register work.
+One per thread. Created once (by `vio::run`, or directly); `run()` blocks until
+`stop()`. `backend_name()` says which mechanism it runs on. Operations take it (or reach it through their handle) to register work.
 On WASM there is no blocking `run()`/`vio::run` — drive the loop with
 `event_loop_t::run_in_loop` instead.
 
@@ -131,7 +133,9 @@ frees its own frame on completion.
 Every fallible operation returns `std::expected<T, vio::error_t>`, where
 `error_t { int code; std::string msg; }`. Check `.has_value()` / `if (result)`,
 read `result.value()` / `result.error()`. Cancellation surfaces as an error;
-test it with `vio::is_cancelled(err)` (code `UV_ECANCELED` / `vio_cancelled`).
+test it with `vio::is_cancelled(err)`. Codes are vio's own and the same on every
+platform: `vio::errc::eof`, `vio::errc::canceled` and the rest are in
+`vio/errc.h`, and `vio::error_message(code)` names one.
 
 ### Cancellation & timeouts
 
@@ -190,12 +194,12 @@ auto client = vio::tcp_accept(server).value();
 
 auto reader = vio::tcp_create_reader(client).value();
 auto in = co_await reader;                         // std::expected<unique_buf_t, error_t>
-if (in) co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(in->base), in->len);
+if (in) co_await vio::write_tcp(client, in->span());
 ```
 
 `write_tcp` has an **owning overload** — move in any contiguous byte range
-(`std::string`, `std::vector<std::byte>`, …) and vio keeps it alive for the
-in-flight `uv_write`, so a cancelled write is UAF-free without a copy. Full
+(`std::string`, `std::vector<std::byte>`, …) and vio keeps it alive until the
+write finishes, so a cancelled write is UAF-free without a copy. Full
 client+server round-trip: [`examples/tcp_echo.cpp`](examples/tcp_echo.cpp).
 
 ### Reading: queue, `read_into` (zero-copy), and backpressure
@@ -203,11 +207,10 @@ client+server round-trip: [`examples/tcp_echo.cpp`](examples/tcp_echo.cpp).
 A `tcp_reader_t` supports three modes over one subscription:
 
 - **`co_await reader`** — the queue path: yields an owned `unique_buf_t` per read.
-- **`reader.read_into(std::span<std::byte> dst)`** — a scatter read that lands
-  socket bytes **directly in your buffer** (true zero-copy; libuv reads into
-  `dst`), resolving to `std::expected<std::size_t, error_t>` (`0` == EOF). After a
-  direct read the reader is left **paused**, so libuv never buffers ahead — the
-  pull cadence is the backpressure.
+- **`reader.read_into(std::span<std::byte> dst)`** — a read that lands socket
+  bytes **directly in your buffer** (true zero-copy; the socket is read straight
+  into `dst`), resolving to `std::expected<std::size_t, error_t>` (`0` == EOF).
+  Nothing is read ahead between calls — the pull cadence is the backpressure.
 - **`reader.pause()` / `reader.resume()`** — explicit start/stop of delivery.
 
 ```cpp
@@ -221,8 +224,8 @@ for (;;)
 ```
 
 See [`examples/tcp_read_into.cpp`](examples/tcp_read_into.cpp). (TLS readers
-decrypt directly into a caller buffer via `reader.read(uv_buf_t)`; they can't be
-truly zero-copy since libuv only ever sees ciphertext.)
+decrypt directly into a caller buffer via `reader.read(std::span<std::byte>)`;
+they can't be truly zero-copy since the socket only ever carries ciphertext.)
 
 ### TLS
 
@@ -266,10 +269,11 @@ unavailable on WASM — drive `event_loop_t` directly via `run_in_loop`.
 ## Dependencies
 
 Fetched at configure time via [cmake-dep](https://github.com/jorgen/cmake-dep):
-**libuv**, **BoringSSL**, **ada** (URL parsing), **doctest** (tests), and
-**cmakerc** (embedded default CA bundle). Each is togglable and overridable:
+**BoringSSL**, **ada** (URL parsing), **structify** (JSON for the object store),
+**doctest** (tests), and **cmakerc** (embedded default CA bundle). Each is
+togglable and overridable:
 
-- `VIO_USE_SYSTEM_{LIBUV,BORINGSSL,ADA,DOCTEST,CMAKERC}` — consume a pre-installed
+- `VIO_USE_SYSTEM_{BORINGSSL,ADA,STRUCTIFY,DOCTEST,CMAKERC}` — consume a pre-installed
   copy via `find_package` instead of fetching.
 - `VIO_<DEP>_VERSION` / `VIO_<DEP>_URL` / `VIO_<DEP>_SHA256` — fetch a different
   version without editing the packages file, e.g.
@@ -300,8 +304,8 @@ target_link_libraries(my_app PRIVATE vio::vio)
 ```
 
 **Installed / `find_package`**: build vio with `VIO_INSTALL=ON` **and** against
-system deps (`-DVIO_USE_SYSTEM_LIBUV=ON …`) — in that configuration it installs a
-relocatable `find_package(vio)` config (`find_dependency`s libuv/BoringSSL/ada):
+system deps (`-DVIO_USE_SYSTEM_BORINGSSL=ON …`) — in that configuration it installs a
+relocatable `find_package(vio)` config (`find_dependency`s BoringSSL/ada):
 
 ```cmake
 find_package(vio CONFIG REQUIRED)
