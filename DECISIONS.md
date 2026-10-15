@@ -72,10 +72,17 @@ chunks of that size.
 
 **D49. A TCP or TLS connection dropped with writes still queued delivers them first.** It lingers
 for up to 10 s, and reads and discards what the peer sends while it does, so two lingering ends
-drain each other. `run()` after `stop()` and `thread_with_event_loop_t::stop_and_join()` wait for a
-linger: they return once the writes drain, or after 10 s if the peer never reads. The discarding
-read does not keep the loop alive; the linger timer and the queued write do. Under libuv a dropped
-TCP handle with queued writes lost them and the peer saw a clean end of stream.
+drain each other. Once the writes are out, a TCP connection shuts down its sending side and goes
+on discarding until the peer closes too, for at most 2 s more, and only then closes the socket; TLS
+does not do this yet. Closing while
+the peer is still sending makes the kernel answer with a reset, and on Windows a reset throws away
+whatever the peer has not read yet. Windows takes a whole queue into the kernel at once, so there
+the writes "finish" long before the peer has them, and closing at that point lost the response the
+linger was there to deliver. `run()` after `stop()` and `thread_with_event_loop_t::stop_and_join()`
+wait for a linger: they return once the peer closes, 2 s after the writes drain, or after 10 s if
+the peer never reads. The discarding read does not keep the loop alive; the linger timer and the
+queued write do. Under libuv a dropped TCP handle with queued writes lost them and the peer saw a
+clean end of stream.
 
 **D48. epoll watches for writability only while a writer waits.** A socket is registered for
 reading, edge-triggered. When a write would block, the writer parks and the backend adds `EPOLLOUT`
@@ -100,8 +107,9 @@ runs, the two are level within 3%: with readiness-first sockets io_uring only re
 `epoll_wait`, which is about 0.1% of the CPU. `BASELINE.md` has the numbers, why, and the
 prototypes that did not help.
 
-**D14. io_uring needs Linux 6.1 or newer, and vio talks to it through raw system calls.** 6.1 brings
-everything vio wants. Older kernels use epoll. vio carries a small ring class instead of depending
+**D14. io_uring needs Linux 5.18 or newer, and vio talks to it through raw system calls.** The ring
+asks for `IORING_SETUP_SUBMIT_ALL`, which 5.18 added; on an older kernel it does not start and vio
+uses epoll. `COOP_TASKRUN` (5.19) and `NO_SQARRAY` (6.6) are used when the kernel has them. vio carries a small ring class instead of depending
 on liburing, which has no CMake build and lags the kernel. libuv, Zig's standard library and
 TigerBeetle take the same approach. When the kernel refuses submissions with `EAGAIN`, the ring
 backs off for up to 30 s and then aborts naming `EAGAIN`; only submissions that make no progress
