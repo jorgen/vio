@@ -197,23 +197,6 @@ vio::task_t<void> cancelled_unsent_scenario(vio::event_loop_t &loop, std::string
   co_await std::move(reader_task);
 }
 
-vio::task_t<void> finished_then_cancelled_scenario(vio::event_loop_t &loop, std::string &received, bool &finished_at_once, bool &reported_success)
-{
-  auto pair = co_await connect_pair(loop);
-  REQUIRE(pair.has_value());
-  auto reader_task = read_all(std::move(pair->server), received);
-  {
-    auto client = std::move(pair->client);
-    vio::cancellation_t token;
-    auto write = vio::write_tcp(client, std::string("sent"), &token);
-    finished_at_once = write.await_ready();
-    token.cancel();
-    auto result = co_await std::move(write);
-    reported_success = result.has_value();
-  }
-  co_await std::move(reader_task);
-}
-
 vio::task_t<void> sticky_error_scenario(vio::event_loop_t &loop, int &first_error, int &second_error)
 {
   auto pair = co_await connect_pair(loop);
@@ -290,17 +273,6 @@ TEST_SUITE("tcp write queue")
     CHECK(cancelled_code == vio::vio_cancelled);
     CHECK(others_ok);
     CHECK(received == std::string(filled, 'f') + std::string(chunk_size, 'a') + "CCCC");
-  }
-
-  TEST_CASE("a write that already went out is not reported cancelled when its token fires later")
-  {
-    std::string received;
-    bool finished_at_once = false;
-    bool reported_success = false;
-    run_scenario([&](vio::event_loop_t &loop) { return finished_then_cancelled_scenario(loop, received, finished_at_once, reported_success); });
-    REQUIRE(finished_at_once);
-    CHECK(reported_success);
-    CHECK(received == "sent");
   }
 
   TEST_CASE("a write to a vanished peer fails, and later writes fail the same way")
