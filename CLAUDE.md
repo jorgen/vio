@@ -864,7 +864,7 @@ defers final destruction until the flush completes or the timer gives up. Plain 
 through `detail::tcp_begin_teardown` when a dropped `tcp_t` still has writes queued
 (`tcp_teardown_linger_ns`). Both keep reading and discarding inbound bytes while they linger, so
 two lingering ends drain each other instead of stalling until the timer. Once the writes are out
-TCP shuts down the sending side and closes only when the peer does, or 2 s later: closing while the
+both shut down the sending side and close only when the peer does, or 2 s later: closing while the
 peer still sends draws a reset, which on Windows destroys data the peer has not read (D49). The `SSL*` and its BIOs
 are freed by the `ssl_engine_t` destructor when the state's storage is deleted — after the
 close_notify has left the engine. Guarded to be a no-op when the engine was never initialized

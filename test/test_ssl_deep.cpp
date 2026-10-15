@@ -941,6 +941,71 @@ TEST_CASE("two TLS ends dropped with writes queued drain each other instead of w
   CHECK(elapsed < std::chrono::seconds(5));
 }
 
+namespace
+{
+vio::task_t<void> read_to_end_then_send_raw(vio::event_loop_t &el, vio::ssl_config_t cc, int port, std::size_t &received, int &end_code, int &late_writes,
+                                            std::chrono::steady_clock::time_point &peer_closed)
+{
+  {
+    auto created = vio::ssl_client_create(el, cc);
+    REQUIRE_EXPECTED(created);
+    auto client = std::move(created.value());
+    auto connected = co_await vio::ssl_client_connect(client, "localhost", port, "127.0.0.1");
+    REQUIRE_EXPECTED(connected);
+    {
+      auto reader = vio::ssl_client_create_reader(client);
+      REQUIRE_EXPECTED(reader);
+      for (;;)
+      {
+        auto chunk = co_await reader.value();
+        if (!chunk.has_value())
+        {
+          end_code = chunk.error().code;
+          break;
+        }
+        received += chunk->size();
+      }
+    }
+    auto native = client.state->tcp.handle->socket.native();
+    std::array<std::byte, 1024> junk{};
+    for (int i = 0; i < 3; ++i)
+    {
+      late_writes += int(vio::detail::socket_send(native, junk) == static_cast<std::int64_t>(junk.size()));
+      [[maybe_unused]] auto slept = co_await vio::sleep(el, std::chrono::milliseconds(20));
+    }
+  }
+  peer_closed = std::chrono::steady_clock::now();
+}
+} // namespace
+
+TEST_CASE("a lingering TLS end sends its end of stream and stays open until the peer closes")
+{
+  auto config = make_pair_config();
+  const std::string payload = make_pattern(4 * 1024 * 1024, 29);
+  std::size_t received = 0;
+  int end_code = 0;
+  int late_writes = 0;
+  std::chrono::steady_clock::time_point peer_closed;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = lingering_tls_server(el, std::move(pair->first), config.server, port, payload);
+      auto client_task = read_to_end_then_send_raw(el, config.client, port, received, end_code, late_writes, peer_closed);
+      co_await std::move(client_task);
+      co_await std::move(server_task);
+      el.stop();
+    });
+  auto linger_after_peer = std::chrono::steady_clock::now() - peer_closed;
+  CHECK(received == payload.size());
+  CHECK(end_code == vio::vio_tls_clean_shutdown);
+  CHECK(late_writes == 3);
+  CHECK(linger_after_peer < std::chrono::seconds(1));
+}
+
 TEST_CASE("a zero-length write resolves at once")
 {
   auto config = make_pair_config();

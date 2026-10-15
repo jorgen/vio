@@ -72,9 +72,9 @@ chunks of that size.
 
 **D49. A TCP or TLS connection dropped with writes still queued delivers them first.** It lingers
 for up to 10 s, and reads and discards what the peer sends while it does, so two lingering ends
-drain each other. Once the writes are out, a TCP connection shuts down its sending side and goes
-on discarding until the peer closes too, for at most 2 s more, and only then closes the socket; TLS
-does not do this yet. Closing while
+drain each other. Once the writes are out (for TLS, the records and the `close_notify`), it shuts
+down its sending side and goes on discarding until the peer closes too, for at most 2 s more, and
+only then closes the socket. Closing while
 the peer is still sending makes the kernel answer with a reset, and on Windows a reset throws away
 whatever the peer has not read yet. Windows takes a whole queue into the kernel at once, so there
 the writes "finish" long before the peer has them, and closing at that point lost the response the

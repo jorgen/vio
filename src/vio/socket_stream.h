@@ -292,6 +292,7 @@ struct tls_stream_t
   static constexpr size_t write_slice = 65536;
   static constexpr int read_budget = 16;
   static constexpr std::int64_t teardown_linger_ns = 10'000'000'000;
+  static constexpr std::int64_t linger_after_fin_ns = 2'000'000'000;
   static constexpr size_t linger_discard_chunk = 16384;
   static constexpr int linger_discard_budget = 64;
   static_assert(ssl_engine_t::output_retain >= write_slice + write_slice / 16 + 1024);
@@ -789,7 +790,7 @@ private:
       flush_out();
       pump_writes();
       if (_lingering && teardown_settled())
-        finish_linger();
+        settle_linger();
       return;
     }
     flush_out();
@@ -1154,6 +1155,32 @@ private:
     return !engine.has_output() && _backlog.empty();
   }
 
+  void settle_linger()
+  {
+    if (_write_error != 0 || socket == nullptr || !socket->is_open() || _read_eof)
+    {
+      finish_linger();
+      return;
+    }
+    if (_linger_fin_sent)
+      return;
+    _linger_fin_sent = true;
+    if (detail::socket_shutdown_write(socket->native()) != 0)
+    {
+      finish_linger();
+      return;
+    }
+    auto deadline = detail::loop_core_t::deadline_after(linger_after_fin_ns);
+    if (_linger.armed() && deadline < _linger.deadline)
+    {
+      _core->remove_timer(_linger);
+      _core->add_timer(_linger, deadline);
+    }
+    linger_read();
+    if (_read_eof)
+      finish_linger();
+  }
+
   void finish_linger()
   {
     _lingering = false;
@@ -1299,6 +1326,7 @@ private:
   bool _write_wants_read = false;
   bool _read_eof = false;
   bool _lingering = false;
+  bool _linger_fin_sent = false;
   bool _notifying = false;
 };
 
