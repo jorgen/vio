@@ -151,6 +151,11 @@ Linux, macOS and Windows.
 Boost.Asio and Tokio on the same operations. Creating a repository on your account needs your
 approval, so its design is in the plan and the repository does not exist yet.
 
+**D44. A write whose token fires before it is awaited reports `vio_cancelled`, even if its bytes
+went out.** libuv behaved this way and the `tcp write cancel` test holds it. Cancelled therefore
+means "you gave up on this write", not "the peer never saw it"; a caller that cancels a write
+should treat the stream as broken. TLS writes follow the same rule.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan), macos-15

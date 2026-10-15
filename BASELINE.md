@@ -59,3 +59,48 @@ Allocations: 5.0 per datagram (bulk, sans-I/O), 12.5 per datagram over sockets, 
 
 The receive rows show what libuv's UDP path cost: a quarter to a half of what the raw calls
 reach. That gap is the first thing the native datagram path should close.
+
+## After: vio on its own event loop
+
+Commit `8dc7ee9`, Release build, same machine. The two builds ran turn about, three times each,
+so both saw the same load: about 2 on 4 vCPUs, because a code review was running beside them.
+Treat a difference under 20% as noise; the sans-I/O rows, which never touch the event loop, move
+that much between runs.
+
+### vio_bench (QUIC), medians, epoll
+
+| row | libuv | native | ratio |
+|-----|-------|--------|-------|
+| bulk stream transfer, sans-I/O | 388 MB/s | 462 MB/s | noise |
+| 512 concurrent streams | 184 MB/s | 201 MB/s | noise |
+| socket, offload off | 108 MB/s | 152 MB/s | 1.4x |
+| socket, offload on | 133 MB/s | 250 MB/s | 1.9x |
+| bulk, callback api | 129 MB/s | 222 MB/s | 1.7x |
+| bulk, coroutine api (read_into) | 133 MB/s | 303 MB/s | 2.3x |
+| bulk, coroutine api (owning read) | 138 MB/s | 315 MB/s | 2.3x |
+| requests, callback api | 34981 req/s | 77511 req/s | 2.2x |
+| requests, coroutine api | 41509 req/s | 50925 req/s | 1.2x |
+
+Allocations fell with it: 12.5 per datagram over sockets became 3.3 (callback) and 3.6
+(coroutine); 23.1 per request became 15.2 (callback), and 31.7 became 24.5 (coroutine).
+
+io_uring, run separately: the socket rows land within noise of epoll. Sockets are
+readiness-first on both, so io_uring only replaces `epoll_wait`, and that is not where the time
+goes. It stays off by default (D13).
+
+### vio_udp_bench, epoll
+
+| path | libuv | native |
+|------|-------|--------|
+| raw `recvmmsg` (the ceiling) | 3462 kpps | 4000 kpps |
+| `uv_udp_recv_start` | 1104 kpps | |
+| `uv_udp_recv_start` + mmsg | 957 kpps | |
+| `udp_reader_t`, pooled | | 896 kpps |
+| `udp_reader_t`, pooled + mmsg | | 1070 kpps |
+| `datagram_reader_t` | | 4112 kpps |
+| `datagram_reader_t`, batch | | 3172 kpps |
+
+`datagram_reader_t` now reaches the raw `recvmmsg` ceiling, about 3.7 times what libuv's
+receive path managed. The older `udp_reader_t` hands out one owned buffer per datagram and stays
+where libuv was. Sends were bound by the kernel before and still are: every path is within noise
+of the raw call it makes.
