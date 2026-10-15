@@ -22,8 +22,9 @@ public:
     reference_counted_t ref_count;
     Data data;
 
+    template <typename D = Data>
+      requires std::default_initializable<D>
     storage_t()
-      requires std::default_initializable<Data>
       : ref_count([this] { delete this; })
       , data{}
     {
@@ -47,8 +48,9 @@ private:
   }
 
 public:
+  template <typename D = Data>
+    requires std::default_initializable<D>
   ref_ptr_t()
-    requires std::default_initializable<Data>
     : _storage(new storage_t())
   {
   }

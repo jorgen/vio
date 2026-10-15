@@ -672,8 +672,8 @@ namespace detail
 [[nodiscard]] inline int udp_set_small_option(native_socket_t native, int level, int name, int value) noexcept
 {
 #if defined(__OpenBSD__) || defined(__sun) || defined(_AIX)
-  const unsigned char small = static_cast<unsigned char>(value);
-  return socket_set_option(native, level, name, &small, static_cast<int>(sizeof(small)));
+  const unsigned char narrow = static_cast<unsigned char>(value);
+  return socket_set_option(native, level, name, &narrow, static_cast<int>(sizeof(narrow)));
 #else
   return udp_set_int_option(native, level, name, value);
 #endif

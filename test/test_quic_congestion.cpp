@@ -121,13 +121,13 @@ TEST_CASE("a loss halves the window and starts a recovery period")
 
   SUBCASE("it never falls below the minimum")
   {
-    congestion_control_t small(datagram);
+    congestion_control_t narrow(datagram);
     for (int i = 0; i < 20; ++i)
     {
       std::vector<sent_packet_t> each = {packet(static_cast<std::uint64_t>(i), at(std::chrono::milliseconds(1000 * (i + 1))))};
-      small.on_packets_lost(each, at(std::chrono::milliseconds(1000 * (i + 1) + 1)), settled_rtt(), 25ms, std::nullopt);
+      narrow.on_packets_lost(each, at(std::chrono::milliseconds(1000 * (i + 1) + 1)), settled_rtt(), 25ms, std::nullopt);
     }
-    CHECK(small.window() == minimum_congestion_window(datagram));
+    CHECK(narrow.window() == minimum_congestion_window(datagram));
   }
 }
 

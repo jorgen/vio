@@ -724,12 +724,12 @@ TEST_CASE("sys_win: a datagram larger than the buffer returns the part that fit"
   for (std::size_t i = 0; i < sizeof(payload); ++i)
     payload[i] = static_cast<std::byte>(i);
   CHECK(socket_sendto(sender, payload, reinterpret_cast<const sockaddr *>(&bound), bound_length) == 100);
-  std::byte small[10] = {};
+  std::byte truncated[10] = {};
   sockaddr_storage from{};
   int from_length = 0;
-  CHECK(sys_win_receive(receiver, small, &from, &from_length) == 10);
+  CHECK(sys_win_receive(receiver, truncated, &from, &from_length) == 10);
   CHECK(from_length == static_cast<int>(sizeof(sockaddr_in)));
-  CHECK(small[9] == std::byte{9});
+  CHECK(truncated[9] == std::byte{9});
   socket_close(sender);
   socket_close(receiver);
 }
