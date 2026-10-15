@@ -60,10 +60,7 @@ vio::task_t<std::expected<http_response, vio::error_t>> fetch(vio::event_loop_t 
                          "User-Agent: vio-fetch\r\n"
                          "Connection: close\r\n"
                          "\r\n";
-  uv_buf_t buf;
-  buf.base = request.data();
-  buf.len = request.size();
-  auto write_result = co_await vio::ssl_client_write(client.value(), buf);
+  auto write_result = co_await vio::ssl_client_write(client.value(), std::as_bytes(std::span(request)));
   if (!write_result)
     co_return std::unexpected(write_result.error());
 
@@ -80,7 +77,7 @@ vio::task_t<std::expected<http_response, vio::error_t>> fetch(vio::event_loop_t 
     if (!read_result)
       break;
     auto &data = read_result.value();
-    raw.append(data.buf.base, data.buf.len);
+    raw.append(data.chars(), data.size());
   }
 
   // Split headers from body

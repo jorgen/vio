@@ -28,10 +28,7 @@ int main()
     std::println("TLS connection established");
 
     std::string request = "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: vio-example\r\nConnection: close\r\n\r\n";
-    uv_buf_t write_buf;
-    write_buf.base = request.data();
-    write_buf.len = request.size();
-    auto write_result = co_await vio::ssl_client_write(ssl_client.value(), write_buf);
+    auto write_result = co_await vio::ssl_client_write(ssl_client.value(), std::as_bytes(std::span(request)));
     if (!write_result)
     {
       std::println(stderr, "ssl_client_write failed: {}", write_result.error().msg);
@@ -54,7 +51,7 @@ int main()
       if (!read_result)
         break;
       auto &data = read_result.value();
-      response.insert(response.end(), data.buf.base, data.buf.base + data.buf.len);
+      response.insert(response.end(), data.chars(), data.chars() + data.size());
     }
 
     std::println("Received {} bytes", response.size());

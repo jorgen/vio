@@ -112,7 +112,7 @@ vio::task_t<void> plaintext_scenario(vio::event_loop_t &event_loop, std::string 
       auto chunk = co_await reader;
       if (!chunk)
         break;
-      captured_request.append(chunk.value().buf.base, chunk.value().buf.len);
+      captured_request.append(chunk.value().chars(), chunk.value().size());
     }
 
     std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
@@ -231,7 +231,7 @@ vio::task_t<void> keepalive_reuse_scenario(vio::event_loop_t &event_loop, int co
         auto chunk = co_await reader;
         if (!chunk)
           co_return;
-        buf.append(chunk.value().buf.base, chunk.value().buf.len);
+        buf.append(chunk.value().chars(), chunk.value().size());
       }
       buf.erase(0, buf.find("\r\n\r\n") + 4); // consume the (body-less) request
       std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
@@ -380,14 +380,13 @@ vio::task_t<void> https_ca_scenario(vio::event_loop_t &event_loop, vio_test::cer
       auto chunk = co_await reader;
       if (!chunk)
         break;
-      request.append(chunk.value()->base, chunk.value()->len);
+      request.append(chunk.value().chars(), chunk.value().size());
       have_request = true;
     }
     if (!have_request)
       co_return; // client aborted the handshake (untrusted CA) — nothing to reply to
     std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
-    const uv_buf_t buf = uv_buf_init(response.data(), response.size());
-    auto write_result = co_await vio::ssl_server_client_write(client, buf);
+    auto write_result = co_await vio::ssl_server_client_write(client, std::as_bytes(std::span(response)));
     REQUIRE_EXPECTED(write_result);
   }(event_loop, std::move(ep->first), certs.cert, certs.key);
 

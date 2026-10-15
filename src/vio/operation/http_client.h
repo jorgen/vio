@@ -27,6 +27,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <cstdlib>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -60,6 +61,11 @@ struct header_t
 
 namespace detail
 {
+inline std::uint64_t monotonic_ms(event_loop_t &loop)
+{
+  return static_cast<std::uint64_t>(vio::loop_now(loop).since_origin().count() / 1000000);
+}
+
 inline bool header_name_equals(std::string_view a, std::string_view b)
 {
   if (a.size() != b.size())
@@ -243,7 +249,7 @@ inline bool chunked_complete(std::string_view body)
 
 inline bool is_stream_end(const error_t &e)
 {
-  return e.code == UV_EOF || e.code == vio_tls_clean_shutdown || e.code == vio_tls_truncated;
+  return e.code == errc::eof || e.code == vio_tls_clean_shutdown || e.code == vio_tls_truncated;
 }
 
 struct framed_response_t
@@ -315,7 +321,7 @@ inline vio::task_t<std::expected<framed_response_t, error_t>> read_framed(Reader
       }
       co_return std::unexpected(chunk.error()); // truncated or a transport error
     }
-    raw.append(chunk.value().buf.base, chunk.value().buf.len);
+    raw.append(chunk.value().chars(), chunk.value().size());
   }
 }
 } // namespace detail
@@ -367,7 +373,7 @@ struct connection_pool_t
     auto it = idle.find(key);
     if (it == idle.end())
       return std::nullopt;
-    const uint64_t now = uv_now(loop.loop());
+    const uint64_t now = detail::monotonic_ms(loop);
     auto &vec = it->second;
     while (!vec.empty())
     {
@@ -385,7 +391,7 @@ struct connection_pool_t
     auto &vec = idle[c.key];
     if (vec.size() >= max_idle_per_host)
       return; // over cap: drop -> connection closes on destruction
-    c.idle_since_ms = uv_now(loop.loop());
+    c.idle_since_ms = detail::monotonic_ms(loop);
     vec.push_back(std::move(c));
   }
 };
@@ -509,12 +515,9 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
     std::optional<error_t> req_err;
     detail::framed_response_t framed;
     {
-      uv_buf_t buf;
-      buf.base = wire.data();
-      buf.len = static_cast<decltype(buf.len)>(wire.size());
       if (pc->tls)
       {
-        auto written = co_await ssl_client_write(pc->tls.value(), buf, cancel);
+        auto written = co_await ssl_client_write(pc->tls.value(), std::as_bytes(std::span(wire)), cancel);
         if (!written)
           req_err = written.error();
         else if (auto rr = ssl_client_create_reader(pc->tls.value()); !rr)
