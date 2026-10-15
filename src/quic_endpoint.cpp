@@ -1784,37 +1784,55 @@ TEST_CASE("a full buffer part way through single sends holds the rest, in order"
 
 TEST_CASE("datagrams held behind a full buffer queue up and leave in order")
 {
-  event_loop_t loop;
+  for (const bool segmenting : {false, true})
   {
-    send_fixture_t fixture(loop);
-    const auto first = numbered_datagrams(3, 1200);
-    const auto second = numbered_datagrams(2, 900);
+    CAPTURE(segmenting);
+    event_loop_t loop;
     {
-      planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .simulate = false});
-      send_or_hold(fixture.impl, first, 1200, fixture.to(), ecn_codepoint_t::not_ect);
-      send_or_hold(fixture.impl, second, 900, fixture.to(), ecn_codepoint_t::ect0);
-      CHECK(send_plan.calls == 1);
-    }
-    CHECK(fixture.impl.held_runs.size() == 2);
-    CHECK(fixture.impl.held.size() == first.size() + second.size());
+      send_fixture_t fixture(loop);
+      const auto probe = numbered_datagrams(2, 100);
+      const bool offload = !segmenting || send_segments(fixture.impl.udp, probe, 100, fixture.to(), udp_ecn_t::not_ect).has_value();
+      if (!offload)
+      {
+        MESSAGE("this platform does not segment UDP sends");
+      }
+      else
+      {
+        if (segmenting)
+        {
+          REQUIRE(fixture.receive(2) == probe);
+        }
+        fixture.impl.segmenting = segmenting;
+        const auto first = numbered_datagrams(3, 1200);
+        const auto second = numbered_datagrams(2, 900);
+        {
+          planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .simulate = false});
+          send_or_hold(fixture.impl, first, 1200, fixture.to(), ecn_codepoint_t::not_ect);
+          send_or_hold(fixture.impl, second, 900, fixture.to(), ecn_codepoint_t::ect0);
+          CHECK(send_plan.calls == 1);
+        }
+        CHECK(fixture.impl.held_runs.size() == 2);
+        CHECK(fixture.impl.held.size() == first.size() + second.size());
 
-    {
-      planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .pass_first = 1, .simulate = false});
-      CHECK_FALSE(release_held(fixture.impl));
-    }
-    CHECK(fixture.impl.blocked);
-    CHECK(fixture.impl.held_runs.size() == 1);
-    CHECK(fixture.impl.held_runs.front().segment == 900);
-    CHECK(fixture.impl.held_runs.front().ecn == ecn_codepoint_t::ect0);
-    CHECK(fixture.impl.held == second);
+        {
+          planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .pass_first = segmenting ? 1 : 3, .simulate = false});
+          CHECK_FALSE(release_held(fixture.impl));
+        }
+        CHECK(fixture.impl.blocked);
+        CHECK(fixture.impl.held_runs.size() == 1);
+        CHECK(fixture.impl.held_runs.front().segment == 900);
+        CHECK(fixture.impl.held_runs.front().ecn == ecn_codepoint_t::ect0);
+        CHECK(fixture.impl.held == second);
 
-    CHECK(release_held(fixture.impl));
-    auto expected = first;
-    expected.insert(expected.end(), second.begin(), second.end());
-    CHECK(fixture.receive(5) == expected);
+        CHECK(release_held(fixture.impl));
+        auto expected = first;
+        expected.insert(expected.end(), second.begin(), second.end());
+        CHECK(fixture.receive(5) == expected);
+      }
+    }
+    loop.stop();
+    loop.run();
   }
-  loop.stop();
-  loop.run();
 }
 
 TEST_CASE("a held batch goes out when the socket says it can take more")
