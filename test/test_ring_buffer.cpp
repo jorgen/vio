@@ -3,6 +3,7 @@
 #include <vio/ring_buffer.h>
 
 #include <cassert>
+#include <utility>
 
 namespace
 {
@@ -85,5 +86,64 @@ TEST_SUITE("ring_buffer_t")
     CHECK_EQ(rb.back().value, 7);
     // A forwarding emplace must not make any copies of the argument.
     CHECK_EQ(counted_t::copies, 0);
+  }
+
+  TEST_CASE("a popped or discarded slot is released once and stays usable")
+  {
+    struct probe_t
+    {
+      int *destroyed_twice = nullptr;
+      int *live = nullptr;
+      bool alive = true;
+
+      probe_t() = default;
+      probe_t(int *twice, int *count)
+        : destroyed_twice(twice)
+        , live(count)
+      {
+        ++*live;
+      }
+      probe_t(probe_t &&other) noexcept
+        : destroyed_twice(other.destroyed_twice)
+        , live(std::exchange(other.live, nullptr))
+      {
+      }
+      probe_t &operator=(probe_t &&other) noexcept
+      {
+        if (live)
+          --*live;
+        destroyed_twice = other.destroyed_twice;
+        live = std::exchange(other.live, nullptr);
+        alive = true;
+        return *this;
+      }
+      ~probe_t()
+      {
+        if (!alive && destroyed_twice)
+          ++*destroyed_twice;
+        if (alive && live)
+          --*live;
+        alive = false;
+      }
+    };
+
+    int destroyed_twice = 0;
+    int live = 0;
+    {
+      vio::ring_buffer_t<probe_t, 4> rb;
+      rb.push(probe_t(&destroyed_twice, &live));
+      rb.push(probe_t(&destroyed_twice, &live));
+      CHECK_EQ(live, 2);
+      {
+        auto taken = rb.pop_front();
+      }
+      CHECK_EQ(live, 1);
+      rb.discard_front();
+      CHECK_EQ(live, 0);
+      rb.push(probe_t(&destroyed_twice, &live));
+      CHECK_EQ(live, 1);
+    }
+    CHECK_EQ(live, 0);
+    CHECK_EQ(destroyed_twice, 0);
   }
 }

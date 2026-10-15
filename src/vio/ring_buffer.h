@@ -57,7 +57,7 @@ struct ring_buffer_t
   {
     assert(!empty());
     T ret = std::move(front());
-    _buffer_queue[_buffer_front].~T();
+    _buffer_queue[_buffer_front] = T();
     _buffer_front = (_buffer_front + 1) % size;
     return ret;
   }
@@ -65,8 +65,7 @@ struct ring_buffer_t
   void discard_front()
   {
     assert(!empty());
-    T ret = std::move(front());
-    _buffer_queue[_buffer_front].~T();
+    _buffer_queue[_buffer_front] = T();
     _buffer_front = (_buffer_front + 1) % size;
   }
 
