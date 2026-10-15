@@ -1,5 +1,6 @@
 #include "require_expected.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -19,8 +20,62 @@
 #include <vio/operation/file.h>
 #include <vio/task.h>
 
+#if defined(_WIN32)
+#include <vio/detail/native.h>
+#else
+#include <sys/mman.h>
+#endif
+
 namespace
 {
+class lazy_buffer_t
+{
+public:
+  explicit lazy_buffer_t(std::size_t size)
+    : _size(size)
+  {
+#if defined(_WIN32)
+    _data = static_cast<std::uint8_t *>(::VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+#if defined(MAP_NORESERVE)
+    constexpr int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+#else
+    constexpr int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#endif
+    void *mapped = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    _data = mapped == MAP_FAILED ? nullptr : static_cast<std::uint8_t *>(mapped);
+#endif
+  }
+
+  lazy_buffer_t(const lazy_buffer_t &) = delete;
+  lazy_buffer_t &operator=(const lazy_buffer_t &) = delete;
+
+  ~lazy_buffer_t()
+  {
+    if (!_data)
+      return;
+#if defined(_WIN32)
+    ::VirtualFree(_data, 0, MEM_RELEASE);
+#else
+    ::munmap(_data, _size);
+#endif
+  }
+
+  std::uint8_t *data() const
+  {
+    return _data;
+  }
+
+  std::string text(std::size_t count) const
+  {
+    return {reinterpret_cast<const char *>(_data), count};
+  }
+
+private:
+  std::uint8_t *_data = nullptr;
+  std::size_t _size;
+};
+
 struct pool_gate_t
 {
   std::mutex mutex;
@@ -411,17 +466,24 @@ TEST_CASE("a length above 4 GiB is clamped, not cut to its low 32 bits")
         REQUIRE(vio::write_file_sync(*file, bytes_of(text), text.size(), 0).has_value());
 
         const std::size_t huge = (std::size_t(1) << 32) + 3;
-        std::string buffer(text.size(), '\0');
-        auto async_read = co_await vio::read_file(ev, *file, bytes_of(buffer), huge, 0);
-        REQUIRE_EXPECTED(async_read);
-        CHECK(async_read.value() == text.size());
-        CHECK(buffer == text);
+        lazy_buffer_t buffer(huge);
+        if (buffer.data())
+        {
+          auto async_read = co_await vio::read_file(ev, *file, buffer.data(), huge, 0);
+          REQUIRE_EXPECTED(async_read);
+          CHECK(async_read.value() == text.size());
+          CHECK(buffer.text(text.size()) == text);
 
-        std::string again(text.size(), '\0');
-        auto sync_read = vio::read_file_sync(*file, bytes_of(again), huge, 0);
-        REQUIRE_EXPECTED(sync_read);
-        CHECK(sync_read.value() == text.size());
-        CHECK(again == text);
+          std::fill_n(buffer.data(), text.size(), std::uint8_t(0));
+          auto sync_read = vio::read_file_sync(*file, buffer.data(), huge, 0);
+          REQUIRE_EXPECTED(sync_read);
+          CHECK(sync_read.value() == text.size());
+          CHECK(buffer.text(text.size()) == text);
+        }
+        else
+        {
+          MESSAGE("no address space for a buffer above 4 GiB");
+        }
 
         close_now(file, ev);
         CHECK(vio::unlink_file(ev, path).has_value());
