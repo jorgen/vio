@@ -1,6 +1,9 @@
+#include <chrono>
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
+#include <vio/operation/sleep.h>
+#include <vio/run.h>
 
 TEST_SUITE("Event Loop")
 {
@@ -50,6 +53,27 @@ TEST_CASE("Run function in event_loop")
   event_loop.run_in_loop([&has_been_called, &event_loop]() { has_been_called = true; event_loop.stop(); });
   event_loop.run();
   CHECK(has_been_called);
+}
+
+TEST_CASE("run returns the value of the coroutine it drives")
+{
+  const int result = vio::run([](vio::event_loop_t &loop) -> vio::task_t<int> {
+    auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(1));
+    co_return slept.has_value() ? 42 : -1;
+  });
+  CHECK(result == 42);
+}
+
+TEST_CASE("run with a void coroutine returns once it finishes")
+{
+  int steps = 0;
+  vio::run([&steps](vio::event_loop_t &loop) -> vio::task_t<void> {
+    ++steps;
+    auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(1));
+    CHECK(slept.has_value());
+    ++steps;
+  });
+  CHECK(steps == 2);
 }
 
 } // TEST_SUITE

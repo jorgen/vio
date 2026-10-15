@@ -12,6 +12,7 @@
 #include <vio/operation/tls_server.h>
 #include <vio/task.h>
 
+#include <memory>
 #include <vector>
 
 static auto long_delay = std::chrono::milliseconds(5000);
@@ -114,13 +115,104 @@ TEST_CASE("registration deregisters on move")
   CHECK(callback_count == 1);
 }
 
+TEST_CASE("a registration that outlives its cancellation is detached")
+{
+  int callback_count = 0;
+  vio::registration_t reg;
+  {
+    vio::cancellation_t cancel;
+    reg = cancel.register_callback([&callback_count]() { callback_count++; });
+    CHECK(reg.active());
+  }
+  CHECK_FALSE(reg.active());
+  reg.reset();
+  CHECK(callback_count == 0);
+}
+
+TEST_CASE("a registration that outlives a cancellation that fired is detached")
+{
+  int callback_count = 0;
+  vio::registration_t reg;
+  {
+    vio::cancellation_t cancel;
+    reg = cancel.register_callback([&callback_count]() { callback_count++; });
+    cancel.cancel();
+    CHECK(callback_count == 1);
+    CHECK_FALSE(reg.active());
+  }
+  CHECK_FALSE(reg.active());
+  CHECK(callback_count == 1);
+}
+
+TEST_CASE("registrations moved by a growing container stay bound to their callbacks")
+{
+  std::vector<int> fired;
+  std::vector<vio::registration_t> regs;
+  {
+    vio::cancellation_t cancel;
+    for (int i = 0; i < 100; ++i)
+      regs.push_back(cancel.register_callback([&fired, i]() { fired.push_back(i); }));
+    regs.erase(regs.begin(), regs.begin() + 50);
+    for (auto &reg : regs)
+      CHECK(reg.active());
+    cancel.cancel();
+  }
+  REQUIRE(fired.size() == 50);
+  for (int i = 0; i < 50; ++i)
+    CHECK(fired[static_cast<std::size_t>(i)] == 50 + i);
+  for (auto &reg : regs)
+    CHECK_FALSE(reg.active());
+}
+
+TEST_CASE("callbacks may reset registrations or destroy the cancellation while it fires")
+{
+  auto cancel = std::make_unique<vio::cancellation_t>();
+  int calls = 0;
+  vio::registration_t first;
+  vio::registration_t second;
+  vio::registration_t third;
+  first = cancel->register_callback([&]() {
+    ++calls;
+    first.reset();
+    second.reset();
+  });
+  second = cancel->register_callback([&]() {
+    ++calls;
+    cancel.reset();
+  });
+  third = cancel->register_callback([&]() { ++calls; });
+  cancel->cancel();
+  CHECK(calls == 3);
+  CHECK_FALSE(cancel);
+  CHECK_FALSE(third.active());
+}
+
+TEST_CASE("a sleep whose cancellation is destroyed first still completes")
+{
+  vio::event_loop_t event_loop;
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &ev) -> vio::task_t<void>
+      {
+        auto cancel = std::make_unique<vio::cancellation_t>();
+        auto sleep_future = vio::sleep(ev, std::chrono::milliseconds(5), cancel.get());
+        cancel.reset();
+        auto result = co_await sleep_future;
+        CHECK(result.has_value());
+        ev.stop();
+      }(event_loop);
+    });
+  event_loop.run();
+}
+
 TEST_CASE("is_cancelled recognizes both error codes")
 {
   vio::error_t vio_err{.code = vio::vio_cancelled, .msg = "cancelled"};
   CHECK(vio::is_cancelled(vio_err));
 
-  vio::error_t uv_err{.code = UV_ECANCELED, .msg = "cancelled"};
-  CHECK(vio::is_cancelled(uv_err));
+  vio::error_t canceled_err{.code = vio::errc::canceled, .msg = "cancelled"};
+  CHECK(vio::is_cancelled(canceled_err));
 
   vio::error_t other_err{.code = -1, .msg = "other"};
   CHECK(!vio::is_cancelled(other_err));
@@ -134,15 +226,11 @@ TEST_CASE("cancel DNS lookup")
     {
       return [](vio::event_loop_t &ev) -> vio::task_t<void>
       {
-        // DNS for localhost may resolve before uv_cancel takes effect.
-        // uv_cancel on getaddrinfo may also produce platform-specific errors.
-        // The test verifies no crash or leak occurs.
         vio::cancellation_t cancel;
         auto dns_future = vio::get_addrinfo(ev, "localhost", {}, &cancel);
         cancel.cancel();
         auto result = co_await dns_future;
-        // Either succeeded (raced ahead of cancel) or got some error
-        CHECK(true);
+        (void)result;
         ev.stop();
       }(event_loop);
     });
@@ -320,8 +408,6 @@ TEST_CASE("sleep without cancellation still works")
   event_loop.run();
 }
 
-// --- TCP connect cancellation tests ---
-
 #define PROPAGATE_ERROR(x)                                                                                                                                                                                                 \
   if (!(x).has_value())                                                                                                                                                                                                    \
     return std::unexpected(std::move((x).error()));
@@ -376,8 +462,6 @@ TEST_CASE("cancel tcp_connect while connecting")
       {
         auto tcp = vio::tcp_create(ev);
         REQUIRE_EXPECTED(tcp);
-        // Connect to localhost on an unlikely port - connect callback fires async,
-        // cancel fires synchronously before it
         auto addr = vio::ip4_addr("127.0.0.1", 1);
         REQUIRE_EXPECTED(addr);
 
@@ -392,8 +476,6 @@ TEST_CASE("cancel tcp_connect while connecting")
     });
   event_loop.run();
 }
-
-// --- TCP listen cancellation tests ---
 
 TEST_CASE("cancel tcp_listen before await (pre-cancelled)")
 {
@@ -438,14 +520,11 @@ TEST_CASE("cancel tcp_listen after starting")
           CHECK(!result.has_value());
           CHECK(vio::is_cancelled(result.error()));
         }
-        // server_pair is destroyed here, dropping the server ref
         ev.stop();
       }(event_loop);
     });
   event_loop.run();
 }
-
-// --- SSL client connect cancellation tests ---
 
 TEST_CASE("cancel ssl_client_connect before await (pre-cancelled)")
 {
@@ -526,7 +605,6 @@ TEST_CASE("cancel ssl_client_connect with direct IP while connecting")
         REQUIRE_EXPECTED(ssl_client);
 
         vio::cancellation_t cancel;
-        // Connect to localhost on an unlikely port - cancel fires synchronously
         auto connect_future = vio::ssl_client_connect(ssl_client.value(), "localhost", 1, "127.0.0.1", &cancel);
         cancel.cancel();
         auto result = co_await connect_future;

@@ -56,6 +56,7 @@
 #include "vio/cancellation.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/loop/loop_core.h"
 #include "vio/quic/endpoint.h"
 #include "vio/ref_counted_wrapper.h"
 #include "vio/task.h"
@@ -74,8 +75,6 @@
 #include <utility>
 #include <vector>
 
-#include <uv.h>
-
 namespace vio
 {
 // -----------------------------------------------------------------------------
@@ -84,7 +83,7 @@ namespace vio
 //
 // One hex word for the subsystem, the way ssl_engine.h owns 0x715c00. Nothing
 // else in vio uses this block: the only other codes are 0x715c00-02 for TLS,
-// 0xca9ce1 for cancellation, and libuv's, which are negative.
+// 0xca9ce1 for cancellation, and vio::errc's, which are negative.
 //
 // 0x9c1c01 to 0x9c1c04 are the stream endings. They are declared here rather
 // than in quic_stream.h because quic_connection_state_t owns the stream
@@ -312,7 +311,7 @@ struct quic_waiter_t
 };
 
 // Its own small allocation rather than a member of whatever reached it, so an
-// awaitable can hold it outright. A milestone owns no libuv handle, so a
+// awaitable can hold it outright. A milestone owns no handle, so a
 // suspended waiter keeping one alive keeps nothing open -- which is what makes
 // this the one place a strong reference is safe, where nothing pointing at the
 // endpoint may be.
@@ -345,8 +344,8 @@ struct quic_op_t
   // other, and whichever lets go last frees it.
   //
   // A count rather than the completed/detached pair udp_send_op_t uses, because
-  // that pair relies on the second owner being a libuv callback that runs
-  // exactly once. Here either owner may let go first -- an operation can be
+  // that pair relies on the second owner being a callback that runs exactly
+  // once. Here either owner may let go first -- an operation can be
   // resolved and then abandoned, or abandoned and then resolved -- and a
   // boolean cannot say which of those has already happened.
   int holds = 0;
@@ -742,8 +741,8 @@ struct quic_connection_state_t
   // same address. `endpoint` goes when the endpoint tears down.
   //
   // Never strong in either direction. A connection that kept its endpoint alive
-  // would keep the UDP socket open, which is uv_loop_close failing and
-  // ~event_loop_t aborting on its assert.
+  // would keep the UDP socket open, which is ~event_loop_t aborting on its
+  // assert.
   quic_endpoint_state_t *endpoint = nullptr;
   vio::quic::connection_t *transport = nullptr;
 
@@ -852,12 +851,68 @@ struct quic_connection_t
 
 namespace detail
 {
+class quic_beat_t final : public resource_t
+{
+public:
+  explicit quic_beat_t(loop_core_t &core) noexcept
+    : resource_t(core, "quic beat")
+  {
+    _unhook.owner = this;
+    _unhook.run = &quic_beat_t::on_unhook;
+    _kick.owner = this;
+    _kick.run = &quic_beat_t::on_kick;
+  }
+
+  void start(hook_t::run_fn_t run, void *owner)
+  {
+    hook.run = run;
+    hook.owner = owner;
+    loop().add_hook(hook);
+    _hooked = true;
+  }
+
+  void kick() noexcept
+  {
+    if (_hooked && !closing())
+    {
+      loop().defer(_kick);
+    }
+  }
+
+  hook_t hook;
+
+private:
+  void do_close() noexcept override
+  {
+    loop().defer(_unhook);
+  }
+
+  static void on_unhook(posted_t *node)
+  {
+    auto *self = static_cast<quic_beat_t *>(node->owner);
+    if (std::exchange(self->_hooked, false))
+    {
+      self->loop().remove_hook(self->hook);
+    }
+    self->close_finished();
+  }
+
+  static void on_kick(posted_t *)
+  {
+  }
+
+  posted_t _unhook;
+  posted_t _kick;
+  bool _hooked = false;
+};
+
 struct quic_endpoint_state_t
 {
   quic_endpoint_state_t(event_loop_t &owner, vio::quic::endpoint_t &&from, quic_config_t configuration)
     : loop(owner)
     , transport(std::move(from))
     , config(std::move(configuration))
+    , beat(core(owner))
   {
   }
   quic_endpoint_state_t(const quic_endpoint_state_t &) = delete;
@@ -866,16 +921,15 @@ struct quic_endpoint_state_t
   event_loop_t &loop;
   // Declared before driver_stop and driver so that it is destroyed after both:
   // the driver's frame holds an endpoint_impl_t reference and owns the datagram
-  // reader, whose poll handle is armed on this socket's descriptor. Teardown
-  // does this in order anyway; the declaration order is the second line of
-  // defence.
+  // reader, which reads this socket's descriptor. Teardown does this in order
+  // anyway; the declaration order is the second line of defence.
   std::optional<vio::quic::endpoint_t> transport;
   cancellation_t driver_stop;
   std::optional<task_t<void>> driver;
   quic_config_t config;
 
   reference_counted_t *rc = nullptr;
-  uv_prepare_t beat = {};
+  quic_beat_t beat;
 
   // Which context slots were filled at create, which is the whole of what makes
   // a dial or an answer legal. Recorded here because endpoint_t does not
@@ -933,7 +987,7 @@ struct quic_endpoint_state_t
 // and asking after the fact must answer rather than block for ever.
 //
 // It is the one thing in this layer that holds a strong reference, and that is
-// safe for a specific reason: a milestone owns no libuv handle, so a suspended
+// safe for a specific reason: a milestone owns no handle, so a suspended
 // waiter keeping one alive keeps nothing open. Every other awaitable here
 // borrows, because holding the endpoint would stop the release that resolves
 // it.
@@ -1095,32 +1149,6 @@ namespace detail
 // -----------------------------------------------------------------------------
 // The beat
 // -----------------------------------------------------------------------------
-//
-// Why a prepare handle rather than a check handle. libuv's iteration is
-//
-//   pending -> idle -> PREPARE -> poll (blocks) -> pending -> CHECK
-//     -> closing handles -> update time -> TIMERS
-//
-// verified in 3rdparty/libuv-v1.51.0/src/unix/core.c. Read it with the wake
-// sources marked. A coroutine made runnable by an arriving datagram becomes so
-// during poll, and nothing blocks between the check that follows and the
-// prepare that opens the next iteration -- so on that path the two phases are
-// worth the same and the beat costs no round trip either way.
-//
-// Timers decide it. They run at the end of the iteration, after check, and the
-// endpoint's own ticker fires there -- and it is that tick which flushes every
-// connection, latches an idle timeout and fires the gone hook. So a connection
-// ending with no traffic on it becomes runnable in the timer phase and nowhere
-// else, and prepare is the next callback phase with nothing blocking in
-// between, where check is reached only after another poll.
-//
-// An idle handle is disqualified outright: uv__backend_timeout returns zero
-// while any idle handle is active, so an always-started one turns the loop into
-// a spin. Neither prepare nor check appears in that function, which is what
-// makes arming this permanently and paying one predicate per turn safer than
-// arming it conditionally -- and step 3 of this work found that making a
-// periodic mechanism in this endpoint conditional produced both a spin and a
-// stall.
 // Moves an operation from the waiting list to the resumable one, keeping the
 // endpoint's hold, which the beat drops after resuming. Nothing here resumes:
 // every caller is standing inside the transport's flush.
@@ -1437,27 +1465,30 @@ inline void quic_beat_flush(quic_endpoint_state_t &self)
   }
 }
 
-inline void quic_beat_cb(uv_prepare_t *handle)
+inline void quic_beat_run(hook_t *hook)
 {
-  // Borrowed, and deliberately not null-checked: libuv fires no callback for a
-  // handle after uv_close, which is the guarantee the borrow rests on. A null
-  // test would not even be the right one, because the reference count
-  // overwrites this field with its own pointer before closing.
-  auto *self = static_cast<quic_endpoint_state_t *>(handle->data);
+  auto *self = static_cast<quic_endpoint_state_t *>(hook->owner);
   if (self->closing)
   {
     return;
   }
   // Bounded: resuming a coroutine can make more work, and an application that
   // always makes more would otherwise starve the loop's I/O inside one
-  // callback. Whatever is left waits for the next turn, which the endpoint's
-  // own ticker guarantees arrives.
-  for (int pass = 0; pass < quic_beat_max_passes && quic_beat_has_work(*self); ++pass)
+  // callback. Whatever is left waits for the next turn.
+  for (int pass = 0; pass < quic_beat_max_passes && !self->closing && quic_beat_has_work(*self); ++pass)
   {
     quic_beat_resume(*self);
     quic_beat_flush(*self);
   }
+  if (self->closing)
+  {
+    return;
+  }
   quic_shutdown_check(*self);
+  if (!self->closing && quic_beat_has_work(*self))
+  {
+    self->beat.kick();
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -1635,8 +1666,8 @@ inline void quic_teardown(quic_endpoint_state_t &self)
 
   // The driver's frame holds a reference to the transport and owns the datagram
   // reader. Cancelling finishes both synchronously: cancellation_t runs its
-  // callbacks inline, the reader's cancel delivers inline, and a cancelled
-  // sleep resumes inline -- so by the time this returns, run() has unwound.
+  // callbacks inline and the reader's cancel delivers inline -- so by the time
+  // this returns, run() has unwound.
   self.driver_stop.cancel();
   self.driver.reset();
 
@@ -1694,7 +1725,7 @@ inline void quic_teardown(quic_endpoint_state_t &self)
 // The context decides what the endpoint is for: one built for a server answers,
 // one built for a client dials. It must outlive the endpoint, which borrows it.
 //
-// Nothing is bound and nothing is read yet. libuv makes a UDP socket lazily and
+// Nothing is bound and nothing is read yet. The UDP socket is made lazily and
 // whoever touches it first fixes its address family, so an endpoint that
 // started reading before it knew where it was going would be pinned to IPv4 --
 // which is why binding and dialling are the only things that create it.
@@ -1719,23 +1750,13 @@ namespace detail
   self->can_accept = can_accept;
   self->can_dial = can_dial;
 
-  if (const int started = uv_prepare_init(loop.loop(), &self->beat); started < 0)
-  {
-    return std::unexpected(error_t{.code = started, .msg = uv_strerror(started)});
-  }
   // Registered with the reference count so that the close is issued once, when
-  // the count reaches zero, on the same terms as the socket. The data pointer
-  // is borrowed and not a parked reference, for the reason timer_impl.h gives:
-  // a reference held in a registered handle keeps the count above zero forever
-  // and the close is never issued at all.
-  endpoint.handle.register_handle(&self->beat);
-  self->beat.data = self;
-  (void)uv_prepare_start(&self->beat, quic_beat_cb);
-  // Unreferenced, so that an endpoint nobody is using does not by itself keep
-  // the loop alive. An endpoint created and never bound has no descriptor --
-  // libuv makes the socket lazily -- so without this the beat would be the only
-  // active handle and run() would never return.
-  uv_unref(reinterpret_cast<uv_handle_t *>(&self->beat));
+  // the count reaches zero, on the same terms as the socket. The owner pointer
+  // is borrowed and not a parked reference: a reference held by a registered
+  // resource keeps the count above zero forever and the close is never issued
+  // at all.
+  endpoint.handle.register_resource(self->beat);
+  self->beat.start(&quic_beat_run, self);
 
   self->transport->on_connection([self](vio::quic::connection_t &connection) { quic_hook_connection(*self, connection); });
   self->transport->on_activity([self](vio::quic::connection_t &connection) { quic_hook_activity(*self, connection); });
@@ -1762,8 +1783,8 @@ inline std::expected<quic_endpoint_t, error_t> quic_endpoint_create(event_loop_t
 namespace detail
 {
 // Starts the read loop, once. Called by whatever first gives the socket an
-// address family -- a bind, or a dial -- and never before, because libuv makes
-// the UDP socket lazily and fixes its family on first touch.
+// address family -- a bind, or a dial -- and never before, because the UDP
+// socket is made lazily and its family is fixed on first touch.
 inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &self)
 {
   if (self.driver_started || self.closing)
@@ -1775,8 +1796,7 @@ inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &sel
   if (self.driver->done())
   {
     // task_t is eager, so run() has already executed through the reader's
-    // creation -- uv_poll_start is synchronous -- down to its first co_await on
-    // this very stack. A reader it could not create is reported with a bare
+    // creation down to its first co_await on this very stack. A reader it could not create is reported with a bare
     // co_return, so being done on the first turn is the only signal there is,
     // and without this a bind would report success on an endpoint that will
     // never read a byte.
@@ -1824,27 +1844,19 @@ inline std::expected<void, error_t> quic_start_driver(quic_endpoint_state_t &sel
 //
 // Port 0 asks the OS to choose, which is what a test wants; read it back with
 // quic_endpoint_local_port.
-//
-// Worth knowing on an endpoint that also dials: the socket ends up IPv6, and a
-// socket that already has an address family cannot send to an address in
-// another one. So a peer-to-peer endpoint bound this way must dial IPv6 or
-// IPv4-mapped addresses, not bare IPv4 literals. Bind with an explicit sockaddr
-// if the peers are named in IPv4.
 [[nodiscard]] inline std::expected<void, error_t> quic_endpoint_bind(quic_endpoint_t &endpoint, std::uint16_t port)
 {
   sockaddr_in6 any6 = {};
-  if (uv_ip6_addr("::", static_cast<int>(port), &any6) == 0)
+  any6.sin6_family = AF_INET6;
+  any6.sin6_port = htons(port);
+  if (auto bound = quic_endpoint_bind(endpoint, reinterpret_cast<const sockaddr *>(&any6)); bound.has_value())
   {
-    if (auto bound = quic_endpoint_bind(endpoint, reinterpret_cast<const sockaddr *>(&any6)); bound.has_value())
-    {
-      return bound;
-    }
+    return bound;
   }
   sockaddr_in any4 = {};
-  if (const int made = uv_ip4_addr("0.0.0.0", static_cast<int>(port), &any4); made < 0)
-  {
-    return std::unexpected(error_t{.code = made, .msg = uv_strerror(made)});
-  }
+  any4.sin_family = AF_INET;
+  any4.sin_port = htons(port);
+  any4.sin_addr.s_addr = htonl(INADDR_ANY);
   return quic_endpoint_bind(endpoint, reinterpret_cast<const sockaddr *>(&any4));
 }
 
@@ -1869,10 +1881,9 @@ namespace detail
 // What a cancellation_t's callback does. It latches and makes ready; it does
 // not resume, which keeps the whole layer to one resumption site.
 //
-// That costs no wall clock, by the same derivation that chose a prepare handle
-// for the beat: whatever phase the cancel was called from -- a timer callback,
-// an I/O callback, another coroutine the beat resumed -- the next prepare is
-// reached before the loop next blocks.
+// That costs no wall clock: whatever phase the cancel was called from -- a
+// timer callback, an I/O callback, another coroutine the beat resumed -- the
+// beat runs again before the loop next blocks.
 inline void quic_op_cancel(quic_op_t *op)
 {
   if (op == nullptr || op->resolved)
@@ -2010,8 +2021,8 @@ using quic_accept_future_t = quic_connection_awaitable_t;
 // is a full handshake rather than a failure to connect.
 //
 // Every synchronous failure comes back on the same awaitable, pre-resolved and
-// never suspending -- a bad address as the raw libuv code, a dial on an endpoint
-// with no client context as a sentence. That is the tcp_connect shape, and it
+// never suspending -- a dial on an endpoint with no client context as a
+// sentence. That is the tcp_connect shape, and it
 // means a caller has one place to look rather than two.
 [[nodiscard]] inline quic_connect_awaitable_t quic_endpoint_connect(quic_endpoint_t &endpoint, const sockaddr *address, std::string_view server_name, std::span<const std::uint8_t> resumption_ticket = {},
                                                                     cancellation_t *cancel = nullptr)

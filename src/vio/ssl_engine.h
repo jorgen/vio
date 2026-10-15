@@ -22,59 +22,82 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
-// ssl_engine_t is a per-connection TLS codec with NO socket knowledge. It wraps
-// an SSL* plus two in-memory BIOs:
-//   rbio -- vio writes inbound CIPHERTEXT here (from the libuv read callback);
-//           SSL_read pulls plaintext out of it.
-//   wbio -- SSL_write / handshake push outbound CIPHERTEXT here; vio drains it
-//           and hands it to uv_write.
-// The owning uv_tls_stream_t driver always drains wbio after every engine call,
-// so any SSL-produced control record (handshake flight, TLS 1.3 KeyUpdate
-// response, alert, close_notify) is sent without the engine ever touching a
-// socket. This keeps io_uring/IOCP under libuv invisible to the crypto layer.
-
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <new>
+#include <span>
 #include <string>
 #include <vector>
 
-#include <uv.h>
-
+#include <vio/detail/native.h>
+#include <vio/detail/sys.h>
 #include <vio/error.h>
 #include <vio/ssl_backend.h>
 #include <vio/ssl_context.h>
 
 namespace vio
 {
-// Distinct, stable error codes so a downstream (e.g. HTTP/2) can branch on the
-// kind of close instead of string-matching messages.
-constexpr int vio_tls_error = 0x715c00;          // TLS protocol / library error
-constexpr int vio_tls_clean_shutdown = 0x715c01; // peer sent close_notify (clean EOF)
-constexpr int vio_tls_truncated = 0x715c02;      // TCP closed without close_notify (unclean)
+constexpr int vio_tls_error = 0x715c00;
+constexpr int vio_tls_clean_shutdown = 0x715c01;
+constexpr int vio_tls_truncated = 0x715c02;
 
-// Outcome of an SSL_read / SSL_write / SSL_do_handshake step. After ANY of
-// these the driver drains wbio and sends whatever ciphertext was produced.
 enum class ssl_status
 {
-  ok,        // progress made (bytes produced/consumed, or handshake finished)
-  want_read, // need more inbound ciphertext (feed rbio, then retry)
-  closed,    // peer sent close_notify -- clean end of stream
-  fatal,     // unrecoverable TLS error; call make_error()
+  ok,
+  want_read,
+  closed,
+  fatal,
 };
 
 inline bool is_ip_literal(const std::string &host)
 {
-  unsigned char buf[sizeof(struct in6_addr)];
-  return uv_inet_pton(AF_INET, host.c_str(), buf) == 0 || uv_inet_pton(AF_INET6, host.c_str(), buf) == 0;
+  unsigned char buffer[sizeof(in6_addr)];
+#if defined(_WIN32)
+  detail::ensure_winsock();
+  return InetPtonA(AF_INET, host.c_str(), buffer) == 1 || InetPtonA(AF_INET6, host.c_str(), buffer) == 1;
+#else
+  return inet_pton(AF_INET, host.c_str(), buffer) == 1 || inet_pton(AF_INET6, host.c_str(), buffer) == 1;
+#endif
 }
+
+struct ssl_engine_t;
+
+namespace detail
+{
+inline int ssl_engine_bio_read(BIO *bio, char *out, int length);
+inline int ssl_engine_bio_write(BIO *bio, const char *in, int length);
+inline long ssl_engine_bio_ctrl(BIO *bio, int command, long number, void *pointer);
+
+inline BIO_METHOD *ssl_engine_bio_method()
+{
+  static BIO_METHOD *method = [] {
+    BIO_METHOD *created = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "vio tls engine");
+    if (created == nullptr)
+      return created;
+    BIO_meth_set_read(created, &ssl_engine_bio_read);
+    BIO_meth_set_write(created, &ssl_engine_bio_write);
+    BIO_meth_set_ctrl(created, &ssl_engine_bio_ctrl);
+    return created;
+  }();
+  return method;
+}
+} // namespace detail
 
 struct ssl_engine_t
 {
+  static constexpr std::size_t inbound_capacity = 65536;
+  static constexpr std::size_t output_retain = 32768;
+
   SSL *ssl = nullptr;
-  BIO *rbio = nullptr; // inbound ciphertext (vio writes, SSL reads)
-  BIO *wbio = nullptr; // outbound ciphertext (SSL writes, vio drains)
+  BIO *rbio = nullptr;
+  BIO *wbio = nullptr;
   bool server = false;
   bool shutdown_sent = false;
-  std::string peer_name; // client: SNI/verification host, also keys the session cache
+  std::string peer_name;
 
   ssl_engine_t() = default;
   ssl_engine_t(const ssl_engine_t &) = delete;
@@ -83,8 +106,6 @@ struct ssl_engine_t
   ssl_engine_t &operator=(ssl_engine_t &&) = delete;
   ~ssl_engine_t()
   {
-    // SSL_set_bio transferred ownership of rbio/wbio to ssl, so SSL_free frees
-    // them too. Only free the BIOs directly if init failed before SSL_set_bio.
     if (ssl != nullptr)
     {
       SSL_free(ssl);
@@ -107,8 +128,6 @@ struct ssl_engine_t
     return ssl != nullptr;
   }
 
-  // `host` is the peer name for SNI + certificate verification (a hostname for
-  // SNI/SSL_set1_host, an address for X509_VERIFY_PARAM). Empty skips both.
   error_t init(ssl_context_t &context, bool is_server, const std::string &host)
   {
     server = is_server;
@@ -117,12 +136,14 @@ struct ssl_engine_t
     {
       return error_t{.code = vio_tls_error, .msg = "SSL_new failed: " + ssl::last_error_string()};
     }
-    rbio = BIO_new(BIO_s_mem());
-    wbio = BIO_new(BIO_s_mem());
+    BIO_METHOD *method = detail::ssl_engine_bio_method();
+    if (method != nullptr)
+    {
+      rbio = BIO_new(method);
+      wbio = BIO_new(method);
+    }
     if (rbio == nullptr || wbio == nullptr)
     {
-      // SSL_set_bio has not run yet, so ownership was not transferred to ssl --
-      // free whichever BIO did allocate so it is not leaked.
       if (rbio != nullptr)
       {
         BIO_free(rbio);
@@ -133,13 +154,15 @@ struct ssl_engine_t
         BIO_free(wbio);
         wbio = nullptr;
       }
-      return error_t{.code = vio_tls_error, .msg = "BIO_new(BIO_s_mem()) failed"};
+      SSL_free(ssl);
+      ssl = nullptr;
+      return error_t{.code = vio_tls_error, .msg = "BIO_new failed"};
     }
-    // An empty memory BIO must report "retry", not EOF, or SSL would treat a
-    // momentarily-empty rbio as a closed connection.
-    BIO_set_mem_eof_return(rbio, -1);
-    BIO_set_mem_eof_return(wbio, -1);
-    SSL_set_bio(ssl, rbio, wbio); // takes ownership of both
+    BIO_set_data(rbio, this);
+    BIO_set_init(rbio, 1);
+    BIO_set_data(wbio, this);
+    BIO_set_init(wbio, 1);
+    SSL_set_bio(ssl, rbio, wbio);
 
     if (server)
     {
@@ -180,37 +203,139 @@ struct ssl_engine_t
     return {};
   }
 
-  // Feed inbound ciphertext (from the libuv read callback) into rbio. A growable
-  // memory BIO always accepts all bytes.
-  void feed_ciphertext(const char *data, size_t len)
+  [[nodiscard]] std::span<std::byte> inbound_space(std::size_t capacity = inbound_capacity)
   {
-    if (len > 0)
+    if (!_in)
     {
-      BIO_write(rbio, data, static_cast<int>(len));
+      _in.reset(new (std::nothrow) std::byte[capacity]);
+      if (!_in)
+        return {};
+      _in_capacity = capacity;
+      _in_head = 0;
+      _in_tail = 0;
     }
+    if (_in_head == _in_tail)
+    {
+      _in_head = 0;
+      _in_tail = 0;
+    }
+    else if (_in_tail == _in_capacity && _in_head > 0)
+    {
+      std::memmove(_in.get(), _in.get() + _in_head, _in_tail - _in_head);
+      _in_tail -= _in_head;
+      _in_head = 0;
+    }
+    return {_in.get() + _in_tail, _in_capacity - _in_tail};
+  }
+
+  void commit_inbound(std::size_t length) noexcept
+  {
+    _in_tail += (std::min)(length, _in_capacity - _in_tail);
+  }
+
+  [[nodiscard]] std::size_t inbound_size() const noexcept
+  {
+    return _in_tail - _in_head;
+  }
+
+  void release_inbound_if_empty() noexcept
+  {
+    if (_in_head != _in_tail)
+      return;
+    _in.reset();
+    _in_capacity = 0;
+    _in_head = 0;
+    _in_tail = 0;
+  }
+
+  bool feed_ciphertext(const char *data, size_t len)
+  {
+    if (len == 0)
+      return true;
+    auto held = inbound_size();
+    if (_in_capacity - held < len)
+    {
+      if (len > (std::numeric_limits<std::size_t>::max)() - held)
+        return false;
+      auto capacity = (std::max)(inbound_capacity, held + len);
+      std::unique_ptr<std::byte[]> grown(new (std::nothrow) std::byte[capacity]);
+      if (!grown)
+        return false;
+      if (held > 0)
+        std::memcpy(grown.get(), _in.get() + _in_head, held);
+      _in = std::move(grown);
+      _in_capacity = capacity;
+      _in_head = 0;
+      _in_tail = held;
+    }
+    auto space = inbound_space(_in_capacity);
+    if (space.size() < len)
+      return false;
+    std::memcpy(space.data(), data, len);
+    commit_inbound(len);
+    return true;
+  }
+
+  [[nodiscard]] bool has_input() const
+  {
+    return inbound_size() > 0 || (ssl != nullptr && SSL_pending(ssl) > 0);
   }
 
   [[nodiscard]] bool has_output() const
   {
-    return wbio != nullptr && BIO_ctrl_pending(wbio) > 0;
+    return output_size() > 0;
   }
 
-  // Append all currently pending outbound ciphertext to `out`. Returns bytes appended.
+  [[nodiscard]] std::size_t output_size() const noexcept
+  {
+    return _out.size() - _out_head;
+  }
+
+  [[nodiscard]] std::span<const std::byte> pending_output() const noexcept
+  {
+    return {_out.data() + _out_head, _out.size() - _out_head};
+  }
+
+  [[nodiscard]] std::uint64_t output_total() const noexcept
+  {
+    return _out_total;
+  }
+
+  [[nodiscard]] std::uint64_t output_sent() const noexcept
+  {
+    return _out_sent;
+  }
+
+  void reserve_output(std::size_t additional)
+  {
+    compact_output();
+    if (_out.capacity() - _out.size() < additional)
+      _out.reserve(_out.size() + additional);
+  }
+
+  void consume_output(std::size_t length) noexcept
+  {
+    length = (std::min)(length, output_size());
+    _out_head += length;
+    _out_sent += length;
+    if (_out_head == _out.size())
+      reset_output();
+  }
+
+  void discard_output() noexcept
+  {
+    _out_sent = _out_total;
+    _out_head = _out.size();
+    reset_output();
+  }
+
   size_t drain_into(std::vector<uint8_t> &out)
   {
-    size_t total = 0;
-    char tmp[16384];
-    for (;;)
-    {
-      const int n = BIO_read(wbio, tmp, static_cast<int>(sizeof(tmp)));
-      if (n <= 0)
-      {
-        break;
-      }
-      out.insert(out.end(), reinterpret_cast<uint8_t *>(tmp), reinterpret_cast<uint8_t *>(tmp) + n);
-      total += static_cast<size_t>(n);
-    }
-    return total;
+    auto pending = pending_output();
+    auto *first = reinterpret_cast<const uint8_t *>(pending.data());
+    out.insert(out.end(), first, first + pending.size());
+    consume_output(pending.size());
+    return pending.size();
   }
 
   [[nodiscard]] bool is_init_finished() const
@@ -234,7 +359,6 @@ struct ssl_engine_t
     return ssl_status::fatal;
   }
 
-  // Decrypt up to `len` bytes into `buf`. out_n receives the decrypted count.
   ssl_status read_plaintext(void *buf, int len, int &out_n)
   {
     out_n = 0;
@@ -246,8 +370,6 @@ struct ssl_engine_t
       return ssl_status::ok;
     }
     const int e = SSL_get_error(ssl, n);
-    // With a growable memory wbio, WANT_WRITE cannot persist, so treat it like
-    // WANT_READ: the driver drains wbio and waits for more inbound ciphertext.
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
     {
       return ssl_status::want_read;
@@ -259,7 +381,6 @@ struct ssl_engine_t
     return ssl_status::fatal;
   }
 
-  // Encrypt up to `len` bytes from `buf`. out_n receives the plaintext consumed.
   ssl_status write_plaintext(const void *buf, int len, int &out_n)
   {
     out_n = 0;
@@ -273,7 +394,6 @@ struct ssl_engine_t
     const int e = SSL_get_error(ssl, n);
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
     {
-      // Handshake not finished yet (write-before-handshake) -- retry after a read.
       return ssl_status::want_read;
     }
     if (e == SSL_ERROR_ZERO_RETURN)
@@ -283,8 +403,6 @@ struct ssl_engine_t
     return ssl_status::fatal;
   }
 
-  // Send a one-way close_notify (best effort). Produces ciphertext into wbio for
-  // the driver to flush. Idempotent.
   void shutdown()
   {
     if (ssl != nullptr && !shutdown_sent)
@@ -350,6 +468,127 @@ struct ssl_engine_t
     }
     return std::vector<uint8_t>(resp, resp + n);
   }
+
+private:
+  friend int detail::ssl_engine_bio_read(BIO *bio, char *out, int length);
+  friend int detail::ssl_engine_bio_write(BIO *bio, const char *in, int length);
+  friend long detail::ssl_engine_bio_ctrl(BIO *bio, int command, long number, void *pointer);
+
+  int pull_input(char *out, int length) noexcept
+  {
+    auto available = inbound_size();
+    if (available == 0 || length <= 0)
+      return 0;
+    auto count = (std::min)(available, static_cast<std::size_t>(length));
+    std::memcpy(out, _in.get() + _in_head, count);
+    _in_head += count;
+    if (_in_head == _in_tail)
+    {
+      _in_head = 0;
+      _in_tail = 0;
+    }
+    return static_cast<int>(count);
+  }
+
+  bool push_output(const char *in, int length)
+  {
+    if (length <= 0)
+      return true;
+    compact_output();
+    auto *first = reinterpret_cast<const std::byte *>(in);
+    try
+    {
+      _out.insert(_out.end(), first, first + length);
+    }
+    catch (...)
+    {
+      return false;
+    }
+    _out_total += static_cast<std::uint64_t>(length);
+    return true;
+  }
+
+  void compact_output()
+  {
+    if (_out_head == 0)
+      return;
+    if (_out_head == _out.size())
+    {
+      _out.clear();
+      _out_head = 0;
+      return;
+    }
+    if (_out_head >= output_retain && _out_head * 2 >= _out.size())
+    {
+      _out.erase(_out.begin(), _out.begin() + static_cast<std::ptrdiff_t>(_out_head));
+      _out_head = 0;
+    }
+  }
+
+  void reset_output() noexcept
+  {
+    _out_head = 0;
+    if (_out.capacity() > output_retain)
+      std::vector<std::byte>().swap(_out);
+    else
+      _out.clear();
+  }
+
+  std::unique_ptr<std::byte[]> _in;
+  std::size_t _in_capacity = 0;
+  std::size_t _in_head = 0;
+  std::size_t _in_tail = 0;
+  std::vector<std::byte> _out;
+  std::size_t _out_head = 0;
+  std::uint64_t _out_total = 0;
+  std::uint64_t _out_sent = 0;
 };
+
+namespace detail
+{
+inline int ssl_engine_bio_read(BIO *bio, char *out, int length)
+{
+  BIO_clear_retry_flags(bio);
+  auto *engine = static_cast<ssl_engine_t *>(BIO_get_data(bio));
+  if (engine == nullptr || length <= 0)
+    return 0;
+  int count = engine->pull_input(out, length);
+  if (count == 0)
+  {
+    BIO_set_retry_read(bio);
+    return -1;
+  }
+  return count;
+}
+
+inline int ssl_engine_bio_write(BIO *bio, const char *in, int length)
+{
+  BIO_clear_retry_flags(bio);
+  auto *engine = static_cast<ssl_engine_t *>(BIO_get_data(bio));
+  if (engine == nullptr)
+    return -1;
+  if (length <= 0)
+    return 0;
+  if (!engine->push_output(in, length))
+    return -1;
+  return length;
+}
+
+inline long ssl_engine_bio_ctrl(BIO *bio, int command, long, void *)
+{
+  auto *engine = static_cast<ssl_engine_t *>(BIO_get_data(bio));
+  switch (command)
+  {
+  case BIO_CTRL_FLUSH:
+    return 1;
+  case BIO_CTRL_PENDING:
+    return engine == nullptr ? 0 : static_cast<long>((std::min)(engine->inbound_size(), static_cast<std::size_t>((std::numeric_limits<long>::max)())));
+  case BIO_CTRL_WPENDING:
+    return 0;
+  default:
+    return 0;
+  }
+}
+} // namespace detail
 
 } // namespace vio

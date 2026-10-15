@@ -22,10 +22,11 @@
 
 #include "vio/quic/endpoint.h"
 
-#include "vio/operation/sleep.h"
-#include "vio/quic/packet.h"
 #include "vio/crypto.h"
+#include "vio/errc.h"
+#include "vio/loop/loop_core.h"
 #include "vio/operation/udp_datagram.h"
+#include "vio/quic/packet.h"
 #include "vio/quic/stateless_reset.h"
 
 #include <algorithm>
@@ -65,9 +66,20 @@ constexpr std::size_t coalesced_receive_size = 64 * 1024;
 // Retry token to the address it was issued to. Only equality and opacity are
 // required of the encoding, so this is the smallest thing that carries the
 // whole address.
-[[nodiscard]] std::vector<std::uint8_t> address_bytes(const sockaddr *address)
+struct address_key_t
 {
-  std::vector<std::uint8_t> out;
+  std::array<std::uint8_t, 1 + 16 + 2> bytes = {};
+  std::size_t size = 0;
+
+  [[nodiscard]] std::span<const std::uint8_t> view() const
+  {
+    return {bytes.data(), size};
+  }
+};
+
+[[nodiscard]] address_key_t address_key(const sockaddr *address)
+{
+  address_key_t out;
   if (address == nullptr)
   {
     return out;
@@ -75,22 +87,42 @@ constexpr std::size_t coalesced_receive_size = 64 * 1024;
   if (address->sa_family == AF_INET)
   {
     const auto *in4 = reinterpret_cast<const sockaddr_in *>(address);
-    out.resize(1 + 4 + 2);
-    out[0] = 4;
-    std::memcpy(out.data() + 1, &in4->sin_addr, 4);
-    std::memcpy(out.data() + 5, &in4->sin_port, 2);
+    out.size = 1 + 4 + 2;
+    out.bytes[0] = 4;
+    std::memcpy(out.bytes.data() + 1, &in4->sin_addr, 4);
+    std::memcpy(out.bytes.data() + 5, &in4->sin_port, 2);
     return out;
   }
   if (address->sa_family == AF_INET6)
   {
     const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(address);
-    out.resize(1 + 16 + 2);
-    out[0] = 6;
-    std::memcpy(out.data() + 1, &in6->sin6_addr, 16);
-    std::memcpy(out.data() + 17, &in6->sin6_port, 2);
+    out.size = 1 + 16 + 2;
+    out.bytes[0] = 6;
+    std::memcpy(out.bytes.data() + 1, &in6->sin6_addr, 16);
+    std::memcpy(out.bytes.data() + 17, &in6->sin6_port, 2);
     return out;
   }
   return out;
+}
+
+[[nodiscard]] const sockaddr *unmap_ipv4(const sockaddr *address, sockaddr_in &storage)
+{
+  if (!is_ipv4_mapped(address))
+  {
+    return address;
+  }
+  const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(address);
+  storage = {};
+  storage.sin_family = AF_INET;
+  storage.sin_port = in6->sin6_port;
+  std::memcpy(&storage.sin_addr, reinterpret_cast<const std::uint8_t *>(&in6->sin6_addr) + 12, 4);
+  return reinterpret_cast<const sockaddr *>(&storage);
+}
+
+[[nodiscard]] std::vector<std::uint8_t> address_bytes(const sockaddr *address)
+{
+  const auto key = address_key(address);
+  return {key.bytes.begin(), key.bytes.begin() + static_cast<std::ptrdiff_t>(key.size)};
 }
 
 // The inverse of address_bytes, for the one caller that is handed an address as
@@ -151,6 +183,17 @@ struct connection_entry_t
   bool announced = false;
 };
 
+struct held_run_t
+{
+  std::size_t size = 0;
+  std::size_t segment = 0;
+  sockaddr_storage peer = {};
+  ecn_codepoint_t ecn = ecn_codepoint_t::not_ect;
+};
+
+void endpoint_tick(::vio::detail::timer_node_t *node);
+void endpoint_writable(::vio::detail::io_op_t *op);
+
 struct endpoint_impl_t
 {
   endpoint_impl_t(event_loop_t &event_loop, const tls_context_t *answering, const tls_context_t *dialling, endpoint_config_t configuration, udp_t socket)
@@ -160,6 +203,23 @@ struct endpoint_impl_t
     , config(std::move(configuration))
     , udp(std::move(socket))
   {
+    ticker.owner = this;
+    ticker.fire = &endpoint_tick;
+    ticker.keeps_alive = false;
+    writable.owner = this;
+    writable.complete = &endpoint_writable;
+  }
+
+  endpoint_impl_t(const endpoint_impl_t &) = delete;
+  endpoint_impl_t &operator=(const endpoint_impl_t &) = delete;
+
+  ~endpoint_impl_t()
+  {
+    ::vio::detail::core(loop).remove_timer(ticker);
+    if (writable.parked)
+    {
+      udp.handle->socket.cancel(writable);
+    }
   }
 
   event_loop_t &loop;
@@ -195,9 +255,13 @@ struct endpoint_impl_t
   // One buffer for the whole endpoint, grown once and reused: a batch is built
   // by polling datagrams straight into it rather than copying them in.
   std::vector<std::uint8_t> batch;
-  // Whether the send-side offload is worth attempting. Cleared the first time
-  // a route refuses it, because it will keep refusing.
+  // Whether the send-side offload is worth attempting.
   bool segmenting = false;
+  ::vio::detail::timer_node_t ticker;
+  ::vio::detail::io_op_t writable;
+  std::vector<std::uint8_t> held;
+  std::vector<held_run_t> held_runs;
+  bool blocked = false;
   endpoint_stats_t stats;
   // Section 10.3.3 suggests a ceiling on stateless resets. The reason is not
   // amplification -- every reset is smaller than the packet that drew it -- but
@@ -212,6 +276,7 @@ struct endpoint_impl_t
 
 using detail::connection_entry_t;
 using detail::endpoint_impl_t;
+using detail::held_run_t;
 
 namespace
 {
@@ -282,10 +347,6 @@ void index_connection(endpoint_impl_t &impl, connection_entry_t &entry)
   }
 }
 
-// libuv creates the UDP socket lazily: a handle that has neither bound nor
-// sent has no descriptor at all. Its own recv_start binds implicitly when that
-// happens, and anything reading or marking the socket directly needs the same,
-// because both start from a descriptor.
 // An endpoint that was never bound gets its socket here. The family has to
 // match the peer it is about to be used for: a socket bound to 0.0.0.0 cannot
 // send to an IPv6 address at all, so a client dialling one has to say which it
@@ -299,17 +360,16 @@ void ensure_socket(endpoint_impl_t &impl, int family = AF_INET)
   if (family == AF_INET6)
   {
     sockaddr_in6 any = {};
-    if (uv_ip6_addr("::", 0, &any) == 0 && udp_bind(impl.udp, reinterpret_cast<const sockaddr *>(&any)).has_value())
+    any.sin6_family = AF_INET6;
+    if (udp_bind(impl.udp, reinterpret_cast<const sockaddr *>(&any)).has_value())
     {
       return;
     }
   }
-  // IPv4 otherwise, matching what libuv's own deferred bind would have chosen.
   sockaddr_in any = {};
-  if (uv_ip4_addr("0.0.0.0", 0, &any) == 0)
-  {
-    (void)udp_bind(impl.udp, reinterpret_cast<const sockaddr *>(&any));
-  }
+  any.sin_family = AF_INET;
+  any.sin_addr.s_addr = htonl(INADDR_ANY);
+  (void)udp_bind(impl.udp, reinterpret_cast<const sockaddr *>(&any));
 }
 
 [[nodiscard]] connection_entry_t *find_connection(endpoint_impl_t &impl, std::span<const std::uint8_t> datagram)
@@ -348,20 +408,203 @@ void ensure_socket(endpoint_impl_t &impl, int family = AF_INET)
   return std::find(impl.config.supported_versions.begin(), impl.config.supported_versions.end(), version) != impl.config.supported_versions.end();
 }
 
+#if defined(VIO_INTERNAL_TESTS)
+using send_fault_t = int (*)(std::size_t datagrams);
+send_fault_t send_fault = nullptr;
+
+[[nodiscard]] int injected_outcome(std::size_t datagrams)
+{
+  return send_fault != nullptr ? send_fault(datagrams) : 0;
+}
+#endif
+
+enum class send_failure_t
+{
+  blocked,
+  refused,
+  other,
+};
+
+[[nodiscard]] send_failure_t classify_send_failure(int code)
+{
+  switch (code)
+  {
+  case errc::again:
+  case errc::no_buffer_space:
+  case errc::interrupted:
+    return send_failure_t::blocked;
+  case errc::not_supported:
+  case errc::io_error:
+  case errc::invalid_argument:
+  case errc::no_protocol_option:
+  case errc::protocol_not_supported:
+  case errc::not_implemented:
+  case errc::unknown:
+    return send_failure_t::refused;
+  default:
+    return send_failure_t::other;
+  }
+}
+
+[[nodiscard]] std::size_t address_size(const sockaddr *address)
+{
+  return address->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+}
+
 // The codepoint travels with the datagram rather than sitting on the socket,
 // so two connections on one port can disagree about ECN -- one still marking,
 // one that has given up on its path -- without either affecting the other.
+[[nodiscard]] int send_one(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, const sockaddr *address, ecn_codepoint_t ecn)
+{
+#if defined(VIO_INTERNAL_TESTS)
+  if (const int injected = injected_outcome(1); injected != 0)
+  {
+    return injected < 0 ? injected : 0;
+  }
+#endif
+  if (ecn == ecn_codepoint_t::not_ect)
+  {
+    const auto sent = udp_try_send(impl.udp, bytes, address);
+    return sent.has_value() ? 0 : sent.error().code;
+  }
+  const auto sent = send_datagram(impl.udp, bytes, address, static_cast<udp_ecn_t>(ecn));
+  return sent.has_value() ? 0 : sent.error().code;
+}
+
+[[nodiscard]] int send_segmented(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, std::size_t segment, std::size_t count, const sockaddr *address, ecn_codepoint_t ecn)
+{
+#if defined(VIO_INTERNAL_TESTS)
+  if (const int injected = injected_outcome(count); injected != 0)
+  {
+    return injected < 0 ? injected : 0;
+  }
+#else
+  (void)count;
+#endif
+  const auto sent = send_segments(impl.udp, bytes, segment, address, static_cast<udp_ecn_t>(ecn));
+  return sent.has_value() ? 0 : sent.error().code;
+}
+
 void send_to(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, const sockaddr *address, ecn_codepoint_t ecn = ecn_codepoint_t::not_ect)
 {
   // A datagram that cannot be handed to the socket is dropped rather than
   // retried: QUIC treats loss as ordinary, and every path here has a
   // retransmission behind it.
-  if (ecn == ecn_codepoint_t::not_ect)
+  (void)send_one(impl, bytes, address, ecn);
+}
+
+[[nodiscard]] std::size_t transmit(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, std::size_t segment, const sockaddr *address, ecn_codepoint_t ecn)
+{
+  const std::size_t count = (bytes.size() + segment - 1) / segment;
+  if (count > 1 && impl.segmenting)
   {
-    (void)udp_try_send(impl.udp, bytes, address);
+    const int code = send_segmented(impl, bytes, segment, count, address, ecn);
+    if (code == 0)
+    {
+      ++impl.stats.sends;
+      impl.stats.datagrams_sent += count;
+      return bytes.size();
+    }
+    // A batch too large for one message says nothing about whether the offload
+    // works, and abandoning it for the life of the endpoint over one is how a
+    // connection ends up making a system call per packet for everything after
+    // its window first grew.
+    const auto failure = classify_send_failure(code);
+    if (failure == send_failure_t::blocked)
+    {
+      return 0;
+    }
+    if (failure == send_failure_t::refused)
+    {
+      impl.segmenting = false;
+    }
+  }
+
+  for (std::size_t offset = 0; offset < bytes.size(); offset += segment)
+  {
+    const std::size_t piece = (std::min)(segment, bytes.size() - offset);
+    if (const int code = send_one(impl, bytes.subspan(offset, piece), address, ecn); code < 0 && classify_send_failure(code) == send_failure_t::blocked)
+    {
+      return offset;
+    }
+    ++impl.stats.sends;
+    ++impl.stats.datagrams_sent;
+  }
+  return bytes.size();
+}
+
+void wait_writable(endpoint_impl_t &impl)
+{
+  auto &socket = impl.udp.handle->socket;
+  if (impl.writable.parked || !socket.is_open())
+  {
     return;
   }
-  (void)send_datagram(impl.udp, bytes, address, static_cast<udp_ecn_t>(ecn));
+  socket.wait(::vio::detail::interest_write, impl.writable);
+}
+
+void hold(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, std::size_t segment, const sockaddr *address, ecn_codepoint_t ecn)
+{
+  held_run_t run;
+  run.size = bytes.size();
+  run.segment = segment;
+  run.ecn = ecn;
+  std::memcpy(&run.peer, address, address_size(address));
+  impl.held.insert(impl.held.end(), bytes.begin(), bytes.end());
+  impl.held_runs.push_back(run);
+  impl.blocked = true;
+  wait_writable(impl);
+}
+
+void send_or_hold(endpoint_impl_t &impl, std::span<const std::uint8_t> bytes, std::size_t segment, const sockaddr *address, ecn_codepoint_t ecn)
+{
+  if (bytes.empty() || segment == 0)
+  {
+    return;
+  }
+  const std::size_t sent = impl.blocked ? 0 : transmit(impl, bytes, segment, address, ecn);
+  if (sent < bytes.size())
+  {
+    hold(impl, bytes.subspan(sent), segment, address, ecn);
+  }
+}
+
+[[nodiscard]] bool release_held(endpoint_impl_t &impl)
+{
+  if (!impl.blocked)
+  {
+    return true;
+  }
+  impl.blocked = false;
+  std::size_t offset = 0;
+  std::size_t index = 0;
+  for (; index < impl.held_runs.size(); ++index)
+  {
+    auto &run = impl.held_runs[index];
+    const std::span<const std::uint8_t> bytes(impl.held.data() + offset, run.size);
+    const std::size_t sent = transmit(impl, bytes, run.segment, reinterpret_cast<const sockaddr *>(&run.peer), run.ecn);
+    offset += sent;
+    if (sent < run.size)
+    {
+      run.size -= sent;
+      break;
+    }
+  }
+  if (index == impl.held_runs.size())
+  {
+    impl.held.clear();
+    impl.held_runs.clear();
+    if (impl.writable.parked)
+    {
+      impl.udp.handle->socket.cancel(impl.writable);
+    }
+    return true;
+  }
+  impl.held.erase(impl.held.begin(), impl.held.begin() + static_cast<std::ptrdiff_t>(offset));
+  impl.held_runs.erase(impl.held_runs.begin(), impl.held_runs.begin() + static_cast<std::ptrdiff_t>(index));
+  impl.blocked = true;
+  wait_writable(impl);
+  return false;
 }
 
 // Section 6.1. Built entirely from the packet that arrived, so a server can
@@ -644,41 +887,12 @@ void attach_qlog(endpoint_impl_t &impl, connection_t &connection, const connecti
 // datagram in it, and as an ordinary send otherwise.
 void flush_batch(endpoint_impl_t &impl, connection_entry_t &entry, std::size_t used, std::size_t segment, std::size_t count)
 {
-  if (used == 0)
+  if (used == 0 || count == 0)
   {
     return;
   }
   const auto *address = reinterpret_cast<const sockaddr *>(&entry.peer);
-  const auto ecn = entry.connection->ecn_sending();
-  const std::span<const std::uint8_t> bytes(impl.batch.data(), used);
-
-  if (count > 1 && impl.segmenting)
-  {
-    auto segmented = send_segments(impl.udp, bytes, segment, address, static_cast<udp_ecn_t>(ecn));
-    if (segmented.has_value())
-    {
-      ++impl.stats.sends;
-      impl.stats.datagrams_sent += count;
-      return;
-    }
-    // A batch too large for one message says nothing about whether the offload
-    // works, and abandoning it for the life of the endpoint over one is how a
-    // connection ends up making a system call per packet for everything after
-    // its window first grew. Anything else is a route or an interface refusing,
-    // which will not change while this endpoint runs.
-    if (segmented.error().code != -EMSGSIZE)
-    {
-      impl.segmenting = false;
-    }
-  }
-
-  for (std::size_t offset = 0; offset < used; offset += segment)
-  {
-    const std::size_t piece = (std::min)(segment, used - offset);
-    send_to(impl, bytes.subspan(offset, piece), address, ecn);
-    ++impl.stats.sends;
-    ++impl.stats.datagrams_sent;
-  }
+  send_or_hold(impl, std::span<const std::uint8_t>(impl.batch.data(), used), segment, address, entry.connection->ecn_sending());
 }
 
 void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
@@ -702,6 +916,10 @@ void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
       used = 0;
       segment = 0;
       count = 0;
+    }
+    if (impl.blocked)
+    {
+      break;
     }
     if (impl.batch.size() < used + max_datagram)
     {
@@ -733,9 +951,7 @@ void flush_entry(endpoint_impl_t &impl, connection_entry_t &entry, tick_t now)
       sockaddr_storage probe = {};
       if (address_from_bytes(destination, probe))
       {
-        send_to(impl, std::span<const std::uint8_t>(impl.batch).subspan(at, *size), reinterpret_cast<const sockaddr *>(&probe));
-        ++impl.stats.sends;
-        ++impl.stats.datagrams_sent;
+        send_or_hold(impl, std::span<const std::uint8_t>(impl.batch).subspan(at, *size), *size, reinterpret_cast<const sockaddr *>(&probe), ecn_codepoint_t::not_ect);
       }
       continue;
     }
@@ -824,7 +1040,57 @@ void reap(endpoint_impl_t &impl, tick_t now)
     it = impl.connections.erase(it);
   }
 }
+
+void flush_all(endpoint_impl_t &impl)
+{
+  const auto now = loop_now(impl.loop);
+  ++impl.walking;
+  for (std::size_t index = 0; index < impl.connections.size(); ++index)
+  {
+    flush_entry(impl, *impl.connections[index], now);
+  }
+  --impl.walking;
+  reap(impl, now);
+}
+
+void arm_ticker(endpoint_impl_t &impl)
+{
+  const auto delay = std::chrono::duration_cast<std::chrono::nanoseconds>(timer_granularity).count();
+  ::vio::detail::core(impl.loop).add_timer(impl.ticker, ::vio::detail::loop_core_t::now() + delay);
+}
+
+void disarm_ticker(endpoint_impl_t &impl)
+{
+  ::vio::detail::core(impl.loop).remove_timer(impl.ticker);
+}
 } // namespace
+
+namespace detail
+{
+void endpoint_tick(::vio::detail::timer_node_t *node)
+{
+  auto &impl = *static_cast<endpoint_impl_t *>(node->owner);
+  if (!impl.running)
+  {
+    return;
+  }
+  (void)release_held(impl);
+  flush_all(impl);
+  if (impl.running)
+  {
+    arm_ticker(impl);
+  }
+}
+
+void endpoint_writable(::vio::detail::io_op_t *op)
+{
+  auto &impl = *static_cast<endpoint_impl_t *>(op->owner);
+  if (release_held(impl))
+  {
+    flush_all(impl);
+  }
+}
+} // namespace detail
 
 endpoint_t::~endpoint_t() = default;
 endpoint_t::endpoint_t(endpoint_t &&) noexcept = default;
@@ -923,11 +1189,13 @@ std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *
     return std::unexpected(error_t{.code = -1, .msg = "connect needs an IPv4 or IPv6 address"});
   }
   ensure_socket(impl, address->sa_family);
+  sockaddr_in unmapped = {};
+  const auto *peer = unmap_ipv4(address, unmapped);
   auto config = impl.config.connection;
   config.role = tls_role_t::client;
   config.stateless_reset_key = impl.config.stateless_reset_key;
-  config.peer_address = address_bytes(address);
-  config.peer_host_address = host_address_bytes(address);
+  config.peer_address = address_bytes(peer);
+  config.peer_host_address = host_address_bytes(peer);
   config.ecn = impl.config.ecn ? ecn_codepoint_t::ect0 : ecn_codepoint_t::not_ect;
   if (!resumption_ticket.empty())
   {
@@ -945,7 +1213,7 @@ std::expected<connection_handle_t, error_t> endpoint_t::connect(const sockaddr *
   entry->connection = std::make_unique<connection_t>(std::move(*created));
   attach_qlog(impl, *entry->connection, entry->connection->original_destination_id(), false, loop_now(impl.loop));
   entry->peer_bytes = config.peer_address;
-  std::memcpy(&entry->peer, address, address->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in));
+  std::memcpy(&entry->peer, peer, address_size(peer));
 
   auto *raw = entry.get();
   impl.connections.push_back(std::move(entry));
@@ -964,15 +1232,7 @@ connection_t *endpoint_t::connection(connection_handle_t handle)
 
 std::expected<void, error_t> endpoint_t::flush()
 {
-  auto &impl = *_impl;
-  const auto now = loop_now(impl.loop);
-  ++impl.walking;
-  for (std::size_t index = 0; index < impl.connections.size(); ++index)
-  {
-    flush_entry(impl, *impl.connections[index], now);
-  }
-  --impl.walking;
-  reap(impl, now);
+  flush_all(*_impl);
   return {};
 }
 
@@ -1006,8 +1266,6 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
 {
   auto &impl = *_impl;
   ensure_socket(impl);
-  // Our own read rather than libuv's, so the ECN codepoint the kernel reports
-  // alongside each datagram survives to the connection that needs it.
   auto reader = datagram_reader_t::create(impl.loop, impl.udp);
   if (!reader.has_value())
   {
@@ -1026,10 +1284,8 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
   }
   impl.running = true;
 
-  // Timers live in their own coroutine because the read is what the endpoint
-  // is normally parked on, and QUIC's deadlines have to fire whether or not a
-  // datagram ever arrives -- loss detection and the idle timeout are both
-  // about the absence of traffic.
+  // QUIC's deadlines have to fire whether or not a datagram ever arrives --
+  // loss detection and the idle timeout are both about the absence of traffic.
   //
   // A fixed 2 ms tick rather than the earliest deadline the connections
   // report, which was tried and reverted. next_timeout is not complete enough
@@ -1039,30 +1295,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
   // Arming on the first spins the loop; arming on the second stalls it. The
   // tick papers over both by flushing unconditionally, and making it
   // deadline-driven means fixing what next_timeout reports first.
-  auto ticker = [](endpoint_impl_t &state, cancellation_t *token) -> detached_task_t
-  {
-    while (state.running)
-    {
-      // A cancelled sleep returns at once, so the token has to be tested as
-      // well as passed -- otherwise cancelling turns this into a hot loop that
-      // starves everything else on the event loop.
-      auto slept = co_await sleep(state.loop, timer_granularity, token);
-      if (!state.running || !slept.has_value() || (token != nullptr && token->is_cancelled()))
-      {
-        break;
-      }
-      const auto now = loop_now(state.loop);
-      ++state.walking;
-      for (std::size_t index = 0; index < state.connections.size(); ++index)
-      {
-        flush_entry(state, *state.connections[index], now);
-      }
-      --state.walking;
-      reap(state, now);
-    }
-    state.running = false;
-  }(impl, cancel);
-  (void)ticker;
+  arm_ticker(impl);
 
   // Cancelling has to reach the read as well, or run() stays parked on a
   // socket that will never speak again.
@@ -1070,6 +1303,10 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
   if (cancel != nullptr)
   {
     stop_reading = cancel->register_callback([reader = &*reader]() { reader->cancel(); });
+    if (cancel->is_cancelled())
+    {
+      reader->cancel();
+    }
   }
 
   // Datagrams that arrived together are answered together. One wakeup usually
@@ -1079,7 +1316,7 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
   std::vector<connection_entry_t *> touched;
   for (;;)
   {
-    auto received = co_await *reader;
+    auto received = co_await reader->receive();
     if (!received.has_value())
     {
       break;
@@ -1092,18 +1329,17 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     impl.stats.datagrams_received = reader->datagrams();
     touched.clear();
 
-    std::optional<std::expected<datagram_t, error_t>> next = std::move(received);
-    for (; next.has_value(); next = reader->try_next())
+    for (const datagram_t &datagram : *received)
     {
-    if (!next->has_value())
+    if (datagram.truncated || datagram.sender() == nullptr)
     {
-      break;
+      continue;
     }
-    auto &datagram = next->value();
+    sockaddr_in unmapped = {};
+    const auto *sender = unmap_ipv4(datagram.sender(), unmapped);
     std::span<std::uint8_t> bytes(datagram.data);
     const auto arriving_ecn = static_cast<ecn_codepoint_t>(datagram.ecn);
     const auto now = loop_now(impl.loop);
-    const auto *sender = datagram.sender();
 
     auto *entry = find_connection(impl, bytes);
     if (entry == nullptr)
@@ -1159,7 +1395,8 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
       }
     }
 
-    const auto peer = address_bytes(sender);
+    const auto peer_key = address_key(sender);
+    const auto peer = peer_key.view();
     const bool fresh = entry->routed.empty() || entry->connection->original_destination_id().empty();
     // Only a rise across this one datagram means the connection accepted a
     // move. The running total does not: it stays above zero for the rest of
@@ -1182,8 +1419,8 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
     {
       // Section 9.3: the connection accepted the move, so replies go to the
       // new address from here on.
-      entry->peer_bytes = peer;
-      std::memcpy(&entry->peer, sender, sender->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in));
+      entry->peer_bytes.assign(peer.begin(), peer.end());
+      std::memcpy(&entry->peer, sender, address_size(sender));
     }
     if (fresh)
     {
@@ -1222,6 +1459,582 @@ task_t<void> endpoint_t::run(cancellation_t *cancel)
   }
 
   impl.running = false;
+  disarm_ticker(impl);
   co_return;
 }
 } // namespace vio::quic
+
+#if defined(VIO_INTERNAL_TESTS)
+#include <doctest/doctest.h>
+
+#include <chrono>
+#include <optional>
+#include <thread>
+
+#include "vio/operation/sleep.h"
+#include "vio/ssl_backend.h"
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
+namespace vio::quic
+{
+namespace
+{
+struct send_plan_t
+{
+  int code = 0;
+  int failures = 0;
+  int pass_first = 0;
+  int every = 0;
+  bool simulate = true;
+  int calls = 0;
+};
+
+send_plan_t send_plan;
+
+int planned_send(std::size_t)
+{
+  ++send_plan.calls;
+  const int pass = send_plan.simulate ? 1 : 0;
+  if (send_plan.every > 0)
+  {
+    return send_plan.calls % send_plan.every == 0 ? send_plan.code : pass;
+  }
+  if (send_plan.pass_first > 0)
+  {
+    --send_plan.pass_first;
+    return pass;
+  }
+  if (send_plan.failures > 0)
+  {
+    --send_plan.failures;
+    return send_plan.code;
+  }
+  return pass;
+}
+
+class planned_sends_t
+{
+public:
+  explicit planned_sends_t(send_plan_t plan)
+  {
+    send_plan = plan;
+    send_fault = &planned_send;
+  }
+  ~planned_sends_t()
+  {
+    send_fault = nullptr;
+    send_plan = {};
+  }
+  planned_sends_t(const planned_sends_t &) = delete;
+  planned_sends_t &operator=(const planned_sends_t &) = delete;
+};
+
+sockaddr_in loopback_address(std::uint16_t port = 0)
+{
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  return address;
+}
+
+std::vector<std::uint8_t> numbered_datagrams(std::size_t count, std::size_t size)
+{
+  std::vector<std::uint8_t> out(count * size);
+  for (std::size_t i = 0; i < count; ++i)
+  {
+    std::fill_n(out.begin() + static_cast<std::ptrdiff_t>(i * size), size, static_cast<std::uint8_t>(i + 1));
+  }
+  return out;
+}
+
+class send_fixture_t
+{
+public:
+  explicit send_fixture_t(event_loop_t &loop)
+    : impl(loop, nullptr, nullptr, endpoint_config_t{}, std::move(*udp_create(loop)))
+    , receiver(std::move(*udp_create(loop)))
+  {
+    const auto any = loopback_address();
+    REQUIRE(udp_bind(impl.udp, reinterpret_cast<const sockaddr *>(&any)).has_value());
+    REQUIRE(udp_bind(receiver, reinterpret_cast<const sockaddr *>(&any)).has_value());
+    const auto name = udp_sockname(receiver);
+    REQUIRE(name.has_value());
+    std::memcpy(&target, &*name, sizeof(target));
+    impl.segmenting = true;
+  }
+
+  [[nodiscard]] const sockaddr *to() const
+  {
+    return reinterpret_cast<const sockaddr *>(&target);
+  }
+
+  std::vector<std::uint8_t> receive(std::size_t expected)
+  {
+    std::vector<std::uint8_t> out;
+    const auto native = udp_fileno(receiver);
+    REQUIRE(native.has_value());
+    std::vector<std::byte> buffer(4096);
+    std::size_t datagrams = 0;
+    for (int attempt = 0; attempt < 2000 && datagrams < expected; ++attempt)
+    {
+      sockaddr_storage from = {};
+      int length = sizeof(from);
+      const auto got = ::vio::detail::socket_recvfrom(*native, buffer, &from, &length);
+      if (got < 0)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      ++datagrams;
+      const auto *first = reinterpret_cast<const std::uint8_t *>(buffer.data());
+      out.insert(out.end(), first, first + got);
+    }
+    return out;
+  }
+
+  endpoint_impl_t impl;
+  udp_t receiver;
+  sockaddr_in target = {};
+};
+
+struct identity_t
+{
+  std::vector<std::uint8_t> certificate_pem;
+  std::vector<std::uint8_t> private_key_pem;
+};
+
+std::vector<std::uint8_t> drain_bio(BIO *bio)
+{
+  std::vector<std::uint8_t> out(static_cast<std::size_t>(BIO_pending(bio)));
+  if (!out.empty())
+  {
+    BIO_read(bio, out.data(), static_cast<int>(out.size()));
+  }
+  return out;
+}
+
+identity_t make_identity()
+{
+  EVP_PKEY *key = nullptr;
+  EVP_PKEY_CTX *key_context = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+  EVP_PKEY_keygen_init(key_context);
+  EVP_PKEY_CTX_set_ec_paramgen_curve_nid(key_context, NID_X9_62_prime256v1);
+  EVP_PKEY_keygen(key_context, &key);
+  EVP_PKEY_CTX_free(key_context);
+
+  X509 *certificate = X509_new();
+  X509_set_version(certificate, 2);
+  ASN1_INTEGER_set(X509_get_serialNumber(certificate), 1);
+  X509_gmtime_adj(X509_getm_notBefore(certificate), 0);
+  X509_gmtime_adj(X509_getm_notAfter(certificate), 31536000L);
+  X509_set_pubkey(certificate, key);
+  X509_NAME *name = X509_get_subject_name(certificate);
+  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>("localhost"), -1, -1, 0);
+  X509_set_issuer_name(certificate, name);
+  X509_EXTENSION *basic = X509V3_EXT_nconf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
+  X509_add_ext(certificate, basic, -1);
+  X509_EXTENSION_free(basic);
+  X509_EXTENSION *san = X509V3_EXT_nconf_nid(nullptr, nullptr, NID_subject_alt_name, "DNS:localhost");
+  X509_add_ext(certificate, san, -1);
+  X509_EXTENSION_free(san);
+  X509_sign(certificate, key, EVP_sha256());
+
+  BIO *certificate_bio = BIO_new(BIO_s_mem());
+  BIO *key_bio = BIO_new(BIO_s_mem());
+  PEM_write_bio_X509(certificate_bio, certificate);
+  PEM_write_bio_PrivateKey(key_bio, key, nullptr, nullptr, 0, nullptr, nullptr);
+  identity_t out{.certificate_pem = drain_bio(certificate_bio), .private_key_pem = drain_bio(key_bio)};
+  BIO_free(certificate_bio);
+  BIO_free(key_bio);
+  X509_free(certificate);
+  EVP_PKEY_free(key);
+  return out;
+}
+} // namespace
+
+TEST_SUITE("quic endpoint send path")
+{
+TEST_CASE("a full socket buffer holds a segmented batch and leaves segmentation on")
+{
+  for (const int code : {errc::again, errc::no_buffer_space})
+  {
+    CAPTURE(code);
+    event_loop_t loop;
+    {
+      send_fixture_t fixture(loop);
+      const auto payload = numbered_datagrams(4, 1200);
+      {
+        planned_sends_t plan(send_plan_t{.code = code, .failures = 1});
+        send_or_hold(fixture.impl, payload, 1200, fixture.to(), ecn_codepoint_t::not_ect);
+        CHECK(send_plan.calls == 1);
+      }
+      CHECK(fixture.impl.blocked);
+      CHECK(fixture.impl.segmenting);
+      CHECK(fixture.impl.held.size() == payload.size());
+      CHECK(fixture.impl.held_runs.size() == 1);
+      CHECK(fixture.impl.writable.parked);
+      CHECK(fixture.impl.stats.sends == 0);
+
+      {
+        planned_sends_t plan(send_plan_t{});
+        CHECK(release_held(fixture.impl));
+        CHECK(send_plan.calls == 1);
+      }
+      CHECK_FALSE(fixture.impl.blocked);
+      CHECK_FALSE(fixture.impl.writable.parked);
+      CHECK(fixture.impl.held.empty());
+      CHECK(fixture.impl.held_runs.empty());
+      CHECK(fixture.impl.segmenting);
+      CHECK(fixture.impl.stats.sends == 1);
+      CHECK(fixture.impl.stats.datagrams_sent == 4);
+    }
+    loop.stop();
+    loop.run();
+  }
+}
+
+TEST_CASE("a batch too large for one message goes out one datagram at a time and keeps segmentation")
+{
+  event_loop_t loop;
+  {
+    send_fixture_t fixture(loop);
+    const auto payload = numbered_datagrams(4, 1200);
+    planned_sends_t plan(send_plan_t{.code = errc::message_too_long, .failures = 1});
+    send_or_hold(fixture.impl, payload, 1200, fixture.to(), ecn_codepoint_t::not_ect);
+    CHECK(send_plan.calls == 5);
+    CHECK_FALSE(fixture.impl.blocked);
+    CHECK(fixture.impl.segmenting);
+    CHECK(fixture.impl.stats.sends == 4);
+    CHECK(fixture.impl.stats.datagrams_sent == 4);
+  }
+  loop.stop();
+  loop.run();
+}
+
+TEST_CASE("an offload the kernel refuses is turned off for good")
+{
+  for (const int code : {errc::not_supported, errc::io_error, errc::invalid_argument})
+  {
+    CAPTURE(code);
+    event_loop_t loop;
+    {
+      send_fixture_t fixture(loop);
+      const auto payload = numbered_datagrams(3, 1000);
+      planned_sends_t plan(send_plan_t{.code = code, .failures = 1});
+      send_or_hold(fixture.impl, payload, 1000, fixture.to(), ecn_codepoint_t::not_ect);
+      CHECK_FALSE(fixture.impl.segmenting);
+      CHECK_FALSE(fixture.impl.blocked);
+      CHECK(fixture.impl.stats.sends == 3);
+
+      send_plan.calls = 0;
+      send_or_hold(fixture.impl, payload, 1000, fixture.to(), ecn_codepoint_t::not_ect);
+      CHECK(send_plan.calls == 3);
+      CHECK(fixture.impl.stats.sends == 6);
+    }
+    loop.stop();
+    loop.run();
+  }
+}
+
+TEST_CASE("a route error drops the datagram without touching segmentation")
+{
+  event_loop_t loop;
+  {
+    send_fixture_t fixture(loop);
+    const auto payload = numbered_datagrams(2, 1000);
+    planned_sends_t plan(send_plan_t{.code = errc::network_unreachable, .failures = 3});
+    send_or_hold(fixture.impl, payload, 1000, fixture.to(), ecn_codepoint_t::not_ect);
+    CHECK(fixture.impl.segmenting);
+    CHECK_FALSE(fixture.impl.blocked);
+    CHECK(fixture.impl.held.empty());
+  }
+  loop.stop();
+  loop.run();
+}
+
+TEST_CASE("a full buffer part way through single sends holds the rest, in order")
+{
+  event_loop_t loop;
+  {
+    send_fixture_t fixture(loop);
+    fixture.impl.segmenting = false;
+    const auto payload = numbered_datagrams(4, 1100);
+    {
+      planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .pass_first = 1, .simulate = false});
+      send_or_hold(fixture.impl, payload, 1100, fixture.to(), ecn_codepoint_t::not_ect);
+    }
+    CHECK(fixture.impl.blocked);
+    CHECK(fixture.impl.held.size() == 3 * 1100);
+    const auto first = fixture.receive(1);
+    CHECK(first == std::vector<std::uint8_t>(payload.begin(), payload.begin() + 1100));
+
+    CHECK(release_held(fixture.impl));
+    const auto rest = fixture.receive(3);
+    CHECK(rest == std::vector<std::uint8_t>(payload.begin() + 1100, payload.end()));
+    CHECK(fixture.impl.stats.datagrams_sent == 4);
+  }
+  loop.stop();
+  loop.run();
+}
+
+TEST_CASE("datagrams held behind a full buffer queue up and leave in order")
+{
+  event_loop_t loop;
+  {
+    send_fixture_t fixture(loop);
+    const auto first = numbered_datagrams(3, 1200);
+    const auto second = numbered_datagrams(2, 900);
+    {
+      planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .simulate = false});
+      send_or_hold(fixture.impl, first, 1200, fixture.to(), ecn_codepoint_t::not_ect);
+      send_or_hold(fixture.impl, second, 900, fixture.to(), ecn_codepoint_t::ect0);
+      CHECK(send_plan.calls == 1);
+    }
+    CHECK(fixture.impl.held_runs.size() == 2);
+    CHECK(fixture.impl.held.size() == first.size() + second.size());
+
+    {
+      planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .pass_first = 1, .simulate = false});
+      CHECK_FALSE(release_held(fixture.impl));
+    }
+    CHECK(fixture.impl.blocked);
+    CHECK(fixture.impl.held_runs.size() == 1);
+    CHECK(fixture.impl.held_runs.front().segment == 900);
+    CHECK(fixture.impl.held_runs.front().ecn == ecn_codepoint_t::ect0);
+    CHECK(fixture.impl.held == second);
+
+    CHECK(release_held(fixture.impl));
+    auto expected = first;
+    expected.insert(expected.end(), second.begin(), second.end());
+    CHECK(fixture.receive(5) == expected);
+  }
+  loop.stop();
+  loop.run();
+}
+
+TEST_CASE("a held batch goes out when the socket says it can take more")
+{
+  event_loop_t loop;
+  bool released = false;
+  std::vector<std::uint8_t> arrived;
+  std::vector<std::uint8_t> sent;
+  std::optional<task_t<void>> task;
+  loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, bool &released, std::vector<std::uint8_t> &arrived, std::vector<std::uint8_t> &sent) -> task_t<void>
+        {
+          {
+            send_fixture_t fixture(loop);
+            sent = numbered_datagrams(3, 1000);
+            {
+              planned_sends_t plan(send_plan_t{.code = errc::again, .failures = 1, .simulate = false});
+              send_or_hold(fixture.impl, sent, 1000, fixture.to(), ecn_codepoint_t::not_ect);
+            }
+            CHECK(fixture.impl.writable.parked);
+            for (int turn = 0; turn < 100 && fixture.impl.blocked; ++turn)
+            {
+              (void)co_await sleep(loop, std::chrono::milliseconds(1));
+            }
+            released = !fixture.impl.blocked;
+            arrived = fixture.receive(3);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(loop, released, arrived, sent));
+    });
+  loop.run();
+  CHECK(released);
+  CHECK(arrived == sent);
+}
+
+TEST_CASE("the ticker retries a held batch when no write edge comes")
+{
+  event_loop_t loop;
+  bool released = false;
+  std::vector<std::uint8_t> arrived;
+  std::vector<std::uint8_t> sent;
+  std::optional<task_t<void>> task;
+  loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, bool &released, std::vector<std::uint8_t> &arrived, std::vector<std::uint8_t> &sent) -> task_t<void>
+        {
+          {
+            send_fixture_t fixture(loop);
+            sent = numbered_datagrams(2, 1000);
+            {
+              planned_sends_t plan(send_plan_t{.code = errc::no_buffer_space, .failures = 1, .simulate = false});
+              send_or_hold(fixture.impl, sent, 1000, fixture.to(), ecn_codepoint_t::not_ect);
+            }
+            CHECK(fixture.impl.blocked);
+            fixture.impl.udp.handle->socket.cancel(fixture.impl.writable);
+            fixture.impl.running = true;
+            arm_ticker(fixture.impl);
+            (void)co_await sleep(loop, std::chrono::milliseconds(20));
+            released = !fixture.impl.blocked;
+            arrived = fixture.receive(2);
+            fixture.impl.running = false;
+            disarm_ticker(fixture.impl);
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(loop, released, arrived, sent));
+    });
+  loop.run();
+  CHECK(released);
+  CHECK(arrived == sent);
+}
+
+TEST_CASE("the ticker never keeps the loop alive")
+{
+  event_loop_t loop;
+  {
+    send_fixture_t fixture(loop);
+    const auto before = ::vio::detail::core(loop).in_flight();
+    fixture.impl.running = true;
+    arm_ticker(fixture.impl);
+    CHECK(fixture.impl.ticker.armed());
+    CHECK(::vio::detail::core(loop).in_flight() == before);
+    loop.stop();
+    loop.run();
+    CHECK(fixture.impl.ticker.armed());
+    fixture.impl.running = false;
+  }
+  loop.run();
+}
+
+TEST_CASE("an IPv4-mapped address is read as the IPv4 address it names")
+{
+  sockaddr_in6 mapped = {};
+  mapped.sin6_family = AF_INET6;
+  mapped.sin6_port = htons(4433);
+  auto *bytes = reinterpret_cast<std::uint8_t *>(&mapped.sin6_addr);
+  bytes[10] = 0xff;
+  bytes[11] = 0xff;
+  bytes[12] = 127;
+  bytes[15] = 1;
+
+  sockaddr_in storage = {};
+  const auto *plain = unmap_ipv4(reinterpret_cast<const sockaddr *>(&mapped), storage);
+  REQUIRE(plain->sa_family == AF_INET);
+  const auto expected = loopback_address(4433);
+  CHECK(address_key(plain).view().size() == 7);
+  CHECK(std::ranges::equal(address_key(plain).view(), address_key(reinterpret_cast<const sockaddr *>(&expected)).view()));
+
+  sockaddr_in6 real = {};
+  real.sin6_family = AF_INET6;
+  real.sin6_port = htons(4433);
+  reinterpret_cast<std::uint8_t *>(&real.sin6_addr)[15] = 1;
+  CHECK(unmap_ipv4(reinterpret_cast<const sockaddr *>(&real), storage) == reinterpret_cast<const sockaddr *>(&real));
+  CHECK(unmap_ipv4(reinterpret_cast<const sockaddr *>(&expected), storage) == reinterpret_cast<const sockaddr *>(&expected));
+}
+
+TEST_CASE("a connection whose sends keep meeting a full buffer still delivers every byte")
+{
+  const auto identity = make_identity();
+  tls_config_t server_tls;
+  server_tls.role = tls_role_t::server;
+  server_tls.certificate_chain_pem = identity.certificate_pem;
+  server_tls.private_key_pem = identity.private_key_pem;
+  server_tls.alpn = {"test"};
+  tls_config_t client_tls;
+  client_tls.role = tls_role_t::client;
+  client_tls.ca_certificates_pem = identity.certificate_pem;
+  client_tls.alpn = {"test"};
+  auto server_context = tls_context_t::create(server_tls);
+  auto client_context = tls_context_t::create(client_tls);
+  REQUIRE(server_context.has_value());
+  REQUIRE(client_context.has_value());
+
+  constexpr std::size_t total = 512 * 1024;
+  event_loop_t loop;
+  std::size_t received = 0;
+  bool finished = false;
+  endpoint_stats_t client_stats;
+  std::optional<task_t<void>> task;
+  loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const tls_context_t &server_tls, const tls_context_t &client_tls, std::size_t &received, bool &finished, endpoint_stats_t &client_stats) -> task_t<void>
+        {
+          planned_sends_t plan(send_plan_t{.code = errc::again, .every = 4, .simulate = false});
+          {
+            auto server = endpoint_t::create(loop, server_tls, endpoint_config_t{});
+            auto client = endpoint_t::create(loop, client_tls, endpoint_config_t{});
+            REQUIRE(server.has_value());
+            REQUIRE(client.has_value());
+            const auto any = loopback_address();
+            REQUIRE(server->bind(reinterpret_cast<const sockaddr *>(&any)).has_value());
+            const auto port = server->local_port();
+            REQUIRE(port.has_value());
+            connection_t *accepted = nullptr;
+            server->on_connection([&accepted](connection_t &connection) { accepted = &connection; });
+
+            cancellation_t stop;
+            auto server_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*server, stop);
+            auto client_run = [](endpoint_t &endpoint, cancellation_t &cancel) -> detached_task_t { co_await endpoint.run(&cancel); }(*client, stop);
+            (void)server_run;
+            (void)client_run;
+
+            const auto target = loopback_address(*port);
+            auto dialled = client->connect(reinterpret_cast<const sockaddr *>(&target), "localhost");
+            REQUIRE(dialled.has_value());
+            for (int i = 0; i < 400; ++i)
+            {
+              auto *connection = client->connection(*dialled);
+              if (connection == nullptr || connection->handshake_complete())
+              {
+                break;
+              }
+              (void)co_await sleep(loop, std::chrono::milliseconds(5));
+            }
+            auto *connection = client->connection(*dialled);
+            REQUIRE(connection != nullptr);
+            REQUIRE(connection->handshake_complete());
+            const auto stream = connection->open_stream(stream_direction_t::bidirectional);
+            REQUIRE(stream.has_value());
+            const std::vector<std::uint8_t> payload(total, 0x5a);
+            CHECK(connection->write_stream(*stream, payload, true) == payload.size());
+            (void)client->flush();
+
+            for (int i = 0; i < 2000 && !finished; ++i)
+            {
+              if (accepted != nullptr)
+              {
+                const auto readable = accepted->readable_stream(*stream);
+                received += readable.size();
+                accepted->consume_stream(*stream, readable.size());
+                finished = accepted->stream_receive_finished(*stream);
+              }
+              if (!finished)
+              {
+                (void)co_await sleep(loop, std::chrono::milliseconds(2));
+              }
+            }
+            client_stats = client->stats();
+            stop.cancel();
+            (void)co_await sleep(loop, std::chrono::milliseconds(5));
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(5));
+          loop.stop();
+        }(loop, *server_context, *client_context, received, finished, client_stats));
+    });
+  loop.run();
+  CHECK(finished);
+  CHECK(received == total);
+#if defined(__linux__)
+  CHECK(client_stats.datagrams_sent > client_stats.sends);
+#endif
+}
+}
+} // namespace vio::quic
+#endif

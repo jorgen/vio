@@ -21,17 +21,32 @@ Copyright (c) 2025 Jørgen Lind
 */
 
 #pragma once
-#include "uv.h"
-#include "vio/cancellation.h"
-#include "vio/error.h"
-#include "vio/event_loop.h"
-#include "vio/uv_coro.h"
 
+#include <algorithm>
 #include <coroutine>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <expected>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <ada/ada_idna.h>
+
+#include "vio/cancellation.h"
+#include "vio/detail/native.h"
+#include "vio/detail/sys.h"
+#include "vio/errc.h"
+#include "vio/error.h"
+#include "vio/event_loop.h"
+#include "vio/future.h"
+#include "vio/loop/blocking_pool.h"
+#include "vio/ref_counted_wrapper.h"
+
+#if !defined(_WIN32)
+#include <netdb.h>
+#endif
 
 namespace vio
 {
@@ -104,7 +119,14 @@ inline address_info_list_t convert_addrinfo_list(const addrinfo *info)
 struct get_addrinfo_state_t
 {
   std::string host;
-  uv_getaddrinfo_t req = {};
+  detail::pool_job_t job;
+  int hint_flags = 0;
+  int hint_family = 0;
+  int hint_socktype = 0;
+  int hint_protocol = 0;
+  int status = 0;
+  address_info_list_t addresses;
+  void *parked = nullptr;
   std::expected<address_info_list_t, error_t> result;
   std::coroutine_handle<> continuation;
   registration_t cancel_registration;
@@ -131,83 +153,21 @@ struct get_addrinfo_state_t
   }
 };
 
-inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, const std::string &host, const address_info_t &hints = address_info_t{}, cancellation_t *cancel = nullptr)
-{
-  using ret_t = future_t<get_addrinfo_state_t>;
-  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
-  ret_t ret;
-
-  if (cancel && cancel->is_cancelled())
-  {
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-    return ret;
-  }
-
-  ret.state_ptr->host = host;
-  auto hints_converted = convert_to_addrinfo(hints);
-  auto req = &ret.state_ptr->req;
-  {
-    auto copy = ret.state_ptr;
-    req->data = copy.release_to_raw();
-  }
-  auto callback = [](uv_getaddrinfo_t *req, int status, addrinfo *res)
-  {
-    auto state = future_ref_ptr_t::from_raw(req->data);
-    state->done = true;
-    state->cancel_registration.reset();
-    if (status < 0)
-    {
-      std::string msg(uv_strerror(status));
-      error_t err = {.code = status, .msg = msg};
-      state->result = std::unexpected(err);
-    }
-    else
-    {
-      state->result = convert_addrinfo_list(res);
-    }
-
-    uv_freeaddrinfo(res);
-
-    if (state->continuation)
-    {
-      state->continuation.resume();
-    }
-  };
-  auto r = uv_getaddrinfo(event_loop.loop(), req, callback, host.c_str(), nullptr, &hints_converted);
-  if (r < 0)
-  {
-    // The callback never runs on synchronous failure, so recover the ref parked
-    // into req->data above (mirrors write_file) to avoid leaking the state.
-    future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
-    ret.state_ptr->req.data = nullptr;
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    return ret;
-  }
-
-  if (cancel)
-  {
-    auto *state_raw = &ret.state_ptr.data();
-    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
-    {
-      if (state_raw->done)
-        return;
-      uv_cancel((uv_req_t *)&state_raw->req);
-    });
-  }
-
-  return ret;
-}
-
 struct name_info_result_t
 {
   std::string host;
   std::string service;
 };
+
 struct getnameinfo_state_t
 {
-  uv_getnameinfo_t req;
+  detail::pool_job_t job;
+  sockaddr_storage address = {};
+  int address_length = 0;
+  int flags = 0;
+  int status = 0;
+  name_info_result_t names;
+  void *parked = nullptr;
   std::expected<name_info_result_t, error_t> result;
   std::coroutine_handle<> continuation;
   registration_t cancel_registration;
@@ -234,68 +194,205 @@ struct getnameinfo_state_t
   }
 };
 
-inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, const address_info_t &addr, int hints = NI_NUMERICHOST | NI_NUMERICSERV, cancellation_t *cancel = nullptr)
+namespace detail
 {
-  using ret_t = future_t<getnameinfo_state_t>;
-  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
-  ret_t ret;
+inline int dns_prepare_host(const std::string &host, std::string &out)
+{
+  if (host.find('\0') != std::string::npos)
+    return errc::invalid_argument;
+  if (std::all_of(host.begin(), host.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; }))
+  {
+    out = host;
+    return 0;
+  }
+  out = ada::idna::to_ascii(host);
+  return out.empty() ? errc::invalid_argument : 0;
+}
+
+inline std::size_t dns_address_length(const address_info_t &address) noexcept
+{
+  const sockaddr *socket_address = address.get_sockaddr();
+  if (socket_address == nullptr || address.addr.size() < sizeof(sockaddr))
+    return 0;
+  std::size_t needed = 0;
+  if (socket_address->sa_family == AF_INET)
+    needed = sizeof(sockaddr_in);
+  else if (socket_address->sa_family == AF_INET6)
+    needed = sizeof(sockaddr_in6);
+  return address.addr.size() >= needed ? needed : 0;
+}
+
+template <typename State>
+void dns_resume(State &state)
+{
+  state.done = true;
+  state.cancel_registration.reset();
+  if (state.continuation)
+    state.continuation.resume();
+}
+
+template <typename State>
+void dns_cancel(State &state)
+{
+  if (state.done)
+    return;
+  pool_cancel(state.job);
+  state.result = std::unexpected(make_error(errc::canceled));
+  dns_resume(state);
+}
+
+template <typename State>
+void dns_submit(event_loop_t &event_loop, future_t<State> &ret, pool_job_t::work_fn_t work, pool_job_t::done_fn_t done, cancellation_t *cancel)
+{
+  auto &state = ret.state_ptr.data();
+  state.job.owner = &state;
+  state.job.work = work;
+  state.job.done = done;
+  auto parked = ret.state_ptr;
+  state.parked = parked.release_to_raw();
+  pool_submit(detail::core(event_loop), state.job, pool_queue::dns);
+  if (cancel)
+  {
+    auto *raw = &state;
+    state.cancel_registration = cancel->register_callback([raw]() { dns_cancel(*raw); });
+  }
+}
+
+inline void get_addrinfo_work(pool_job_t *job)
+{
+  auto *state = static_cast<get_addrinfo_state_t *>(job->owner);
+#if defined(_WIN32)
+  ensure_winsock();
+#endif
+  addrinfo hints{};
+  hints.ai_flags = state->hint_flags;
+  hints.ai_family = state->hint_family;
+  hints.ai_socktype = state->hint_socktype;
+  hints.ai_protocol = state->hint_protocol;
+  addrinfo *list = nullptr;
+  const int code = ::getaddrinfo(state->host.c_str(), nullptr, &hints, &list);
+  if (code != 0)
+  {
+    state->status = errc_from_gai(code);
+    return;
+  }
+  try
+  {
+    state->addresses = convert_addrinfo_list(list);
+  }
+  catch (...)
+  {
+    state->status = errc::dns_memory;
+  }
+  ::freeaddrinfo(list);
+}
+
+inline void get_addrinfo_done(pool_job_t *job, bool)
+{
+  auto *state = static_cast<get_addrinfo_state_t *>(job->owner);
+  auto owned = ref_ptr_t<get_addrinfo_state_t>::from_raw(std::exchange(state->parked, nullptr));
+  if (state->done)
+  {
+    address_info_list_t().swap(state->addresses);
+    return;
+  }
+  if (state->status < 0)
+    state->result = std::unexpected(make_error(state->status));
+  else
+    state->result = std::move(state->addresses);
+  dns_resume(*state);
+}
+
+inline void get_nameinfo_work(pool_job_t *job)
+{
+  auto *state = static_cast<getnameinfo_state_t *>(job->owner);
+#if defined(_WIN32)
+  ensure_winsock();
+#endif
+  char host[1025] = {};
+  char service[32] = {};
+  const int code = ::getnameinfo(reinterpret_cast<const sockaddr *>(&state->address), static_cast<socklen_t>(state->address_length), host, sizeof(host), service, sizeof(service), state->flags);
+  if (code != 0)
+  {
+    state->status = errc_from_gai(code);
+    return;
+  }
+  try
+  {
+    state->names.host = host;
+    state->names.service = service;
+  }
+  catch (...)
+  {
+    state->status = errc::dns_memory;
+  }
+}
+
+inline void get_nameinfo_done(pool_job_t *job, bool)
+{
+  auto *state = static_cast<getnameinfo_state_t *>(job->owner);
+  auto owned = ref_ptr_t<getnameinfo_state_t>::from_raw(std::exchange(state->parked, nullptr));
+  if (state->done)
+    return;
+  if (state->status < 0)
+    state->result = std::unexpected(make_error(state->status));
+  else
+    state->result = std::move(state->names);
+  dns_resume(*state);
+}
+} // namespace detail
+
+inline future_t<get_addrinfo_state_t> get_addrinfo(event_loop_t &event_loop, const std::string &host, const address_info_t &hints = address_info_t{}, cancellation_t *cancel = nullptr)
+{
+  future_t<get_addrinfo_state_t> ret;
+  auto &state = ret.state_ptr.data();
 
   if (cancel && cancel->is_cancelled())
   {
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    state.done = true;
+    state.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
     return ret;
   }
 
-  auto req = &ret.state_ptr->req;
+  if (int code = detail::dns_prepare_host(host, state.host); code < 0)
   {
-    auto copy = ret.state_ptr;
-    req->data = copy.release_to_raw();
-  }
-  auto callback = [](uv_getnameinfo_t *req, int status, const char *hostname, const char *service)
-  {
-    auto state = future_ref_ptr_t::from_raw(req->data);
-    state->done = true;
-    state->cancel_registration.reset();
-    if (status < 0)
-    {
-      std::string msg(uv_strerror(status));
-      error_t err = {.code = status, .msg = msg};
-      state->result = std::unexpected(err);
-    }
-    else
-    {
-      state->result = {std::string(hostname), std::string(service)};
-    }
-
-    if (state->continuation)
-    {
-      state->continuation.resume();
-    }
-  };
-  auto r = uv_getnameinfo(event_loop.loop(), req, callback, addr.get_sockaddr(), hints);
-  if (r < 0)
-  {
-    // The callback never runs on synchronous failure, so recover the ref parked
-    // into req->data above (mirrors write_file) to avoid leaking the state.
-    future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
-    ret.state_ptr->req.data = nullptr;
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    state.done = true;
+    state.result = std::unexpected(make_error(code));
     return ret;
   }
 
-  if (cancel)
+  state.hint_flags = hints.flags;
+  state.hint_family = hints.family;
+  state.hint_socktype = hints.socktype;
+  state.hint_protocol = hints.protocol;
+  detail::dns_submit(event_loop, ret, &detail::get_addrinfo_work, &detail::get_addrinfo_done, cancel);
+  return ret;
+}
+
+inline future_t<getnameinfo_state_t> get_nameinfo(event_loop_t &event_loop, const address_info_t &addr, int hints = NI_NUMERICHOST | NI_NUMERICSERV, cancellation_t *cancel = nullptr)
+{
+  future_t<getnameinfo_state_t> ret;
+  auto &state = ret.state_ptr.data();
+
+  if (cancel && cancel->is_cancelled())
   {
-    auto *state_raw = &ret.state_ptr.data();
-    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
-    {
-      if (state_raw->done)
-        return;
-      uv_cancel((uv_req_t *)&state_raw->req);
-    });
+    state.done = true;
+    state.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    return ret;
   }
 
+  const std::size_t length = detail::dns_address_length(addr);
+  if (length == 0)
+  {
+    state.done = true;
+    state.result = std::unexpected(make_error(errc::invalid_argument));
+    return ret;
+  }
+
+  std::memcpy(&state.address, addr.addr.data(), length);
+  state.address_length = static_cast<int>(length);
+  state.flags = hints;
+  detail::dns_submit(event_loop, ret, &detail::get_nameinfo_work, &detail::get_nameinfo_done, cancel);
   return ret;
 }
 

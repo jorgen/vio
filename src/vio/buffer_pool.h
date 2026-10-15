@@ -24,12 +24,6 @@
 
 // A free list of fixed-size read buffers.
 //
-// libuv asks the allocator for 64 KiB before every read, and default_alloc
-// answers with new char[65536]. For a datagram socket that is a 64 KiB
-// allocation and free per ~1.2 KiB packet. The pool answers with a block sized
-// for the traffic and takes it back afterwards, so a steady-state read loop
-// stops allocating entirely.
-//
 // A recycled block still holds the previous datagram's bytes. Nothing reads
 // past a datagram's length, so this is not a leak -- but QUIC decrypts in
 // place, which means those bytes can be plaintext. Zeroing every block costs
@@ -40,18 +34,61 @@
 // handed out from it -- a unique_buf_t holds a pointer to it as its
 // deallocator's user handle.
 
-#include <uv.h>
-
 #include "vio/unique_buf.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
+#include <span>
 #include <vector>
+
+#if defined(__SANITIZE_ADDRESS__)
+#define VIO_BUFFER_POOL_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define VIO_BUFFER_POOL_ASAN 1
+#endif
+#endif
+
+#if defined(VIO_BUFFER_POOL_ASAN)
+extern "C" void __asan_poison_memory_region(void const volatile *address, std::size_t size);
+extern "C" void __asan_unpoison_memory_region(void const volatile *address, std::size_t size);
+#endif
 
 namespace vio
 {
+namespace detail
+{
+inline void poison_memory(const void *address, std::size_t size) noexcept
+{
+#if defined(VIO_BUFFER_POOL_ASAN)
+  __asan_poison_memory_region(address, size);
+#else
+  (void)address;
+  (void)size;
+#endif
+}
+
+inline void secure_zero(void *address, std::size_t size) noexcept
+{
+  static void *(*const volatile wipe)(void *, int, std::size_t) = std::memset;
+  wipe(address, 0, size);
+}
+
+inline void unpoison_memory(const void *address, std::size_t size) noexcept
+{
+#if defined(VIO_BUFFER_POOL_ASAN)
+  __asan_unpoison_memory_region(address, size);
+#else
+  (void)address;
+  (void)size;
+#endif
+}
+} // namespace detail
+
 // Room for any datagram that survives the internet unfragmented (1500 byte
 // Ethernet MTU) with slack, and a power of two.
 inline constexpr std::size_t default_pool_block_size = 2048;
@@ -69,8 +106,9 @@ public:
 
   ~buffer_pool_t()
   {
-    for (char *block : _free)
+    for (std::byte *block : _free)
     {
+      detail::unpoison_memory(block, _block_size);
       delete[] block;
     }
   }
@@ -80,50 +118,52 @@ public:
   buffer_pool_t(buffer_pool_t &&) = delete;
   buffer_pool_t &operator=(buffer_pool_t &&) = delete;
 
-  void acquire(uv_buf_t *buf)
+  [[nodiscard]] std::span<std::byte> acquire()
   {
-    if (buf == nullptr)
-    {
-      return;
-    }
-    char *block = nullptr;
+    std::byte *block = nullptr;
     if (!_free.empty())
     {
       block = _free.back();
       _free.pop_back();
+      detail::unpoison_memory(block, _block_size);
       ++_reuses;
     }
     else
     {
-      block = new (std::nothrow) char[_block_size];
+      block = new (std::nothrow) std::byte[_block_size];
+      if (block == nullptr)
+      {
+        return {};
+      }
       ++_allocations;
     }
-    buf->base = block;
-    buf->len = block == nullptr ? 0 : static_cast<decltype(buf->len)>(_block_size);
+    return {block, _block_size};
   }
 
-  void release(uv_buf_t *buf)
+  void release(std::span<std::byte> buffer)
   {
-    if (buf == nullptr || buf->base == nullptr)
+    if (buffer.data() == nullptr)
     {
       return;
     }
+    if (buffer.size() != _block_size)
+    {
+      std::fprintf(stderr, "vio: buffer_pool_t was handed back a %zu byte block that it did not hand out (its blocks are %zu bytes)\n", buffer.size(), _block_size);
+      std::abort();
+    }
     if (_zero_on_release)
     {
-      // memset, not a secure-zero intrinsic: the block goes back on the free
-      // list and is read again through it, so the store cannot be eliminated.
-      std::memset(buf->base, 0, _block_size);
+      detail::secure_zero(buffer.data(), _block_size);
     }
     if (_free.size() < _max_retained)
     {
-      _free.push_back(buf->base);
+      detail::poison_memory(buffer.data(), _block_size);
+      _free.push_back(buffer.data());
     }
     else
     {
-      delete[] buf->base;
+      delete[] buffer.data();
     }
-    buf->base = nullptr;
-    buf->len = 0;
   }
 
   [[nodiscard]] std::size_t block_size() const
@@ -146,18 +186,18 @@ public:
     return _reuses;
   }
 
-  static void alloc_cb(void *user, std::size_t /*suggested_size*/, uv_buf_t *buf)
+  static std::span<std::byte> alloc_cb(void *user, std::size_t /*suggested_size*/)
   {
-    static_cast<buffer_pool_t *>(user)->acquire(buf);
+    return static_cast<buffer_pool_t *>(user)->acquire();
   }
 
-  static void dealloc_cb(void *user, uv_buf_t *buf)
+  static void dealloc_cb(void *user, std::span<std::byte> buffer)
   {
-    static_cast<buffer_pool_t *>(user)->release(buf);
+    static_cast<buffer_pool_t *>(user)->release(buffer);
   }
 
 private:
-  std::vector<char *> _free;
+  std::vector<std::byte *> _free;
   std::size_t _block_size;
   std::size_t _max_retained;
   bool _zero_on_release = false;

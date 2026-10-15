@@ -26,6 +26,8 @@ Copyright (c) 2025 Jørgen Lind
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <future>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -36,9 +38,78 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/loop/blocking_pool.h>
 #include <vio/operation/sleep.h>
 #include <vio/operation/timer.h>
+#include <vio/ref_counted_wrapper.h>
 #include <vio/task.h>
 
 using namespace std::chrono_literals;
+
+namespace
+{
+struct turn_counter_t
+{
+  vio::detail::hook_t hook;
+  std::int64_t turns = 0;
+
+  turn_counter_t()
+  {
+    hook.owner = this;
+    hook.run = [](vio::detail::hook_t *raw) { ++static_cast<turn_counter_t *>(raw->owner)->turns; };
+  }
+};
+
+struct held_resource_t final : vio::detail::resource_t
+{
+  explicit held_resource_t(vio::event_loop_t &loop)
+    : resource_t(vio::detail::core(loop), "held")
+  {
+  }
+  void do_close() noexcept override
+  {
+    close_finished();
+  }
+};
+
+struct holder_t
+{
+  held_resource_t resource;
+  bool &freed;
+  holder_t(vio::event_loop_t &loop, bool &freed)
+    : resource(loop)
+    , freed(freed)
+  {
+  }
+  holder_t(const holder_t &) = delete;
+  holder_t &operator=(const holder_t &) = delete;
+  holder_t(holder_t &&) = delete;
+  holder_t &operator=(holder_t &&) = delete;
+  ~holder_t()
+  {
+    freed = true;
+  }
+};
+
+vio::ref_ptr_t<holder_t> make_holder(vio::event_loop_t &loop, bool &freed)
+{
+  vio::ref_ptr_t<holder_t> holder(loop, freed);
+  holder.register_resource(holder->resource);
+  return holder;
+}
+
+vio::timer_t make_timer(vio::event_loop_t &loop)
+{
+  auto created = vio::timer_create(loop);
+  REQUIRE(created.has_value());
+  return std::move(created.value());
+}
+
+void barrier(vio::event_loop_t &loop)
+{
+  std::promise<void> passed;
+  auto future = passed.get_future();
+  loop.run_in_loop([&passed] { passed.set_value(); });
+  future.wait();
+}
+} // namespace
 
 TEST_CASE("run_in_loop work runs and stop ends run")
 {
@@ -125,27 +196,35 @@ TEST_CASE("timers fire in deadline order and equal deadlines keep their order")
   CHECK(order == std::vector<int>{3, 1, 2, 4, 0});
 }
 
-TEST_CASE("a timer rearmed for now from its own callback fires on a later turn")
+TEST_CASE("a timer rearmed into the past from its own callback fires on a later turn")
 {
   vio::event_loop_t loop;
   auto &core = vio::detail::core(loop);
+  turn_counter_t counter;
+  core.add_hook(counter.hook);
   struct state_t
   {
     vio::detail::timer_node_t node;
-    vio::detail::loop_core_t *core;
-    int fired = 0;
+    vio::detail::loop_core_t *core = nullptr;
+    turn_counter_t *counter = nullptr;
+    std::vector<std::int64_t> turns;
   } state;
   state.core = &core;
+  state.counter = &counter;
   state.node.owner = &state;
   state.node.fire = [](vio::detail::timer_node_t *node) {
     auto *self = static_cast<state_t *>(node->owner);
-    if (++self->fired < 3)
-      self->core->add_timer(self->node, vio::detail::loop_core_t::now() - 1);
+    self->turns.push_back(self->counter->turns);
+    if (self->turns.size() < 5)
+      self->core->add_timer(self->node, vio::detail::loop_core_t::now() - 1'000'000'000);
   };
-  core.add_timer(state.node, vio::detail::loop_core_t::now());
+  core.add_timer(state.node, vio::detail::loop_core_t::now() - 1'000'000'000);
   loop.stop();
   loop.run();
-  CHECK(state.fired == 3);
+  core.remove_hook(counter.hook);
+  REQUIRE(state.turns.size() == 5);
+  for (std::size_t i = 1; i < state.turns.size(); ++i)
+    CHECK(state.turns[i] > state.turns[i - 1]);
 }
 
 TEST_CASE("sleep waits about the time asked and a negative sleep still returns")
@@ -373,4 +452,234 @@ TEST_CASE("thread_with_event_loop_t runs posted work and joins")
     thread.stop_and_join();
   }
   CHECK(ran);
+}
+
+TEST_CASE("work posted before stop from another thread always runs")
+{
+  for (int round = 0; round < 50; ++round)
+  {
+    std::atomic<int> ran{0};
+    {
+      vio::thread_with_event_loop_t thread;
+      auto &loop = thread.event_loop();
+      for (int i = 0; i < 100; ++i)
+        loop.run_in_loop([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+      thread.stop_and_join();
+    }
+    REQUIRE(ran.load() == 100);
+  }
+}
+
+TEST_CASE("work posted by a callback after stop still runs")
+{
+  vio::event_loop_t loop;
+  std::vector<int> order;
+  loop.run_in_loop([&] {
+    loop.stop();
+    loop.run_in_loop([&] {
+      order.push_back(1);
+      loop.run_in_loop([&] { order.push_back(2); });
+    });
+  });
+  loop.run();
+  CHECK(order == std::vector<int>{1, 2});
+}
+
+TEST_CASE("many timers at one deadline fire in the order they were armed")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  constexpr int count = 1000;
+  struct fired_t
+  {
+    vio::detail::timer_node_t node;
+    std::vector<int> *order = nullptr;
+    int id = 0;
+  };
+  std::vector<fired_t> timers(count);
+  std::vector<int> order;
+  std::vector<int> expected;
+  const auto deadline = vio::detail::loop_core_t::now() + 2'000'000;
+  for (int i = 0; i < count; ++i)
+  {
+    auto &timer = timers[static_cast<std::size_t>(i)];
+    timer.order = &order;
+    timer.id = i;
+    timer.node.owner = &timer;
+    timer.node.fire = [](vio::detail::timer_node_t *node) {
+      auto *self = static_cast<fired_t *>(node->owner);
+      self->order->push_back(self->id);
+    };
+    core.add_timer(timer.node, deadline);
+  }
+  for (int i = 0; i < count; ++i)
+  {
+    if (i % 11 == 0)
+      core.remove_timer(timers[static_cast<std::size_t>(i)].node);
+    else if (i % 7 != 0)
+      expected.push_back(i);
+  }
+  for (int i = count - 1; i >= 0; --i)
+  {
+    if (i % 7 == 0 && i % 11 != 0)
+    {
+      core.add_timer(timers[static_cast<std::size_t>(i)].node, deadline);
+      expected.push_back(i);
+    }
+  }
+  loop.stop();
+  loop.run();
+  CHECK(order == expected);
+  CHECK(core.in_flight() == 0);
+}
+
+TEST_CASE("about-to-block listeners added and removed from another thread are done with once a barrier passes")
+{
+  struct listener_t : vio::about_to_block_t
+  {
+    std::atomic<int> calls{0};
+    void about_to_block() override
+    {
+      calls.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  vio::thread_with_event_loop_t thread;
+  auto &loop = thread.event_loop();
+
+  for (int round = 0; round < 100; ++round)
+  {
+    auto listener = std::make_unique<listener_t>();
+    loop.add_about_to_block_listener(listener.get());
+    barrier(loop);
+    const auto give_up = std::chrono::steady_clock::now() + 5s;
+    while (listener->calls.load() == 0 && std::chrono::steady_clock::now() < give_up)
+      barrier(loop);
+    REQUIRE(listener->calls.load() > 0);
+
+    loop.remove_about_to_block_listener(listener.get());
+    barrier(loop);
+    const int settled = listener->calls.load();
+    barrier(loop);
+    barrier(loop);
+    REQUIRE(listener->calls.load() == settled);
+    listener.reset();
+    barrier(loop);
+
+    auto fleeting = std::make_unique<listener_t>();
+    loop.add_about_to_block_listener(fleeting.get());
+    loop.remove_about_to_block_listener(fleeting.get());
+    barrier(loop);
+    fleeting.reset();
+    barrier(loop);
+  }
+  thread.stop_and_join();
+}
+
+TEST_CASE("stop followed by dropping handles in the same frame closes them before run returns")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  bool fired = false;
+  bool freed = false;
+  std::optional<vio::task_t<void>> task;
+
+  SUBCASE("in a posted callback")
+  {
+    loop.run_in_loop([&] {
+      auto timer = make_timer(loop);
+      vio::timer_on_fire(timer, [&fired] { fired = true; });
+      REQUIRE(vio::timer_rearm(timer, 10s).has_value());
+      auto holder = make_holder(loop, freed);
+      loop.stop();
+    });
+  }
+
+  SUBCASE("in a coroutine frame that ends after stop")
+  {
+    loop.run_in_loop([&] {
+      task.emplace([](vio::event_loop_t &loop, bool &fired, bool &freed) -> vio::task_t<void> {
+        auto timer = make_timer(loop);
+        vio::timer_on_fire(timer, [&fired] { fired = true; });
+        REQUIRE(vio::timer_rearm(timer, 10s).has_value());
+        auto holder = make_holder(loop, freed);
+        auto slept = co_await vio::sleep(loop, 1ms);
+        CHECK(slept.has_value());
+        loop.stop();
+      }(loop, fired, freed));
+    });
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  loop.run();
+  CHECK(std::chrono::steady_clock::now() - start < 5s);
+  CHECK_FALSE(fired);
+  CHECK(freed);
+  CHECK(core.open_resources() == 0);
+  CHECK(core.in_flight() == 0);
+  CHECK((!task.has_value() || task->done()));
+}
+
+TEST_CASE("a loop with a ticking timer does not spin over an idle second")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  turn_counter_t counter;
+  core.add_hook(counter.hook);
+
+  constexpr int ticks_wanted = 100;
+  int ticks = 0;
+  int early = 0;
+  std::int64_t due = 0;
+  std::optional<vio::timer_t> timer;
+  timer.emplace(make_timer(loop));
+  auto arm = [&] {
+    due = vio::detail::loop_core_t::now() + std::chrono::nanoseconds(10ms).count();
+    REQUIRE(vio::timer_rearm(*timer, 10ms).has_value());
+  };
+  vio::timer_on_fire(*timer, [&] {
+    if (vio::detail::loop_core_t::now() < due)
+      ++early;
+    if (++ticks == ticks_wanted)
+    {
+      timer.reset();
+      loop.stop();
+      return;
+    }
+    arm();
+  });
+  arm();
+
+  const auto start = std::chrono::steady_clock::now();
+  loop.run();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  core.remove_hook(counter.hook);
+
+  MESSAGE("turns: " << counter.turns << " for " << ticks << " ticks");
+  CHECK(ticks == ticks_wanted);
+  CHECK(early == 0);
+  CHECK(elapsed >= 1s);
+  CHECK(counter.turns <= 3 * ticks_wanted + 20);
+}
+
+TEST_CASE("an idle loop blocks instead of turning")
+{
+  vio::thread_with_event_loop_t thread;
+  auto &loop = thread.event_loop();
+  turn_counter_t counter;
+  loop.run_in_loop([&] { vio::detail::core(loop).add_hook(counter.hook); });
+  barrier(loop);
+  std::this_thread::sleep_for(300ms);
+  std::int64_t turns = -1;
+  std::promise<void> read;
+  auto read_future = read.get_future();
+  loop.run_in_loop([&] {
+    turns = counter.turns;
+    vio::detail::core(loop).remove_hook(counter.hook);
+    read.set_value();
+  });
+  read_future.wait();
+  thread.stop_and_join();
+  MESSAGE("turns while idle: " << turns);
+  CHECK(turns >= 1);
+  CHECK(turns <= 5);
 }

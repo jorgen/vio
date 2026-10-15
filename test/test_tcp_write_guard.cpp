@@ -1,3 +1,25 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <doctest/doctest.h>
 
 #include <vio/event_loop.h>
@@ -9,112 +31,225 @@
 #include "require_expected.h"
 
 #include <chrono>
+#include <cstddef>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace
 {
-std::expected<std::pair<vio::tcp_server_t, int>, vio::error_t> bound_tcp_server(vio::event_loop_t &event_loop)
+constexpr std::size_t chunk_size = 4u * 1024u * 1024u;
+
+void shrink_buffers(vio::tcp_t &tcp)
 {
-  auto addr = vio::ip4_addr("127.0.0.1", 0);
-  if (!addr)
-    return std::unexpected(addr.error());
-  auto server = vio::tcp_create_server(event_loop);
-  if (!server)
-    return std::unexpected(server.error());
-  auto bound = vio::tcp_bind(server.value(), reinterpret_cast<const sockaddr *>(&addr.value()));
-  if (!bound)
-    return std::unexpected(bound.error());
-  auto sn = vio::sockname(server->tcp);
-  if (!sn)
-    return std::unexpected(sn.error());
-  sockaddr_storage storage = sn.value();
-  const auto *in = reinterpret_cast<const sockaddr_in *>(&storage);
-  return std::make_pair(std::move(server.value()), static_cast<int>(ntohs(in->sin_port)));
+  int size = 64 * 1024;
+  auto socket = tcp.handle->socket.native();
+  REQUIRE(vio::detail::socket_set_option(socket, SOL_SOCKET, SO_SNDBUF, &size, static_cast<int>(sizeof(size))) == 0);
+  REQUIRE(vio::detail::socket_set_option(socket, SOL_SOCKET, SO_RCVBUF, &size, static_cast<int>(sizeof(size))) == 0);
 }
 
-vio::task_t<void> write_guard_scenario(vio::event_loop_t &event_loop, bool &second_rejected, bool &first_completed)
+struct connected_pair_t
 {
-  auto server_and_port = bound_tcp_server(event_loop);
-  REQUIRE_EXPECTED(server_and_port);
-  const int port = server_and_port->second;
-  auto addr = vio::ip4_addr("127.0.0.1", port);
-  REQUIRE_EXPECTED(addr);
+  vio::tcp_t client;
+  vio::tcp_t server;
+};
 
-  auto server_task = [](vio::tcp_server_t s) -> vio::task_t<void>
+vio::task_t<std::optional<connected_pair_t>> connect_pair(vio::event_loop_t &loop)
+{
+  auto any = vio::ip4_addr("127.0.0.1", 0);
+  REQUIRE_EXPECTED(any);
+  auto server = vio::tcp_create_server(loop);
+  REQUIRE_EXPECTED(server);
+  auto bound = vio::tcp_bind(server.value(), reinterpret_cast<const sockaddr *>(&any.value()));
+  REQUIRE_EXPECTED(bound);
+  auto name = vio::sockname(server->tcp);
+  REQUIRE_EXPECTED(name);
+  auto port = ntohs(reinterpret_cast<const sockaddr_in *>(&name.value())->sin_port);
+  auto address = vio::ip4_addr("127.0.0.1", port);
+  REQUIRE_EXPECTED(address);
+
+  auto listening = vio::tcp_listen(server.value(), 8);
+  auto client = vio::tcp_create(loop);
+  REQUIRE_EXPECTED(client);
+  auto connected = co_await vio::tcp_connect(client.value(), reinterpret_cast<const sockaddr *>(&address.value()));
+  REQUIRE_EXPECTED(connected);
+  auto ready = co_await std::move(listening);
+  REQUIRE_EXPECTED(ready);
+  auto accepted = vio::tcp_accept(server.value());
+  REQUIRE_EXPECTED(accepted);
+  shrink_buffers(client.value());
+  shrink_buffers(accepted.value());
+  co_return connected_pair_t{std::move(client.value()), std::move(accepted.value())};
+}
+
+vio::task_t<void> read_all(vio::tcp_t connection, std::string &received)
+{
+  auto reader = vio::tcp_create_reader(connection);
+  REQUIRE_EXPECTED(reader);
+  for (;;)
   {
-    auto server = std::move(s);
-    auto listen_result = co_await vio::tcp_listen(server, 10);
-    REQUIRE_EXPECTED(listen_result);
-    auto accepted = vio::tcp_accept(server);
-    REQUIRE_EXPECTED(accepted);
-    auto client_on_server = std::move(accepted.value());
-    auto reader = vio::tcp_create_reader(client_on_server);
-    REQUIRE_EXPECTED(reader);
-    auto r = std::move(reader.value());
-    while (true)
+    auto chunk = co_await reader.value();
+    if (!chunk.has_value())
     {
-      auto chunk = co_await r;
-      if (!chunk.has_value())
-        break; // EOF once the client closes
+      CHECK(chunk.error().code == vio::errc::eof);
+      break;
     }
-  }(std::move(server_and_port->first));
+    received.append(chunk->chars(), chunk->size());
+  }
+}
 
-  co_await [](vio::event_loop_t &el, const sockaddr *sa, bool &rejected, bool &completed) -> vio::task_t<void>
+vio::task_t<void> ordered_writes_scenario(vio::event_loop_t &loop, std::string &received, std::size_t &queued_after_issue, std::size_t &queued_after_done, int &results)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto reader_task = read_all(std::move(pair->server), received);
+
   {
-    auto client_or_err = vio::tcp_create(el);
-    REQUIRE_EXPECTED(client_or_err);
-    auto client = std::move(client_or_err.value());
-    auto connect_result = co_await vio::tcp_connect(client, sa);
-    REQUIRE_EXPECTED(connect_result);
+    auto client = std::move(pair->client);
+    std::string first(chunk_size, 'a');
+    std::vector<std::byte> third(chunk_size, std::byte{'c'});
 
-    const std::string payload = "hello";
+    auto write1 = vio::write_tcp(client, reinterpret_cast<const uint8_t *>(first.data()), first.size());
+    auto write2 = vio::write_tcp(client, std::string(chunk_size, 'b'));
+    auto write3 = vio::write_tcp(client, std::span<const std::byte>(third.data(), third.size()));
+    queued_after_issue = vio::tcp_write_queue_size(client);
 
-    // Issue two writes back-to-back with no suspension in between, so the first
-    // is still in flight (its uv_write callback cannot have run yet) when the
-    // second is issued.
-    auto write1 = vio::write_tcp(client, reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
-    auto write2 = vio::write_tcp(client, reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
-
+    auto result3 = co_await std::move(write3);
+    queued_after_done = vio::tcp_write_queue_size(client);
     auto result2 = co_await std::move(write2);
-    rejected = !result2.has_value();
-
     auto result1 = co_await std::move(write1);
-    completed = true;
-    (void)result1;
+    results = int(result1.has_value()) + int(result2.has_value()) + int(result3.has_value());
+  }
+  co_await std::move(reader_task);
+}
 
-    // Let the first write's real uv_write callback run so its parked ref is
-    // reclaimed before the buffer/socket go away.
-    [[maybe_unused]] auto slept = co_await vio::sleep(el, std::chrono::milliseconds(20));
-  }(event_loop, reinterpret_cast<const sockaddr *>(&addr.value()), second_rejected, first_completed);
+vio::task_t<void> dropped_future_scenario(vio::event_loop_t &loop, std::string &received)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto reader_task = read_all(std::move(pair->server), received);
+  {
+    auto client = std::move(pair->client);
+    std::string payload(chunk_size, 'd');
+    {
+      auto dropped = vio::write_tcp(client, reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
+      CHECK_FALSE(dropped.await_ready());
+    }
+    payload.assign(payload.size(), 'z');
+    const std::string tail = "e";
+    auto flushed = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(tail.data()), tail.size());
+    REQUIRE_EXPECTED(flushed);
+  }
+  co_await std::move(reader_task);
+}
 
-  co_await std::move(server_task);
+vio::task_t<void> cancelled_unsent_scenario(vio::event_loop_t &loop, std::string &received, int &cancelled_code, bool &others_ok)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto reader_task = read_all(std::move(pair->server), received);
+  {
+    auto client = std::move(pair->client);
+    std::string big(chunk_size, 'a');
+    auto first = vio::write_tcp(client, reinterpret_cast<const uint8_t *>(big.data()), big.size());
+    vio::cancellation_t token;
+    auto skipped = vio::write_tcp(client, std::string("BBBB"), &token);
+    auto last = vio::write_tcp(client, std::string("CCCC"));
+    token.cancel();
+    auto skipped_result = co_await std::move(skipped);
+    REQUIRE_FALSE(skipped_result.has_value());
+    cancelled_code = skipped_result.error().code;
+    auto first_result = co_await std::move(first);
+    auto last_result = co_await std::move(last);
+    others_ok = first_result.has_value() && last_result.has_value();
+  }
+  co_await std::move(reader_task);
+}
+
+vio::task_t<void> sticky_error_scenario(vio::event_loop_t &loop, int &first_error, int &second_error)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  auto client = std::move(pair->client);
+  {
+    auto peer = std::move(pair->server);
+  }
+  [[maybe_unused]] auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(20));
+  std::string payload(64 * 1024, 'x');
+  for (int i = 0; i < 100 && first_error == 0; ++i)
+  {
+    auto written = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
+    if (!written.has_value())
+    {
+      first_error = written.error().code;
+      break;
+    }
+    [[maybe_unused]] auto pause = co_await vio::sleep(loop, std::chrono::milliseconds(5));
+  }
+  auto again = co_await vio::write_tcp(client, reinterpret_cast<const uint8_t *>(payload.data()), 1);
+  if (!again.has_value())
+    second_error = again.error().code;
+}
+
+template <typename Scenario>
+void run_scenario(Scenario &&scenario)
+{
+  vio::event_loop_t loop;
+  loop.run_in_loop([&] {
+    return [](vio::event_loop_t &loop, Scenario &scenario) -> vio::task_t<void> {
+      co_await scenario(loop);
+      loop.stop();
+    }(loop, scenario);
+  });
+  loop.run();
 }
 } // namespace
 
-TEST_SUITE("tcp write guard")
+TEST_SUITE("tcp write queue")
 {
-  // write_tcp must reject a second write while one is in flight rather than
-  // overwriting the single embedded uv_write_t and leaking the first parked ref.
-  TEST_CASE("a concurrent second write is rejected")
+  TEST_CASE("concurrent writes are queued and sent in the order they were issued")
   {
-    vio::event_loop_t event_loop;
-    bool second_rejected = false;
-    bool first_completed = false;
+    std::string received;
+    std::size_t queued_after_issue = 0;
+    std::size_t queued_after_done = 1;
+    int results = 0;
+    run_scenario([&](vio::event_loop_t &loop) { return ordered_writes_scenario(loop, received, queued_after_issue, queued_after_done, results); });
 
-    event_loop.run_in_loop(
-      [&]
-      {
-        return [](vio::event_loop_t &el, bool &r, bool &c) -> vio::task_t<void>
-        {
-          co_await write_guard_scenario(el, r, c);
-          el.stop();
-        }(event_loop, second_rejected, first_completed);
-      });
+    CHECK(results == 3);
+    CHECK(queued_after_issue > 0);
+    CHECK(queued_after_issue <= 3 * chunk_size);
+    CHECK(queued_after_done == 0);
+    REQUIRE(received.size() == 3 * chunk_size);
+    CHECK(received == std::string(chunk_size, 'a') + std::string(chunk_size, 'b') + std::string(chunk_size, 'c'));
+  }
 
-    event_loop.run();
+  TEST_CASE("a write whose future is dropped still sends the bytes it was given")
+  {
+    std::string received;
+    run_scenario([&](vio::event_loop_t &loop) { return dropped_future_scenario(loop, received); });
+    REQUIRE(received.size() == chunk_size + 1);
+    CHECK(received == std::string(chunk_size, 'd') + "e");
+  }
 
-    CHECK(first_completed);
-    CHECK(second_rejected);
+  TEST_CASE("a cancelled write that has not started is never sent")
+  {
+    std::string received;
+    int cancelled_code = 0;
+    bool others_ok = false;
+    run_scenario([&](vio::event_loop_t &loop) { return cancelled_unsent_scenario(loop, received, cancelled_code, others_ok); });
+    CHECK(cancelled_code == vio::vio_cancelled);
+    CHECK(others_ok);
+    CHECK(received == std::string(chunk_size, 'a') + "CCCC");
+  }
+
+  TEST_CASE("a write to a vanished peer fails, and later writes fail the same way")
+  {
+    int first_error = 0;
+    int second_error = 0;
+    run_scenario([&](vio::event_loop_t &loop) { return sticky_error_scenario(loop, first_error, second_error); });
+    CHECK(first_error != 0);
+    CHECK(second_error == first_error);
   }
 }

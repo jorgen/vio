@@ -75,6 +75,14 @@ target_include_directories(vio_tests PRIVATE
 )
 
 add_test(NAME vio_tests COMMAND vio_tests)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    option(VIO_TEST_IO_URING "Also run vio_tests on the io_uring backend" ON)
+    if(VIO_TEST_IO_URING)
+        add_test(NAME vio_tests_io_uring COMMAND vio_tests)
+        set_tests_properties(vio_tests_io_uring PROPERTIES ENVIRONMENT "VIO_BACKEND=io_uring")
+    endif()
+endif()
+
 # A benchmark, not a test: it replaces global operator new to count
 # allocations, so it must not share a binary with anything else. Excluded from
 # the default build; configure and then "cmake --build . --target vio_bench".
@@ -94,14 +102,13 @@ add_executable(vio_profile_quic EXCLUDE_FROM_ALL profile_quic.cpp)
 CmDepTargetLinkLibrary(vio_profile_quic PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_profile_quic PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
-# What the AEAD costs per packet, for comparing against another stack's crypto.
-# What the datagram path costs per API -- raw syscalls against libuv's own,
-# both directions. Spawns threads and saturates a loopback port, so it is a tool
-# rather than a test: "cmake --build . --target vio_udp_bench".
+# Spawns threads and saturates a loopback port, so it is a tool rather than a
+# test: "cmake --build . --target vio_udp_bench".
 add_executable(vio_udp_bench EXCLUDE_FROM_ALL udp_bench.cpp)
 CmDepTargetLinkLibrary(vio_udp_bench PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_udp_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# What the AEAD costs per packet, for comparing against another stack's crypto.
 add_executable(vio_crypto_bench EXCLUDE_FROM_ALL crypto_bench.cpp)
 CmDepTargetLinkLibrary(vio_crypto_bench PRIVATE vio BoringSSL::SSL BoringSSL::Crypto)
 target_include_directories(vio_crypto_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)

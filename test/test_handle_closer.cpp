@@ -1,360 +1,473 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <algorithm>
+#include <functional>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include <doctest/doctest.h>
 #include <vio/event_loop.h>
 #include <vio/ref_counted_wrapper.h>
 
 namespace
 {
+using log_t = std::vector<std::string>;
 
-// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
-struct simple_async_data_t
+class probe_t final : public vio::detail::resource_t
 {
-  std::function<void()> callback;
-  uv_async_t async_handle = {};
-  bool &closed;
-  bool &destroyed;
-
-  simple_async_data_t(std::function<void()> &&callback, bool &closed, bool &destroyed, vio::event_loop_t &loop)
-    : callback(std::move(callback))
-    , closed(closed)
-    , destroyed(destroyed)
+public:
+  probe_t(vio::event_loop_t &loop, log_t &log, std::string name, bool hold = false)
+    : resource_t(vio::detail::core(loop), "probe")
+    , _log(log)
+    , _name(std::move(name))
+    , _hold(hold)
   {
-    async_handle.data = this;
-    uv_async_init(loop.loop(), &async_handle, on_async_callback);
   }
 
-  ~simple_async_data_t()
+  void finish() noexcept
   {
-    destroyed = true;
+    _log.push_back("finish " + _name);
+    close_finished();
   }
 
-  static void on_async_callback(uv_async_t *async)
+private:
+  void do_close() noexcept override
   {
-    auto *data = static_cast<simple_async_data_t *>(async->data);
-    data->callback();
+    _log.push_back("close " + _name);
+    if (!_hold)
+      close_finished();
+  }
+
+  log_t &_log;
+  std::string _name;
+  bool _hold;
+};
+
+struct single_t
+{
+  log_t &log;
+  probe_t probe;
+
+  single_t(vio::event_loop_t &loop, log_t &log, bool hold = false)
+    : log(log)
+    , probe(loop, log, "a", hold)
+  {
+  }
+  single_t(const single_t &) = delete;
+  single_t &operator=(const single_t &) = delete;
+  single_t(single_t &&) = delete;
+  single_t &operator=(single_t &&) = delete;
+  ~single_t()
+  {
+    log.push_back("freed");
   }
 };
 
-using owned_async_t = vio::ref_ptr_t<simple_async_data_t>;
+struct triple_t
+{
+  log_t &log;
+  probe_t a;
+  probe_t b;
+  probe_t c;
+
+  triple_t(vio::event_loop_t &loop, log_t &log, bool hold_b = false)
+    : log(log)
+    , a(loop, log, "a")
+    , b(loop, log, "b", hold_b)
+    , c(loop, log, "c")
+  {
+  }
+  triple_t(const triple_t &) = delete;
+  triple_t &operator=(const triple_t &) = delete;
+  triple_t(triple_t &&) = delete;
+  triple_t &operator=(triple_t &&) = delete;
+  ~triple_t()
+  {
+    log.push_back("freed");
+  }
+};
+
+struct signal_t
+{
+  vio::detail::loop_core_t &core;
+  vio::detail::posted_t node;
+  probe_t probe;
+  std::function<void()> callback;
+  bool &freed;
+
+  signal_t(vio::event_loop_t &loop, log_t &log, std::function<void()> callback, bool &freed)
+    : core(vio::detail::core(loop))
+    , probe(loop, log, "signal")
+    , callback(std::move(callback))
+    , freed(freed)
+  {
+    node.owner = this;
+    node.run = [](vio::detail::posted_t *posted) { static_cast<signal_t *>(posted->owner)->callback(); };
+  }
+  signal_t(const signal_t &) = delete;
+  signal_t &operator=(const signal_t &) = delete;
+  signal_t(signal_t &&) = delete;
+  signal_t &operator=(signal_t &&) = delete;
+  ~signal_t()
+  {
+    core.unpost(node);
+    freed = true;
+  }
+
+  void send()
+  {
+    core.post(node);
+  }
+};
+
+bool contains(const log_t &log, const std::string &entry)
+{
+  return std::ranges::find(log, entry) != log.end();
+}
 
 TEST_SUITE("Handle Closer")
 {
-TEST_CASE("register_handle with ref_ptr_t")
-{
-  SUBCASE("async handle initialization and callback")
+  TEST_CASE("an object may drop its own last reference inside its own callback")
   {
     vio::event_loop_t loop;
-    int callback_count = 0;
-    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
-    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
-
-    std::function<void()> called_from_callback;
-
-    auto callback = [&called_from_callback]() { called_from_callback(); };
-    owned_async_t async_wrapper(std::move(callback), async_closed, async_destroyed, loop);
-    async_wrapper.register_handle(&async_wrapper->async_handle);
-    async_wrapper.on_destroy([&async_closed]() { async_closed = true; });
-
-    called_from_callback = [&async_wrapper, &callback_count]()
-    {
-      ++callback_count;
-      async_wrapper.release();
+    log_t log;
+    bool freed = false;
+    bool freed_inside_callback = true;
+    int calls = 0;
+    std::function<void()> on_signal;
+    vio::ref_ptr_t<signal_t> signal(loop, log, [&on_signal] { on_signal(); }, freed);
+    signal.register_resource(signal->probe);
+    on_signal = [&] {
+      ++calls;
+      signal.release();
+      freed_inside_callback = freed;
+      loop.stop();
     };
 
-    CHECK(callback_count == 0);
-
-    loop.run_in_loop(
-      [&loop, &async_wrapper]()
-      {
-        uv_async_send(&async_wrapper->async_handle);
-        loop.stop();
-      });
-
+    loop.run_in_loop([&] { signal->send(); });
     loop.run();
 
-    CHECK(callback_count > 0);
+    CHECK(calls == 1);
+    CHECK_FALSE(freed_inside_callback);
+    CHECK(freed);
+    CHECK(log == log_t{"close signal"});
+    CHECK(vio::detail::core(loop).open_resources() == 0);
   }
 
-  SUBCASE("owned wrapper can be copied and shared")
+  TEST_CASE("a signal sent many times before it runs runs once")
   {
     vio::event_loop_t loop;
-    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
-    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
-    owned_async_t async1([] {}, async_closed, async_destroyed, loop);
-    async1.register_handle(&async1->async_handle);
+    log_t log;
+    bool freed = false;
+    int calls = 0;
+    std::optional<vio::ref_ptr_t<signal_t>> signal;
+    signal.emplace(loop, log, [&calls] { ++calls; }, freed);
+    (*signal).register_resource((*signal)->probe);
 
-    CHECK(async1.ref_counted()->ref_count == 1);
+    loop.run_in_loop([&] {
+      for (int i = 0; i < 5; ++i)
+        (*signal)->send();
+      loop.run_in_loop([&] {
+        signal.reset();
+        loop.stop();
+      });
+    });
+    loop.run();
 
-    {
-      owned_async_t async2 = async1;
-      CHECK(async1.ref_counted()->ref_count == 2);
-      CHECK(async2.ref_counted()->ref_count == 2);
-
-      loop.run_in_loop(
-        [&loop, &async1, &async2]()
-        {
-          loop.stop();
-          async1.release();
-          CHECK(async2.ref_counted()->ref_count == 1);
-          async2.release();
-        });
-      loop.run();
-    }
+    CHECK(calls == 1);
+    CHECK(freed);
   }
 
-  SUBCASE("handle closes when last reference is dropped")
+  TEST_CASE("a wrapper with a resource can be copied and shared")
   {
     vio::event_loop_t loop;
-    bool destroyed = false; // NOLINT(misc-const-correctness) modified via callback
-    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
-    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
+    log_t log;
+    vio::ref_ptr_t<single_t> first(loop, log);
+    first.register_resource(first->probe);
+    CHECK(first.ref_counted()->ref_count == 1);
 
+    vio::ref_ptr_t<single_t> second = first;
+    CHECK(first.ref_counted()->ref_count == 2);
+    CHECK(second.ref_counted()->ref_count == 2);
+    CHECK(&first.data() == &second.data());
+
+    loop.run_in_loop([&] {
+      first.release();
+      CHECK(second.ref_counted()->ref_count == 1);
+      CHECK(log.empty());
+      second.release();
+      CHECK(log == log_t{"close a"});
+      loop.stop();
+    });
+    loop.run();
+
+    CHECK(log == log_t{"close a", "freed"});
+  }
+
+  TEST_CASE("dropping the last reference outside the loop closes on the next run")
+  {
+    vio::event_loop_t loop;
+    log_t log;
+    bool destroyed = false;
     {
-      owned_async_t async1([] {}, async_closed, async_destroyed, loop);
-      async1.register_handle(&async1->async_handle);
-      async1.on_destroy([&destroyed]() { destroyed = true; });
-      async1.on_destroy([&async_closed]() { async_closed = true; });
-
+      vio::ref_ptr_t<single_t> first(loop, log);
+      first.register_resource(first->probe);
+      first.on_destroy([&] { destroyed = true; });
       {
-        const owned_async_t async2 = async1; // NOLINT(performance-unnecessary-copy-initialization)
-        const owned_async_t async3 = async2; // NOLINT(performance-unnecessary-copy-initialization)
-        CHECK(async1.ref_counted()->ref_count == 3);
+        const vio::ref_ptr_t<single_t> second = first;
+        const vio::ref_ptr_t<single_t> third = second;
+        CHECK(first.ref_counted()->ref_count == 3);
         CHECK_FALSE(destroyed);
       }
-
-      CHECK(async1.ref_counted()->ref_count == 1);
+      CHECK(first.ref_counted()->ref_count == 1);
       CHECK_FALSE(destroyed);
     }
 
     CHECK(destroyed);
-    CHECK(async_closed);
-    CHECK_FALSE(async_destroyed);
-    loop.run_in_loop([&loop] { loop.stop(); });
+    CHECK(log == log_t{"close a"});
+    CHECK(vio::detail::core(loop).open_resources() == 1);
+
+    loop.stop();
     loop.run();
-    CHECK(async_destroyed);
+
+    CHECK(log == log_t{"close a", "freed"});
+    CHECK(vio::detail::core(loop).open_resources() == 0);
   }
 
-  SUBCASE("async send and receive multiple times")
+  TEST_CASE("a close finishes on a later turn, never inside the call that closed")
   {
     vio::event_loop_t loop;
-    bool async_closed = false; // NOLINT(misc-const-correctness) modified via callback
-    bool async_destroyed = false; // NOLINT(misc-const-correctness) modified via destructor
+    log_t log;
+    std::optional<vio::ref_ptr_t<single_t>> wrapper;
+    wrapper.emplace(loop, log);
+    (*wrapper).register_resource((*wrapper)->probe);
+    bool freed_in_same_call = true;
+    bool freed_on_later_turn = false;
 
-    int call_count = 0; // NOLINT(misc-const-correctness) modified via lambda capture
-    owned_async_t async_wrapper([&call_count] { call_count++; }, async_closed, async_destroyed, loop);
-    async_wrapper.register_handle(&async_wrapper->async_handle);
-
-    int send_count = 5;
-    loop.run_in_loop(
-      [&loop, &async_wrapper, &send_count]()
-      {
-        for (int i = 0; i < send_count; ++i)
-        {
-          uv_async_send(&async_wrapper->async_handle);
-        }
-        loop.run_in_loop(
-          [&async_wrapper, &loop]
-          {
-            async_wrapper.release();
-            loop.stop();
-          });
+    loop.run_in_loop([&] {
+      wrapper.reset();
+      freed_in_same_call = contains(log, "freed");
+      loop.run_in_loop([&] {
+        freed_on_later_turn = contains(log, "freed");
+        loop.stop();
       });
-
+    });
     loop.run();
 
-    CHECK(call_count >= 1);
+    CHECK_FALSE(freed_in_same_call);
+    CHECK(freed_on_later_turn);
+  }
+
+  TEST_CASE("destroy callbacks run in reverse, before any resource closes, and resources close in reverse")
+  {
+    vio::event_loop_t loop;
+    log_t log;
+    {
+      vio::ref_ptr_t<triple_t> wrapper(loop, log);
+      wrapper.register_resource(wrapper->a);
+      wrapper.register_resource(wrapper->b);
+      wrapper.register_resource(wrapper->c);
+      wrapper.on_destroy([&log] { log.push_back("destroy 1"); });
+      wrapper.on_destroy([&log] { log.push_back("destroy 2"); });
+      wrapper.on_destroy([&log] { log.push_back("destroy 3"); });
+      CHECK(log.empty());
+    }
+    CHECK(log == log_t{"destroy 3", "destroy 2", "destroy 1", "close c", "close b", "close a"});
+
+    loop.stop();
+    loop.run();
+
+    CHECK(log == log_t{"destroy 3", "destroy 2", "destroy 1", "close c", "close b", "close a", "freed"});
+  }
+
+  TEST_CASE("storage is freed only after every resource has closed")
+  {
+    vio::event_loop_t loop;
+    auto &core = vio::detail::core(loop);
+    log_t log;
+    std::optional<vio::ref_ptr_t<triple_t>> wrapper;
+    wrapper.emplace(loop, log, true);
+    (*wrapper).register_resource((*wrapper)->a);
+    (*wrapper).register_resource((*wrapper)->b);
+    (*wrapper).register_resource((*wrapper)->c);
+    probe_t *held = &(*wrapper)->b;
+    CHECK(core.open_resources() == 3);
+
+    std::size_t open_while_held = 0;
+    bool freed_while_held = true;
+    bool freed_right_after_finish = true;
+    loop.run_in_loop([&] {
+      wrapper.reset();
+      loop.run_in_loop([&] {
+        open_while_held = core.open_resources();
+        freed_while_held = contains(log, "freed");
+        held->finish();
+        freed_right_after_finish = contains(log, "freed");
+        loop.stop();
+      });
+    });
+    loop.run();
+
+    CHECK(open_while_held == 1);
+    CHECK_FALSE(freed_while_held);
+    CHECK_FALSE(freed_right_after_finish);
+    CHECK(log == log_t{"close c", "close b", "close a", "finish b", "freed"});
+    CHECK(core.open_resources() == 0);
+  }
+
+  TEST_CASE("a held close keeps a stopped loop running until it finishes")
+  {
+    vio::event_loop_t loop;
+    log_t log;
+    std::optional<vio::ref_ptr_t<single_t>> wrapper;
+    wrapper.emplace(loop, log, true);
+    (*wrapper).register_resource((*wrapper)->probe);
+    probe_t *held = &(*wrapper)->probe;
+
+    vio::thread_with_event_loop_t finisher;
+    loop.run_in_loop([&] {
+      loop.stop();
+      wrapper.reset();
+      finisher.event_loop().run_in_loop([&loop, held] { loop.run_in_loop([held] { held->finish(); }); });
+    });
+    loop.run();
+    finisher.stop_and_join();
+
+    CHECK(log == log_t{"close a", "finish a", "freed"});
+    CHECK(vio::detail::core(loop).open_resources() == 0);
+  }
+
+  TEST_CASE("a parked reference defers closing and freeing until it is released")
+  {
+    vio::event_loop_t loop;
+    log_t log;
+    std::optional<vio::ref_ptr_t<single_t>> wrapper;
+    wrapper.emplace(loop, log);
+    (*wrapper).register_resource((*wrapper)->probe);
+    vio::reference_counted_t *counted = (*wrapper).ref_counted();
+    (*wrapper).on_destroy([&] {
+      log.push_back("park");
+      counted->inc();
+      loop.run_in_loop([&] {
+        log.push_back("unpark");
+        counted->dec();
+      });
+    });
+
+    loop.run_in_loop([&] {
+      wrapper.reset();
+      CHECK(log == log_t{"park"});
+      loop.stop();
+    });
+    loop.run();
+
+    CHECK(log == log_t{"park", "unpark", "close a", "freed"});
+  }
+
+  TEST_CASE("a destroy callback that takes and drops a reference at once does not restart destruction")
+  {
+    vio::event_loop_t loop;
+    log_t log;
+    int destroy_calls = 0;
+    {
+      vio::ref_ptr_t<single_t> wrapper(loop, log);
+      wrapper.register_resource(wrapper->probe);
+      vio::reference_counted_t *counted = wrapper.ref_counted();
+      wrapper.on_destroy([&destroy_calls, counted] {
+        ++destroy_calls;
+        counted->inc();
+        CHECK_FALSE(counted->dec());
+      });
+    }
+    CHECK(destroy_calls == 1);
+    CHECK(log == log_t{"close a"});
+
+    loop.stop();
+    loop.run();
+
+    CHECK(destroy_calls == 1);
+    CHECK(log == log_t{"close a", "freed"});
+  }
+
+  TEST_CASE("independent wrappers with nested lifetimes all close and free")
+  {
+    vio::event_loop_t loop;
+    log_t log_1;
+    log_t log_2;
+    log_t log_3;
+    std::vector<int> destroy_order;
+    {
+      vio::ref_ptr_t<single_t> first(loop, log_1);
+      first.register_resource(first->probe);
+      first.on_destroy([&destroy_order] { destroy_order.push_back(1); });
+      {
+        vio::ref_ptr_t<single_t> second(loop, log_2);
+        second.register_resource(second->probe);
+        second.on_destroy([&destroy_order] { destroy_order.push_back(2); });
+        vio::ref_ptr_t<single_t> third(loop, log_3);
+        third.register_resource(third->probe);
+        third.on_destroy([&destroy_order] { destroy_order.push_back(3); });
+      }
+      CHECK(destroy_order == std::vector<int>{3, 2});
+    }
+    CHECK(destroy_order == std::vector<int>{3, 2, 1});
+    CHECK(vio::detail::core(loop).open_resources() == 3);
+
+    loop.stop();
+    loop.run();
+
+    CHECK(log_1 == log_t{"close a", "freed"});
+    CHECK(log_2 == log_t{"close a", "freed"});
+    CHECK(log_3 == log_t{"close a", "freed"});
+    CHECK(vio::detail::core(loop).open_resources() == 0);
+  }
+
+  TEST_CASE("a wrapper with no resource is freed at once")
+  {
+    log_t log;
+    struct plain_t
+    {
+      log_t &log;
+      explicit plain_t(log_t &log)
+        : log(log)
+      {
+      }
+      plain_t(const plain_t &) = delete;
+      plain_t &operator=(const plain_t &) = delete;
+      plain_t(plain_t &&) = delete;
+      plain_t &operator=(plain_t &&) = delete;
+      ~plain_t()
+      {
+        log.push_back("freed");
+      }
+    };
+    {
+      vio::ref_ptr_t<plain_t> wrapper(log);
+      wrapper.on_destroy([&log] { log.push_back("destroy"); });
+    }
+    CHECK(log == log_t{"destroy", "freed"});
   }
 }
-
-TEST_CASE("register_handle reference counting with event loop")
-{
-  SUBCASE("handle keeps object alive during close")
-  {
-    vio::event_loop_t loop;
-    int destruction_phase = 0;
-
-    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
-    struct tracked_async_t
-    {
-      uv_async_t handle = {};
-      int *phase;
-
-      explicit tracked_async_t(vio::event_loop_t &loop, int *p)
-        : phase(p)
-      {
-        uv_async_init(loop.loop(), &handle, nullptr);
-      }
-
-      ~tracked_async_t()
-      {
-        *phase = 2;
-      }
-    };
-
-    using owned_tracked_t = vio::ref_ptr_t<tracked_async_t>;
-
-    {
-      owned_tracked_t async(loop, &destruction_phase);
-      async.register_handle(&async->handle);
-      async.on_destroy([p = &destruction_phase]() { *p = 1; });
-      CHECK(destruction_phase == 0);
-    }
-
-    CHECK(destruction_phase == 1);
-
-    loop.run_in_loop([&loop] { loop.stop(); });
-    loop.run();
-
-    CHECK(destruction_phase == 2);
-  }
-
-  SUBCASE("multiple handles close in LIFO order")
-  {
-    vio::event_loop_t loop;
-
-    struct multi_handle_t
-    {
-      uv_async_t async1 = {};
-      uv_async_t async2 = {};
-      uv_async_t async3 = {};
-
-      explicit multi_handle_t(vio::event_loop_t &loop)
-      {
-        uv_async_init(loop.loop(), &async1, nullptr);
-        uv_async_init(loop.loop(), &async2, nullptr);
-        uv_async_init(loop.loop(), &async3, nullptr);
-      }
-    };
-
-    using owned_multi_t = vio::ref_ptr_t<multi_handle_t>;
-
-    const std::vector<uv_handle_t *> close_order;
-
-    {
-      owned_multi_t wrapper(loop);
-      wrapper.register_handle(&wrapper->async1);
-      wrapper.register_handle(&wrapper->async2);
-      wrapper.register_handle(&wrapper->async3);
-    }
-
-    loop.run_in_loop([&loop] { loop.stop(); });
-    loop.run();
-  }
-
-  SUBCASE("multiple independent wrappers with different lifetimes")
-  {
-    vio::event_loop_t loop;
-
-    struct counted_async_t
-    {
-      uv_async_t handle = {};
-      int id;
-
-      explicit counted_async_t(vio::event_loop_t &loop, int i)
-        : id(i)
-      {
-        uv_async_init(loop.loop(), &handle, nullptr);
-      }
-    };
-
-    using owned_counted_t = vio::ref_ptr_t<counted_async_t>;
-
-    static std::vector<int> close_order;
-    close_order.clear();
-
-    {
-      owned_counted_t async1(loop, 1);
-      async1.register_handle(&async1->handle);
-      async1.on_destroy([&]() { close_order.push_back(1); });
-      {
-        owned_counted_t async2(loop, 2);
-        async2.register_handle(&async2->handle);
-        async2.on_destroy([&]() { close_order.push_back(2); });
-        owned_counted_t async3(loop, 3);
-        async3.register_handle(&async3->handle);
-        async3.on_destroy([&]() { close_order.push_back(3); });
-      }
-    }
-    loop.run_in_loop([&loop] { loop.stop(); });
-    loop.run();
-
-    REQUIRE(close_order.size() == 3);
-    CHECK(std::ranges::find(close_order, 1) != close_order.end());
-    CHECK(std::ranges::find(close_order, 2) != close_order.end());
-    CHECK(std::ranges::find(close_order, 3) != close_order.end());
-  }
-}
-
-TEST_CASE("on_destroy callback behavior")
-{
-  SUBCASE("destroy callbacks run before handle closing")
-  {
-    vio::event_loop_t loop;
-    bool callback_called = false;
-
-    struct simple_handle_t
-    {
-      uv_async_t handle = {};
-
-      explicit simple_handle_t(vio::event_loop_t &loop)
-      {
-        uv_async_init(loop.loop(), &handle, nullptr);
-      }
-    };
-
-    using owned_simple_t = vio::ref_ptr_t<simple_handle_t>;
-
-    {
-      owned_simple_t wrapper(loop);
-      wrapper.register_handle(&wrapper->handle);
-      wrapper.on_destroy([&callback_called]() { callback_called = true; });
-      CHECK_FALSE(callback_called);
-    }
-
-    CHECK(callback_called);
-    loop.run_in_loop([&loop] { loop.stop(); });
-    loop.run();
-  }
-
-  SUBCASE("destroy callback can increment refcount to postpone destruction")
-  {
-    vio::event_loop_t loop;
-
-    struct simple_handle_t
-    {
-      uv_async_t handle = {};
-
-      explicit simple_handle_t(vio::event_loop_t &loop)
-      {
-        uv_async_init(loop.loop(), &handle, nullptr);
-      }
-    };
-
-    using owned_simple_t = vio::ref_ptr_t<simple_handle_t>;
-
-    bool destroyed = false;
-    owned_simple_t *wrapper_ptr = nullptr;
-
-    {
-      owned_simple_t wrapper(loop);
-      wrapper.register_handle(&wrapper->handle);
-      wrapper_ptr = &wrapper;
-
-      wrapper.ref_counted()->register_destroy_callback(
-        [&]()
-        {
-          wrapper_ptr->ref_counted()->inc();
-          auto close_callback = [wrapper_ptr]() { wrapper_ptr->ref_counted()->dec(); };
-          close_callback();
-        });
-
-      wrapper.on_destroy([&destroyed]() { destroyed = true; });
-    }
-
-    CHECK(destroyed);
-    loop.run_in_loop([&loop] { loop.stop(); });
-    loop.run();
-  }
-}
-} // TEST_SUITE
 } // namespace

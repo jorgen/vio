@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <optional>
+#include <vector>
 #include <doctest/doctest.h>
 
 #include <vio/operation/quic_endpoint.h>
@@ -484,12 +485,8 @@ TEST_CASE("an endpoint that is never bound does not keep the loop running")
 {
   using namespace vio;
 
-  // The case uv_unref exists for, and the one that is easy to get wrong in a
-  // way no assertion catches: libuv makes the UDP socket lazily, so an endpoint
-  // created and never bound owns no descriptor at all. Its beat is therefore
-  // the only active handle on the loop, and a referenced prepare handle is
-  // enough on its own to make uv_run block for ever -- stop() closes vio's
-  // internal handles and nothing else.
+  // An endpoint created and never bound owns no descriptor at all, so its beat
+  // is the only thing it has on the loop.
   //
   // So this test hanging *is* the failure. There is no assertion that can
   // report it, which is why it is worth writing down rather than assuming.
@@ -504,8 +501,7 @@ TEST_CASE("an endpoint that is never bound does not keep the loop running")
     REQUIRE(endpoint.has_value());
     created = endpoint->handle.ref_counted() != nullptr;
     event_loop.stop();
-    // Returning at all is the assertion. With the beat referenced, uv_run has
-    // an active handle and blocks here for ever.
+    // Returning at all is the assertion.
     event_loop.run();
   } // and only now is the endpoint released, which requests the closes
   // A second run drains them. Every other test in this file releases its
@@ -522,8 +518,8 @@ TEST_CASE("an endpoint released while the loop can still run leaves nothing open
 
   // The other half of the same rule, from the handle-lifetime section of
   // CLAUDE.md: a vio handle must be released while the loop can still run, or
-  // its uv_close is requested and never drained, uv_loop_close fails with EBUSY
-  // and the event loop destructor aborts on its assert.
+  // its close is requested and never drained and the event loop destructor
+  // aborts on its assert.
   //
   // Here the endpoint is dropped inside the task, so the close is issued during
   // the run() that is still in progress. If the beat were not registered with
@@ -595,16 +591,10 @@ TEST_CASE("a permanently armed beat still lets the loop sleep")
   using namespace vio;
 
   // The beat is armed for the life of the endpoint and costs one predicate per
-  // loop turn. That is deliberate: an idle handle is disqualified outright,
-  // because uv__backend_timeout returns zero while one is active and the loop
-  // stops sleeping altogether. Neither prepare nor check appears in that
-  // function, which is what makes arming this permanently cheaper to reason
-  // about than arming it conditionally -- and step 3 of this work found that
-  // making a periodic mechanism in this endpoint conditional produced both a
-  // spin and a stall.
+  // loop turn.
   //
   // What is checked here is that a timer still ends the sleep with the beat
-  // running, which is the observable half of that claim.
+  // running.
   const auto identity = vio_test::make_self_signed("localhost");
   const auto context = make_server_context(identity);
   REQUIRE(context.has_value());
@@ -794,6 +784,69 @@ TEST_CASE("teardown resolves an operation nobody would otherwise resume")
   CHECK(resolved);
   CHECK(code == vio_quic_endpoint_closed);
 }
+
+namespace
+{
+vio::detached_task_t relay_milestone(vio::detail::quic_endpoint_state_t &state, std::vector<vio::ref_ptr_t<vio::detail::quic_connection_state_t>> &chain, std::size_t index, int &woken)
+{
+  (void)co_await vio::quic_milestone_t{chain[index]->ready};
+  ++woken;
+  if (index + 1 < chain.size())
+  {
+    vio::detail::quic_milestone_reach(chain[index + 1]->ready.data(), {});
+    vio::detail::quic_mark_pending(state, chain[index + 1]);
+  }
+}
+} // namespace
+
+TEST_CASE("work the beat leaves over runs on the next turn rather than waiting for a timer")
+{
+  using namespace vio;
+
+  const auto identity = vio_test::make_self_signed("localhost");
+  const auto context = make_server_context(identity);
+  REQUIRE(context.has_value());
+
+  event_loop_t event_loop;
+  std::optional<vio::task_t<void>> task;
+  int woken = 0;
+  int woken_before_timer = 0;
+  constexpr std::size_t depth = 3 * detail::quic_beat_max_passes;
+
+  event_loop.run_in_loop(
+    [&]
+    {
+      task.emplace(
+        [](event_loop_t &loop, const vio::quic::tls_context_t &tls, int &woken, int &woken_before_timer) -> vio::task_t<void>
+        {
+          std::vector<ref_ptr_t<detail::quic_connection_state_t>> chain;
+          {
+            auto endpoint = quic_endpoint_create(loop, tls);
+            REQUIRE(endpoint.has_value());
+            auto &state = endpoint->handle.data();
+            for (std::size_t i = 0; i < depth; ++i)
+            {
+              chain.emplace_back(&state, nullptr, vio::quic::tls_role_t::server);
+              chain.back()->ready = ref_ptr_t<detail::quic_milestone_state_t>();
+            }
+            for (std::size_t i = 0; i < depth; ++i)
+            {
+              relay_milestone(state, chain, i, woken);
+            }
+            detail::quic_milestone_reach(chain.front()->ready.data(), {});
+            detail::quic_mark_pending(state, chain.front());
+            (void)co_await sleep(loop, std::chrono::milliseconds(50));
+            woken_before_timer = woken;
+          }
+          (void)co_await sleep(loop, std::chrono::milliseconds(1));
+          loop.stop();
+        }(event_loop, *context, woken, woken_before_timer));
+    });
+  event_loop.run();
+
+  CHECK(woken_before_timer == static_cast<int>(depth));
+  CHECK(woken == static_cast<int>(depth));
+}
 }
 
 TEST_SUITE("quic coroutine bind")
@@ -825,8 +878,8 @@ TEST_CASE("binding to zero picks a port and starts the read loop")
   using namespace vio;
 
   // Binding is the moment the socket acquires an address family, which is why
-  // the read loop starts here and not at creation: libuv makes the socket
-  // lazily and pins its family to whoever touches it first, so an endpoint that
+  // the read loop starts here and not at creation: the socket is made lazily
+  // and its family is pinned by whoever touches it first, so an endpoint that
   // started reading before anyone said where would be IPv4 for ever.
   const auto identity = vio_test::make_self_signed("localhost");
   const auto context = server_context_for(identity);
@@ -898,7 +951,9 @@ TEST_CASE("a bind that fails does not leave the endpoint reading")
             auto endpoint = quic_endpoint_create(loop, tls);
             REQUIRE(endpoint.has_value());
             sockaddr_in unassignable = {};
-            REQUIRE(uv_ip4_addr("192.0.2.1", 4433, &unassignable) == 0);
+            unassignable.sin_family = AF_INET;
+            unassignable.sin_port = htons(4433);
+            REQUIRE(inet_pton(AF_INET, "192.0.2.1", &unassignable.sin_addr) == 1);
             const auto bound = quic_endpoint_bind(*endpoint, reinterpret_cast<const sockaddr *>(&unassignable));
             refused = !bound.has_value();
             never_read = !endpoint->handle->driver_started;
@@ -955,11 +1010,10 @@ TEST_CASE("the read loop is started once, however many times bind is called")
 {
   using namespace vio;
 
-  // uv_udp_bind refuses a second bind on a bound socket, so the second call
-  // never reaches the driver -- but the guard is what makes that a property of
-  // this layer rather than a happy accident of libuv's. Two run() frames on one
-  // socket would be two readers, two poll handles and two owners of the same
-  // datagrams.
+  // A second bind on a bound socket is refused, so the second call never
+  // reaches the driver -- but the guard is what makes that a property of this
+  // layer rather than a happy accident of the socket's. Two run() frames on one
+  // socket would be two readers and two owners of the same datagrams.
   const auto identity = vio_test::make_self_signed("localhost");
   const auto context = server_context_for(identity);
   REQUIRE(context.has_value());
@@ -1036,7 +1090,9 @@ vio::quic::tls_config_t client_tls(const vio_test::identity_t &identity)
 sockaddr_in loopback(std::uint16_t port)
 {
   sockaddr_in address = {};
-  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return address;
 }
 } // namespace
@@ -1129,12 +1185,12 @@ TEST_CASE("a dial nobody answers resolves with the handshake failure")
             auto silence = udp_create(loop);
             REQUIRE(silence.has_value());
             sockaddr_in any = {};
-            REQUIRE(uv_ip4_addr("127.0.0.1", 0, &any) == 0);
+            any.sin_family = AF_INET;
+            any.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             REQUIRE(udp_bind(*silence, reinterpret_cast<const sockaddr *>(&any)).has_value());
-            sockaddr_storage bound = {};
-            int length = sizeof(bound);
-            REQUIRE(uv_udp_getsockname(silence->get_udp(), reinterpret_cast<sockaddr *>(&bound), &length) == 0);
-            const auto port = ntohs(reinterpret_cast<const sockaddr_in *>(&bound)->sin_port);
+            const auto bound = udp_sockname(*silence);
+            REQUIRE(bound.has_value());
+            const auto port = ntohs(reinterpret_cast<const sockaddr_in *>(&*bound)->sin_port);
 
             quic_config_t config;
             config.transport.connection.handshake_timeout = std::chrono::milliseconds(300);
@@ -1190,7 +1246,7 @@ TEST_CASE("a dial on an endpoint with no client context is refused with a senten
   // fixed at create. Refusing here rather than at create is what lets one
   // answer-only endpoint exist without every dial site having to prove it is
   // allowed -- and the refusal has to come before endpoint_t::connect touches
-  // the socket, since libuv fixes the address family on first touch and a dial
+  // the socket, since the address family is fixed on first touch and a dial
   // that cannot happen must not pin the endpoint to IPv4.
   const auto identity = vio_test::make_self_signed("localhost");
   const auto server_context = vio::quic::tls_context_t::create(server_tls(identity));
@@ -1241,7 +1297,7 @@ TEST_CASE("an endpoint released mid-dial resolves the dial and closes its loop")
   // Test 4, and the falsification of the design sketch this layer started from.
   // Had the awaitable held a strong reference to the endpoint state, the
   // application's release would take the count from two to one, on_destroy
-  // would never run, nothing would resolve the dial, and the socket's uv_close
+  // would never run, nothing would resolve the dial, and the socket's close
   // would never be issued -- so event_loop.run() would never return and the
   // failure would look like a hang rather than a leak.
   //
@@ -1330,7 +1386,9 @@ vio::quic::tls_config_t dialling_tls(const vio_test::identity_t &identity)
 sockaddr_in to_loopback(std::uint16_t port)
 {
   sockaddr_in address = {};
-  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return address;
 }
 } // namespace
@@ -1812,7 +1870,9 @@ vio::quic::tls_config_t connecting_tls(const vio_test::identity_t &identity)
 sockaddr_in at_loopback(std::uint16_t port)
 {
   sockaddr_in address = {};
-  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return address;
 }
 } // namespace
@@ -2149,7 +2209,9 @@ vio::quic::tls_config_t shutdown_client_tls(const vio_test::identity_t &identity
 sockaddr_in shutdown_loopback(std::uint16_t port)
 {
   sockaddr_in address = {};
-  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return address;
 }
 } // namespace
@@ -2404,7 +2466,9 @@ vio::quic::tls_config_t cancel_client_tls(const vio_test::identity_t &identity)
 sockaddr_in cancel_loopback(std::uint16_t port)
 {
   sockaddr_in address = {};
-  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return address;
 }
 } // namespace
@@ -2506,8 +2570,8 @@ TEST_CASE("a cancelled dial resolves the caller and closes what it built")
             REQUIRE_FALSE(dial.await_ready());
 
             // Cancelled from a callback phase the beat has not yet reached,
-            // which is the ordinary case: whichever phase this is, the next
-            // prepare comes before the loop blocks again.
+            // which is the ordinary case: whichever phase this is, the beat
+            // runs before the loop blocks again.
             token.cancel();
             const auto result = co_await std::move(dial);
             cancelled = !result.has_value() && is_cancelled(result.error());
@@ -2736,7 +2800,9 @@ vio::quic::tls_config_t stream_client_tls(const vio_test::identity_t &identity)
 sockaddr_in stream_loopback(std::uint16_t port)
 {
   sockaddr_in address = {};
-  uv_ip4_addr("127.0.0.1", static_cast<int>(port), &address);
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return address;
 }
 
@@ -2747,7 +2813,7 @@ std::span<const std::uint8_t> bytes_of(std::string_view text)
 
 std::string text_of(const vio::unique_buf_t &buffer)
 {
-  return std::string(buffer.buf.base, buffer.buf.len);
+  return std::string(buffer.chars(), buffer.size());
 }
 
 // A server and a client on one loop, both bound to IPv4 so the dial can name a

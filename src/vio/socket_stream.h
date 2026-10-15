@@ -22,32 +22,27 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
-// uv_tls_stream_t is the TLS byte-duplex driver. It rides libuv's stream API
-// (uv_read_start / uv_write on a uv_tcp_t) -- vio issues NO raw recv/send, so
-// io_uring/IOCP under libuv is invisible here -- and drives a socket-free
-// ssl_engine_t (memory BIOs) as a pure codec:
-//
-//   inbound:  read_cb -> engine.feed_ciphertext(rbio) -> SSL_read -> plaintext buffer_queue
-//   outbound: ssl_*_write -> SSL_write -> drain wbio ciphertext -> uv_write
-//
-// It presents exactly the member surface the coroutine awaitables below
-// (stream_reader_t / stream_read_awaitable_t / stream_write_awaitable_t) need,
-// so the public reader/writer API and its semantics (co_await, reader.read(buf)
-// exact-fill, cancel/UV_ECANCELED, concurrent per-slot writes) are preserved.
-
+#include <algorithm>
+#include <cassert>
 #include <coroutine>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <optional>
-#include <queue>
+#include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include <uv.h>
-
 #include <vio/cancellation.h>
-#include <vio/elastic_index_storage.h>
+#include <vio/detail/sys.h>
+#include <vio/errc.h>
 #include <vio/error.h>
+#include <vio/loop/loop_core.h>
+#include <vio/loop/socket.h>
 #include <vio/ref_counted_wrapper.h>
 #include <vio/ring_buffer.h>
 #include <vio/ssl_engine.h>
@@ -55,86 +50,189 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio
 {
+enum class stream_write_kind : std::uint8_t
+{
+  data,
+  shutdown
+};
 
-// A single application write. The plaintext `buf` is borrowed from the caller
-// and kept alive by the suspended awaiter. `ref` is released by the awaitable
-// (once) and by the in-flight uv_write (once), so the slot is freed only after
-// both are done -- in either order.
 struct stream_write_state_t
 {
-  uv_buf_t buf = {};
-  size_t bytes_written = 0; // plaintext consumed by SSL_write
+  const std::byte *data = nullptr;
+  std::size_t size = 0;
+  std::size_t bytes_written = 0;
+  std::uint64_t cipher_end = 0;
+  std::vector<std::byte> owned_plain;
   int error_code = 0;
-  // Two holds: one for the awaitable (released in its destructor) and one for the
-  // write operation (released exactly once -- by write_cb for an async write, or
-  // by finish_write_ok/finish_write_error for a synchronous completion). The slot
-  // is deactivated only when both reach zero, so a synchronous completion cannot
-  // free the slot out from under the not-yet-constructed awaitable.
-  int8_t ref = 2;
+  std::int8_t ref = 2;
   bool done = false;
-  bool in_flight = false;
-  bool pending_handshake = false;
+  bool active = false;
+  stream_write_kind kind = stream_write_kind::data;
   std::string error_msg;
   std::coroutine_handle<> continuation = {};
-  registration_t cancel_registration; // fires cancel_write(idx) when the caller's cancellation triggers
-  // For a vectored write, the coalesced plaintext is owned here so it survives
-  // being parked for backpressure (a std::vector move preserves its heap pointer,
-  // so this stays valid across write_queue reallocation). Empty for a scalar
-  // write, whose plaintext is borrowed via `buf` and kept alive by the suspended
-  // awaiter.
-  std::vector<char> owned_plain;
+  registration_t cancel_registration;
 };
 
-struct stream_client_buffer_t
+class stream_write_slots_t
 {
-  uv_buf_t buf;
-  size_t capacity;
-  dealloc_cb_t dealloc_cb;
+public:
+  std::size_t activate()
+  {
+    std::size_t index = 0;
+    if (!_free.empty())
+    {
+      index = _free.back();
+      _free.pop_back();
+    }
+    else
+    {
+      index = _slots.size();
+      _slots.emplace_back();
+    }
+    _slots[index].active = true;
+    return index;
+  }
+
+  void deactivate(std::size_t index)
+  {
+    _slots[index] = stream_write_state_t{};
+    _free.push_back(index);
+  }
+
+  [[nodiscard]] bool is_active(std::size_t index) const noexcept
+  {
+    return index < _slots.size() && _slots[index].active;
+  }
+
+  stream_write_state_t &operator[](std::size_t index) noexcept
+  {
+    assert(is_active(index) && "Invalid write slot");
+    return _slots[index];
+  }
+
+  const stream_write_state_t &operator[](std::size_t index) const noexcept
+  {
+    assert(is_active(index) && "Invalid write slot");
+    return _slots[index];
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept
+  {
+    return _slots.size();
+  }
+
+private:
+  std::vector<stream_write_state_t> _slots;
+  std::vector<std::size_t> _free;
 };
 
-struct uv_tls_stream_t; // fwd
-
-// One in-flight uv_write of ciphertext (an app write, a handshake flight, or a
-// TLS control record). Heap-allocated so it (and its owned ciphertext + the
-// uv_write_t) outlive the write regardless of write_queue reallocation.
-struct tls_write_op_t
+class stream_index_fifo_t
 {
-  uv_write_t req = {};
-  std::vector<uint8_t> cipher;
-  uv_tls_stream_t *stream = nullptr;
-  bool has_slot = false;
-  size_t slot = 0;
-};
+public:
+  [[nodiscard]] bool empty() const noexcept
+  {
+    return _head == _items.size();
+  }
 
-// ---- exact-fill read awaitable (reader.read(uv_buf_t)) --------------------
+  [[nodiscard]] std::size_t front() const noexcept
+  {
+    return _items[_head];
+  }
+
+  void push(std::size_t value)
+  {
+    _items.push_back(value);
+  }
+
+  void pop() noexcept
+  {
+    ++_head;
+    settle();
+  }
+
+  bool remove(std::size_t value) noexcept
+  {
+    auto it = std::find(_items.begin() + static_cast<std::ptrdiff_t>(_head), _items.end(), value);
+    if (it == _items.end())
+      return false;
+    _items.erase(it);
+    settle();
+    return true;
+  }
+
+  void clear() noexcept
+  {
+    _items.clear();
+    _head = 0;
+  }
+
+private:
+  void settle() noexcept
+  {
+    if (_head == _items.size())
+    {
+      _items.clear();
+      _head = 0;
+    }
+    else if (_head >= 64 && _head * 2 >= _items.size())
+    {
+      _items.erase(_items.begin(), _items.begin() + static_cast<std::ptrdiff_t>(_head));
+      _head = 0;
+    }
+  }
+
+  std::vector<std::size_t> _items;
+  std::size_t _head = 0;
+};
 
 template <typename REF_PTR_T, typename STREAM>
 struct stream_read_awaitable_t
 {
   REF_PTR_T ref_ptr;
-  STREAM *stream;
+  STREAM *stream = nullptr;
+  std::span<std::byte> target;
+
+  stream_read_awaitable_t(const REF_PTR_T &ref_ptr, STREAM *stream, std::span<std::byte> target)
+    : ref_ptr(ref_ptr)
+    , stream(stream)
+    , target(target)
+  {
+  }
+
+  stream_read_awaitable_t(stream_read_awaitable_t &&other) noexcept
+    : ref_ptr(std::move(other.ref_ptr))
+    , stream(std::exchange(other.stream, nullptr))
+    , target(other.target)
+  {
+  }
+
+  stream_read_awaitable_t(const stream_read_awaitable_t &) = delete;
+  stream_read_awaitable_t &operator=(const stream_read_awaitable_t &) = delete;
+  stream_read_awaitable_t &operator=(stream_read_awaitable_t &&) = delete;
+
+  ~stream_read_awaitable_t()
+  {
+    if (ref_ptr && stream != nullptr)
+      stream->abandon_exact_fill(target);
+  }
 
   bool await_ready() noexcept
   {
-    assert(ref_ptr && "Invalid state in await_ready");
-    return stream->bytes_read == stream->read_buffer.len || stream->read_buffer_error.code;
+    return stream == nullptr || stream->exact_fill_ready();
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
   {
-    assert(ref_ptr && "Invalid state in await_suspend");
     stream->read_buffer_continuation = continuation;
+    stream->on_wait();
   }
 
-  auto await_resume() noexcept
+  std::expected<std::span<std::byte>, error_t> await_resume() noexcept
   {
-    assert(stream && "Invalid state in await_resume");
-    std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t> ret =
-      stream->read_buffer_error.code ? std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>{std::unexpect, stream->read_buffer_error} : std::expected<std::pair<uv_buf_t, dealloc_cb_t>, error_t>{{stream->read_buffer, nullptr}};
-    // Leave exact-fill mode so a subsequent plain `co_await reader` uses the queue path.
-    stream->read_buffer = uv_buf_t{};
-    stream->bytes_read = 0;
-    return ret;
+    if (stream == nullptr)
+      return std::unexpected(make_error(errc::bad_descriptor));
+    auto *owner = std::exchange(stream, nullptr);
+    return owner->finish_exact_fill();
   }
 };
 
@@ -158,7 +256,7 @@ struct stream_reader_t
   auto await_resume() noexcept -> std::expected<unique_buf_t, error_t>;
   void cancel() noexcept;
   [[nodiscard]] bool is_cancelled() const noexcept;
-  stream_read_awaitable_t<REF_PTR_T, STREAM> read(uv_buf_t buf);
+  stream_read_awaitable_t<REF_PTR_T, STREAM> read(std::span<std::byte> buf);
 };
 
 template <typename REF_PTR_T, typename STREAM>
@@ -174,810 +272,989 @@ struct stream_write_awaitable_t
   stream_write_awaitable_t(const stream_write_awaitable_t &) = delete;
   stream_write_awaitable_t &operator=(const stream_write_awaitable_t &) = delete;
 
-  stream_write_awaitable_t(stream_write_awaitable_t &&) noexcept = default;
-  stream_write_awaitable_t &operator=(stream_write_awaitable_t &&) noexcept = default;
+  stream_write_awaitable_t(stream_write_awaitable_t &&other) noexcept;
+  stream_write_awaitable_t &operator=(stream_write_awaitable_t &&other) noexcept;
 
   [[nodiscard]] bool await_ready() const noexcept;
   void await_suspend(std::coroutine_handle<> h) noexcept;
   std::expected<void, error_t> await_resume() noexcept;
+
+private:
+  void release() noexcept;
 };
 
-// ---------------------------------------------------------------------------
-// uv_tls_stream_t
-// ---------------------------------------------------------------------------
-
-struct uv_tls_stream_t
+struct tls_stream_t
 {
   static constexpr size_t read_chunk = 65536;
-  static constexpr size_t write_high_water = 1u << 20; // 1 MiB
-  static constexpr size_t write_low_water = 1u << 18;  // 256 KiB
+  static constexpr size_t write_high_water = 1u << 20;
+  static constexpr size_t write_low_water = 1u << 18;
+  static constexpr size_t write_slice = 65536;
+  static constexpr int read_budget = 16;
+  static constexpr std::int64_t teardown_linger_ns = 10'000'000'000;
 
   ssl_engine_t &engine;
   alloc_cb_t alloc_cb;
   dealloc_cb_t dealloc_cb;
   void *user_alloc_ptr;
 
-  // Bound after construction (the uv_tcp handle and owning ref-count live in the
-  // connection state, which finishes constructing this stream first).
-  uv_stream_t *tcp_stream = nullptr;
+  detail::socket_resource_t *socket = nullptr;
   reference_counted_t *rc = nullptr;
 
-  // reader-facing state consumed by the awaitables:
   bool reader_active = false;
   bool read_cancelled = false;
   std::coroutine_handle<> read_continuation = {};
   std::coroutine_handle<> read_buffer_continuation = {};
-  uv_buf_t read_buffer = {};
+  std::span<std::byte> read_buffer = {};
   size_t bytes_read = 0;
-  error_t read_buffer_error = {};
-  ring_buffer_t<std::expected<stream_client_buffer_t, error_t>, 10> buffer_queue;
-  elastic_index_storage_t<stream_write_state_t> write_queue;
+  std::optional<error_t> read_error;
+  ring_buffer_t<unique_buf_t, 10> buffer_queue;
+  size_t front_offset = 0;
+  stream_write_slots_t write_queue;
 
-  // driver state:
-  bool read_armed = false;
-  bool read_paused = false;
   bool handshaking = false;
   bool peer_closed = false;
-  bool closed = false; // teardown started
+  bool closed = false;
   std::function<void(std::optional<error_t>)> on_handshake_complete;
-  std::vector<size_t> pending_handshake_writes;
-  std::queue<size_t> submit_waiters;
 
-  uv_tls_stream_t(ssl_engine_t &engine, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
+  tls_stream_t(ssl_engine_t &engine, alloc_cb_t alloc_cb, dealloc_cb_t dealloc_cb, void *user_alloc_ptr)
     : engine(engine)
     , alloc_cb(alloc_cb)
     , dealloc_cb(dealloc_cb)
     , user_alloc_ptr(user_alloc_ptr)
   {
+    _read_op.owner = this;
+    _read_op.complete = &tls_stream_t::on_read_ready;
+    _write_op.owner = this;
+    _write_op.complete = &tls_stream_t::on_write_ready;
+    _kick.owner = this;
+    _kick.run = &tls_stream_t::on_kick;
+    _kick.discard = &tls_stream_t::on_kick_discard;
+    _linger.owner = this;
+    _linger.fire = &tls_stream_t::on_linger;
   }
-  uv_tls_stream_t(const uv_tls_stream_t &) = delete;
-  uv_tls_stream_t &operator=(const uv_tls_stream_t &) = delete;
-  uv_tls_stream_t(uv_tls_stream_t &&) = delete;
-  uv_tls_stream_t &operator=(uv_tls_stream_t &&) = delete;
+  tls_stream_t(const tls_stream_t &) = delete;
+  tls_stream_t &operator=(const tls_stream_t &) = delete;
+  tls_stream_t(tls_stream_t &&) = delete;
+  tls_stream_t &operator=(tls_stream_t &&) = delete;
 
-  ~uv_tls_stream_t()
+  ~tls_stream_t()
   {
-    while (!buffer_queue.empty())
+    if (socket != nullptr)
     {
-      auto item = buffer_queue.pop_front();
-      if (item.has_value() && item.value().dealloc_cb && item.value().buf.base)
-      {
-        item.value().dealloc_cb(user_alloc_ptr, &item.value().buf);
-      }
+      if (_read_op.parked)
+        socket->cancel(_read_op);
+      if (_write_op.parked)
+        socket->cancel(_write_op);
     }
+    if (_core != nullptr && _linger.armed())
+      _core->remove_timer(_linger);
   }
 
-  void bind(uv_stream_t *stream, reference_counted_t *ref_count)
+  void bind(detail::socket_resource_t &resource, reference_counted_t *ref_count)
   {
-    tcp_stream = stream;
+    socket = &resource;
     rc = ref_count;
-    tcp_stream->data = this;
+    _core = &resource.loop();
+  }
+
+  [[nodiscard]] bool has_front_data() const
+  {
+    return !buffer_queue.empty() && buffer_queue.front().size() > front_offset;
   }
 
   [[nodiscard]] bool has_buffer_with_data_or_error() const
   {
-    if (buffer_queue.empty())
-    {
-      return false;
-    }
-    const auto &b = buffer_queue.front();
-    if (b.has_value() && b.value().buf.len > 0)
-    {
-      return true;
-    }
-    if (!b.has_value() && b.error().code != 0)
-    {
-      return true;
-    }
-    return false;
+    return has_front_data() || read_error.has_value();
   }
 
-  // ---- reader-driver glue expected by stream_reader_t --------------------
-
-  // Called by the reader constructor. Begin/continue delivering plaintext.
-  bool read()
+  [[nodiscard]] size_t pending_write_bytes() const noexcept
   {
-    if (engine.initialized())
-    {
-      arm_reads();
-      pump();
-    }
-    return true;
+    return engine.output_size();
   }
 
-  void set_poll_state() {} // no-op under the libuv stream model
+  void start_reading()
+  {
+    if (!engine.initialized() || closed)
+      return;
+    user_progress();
+  }
 
-  // Called by the reader on every consume (pop / exact-fill drain): decrypt any
-  // ciphertext still buffered in rbio into the freed capacity and re-arm socket
-  // reads. Does NOT resume continuations (we are inside the consuming coroutine).
   void on_consume()
   {
     if (!engine.initialized() || closed)
-    {
       return;
-    }
-    pump();
-    const bool exact_fill_pending = read_buffer.len > 0 && bytes_read < read_buffer.len;
-    if (reader_active && read_paused && (!buffer_queue.full() || exact_fill_pending))
-    {
-      read_paused = false;
-      arm_reads();
-    }
+    user_progress();
   }
 
-  // ---- handshake ---------------------------------------------------------
+  void on_wait()
+  {
+    if (closed || socket == nullptr)
+      return;
+    if (_read_op.parked)
+    {
+      if (!_read_op.keeps_alive)
+      {
+        socket->cancel(_read_op);
+        park_read();
+      }
+      return;
+    }
+    if (wants_socket_read())
+      schedule();
+  }
 
   void begin_handshake()
   {
     handshaking = true;
-    arm_reads();
-    pump();
+    user_progress();
   }
 
-  // The reader object was destroyed: stop pulling ciphertext with no consumer.
   void on_reader_gone()
   {
-    disarm_reads();
-    read_paused = false;
+    reader_active = false;
+    read_continuation = {};
+    abandon_exact_fill();
+    stop_reading_if_unwanted();
   }
 
-  // Called from the owning state's on_destroy. Best-effort one-way close_notify
-  // (its fire-and-forget uv_write parks a ref, deferring final destruction until
-  // the flush completes), then stop reads. The engine's SSL*/BIOs are freed by
-  // the ssl_engine_t destructor when the state's storage is deleted -- after the
-  // close_notify ciphertext has already been copied out of wbio.
+  void cancel_reads()
+  {
+    if (read_cancelled)
+      return;
+    read_cancelled = true;
+    stop_reading_if_unwanted();
+    auto plain = std::exchange(read_continuation, {});
+    auto exact = std::exchange(read_buffer_continuation, {});
+    if (plain)
+      plain.resume();
+    if (exact)
+      exact.resume();
+  }
+
+  [[nodiscard]] bool exact_fill_ready() const noexcept
+  {
+    return read_cancelled || bytes_read >= read_buffer.size() || read_error.has_value();
+  }
+
+  void abandon_exact_fill() noexcept
+  {
+    read_buffer = {};
+    bytes_read = 0;
+    read_buffer_continuation = {};
+  }
+
+  void abandon_exact_fill(std::span<std::byte> target) noexcept
+  {
+    if (read_buffer.data() == target.data() && read_buffer.size() == target.size())
+      abandon_exact_fill();
+  }
+
+  std::expected<std::span<std::byte>, error_t> finish_exact_fill()
+  {
+    auto target = read_buffer;
+    bool filled = bytes_read >= target.size();
+    abandon_exact_fill();
+    if (filled)
+      return target;
+    if (read_cancelled)
+      return std::unexpected(error_t{.code = errc::canceled, .msg = "Operation was cancelled"});
+    if (read_error)
+      return std::unexpected(*read_error);
+    return std::unexpected(make_error(errc::canceled));
+  }
+
+  void begin_exact_fill(std::span<std::byte> target)
+  {
+    read_buffer = target;
+    bytes_read = 0;
+    while (bytes_read < target.size() && has_front_data())
+    {
+      auto &queued = buffer_queue.front();
+      auto available = queued.size() - front_offset;
+      auto to_copy = (std::min)(available, target.size() - bytes_read);
+      std::memcpy(target.data() + bytes_read, queued.data() + front_offset, to_copy);
+      bytes_read += to_copy;
+      if (to_copy == available)
+      {
+        buffer_queue.discard_front();
+        front_offset = 0;
+      }
+      else
+      {
+        front_offset += to_copy;
+      }
+    }
+    on_consume();
+  }
+
+  unique_buf_t take_front()
+  {
+    auto buffer = buffer_queue.pop_front();
+    if (front_offset > 0)
+    {
+      auto remaining = buffer.size() - front_offset;
+      std::memmove(buffer.data(), buffer.data() + front_offset, remaining);
+      buffer.resize(remaining);
+      front_offset = 0;
+    }
+    return buffer;
+  }
+
   void begin_teardown()
   {
     if (closed)
-    {
       return;
-    }
     closed = true;
     reader_active = false;
-    if (engine.initialized() && engine.is_init_finished() && !engine.shutdown_sent && tcp_stream != nullptr && !uv_is_closing(reinterpret_cast<uv_handle_t *>(tcp_stream)))
+    read_continuation = {};
+    abandon_exact_fill();
+    on_handshake_complete = nullptr;
+    _handshake_notify = false;
+    _completed.clear();
+    if (socket == nullptr)
+      return;
+    if (_read_op.parked)
+      socket->cancel(_read_op);
+    if (!socket->is_open() || _write_error != 0 || !engine.initialized())
     {
-      engine.shutdown();
-      flush_output();
+      drop_writes();
+      return;
     }
-    disarm_reads();
+    if (!engine.is_init_finished())
+      drop_backlog();
+    pump_writes();
+    flush_out();
+    if (teardown_settled())
+    {
+      drop_writes();
+      discard_inbound();
+      return;
+    }
+    _lingering = true;
+    rc->inc();
+    _core->add_timer(_linger, detail::loop_core_t::now() + teardown_linger_ns);
   }
-
-  // ---- writes ------------------------------------------------------------
 
   void begin_write(size_t idx)
   {
+    auto &ws = write_queue[idx];
     if (!engine.initialized())
     {
-      finish_write_error(idx, error_t{.code = vio_tls_error, .msg = "TLS engine not initialized"});
+      complete_slot(idx, vio_tls_error, "TLS engine not initialized");
       return;
     }
-    if (handshaking || !engine.is_init_finished())
+    if (closed || _write_error != 0)
     {
-      // A write issued before the handshake completes: SSL_write returns
-      // WANT_READ; the slot is retried once the handshake finishes.
-      pump_write(idx);
+      complete_slot(idx, _write_error != 0 ? _write_error : errc::bad_descriptor, error_message(_write_error != 0 ? _write_error : errc::bad_descriptor));
       return;
     }
-    if (tcp_stream != nullptr && uv_stream_get_write_queue_size(tcp_stream) >= write_high_water)
+    if (ws.size == 0)
     {
-      submit_waiters.push(idx); // producer backpressure -- awaitable stays suspended
+      complete_slot(idx, 0, {});
       return;
     }
-    pump_write(idx);
+    _backlog.push(idx);
+    pump_writes();
+    after_user_call();
   }
 
-  // Vectored write: coalesce several plaintext buffers into a single TLS record
-  // (one SSL_write) and one uv_write -- useful for HTTP/2 frame batching. The
-  // plaintext is consumed synchronously, so the caller's buffers need not outlive
-  // the call.
-  void begin_writev(size_t idx, const uv_buf_t *bufs, size_t n)
+  void begin_writev(size_t idx, std::span<const std::span<const std::byte>> buffers)
   {
     if (!engine.initialized() || !engine.is_init_finished())
     {
-      finish_write_error(idx, error_t{.code = vio_tls_error, .msg = "Can not writev before the handshake completes"});
+      complete_slot(idx, vio_tls_error, "Can not writev before the handshake completes");
       return;
+    }
+    size_t total = 0;
+    for (const auto &buffer : buffers)
+    {
+      if (buffer.size() > (std::numeric_limits<size_t>::max)() - total)
+      {
+        complete_slot(idx, errc::invalid_argument, error_message(errc::invalid_argument));
+        return;
+      }
+      total += buffer.size();
     }
     auto &ws = write_queue[idx];
-    ws.buf = uv_buf_t{};
-    ws.bytes_written = 0;
     ws.owned_plain.clear();
-    size_t total = 0;
-    for (size_t i = 0; i < n; ++i)
-    {
-      total += bufs[i].len;
-    }
-    if (total == 0)
-    {
-      finish_write_ok(idx);
-      return;
-    }
     ws.owned_plain.reserve(total);
-    for (size_t i = 0; i < n; ++i)
-    {
-      ws.owned_plain.insert(ws.owned_plain.end(), bufs[i].base, bufs[i].base + bufs[i].len);
-    }
-    // Same producer backpressure as begin_write: the coalesced plaintext is owned
-    // in the slot, so the write can be parked over the high-water mark and
-    // encrypted only when the socket drains -- no unbounded ciphertext buildup.
-    if (tcp_stream != nullptr && uv_stream_get_write_queue_size(tcp_stream) >= write_high_water)
-    {
-      submit_waiters.push(idx);
-      return;
-    }
-    pump_write(idx);
+    for (const auto &buffer : buffers)
+      ws.owned_plain.insert(ws.owned_plain.end(), buffer.begin(), buffer.end());
+    ws.data = ws.owned_plain.data();
+    ws.size = ws.owned_plain.size();
+    ws.bytes_written = 0;
+    begin_write(idx);
   }
 
-  // Register a cancellation for an in-progress write. Call after begin_write/
-  // begin_writev. If the write already completed synchronously, this is a no-op.
   void arm_write_cancel(size_t idx, cancellation_t &cancel)
   {
-    if (!write_queue.is_active(idx) || write_queue[idx].done)
-    {
+    if (!write_queue.is_active(idx))
       return;
-    }
     auto *self = this;
     write_queue[idx].cancel_registration = cancel.register_callback([self, idx]() { self->cancel_write(idx); });
   }
 
-  // Resolve a pending write with vio_cancelled. If a uv_write is already in flight
-  // its owned ciphertext stays alive until write_cb (which releases the operation
-  // hold); otherwise this releases it. A cancelled TLS write leaves a partial
-  // record on the wire, so the caller is expected to close the connection.
   void cancel_write(size_t idx)
   {
-    if (!write_queue.is_active(idx) || write_queue[idx].done)
-    {
+    if (!write_queue.is_active(idx))
       return;
-    }
-    bool in_flight = false;
-    std::coroutine_handle<> c = {};
+    std::coroutine_handle<> continuation = {};
+    bool queued = false;
     {
       auto &ws = write_queue[idx];
-      ws.error_code = vio_cancelled;
-      ws.error_msg = "cancelled";
-      ws.done = true;
-      // Deregister before the caller's coroutine (which owns the cancellation_t)
-      // can resume and destroy that token -- otherwise the registration's later
-      // destructor would dereference a freed cancellation_t.
       ws.cancel_registration.reset();
-      in_flight = ws.in_flight;
-      c = ws.continuation;
-      ws.continuation = {};
+      if (ws.error_code == 0)
+      {
+        ws.error_code = vio_cancelled;
+        ws.error_msg = "cancelled";
+      }
+      continuation = std::exchange(ws.continuation, {});
+      if (!ws.done)
+      {
+        ws.done = true;
+        queued = _backlog.remove(idx);
+        if (!queued && !in_flight(idx))
+          queued = true;
+      }
     }
-    if (c)
-    {
-      c.resume(); // may reallocate write_queue -- re-index afterwards
-    }
-    // A submitted write's operation hold is released by write_cb; for a deferred
-    // or never-submitted write, release it here.
-    if (!in_flight && write_queue.is_active(idx) && --write_queue[idx].ref == 0)
-    {
-      write_queue.deactivate(idx);
-    }
+    auto *count = continuation ? rc : nullptr;
+    if (count != nullptr)
+      count->inc();
+    if (continuation)
+      continuation.resume();
+    if (queued && write_queue.is_active(idx))
+      release_op_hold(idx);
+    if (count != nullptr)
+      count->dec();
   }
 
-  // Half-close: send a one-way close_notify and keep reading (HTTP/2 GOAWAY /
-  // graceful shutdown). The awaitable resolves when the close_notify is on the wire.
   void begin_shutdown(size_t idx)
   {
     if (!engine.initialized() || !engine.is_init_finished())
     {
-      finish_write_error(idx, error_t{.code = vio_tls_error, .msg = "Can not shut down before the handshake completes"});
+      complete_slot(idx, vio_tls_error, "Can not shut down before the handshake completes");
       return;
     }
-    engine.shutdown();
-    write_queue[idx].buf = uv_buf_t{};
-    write_queue[idx].bytes_written = 0;
-    submit_app_write(idx);
+    if (closed || _write_error != 0)
+    {
+      complete_slot(idx, _write_error != 0 ? _write_error : errc::bad_descriptor, error_message(_write_error != 0 ? _write_error : errc::bad_descriptor));
+      return;
+    }
+    write_queue[idx].kind = stream_write_kind::shutdown;
+    _backlog.push(idx);
+    pump_writes();
+    after_user_call();
+  }
+
+  void abandon_write(size_t idx)
+  {
+    auto &ws = write_queue[idx];
+    ws.continuation = {};
+    ws.cancel_registration.reset();
+    if (!ws.done && ws.kind == stream_write_kind::data && ws.bytes_written < ws.size && (ws.owned_plain.empty() || ws.data != ws.owned_plain.data()))
+    {
+      try
+      {
+        std::vector<std::byte> copy(ws.data + ws.bytes_written, ws.data + ws.size);
+        ws.owned_plain = std::move(copy);
+        ws.data = ws.owned_plain.data();
+        ws.size = ws.owned_plain.size();
+        ws.bytes_written = 0;
+      }
+      catch (...)
+      {
+        _backlog.remove(idx);
+        ws.done = true;
+        ws.ref--;
+      }
+    }
+    release_op_hold(idx);
   }
 
 private:
-  // ---- read pump ---------------------------------------------------------
-
-  void arm_reads()
+  [[nodiscard]] bool exact_fill_pending() const noexcept
   {
-    if (read_armed || closed || tcp_stream == nullptr)
+    return bytes_read < read_buffer.size() && !read_cancelled;
+  }
+
+  [[nodiscard]] bool read_is_awaited() const noexcept
+  {
+    return handshaking || _write_wants_read || static_cast<bool>(read_continuation) || static_cast<bool>(read_buffer_continuation);
+  }
+
+  [[nodiscard]] bool wants_socket_read() const
+  {
+    if (closed || _read_eof || read_error || socket == nullptr || !socket->is_open() || !engine.initialized())
+      return false;
+    if (handshaking || _write_wants_read || exact_fill_pending())
+      return true;
+    return reader_active && !read_cancelled && !buffer_queue.full();
+  }
+
+  [[nodiscard]] bool in_flight(size_t idx) const noexcept
+  {
+    return write_queue[idx].cipher_end != 0 || write_queue[idx].kind == stream_write_kind::shutdown;
+  }
+
+  void stop_reading_if_unwanted()
+  {
+    if (socket != nullptr && _read_op.parked && !wants_socket_read())
+      socket->cancel(_read_op);
+  }
+
+  void set_read_error(error_t error)
+  {
+    if (!read_error)
+      read_error = std::move(error);
+    stop_reading_if_unwanted();
+  }
+
+  void park_read()
+  {
+    if (_read_op.parked)
+      return;
+    _read_op.keeps_alive = read_is_awaited();
+    socket->wait(detail::interest_read, _read_op);
+  }
+
+  void park_write()
+  {
+    if (_write_op.parked)
+      return;
+    _write_op.keeps_alive = true;
+    socket->wait(detail::interest_write, _write_op);
+  }
+
+  void schedule()
+  {
+    if (_core == nullptr || rc == nullptr || _kick.queued)
+      return;
+    rc->inc();
+    _core->defer(_kick);
+  }
+
+  void user_progress()
+  {
+    process_inbound();
+    after_user_call();
+  }
+
+  void after_user_call()
+  {
+    if (closed)
+      return;
+    if (wants_socket_read() && !_read_op.parked)
     {
+      schedule();
       return;
     }
-    tcp_stream->data = this;
-    if (uv_read_start(tcp_stream, alloc_trampoline, read_cb) >= 0)
-    {
-      read_armed = true;
-    }
+    if (!_notifying && has_eligible())
+      schedule();
   }
 
-  void disarm_reads()
+  [[nodiscard]] bool has_eligible() const
   {
-    if (!read_armed || tcp_stream == nullptr)
+    if (_handshake_notify || !_completed.empty())
+      return true;
+    if (read_buffer_continuation && exact_fill_ready())
+      return true;
+    return read_continuation && (read_cancelled || has_buffer_with_data_or_error());
+  }
+
+  void service()
+  {
+    if (closed)
     {
+      flush_out();
+      pump_writes();
+      if (_lingering && teardown_settled())
+        finish_linger();
       return;
     }
-    uv_read_stop(tcp_stream);
-    read_armed = false;
+    flush_out();
+    pump_writes();
+    read_socket();
+    notify();
   }
 
-  stream_client_buffer_t *current_read_target()
+  void read_socket()
   {
-    if (!buffer_queue.empty())
+    process_inbound();
+    int budget = read_budget;
+    while (wants_socket_read() && !_read_op.parked)
     {
-      auto &last = buffer_queue.back();
-      if (last.has_value() && last->buf.len < last->capacity)
+      if (budget-- == 0)
       {
-        return &last.value();
+        schedule();
+        return;
       }
+      auto space = engine.inbound_space(read_chunk);
+      if (space.empty())
+        return;
+      auto received = detail::socket_recv(socket->native(), space);
+      if (received == errc::again)
+      {
+        engine.release_inbound_if_empty();
+        park_read();
+        return;
+      }
+      if (received <= 0)
+      {
+        on_read_end(static_cast<int>(received));
+        return;
+      }
+      engine.commit_inbound(static_cast<size_t>(received));
+      process_inbound();
     }
-    if (buffer_queue.full())
-    {
-      return nullptr;
-    }
-    uv_buf_t rb;
-    alloc_cb(user_alloc_ptr, read_chunk, &rb);
-    const auto capacity = rb.len;
-    rb.len = 0;
-    return &buffer_queue.push(std::expected<stream_client_buffer_t, error_t>{stream_client_buffer_t{rb, capacity, dealloc_cb}}).value();
   }
 
-  void push_read_error(error_t err)
+  void process_inbound()
   {
-    if (!buffer_queue.empty() && buffer_queue.back().has_value() && buffer_queue.back()->buf.len == 0)
+    if (!engine.initialized() || closed)
+      return;
+    if (handshaking && !drive_handshake())
     {
-      auto &b = buffer_queue.back().value();
-      if (b.dealloc_cb && b.buf.base)
-      {
-        b.dealloc_cb(user_alloc_ptr, &b.buf);
-      }
-      buffer_queue.replace_back(std::unexpected(std::move(err)));
+      flush_out();
+      return;
     }
-    else if (!buffer_queue.full())
+    if (_write_wants_read)
     {
-      buffer_queue.push(std::unexpected(std::move(err)));
+      _write_wants_read = false;
+      pump_writes();
     }
-    // else: queue full -- reads are paused; re-detected on the next pump() after consume.
+    drive_reads();
+    flush_out();
   }
 
-  // Drive the handshake one step. Returns true if the handshake is (now) finished.
   bool drive_handshake()
   {
-    const ssl_status st = engine.do_handshake();
-    flush_output(); // send any handshake flight
+    const ssl_status status = engine.do_handshake();
     if (engine.is_init_finished())
     {
       handshaking = false;
-      if (on_handshake_complete)
-      {
-        auto cb = std::move(on_handshake_complete);
-        on_handshake_complete = nullptr;
-        cb(std::nullopt);
-      }
-      auto pend = std::move(pending_handshake_writes);
-      pending_handshake_writes.clear();
-      for (size_t idx : pend)
-      {
-        if (write_queue.is_active(idx) && !write_queue[idx].done)
-        {
-          write_queue[idx].pending_handshake = false;
-          pump_write(idx);
-        }
-      }
-      if (!reader_active)
-      {
-        disarm_reads();
-      }
+      _handshake_notify = true;
+      _handshake_error.reset();
+      pump_writes();
       return true;
     }
-    if (st == ssl_status::fatal)
+    if (status == ssl_status::fatal)
     {
       handshaking = false;
-      auto err = engine.make_error();
-      if (on_handshake_complete)
-      {
-        auto cb = std::move(on_handshake_complete);
-        on_handshake_complete = nullptr;
-        cb(err);
-      }
-      read_buffer_error = err;
-      push_read_error(err);
-      fail_pending_handshake_writes(err);
+      auto error = engine.make_error();
+      _handshake_notify = true;
+      _handshake_error = error;
+      fail_backlog(error);
+      set_read_error(std::move(error));
     }
-    return false; // want_read (or fatal handled above)
+    return false;
   }
 
-  // Decrypt as much plaintext as possible into the exact-fill target or the queue.
+  static int clamp_int(size_t value) noexcept
+  {
+    return static_cast<int>((std::min)(value, static_cast<size_t>((std::numeric_limits<int>::max)())));
+  }
+
+  bool on_plaintext_status(ssl_status status)
+  {
+    if (status == ssl_status::closed)
+    {
+      peer_closed = true;
+      set_read_error(error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"});
+      return false;
+    }
+    if (status == ssl_status::fatal)
+    {
+      set_read_error(engine.make_error());
+      return false;
+    }
+    return status == ssl_status::ok;
+  }
+
   void drive_reads()
   {
-    for (;;)
+    while (!read_error && engine.has_input())
     {
-      if (read_buffer.len > 0 && bytes_read < read_buffer.len)
+      if (exact_fill_pending())
       {
-        int n = 0;
-        const ssl_status st = engine.read_plaintext(read_buffer.base + bytes_read, static_cast<int>(read_buffer.len - bytes_read), n);
-        flush_output();
-        if (st == ssl_status::ok)
-        {
-          bytes_read += static_cast<size_t>(n);
-          if (bytes_read == read_buffer.len)
-          {
-            return;
-          }
-          continue;
-        }
-        if (st == ssl_status::want_read)
-        {
+        int count = 0;
+        auto status = engine.read_plaintext(read_buffer.data() + bytes_read, clamp_int(read_buffer.size() - bytes_read), count);
+        if (!on_plaintext_status(status))
           return;
-        }
-        if (st == ssl_status::closed)
-        {
-          peer_closed = true;
-          if (!read_buffer_error.code)
-          {
-            read_buffer_error = error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"};
-          }
-          return;
-        }
-        read_buffer_error = engine.make_error();
-        return;
-      }
-
-      stream_client_buffer_t *cur = current_read_target();
-      if (cur == nullptr) // queue full -> backpressure
-      {
-        if (read_armed && !read_paused)
-        {
-          disarm_reads();
-          read_paused = true;
-        }
-        return;
-      }
-      int n = 0;
-      const ssl_status st = engine.read_plaintext(cur->buf.base + cur->buf.len, static_cast<int>(cur->capacity - cur->buf.len), n);
-      flush_output();
-      if (st == ssl_status::ok)
-      {
-        cur->buf.len += static_cast<size_t>(n);
+        bytes_read += static_cast<size_t>(count);
         continue;
       }
-      if (st == ssl_status::want_read)
+      if (!reader_active || read_cancelled)
+        return;
+      if (!buffer_queue.empty() && buffer_queue.back().size() < buffer_queue.back().capacity())
       {
+        auto &back = buffer_queue.back();
+        int count = 0;
+        auto status = engine.read_plaintext(back.data() + back.size(), clamp_int(back.capacity() - back.size()), count);
+        if (!on_plaintext_status(status))
+          return;
+        back.resize(back.size() + static_cast<size_t>(count));
+        continue;
+      }
+      if (buffer_queue.full())
+        return;
+      auto memory = alloc_cb(user_alloc_ptr, read_chunk);
+      if (memory.empty())
+      {
+        if (memory.data() != nullptr)
+          dealloc_cb(user_alloc_ptr, memory);
+        set_read_error(make_error(errc::no_buffer_space));
         return;
       }
-      if (st == ssl_status::closed)
-      {
-        peer_closed = true;
-        push_read_error(error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"});
+      unique_buf_t chunk(memory, dealloc_cb, user_alloc_ptr);
+      chunk.resize(0);
+      int count = 0;
+      auto status = engine.read_plaintext(chunk.data(), clamp_int(chunk.capacity()), count);
+      if (!on_plaintext_status(status))
         return;
-      }
-      push_read_error(engine.make_error());
-      return;
+      chunk.resize(static_cast<size_t>(count));
+      buffer_queue.push(std::move(chunk));
     }
   }
 
-  // Handshake-then-fall-through: after the handshake completes inside a read_cb,
-  // trailing application data in the same segment is decrypted in the SAME pass.
-  void pump()
+  void on_read_end(int received)
   {
-    if (!engine.initialized())
-    {
-      return;
-    }
-    if (handshaking)
-    {
-      if (!drive_handshake())
-      {
-        return; // still handshaking or handshake failed
-      }
-    }
-    drive_reads();
-  }
-
-  void resume_readers()
-  {
-    if (read_buffer_continuation && ((read_buffer.len > 0 && bytes_read == read_buffer.len) || read_buffer_error.code))
-    {
-      auto c = read_buffer_continuation;
-      read_buffer_continuation = {};
-      c.resume();
-      return;
-    }
-    if (read_buffer.len == 0 && read_continuation && (has_buffer_with_data_or_error() || read_cancelled))
-    {
-      auto c = read_continuation;
-      read_continuation = {};
-      c.resume();
-    }
-  }
-
-  void on_read_error(ssize_t nread)
-  {
-    error_t err;
-    if (nread == UV_EOF)
-    {
-      err = peer_closed ? error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"} : error_t{.code = vio_tls_truncated, .msg = "Connection closed by peer"};
-    }
-    else
-    {
-      err = error_t{.code = static_cast<int>(nread), .msg = uv_strerror(static_cast<int>(nread))};
-    }
+    _read_eof = true;
+    error_t error = received == 0 ? (peer_closed ? error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"} : error_t{.code = vio_tls_truncated, .msg = "Connection closed by peer"})
+                                  : make_error(received);
     peer_closed = true;
     if (handshaking)
     {
       handshaking = false;
-      if (on_handshake_complete)
+      _handshake_notify = true;
+      _handshake_error = error;
+    }
+    if (!engine.is_init_finished() || _write_wants_read)
+      fail_backlog(error);
+    set_read_error(std::move(error));
+  }
+
+  void pump_writes()
+  {
+    while (!_backlog.empty())
+    {
+      if (_write_error != 0)
       {
-        auto cb = std::move(on_handshake_complete);
+        fail_backlog(make_error(_write_error));
+        return;
+      }
+      if (!engine.is_init_finished())
+      {
+        if (handshaking)
+          return;
+        if (!closed && !read_error && !_read_eof)
+        {
+          handshaking = true;
+          after_user_call();
+          return;
+        }
+        fail_backlog(read_error ? *read_error : make_error(errc::not_connected));
+        return;
+      }
+      auto pending = engine.output_size();
+      if (_throttled)
+      {
+        if (pending >= write_low_water)
+          return;
+        _throttled = false;
+      }
+      if (pending >= write_high_water)
+      {
+        _throttled = true;
+        return;
+      }
+      auto idx = _backlog.front();
+      auto &ws = write_queue[idx];
+      if (ws.kind == stream_write_kind::shutdown)
+      {
+        _backlog.pop();
+        engine.shutdown();
+        ws.cipher_end = engine.output_total();
+        _inflight.push(idx);
+        flush_out();
+        continue;
+      }
+      auto slice = (std::min)(ws.size - ws.bytes_written, write_slice);
+      if (slice > 0)
+      {
+        engine.reserve_output(slice + slice / 16 + 1024);
+        int count = 0;
+        auto status = engine.write_plaintext(ws.data + ws.bytes_written, static_cast<int>(slice), count);
+        if (status == ssl_status::want_read)
+        {
+          _write_wants_read = true;
+          flush_out();
+          after_user_call();
+          return;
+        }
+        if (status != ssl_status::ok)
+        {
+          _backlog.pop();
+          auto error = status == ssl_status::closed ? error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"} : engine.make_error();
+          complete_slot(idx, error.code, std::move(error.msg));
+          flush_out();
+          continue;
+        }
+        ws.bytes_written += static_cast<size_t>(count);
+      }
+      if (ws.bytes_written >= ws.size)
+      {
+        _backlog.pop();
+        ws.cipher_end = engine.output_total();
+        _inflight.push(idx);
+      }
+      flush_out();
+    }
+    if (closed && engine.is_init_finished() && !engine.shutdown_sent && _write_error == 0)
+    {
+      engine.shutdown();
+      flush_out();
+    }
+  }
+
+  void flush_out()
+  {
+    if (_write_error != 0)
+    {
+      engine.discard_output();
+      return;
+    }
+    if (socket != nullptr && socket->is_open() && !_write_op.parked)
+    {
+      while (engine.has_output())
+      {
+        auto sent = detail::socket_send(socket->native(), engine.pending_output());
+        if (sent == errc::again || sent == 0)
+        {
+          park_write();
+          break;
+        }
+        if (sent < 0)
+        {
+          on_write_failure(static_cast<int>(sent));
+          return;
+        }
+        engine.consume_output(static_cast<size_t>(sent));
+      }
+    }
+    complete_inflight();
+  }
+
+  void complete_inflight()
+  {
+    auto sent = engine.output_sent();
+    while (!_inflight.empty())
+    {
+      auto idx = _inflight.front();
+      if (write_queue[idx].cipher_end > sent)
+        return;
+      _inflight.pop();
+      complete_slot(idx, 0, {});
+    }
+  }
+
+  void on_write_failure(int code)
+  {
+    _write_error = code;
+    engine.discard_output();
+    if (_write_op.parked)
+      socket->cancel(_write_op);
+    auto error = make_error(code);
+    while (!_inflight.empty())
+    {
+      auto idx = _inflight.front();
+      _inflight.pop();
+      complete_slot(idx, error.code, error.msg);
+    }
+    fail_backlog(error);
+  }
+
+  void complete_slot(size_t idx, int code, std::string message)
+  {
+    auto &ws = write_queue[idx];
+    if (!ws.done)
+    {
+      ws.done = true;
+      if (code != 0 && ws.error_code == 0)
+      {
+        ws.error_code = code;
+        ws.error_msg = std::move(message);
+      }
+    }
+    if (ws.continuation)
+      _completed.push(idx);
+    else
+      release_op_hold(idx);
+  }
+
+  void release_op_hold(size_t idx)
+  {
+    if (--write_queue[idx].ref <= 0)
+      write_queue.deactivate(idx);
+  }
+
+  void fail_backlog(const error_t &error)
+  {
+    _write_wants_read = false;
+    _throttled = false;
+    while (!_backlog.empty())
+    {
+      auto idx = _backlog.front();
+      _backlog.pop();
+      complete_slot(idx, error.code != 0 ? error.code : vio_tls_error, error.msg);
+    }
+  }
+
+  void drop_backlog()
+  {
+    while (!_backlog.empty())
+    {
+      auto idx = _backlog.front();
+      _backlog.pop();
+      complete_slot(idx, errc::canceled, error_message(errc::canceled));
+    }
+  }
+
+  void drop_writes()
+  {
+    drop_backlog();
+    if (socket != nullptr && _write_op.parked)
+      socket->cancel(_write_op);
+  }
+
+  [[nodiscard]] bool teardown_settled() const
+  {
+    if (_write_error != 0 || socket == nullptr || !socket->is_open())
+      return true;
+    return !engine.has_output() && _backlog.empty();
+  }
+
+  void finish_linger()
+  {
+    _lingering = false;
+    if (_linger.armed())
+      _core->remove_timer(_linger);
+    drop_writes();
+    engine.discard_output();
+    discard_inbound();
+    rc->dec();
+  }
+
+  void discard_inbound() noexcept
+  {
+    if (socket == nullptr || !socket->is_open() || _read_eof)
+      return;
+    std::byte scratch[4096];
+    for (int i = 0; i < 64; ++i)
+    {
+      if (detail::socket_recv(socket->native(), std::span<std::byte>(scratch)) <= 0)
+        return;
+    }
+  }
+
+  void notify()
+  {
+    if (_notifying)
+      return;
+    _notifying = true;
+    while (!closed)
+    {
+      if (_handshake_notify)
+      {
+        _handshake_notify = false;
+        auto callback = std::move(on_handshake_complete);
         on_handshake_complete = nullptr;
-        cb(err);
+        if (callback)
+          callback(_handshake_error);
+        continue;
       }
-    }
-    read_buffer_error = err;
-    fail_pending_handshake_writes(err);
-    push_read_error(std::move(err));
-  }
-
-  // ---- write pump --------------------------------------------------------
-
-  void pump_write(size_t idx)
-  {
-    auto &ws = write_queue[idx];
-    // Scalar writes borrow `buf`; vectored writes own the coalesced plaintext.
-    const char *src = ws.owned_plain.empty() ? ws.buf.base : ws.owned_plain.data();
-    const size_t src_len = ws.owned_plain.empty() ? ws.buf.len : ws.owned_plain.size();
-    int n = 0;
-    const ssl_status st = engine.write_plaintext(src + ws.bytes_written, static_cast<int>(src_len - ws.bytes_written), n);
-    if (st == ssl_status::want_read)
-    {
-      // Handshake not finished yet -- retry after it completes.
-      if (!ws.pending_handshake)
+      if (!_completed.empty())
       {
-        ws.pending_handshake = true;
-        pending_handshake_writes.push_back(idx);
+        auto idx = _completed.front();
+        _completed.pop();
+        if (!write_queue.is_active(idx))
+          continue;
+        auto continuation = std::exchange(write_queue[idx].continuation, {});
+        if (continuation)
+          continuation.resume();
+        if (write_queue.is_active(idx))
+          release_op_hold(idx);
+        continue;
       }
-      flush_output();
-      if (!handshaking && !engine.is_init_finished())
+      if (read_buffer_continuation && exact_fill_ready())
       {
-        handshaking = true;
-        arm_reads();
-        pump();
+        std::exchange(read_buffer_continuation, {}).resume();
+        continue;
       }
-      return;
-    }
-    if (st == ssl_status::fatal)
-    {
-      finish_write_error(idx, engine.make_error());
-      return;
-    }
-    if (st == ssl_status::closed)
-    {
-      finish_write_error(idx, error_t{.code = vio_tls_clean_shutdown, .msg = "TLS connection closed"});
-      return;
-    }
-    ws.bytes_written += static_cast<size_t>(n);
-    submit_app_write(idx);
-  }
-
-  void submit_app_write(size_t idx)
-  {
-    auto *op = new tls_write_op_t();
-    op->stream = this;
-    op->has_slot = true;
-    op->slot = idx;
-    engine.drain_into(op->cipher);
-    if (op->cipher.empty())
-    {
-      // Nothing produced (should not happen for a real write) -- complete it.
-      delete op;
-      finish_write_ok(idx);
-      return;
-    }
-    op->req.data = op;
-    uv_buf_t b = uv_buf_init(reinterpret_cast<char *>(op->cipher.data()), static_cast<unsigned int>(op->cipher.size()));
-    write_queue[idx].in_flight = true;
-    rc->inc(); // keep the state alive until write_cb (which releases the op hold)
-    if (uv_write(&op->req, tcp_stream, &b, 1, write_cb) < 0)
-    {
-      rc->dec();
-      write_queue[idx].in_flight = false;
-      delete op;
-      finish_write_error(idx, error_t{.code = vio_tls_error, .msg = "uv_write failed"});
-    }
-  }
-
-  void flush_output()
-  {
-    if (!engine.has_output() || tcp_stream == nullptr)
-    {
-      return;
-    }
-    auto *op = new tls_write_op_t();
-    op->stream = this;
-    op->has_slot = false;
-    engine.drain_into(op->cipher);
-    if (op->cipher.empty())
-    {
-      delete op;
-      return;
-    }
-    op->req.data = op;
-    uv_buf_t b = uv_buf_init(reinterpret_cast<char *>(op->cipher.data()), static_cast<unsigned int>(op->cipher.size()));
-    rc->inc();
-    if (uv_write(&op->req, tcp_stream, &b, 1, write_cb) < 0)
-    {
-      rc->dec();
-      delete op;
-    }
-  }
-
-  void finish_write_ok(size_t idx)
-  {
-    auto &ws = write_queue[idx];
-    ws.done = true;
-    ws.cancel_registration.reset();
-    std::coroutine_handle<> c = ws.continuation;
-    ws.continuation = {};
-    if (c)
-    {
-      c.resume();
-    }
-    if (write_queue.is_active(idx) && --write_queue[idx].ref == 0)
-    {
-      write_queue.deactivate(idx);
-    }
-  }
-
-  void finish_write_error(size_t idx, error_t err)
-  {
-    auto &ws = write_queue[idx];
-    ws.error_code = err.code != 0 ? err.code : vio_tls_error;
-    ws.error_msg = std::move(err.msg);
-    ws.done = true;
-    ws.cancel_registration.reset();
-    std::coroutine_handle<> c = ws.continuation;
-    ws.continuation = {};
-    if (c)
-    {
-      c.resume();
-    }
-    if (write_queue.is_active(idx) && --write_queue[idx].ref == 0)
-    {
-      write_queue.deactivate(idx);
-    }
-  }
-
-  // Fail every write parked awaiting handshake completion. Called when the
-  // handshake fails or the transport dies before it finishes, so a server that
-  // wrote before the handshake completed does not hang forever.
-  void fail_pending_handshake_writes(const error_t &err)
-  {
-    if (pending_handshake_writes.empty())
-    {
-      return;
-    }
-    auto pend = std::move(pending_handshake_writes);
-    pending_handshake_writes.clear();
-    for (size_t idx : pend)
-    {
-      if (write_queue.is_active(idx) && !write_queue[idx].done)
+      if (read_continuation && (read_cancelled || has_buffer_with_data_or_error()))
       {
-        write_queue[idx].pending_handshake = false;
-        finish_write_error(idx, err);
+        std::exchange(read_continuation, {}).resume();
+        continue;
       }
+      break;
     }
+    _notifying = false;
   }
 
-  void drain_waiters()
+  static void on_read_ready(detail::io_op_t *op)
   {
-    if (closed)
-    {
-      return;
-    }
-    while (!submit_waiters.empty() && tcp_stream != nullptr && uv_stream_get_write_queue_size(tcp_stream) < write_low_water)
-    {
-      const size_t idx = submit_waiters.front();
-      submit_waiters.pop();
-      if (write_queue.is_active(idx) && !write_queue[idx].done)
-      {
-        pump_write(idx);
-      }
-    }
+    auto *self = static_cast<tls_stream_t *>(op->owner);
+    auto *count = self->rc;
+    count->inc();
+    self->service();
+    count->dec();
   }
 
-  // ---- libuv trampolines -------------------------------------------------
-
-  static void alloc_trampoline(uv_handle_t *h, size_t suggested, uv_buf_t *buf)
+  static void on_write_ready(detail::io_op_t *op)
   {
-    auto *self = static_cast<uv_tls_stream_t *>(h->data);
-    self->alloc_cb(self->user_alloc_ptr, suggested, buf);
+    auto *self = static_cast<tls_stream_t *>(op->owner);
+    auto *count = self->rc;
+    count->inc();
+    self->service();
+    count->dec();
   }
 
-  static void read_cb(uv_stream_t *h, ssize_t nread, const uv_buf_t *buf)
+  static void on_kick(detail::posted_t *node)
   {
-    auto *self = static_cast<uv_tls_stream_t *>(h->data);
-    if (self == nullptr)
-    {
-      return;
-    }
-    self->rc->inc(); // keep the state alive for the whole callback
-    if (nread == 0)
-    {
-      if (buf != nullptr && buf->base != nullptr)
-      {
-        self->dealloc_cb(self->user_alloc_ptr, const_cast<uv_buf_t *>(buf));
-      }
-      self->rc->dec();
-      return;
-    }
-    if (nread < 0)
-    {
-      if (buf != nullptr && buf->base != nullptr)
-      {
-        self->dealloc_cb(self->user_alloc_ptr, const_cast<uv_buf_t *>(buf));
-      }
-      self->disarm_reads();
-      self->on_read_error(nread);
-      self->resume_readers();
-      self->rc->dec();
-      return;
-    }
-    self->engine.feed_ciphertext(buf->base, static_cast<size_t>(nread));
-    if (buf != nullptr && buf->base != nullptr)
-    {
-      self->dealloc_cb(self->user_alloc_ptr, const_cast<uv_buf_t *>(buf));
-    }
-    self->pump();
-    self->resume_readers();
-    self->rc->dec(); // final -- may destroy the state
+    auto *self = static_cast<tls_stream_t *>(node->owner);
+    auto *count = self->rc;
+    self->service();
+    count->dec();
   }
 
-  static void write_cb(uv_write_t *req, int status)
+  static void on_kick_discard(detail::posted_t *node)
   {
-    auto *op = static_cast<tls_write_op_t *>(req->data);
-    auto *self = op->stream;
-    reference_counted_t *rc = self->rc;
-
-    if (op->has_slot)
-    {
-      const size_t idx = op->slot;
-      if (self->write_queue.is_active(idx))
-      {
-        {
-          auto &ws = self->write_queue[idx];
-          ws.in_flight = false;
-          if (status < 0 && ws.error_code == 0)
-          {
-            ws.error_code = status;
-            ws.error_msg = uv_strerror(status);
-          }
-          ws.done = true;
-          ws.cancel_registration.reset();
-        }
-        std::coroutine_handle<> c = {};
-        {
-          auto &ws = self->write_queue[idx];
-          c = ws.continuation;
-          ws.continuation = {};
-        }
-        if (c)
-        {
-          c.resume(); // may reallocate write_queue -- do not hold a slot ref across this
-        }
-        if (self->write_queue.is_active(idx) && --self->write_queue[idx].ref == 0)
-        {
-          self->write_queue.deactivate(idx);
-        }
-      }
-    }
-    // Re-evaluate producer backpressure after ANY write completes -- including a
-    // control/handshake (has_slot == false) write, which may be what drops the
-    // uv write queue below the low-water mark.
-    self->drain_waiters();
-
-    delete op;
-    rc->dec(); // final -- may destroy the state
+    static_cast<tls_stream_t *>(node->owner)->rc->dec();
   }
 
+  static void on_linger(detail::timer_node_t *node)
+  {
+    auto *self = static_cast<tls_stream_t *>(node->owner);
+    if (self->_lingering)
+      self->finish_linger();
+  }
+
+  detail::loop_core_t *_core = nullptr;
+  detail::io_op_t _read_op;
+  detail::io_op_t _write_op;
+  detail::posted_t _kick;
+  detail::timer_node_t _linger;
+  stream_index_fifo_t _backlog;
+  stream_index_fifo_t _inflight;
+  stream_index_fifo_t _completed;
+  std::optional<error_t> _handshake_error;
+  int _write_error = 0;
+  bool _handshake_notify = false;
+  bool _throttled = false;
+  bool _write_wants_read = false;
+  bool _read_eof = false;
+  bool _lingering = false;
+  bool _notifying = false;
 };
-
-// ---- stream_reader_t definitions ------------------------------------------
 
 template <typename REF_PTR_T, typename STREAM>
 stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(const REF_PTR_T &ref_ptr, STREAM *stream)
@@ -985,17 +1262,14 @@ stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(const REF_PTR_T &ref_ptr, ST
   , stream(stream)
 {
   stream->reader_active = true;
-  stream->read();
-  stream->set_poll_state();
+  stream->start_reading();
 }
 
 template <typename REF_PTR_T, typename STREAM>
 stream_reader_t<REF_PTR_T, STREAM>::stream_reader_t(stream_reader_t &&other) noexcept
   : ref_ptr(std::move(other.ref_ptr))
-  , stream(other.stream)
+  , stream(std::exchange(other.stream, nullptr))
 {
-  assert(ref_ptr && "Invalid state in move constructor");
-  other.stream = nullptr;
 }
 
 template <typename REF_PTR_T, typename STREAM>
@@ -1003,10 +1277,10 @@ stream_reader_t<REF_PTR_T, STREAM> &stream_reader_t<REF_PTR_T, STREAM>::operator
 {
   if (this != &other)
   {
-    assert(other.ref_ptr && "Invalid state in move assignment");
+    if (ref_ptr && stream != nullptr && stream != other.stream)
+      stream->on_reader_gone();
     ref_ptr = std::move(other.ref_ptr);
-    stream = other.stream;
-    other.stream = nullptr;
+    stream = std::exchange(other.stream, nullptr);
   }
   return *this;
 }
@@ -1014,11 +1288,10 @@ stream_reader_t<REF_PTR_T, STREAM> &stream_reader_t<REF_PTR_T, STREAM>::operator
 template <typename REF_PTR_T, typename STREAM>
 stream_reader_t<REF_PTR_T, STREAM>::~stream_reader_t()
 {
-  if (!ref_ptr)
+  if (!ref_ptr || stream == nullptr)
   {
     return;
   }
-  stream->reader_active = false;
   stream->on_reader_gone();
 }
 
@@ -1034,6 +1307,7 @@ void stream_reader_t<REF_PTR_T, STREAM>::await_suspend(std::coroutine_handle<> c
 {
   assert(ref_ptr && "Invalid state in await_suspend");
   stream->read_continuation = continuation;
+  stream->on_wait();
 }
 
 template <typename REF_PTR_T, typename STREAM>
@@ -1042,33 +1316,26 @@ auto stream_reader_t<REF_PTR_T, STREAM>::await_resume() noexcept -> std::expecte
   assert(ref_ptr && "Invalid state in await_resume");
   if (stream->read_cancelled)
   {
-    return std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"});
+    return std::unexpected(error_t{.code = errc::canceled, .msg = "Operation was cancelled"});
   }
-  assert(stream->has_buffer_with_data_or_error() && "Empty buffer in await_resume");
-  auto ret = stream->buffer_queue.pop_front();
-  stream->on_consume();
-  if (!ret.has_value())
+  if (stream->has_front_data())
   {
-    return std::unexpected(ret.error());
+    auto buffer = stream->take_front();
+    stream->on_consume();
+    return buffer;
   }
-  return unique_buf_t(ret.value().buf, ret.value().dealloc_cb, stream->user_alloc_ptr);
+  if (stream->read_error)
+  {
+    return std::unexpected(*stream->read_error);
+  }
+  return std::unexpected(make_error(errc::canceled));
 }
 
 template <typename REF_PTR_T, typename STREAM>
 void stream_reader_t<REF_PTR_T, STREAM>::cancel() noexcept
 {
   assert(ref_ptr && "Invalid state in cancel");
-  if (stream->read_cancelled)
-  {
-    return;
-  }
-  stream->read_cancelled = true;
-  if (stream->read_continuation)
-  {
-    auto continuation = stream->read_continuation;
-    stream->read_continuation = {};
-    continuation.resume();
-  }
+  stream->cancel_reads();
 }
 
 template <typename REF_PTR_T, typename STREAM>
@@ -1079,43 +1346,11 @@ bool stream_reader_t<REF_PTR_T, STREAM>::is_cancelled() const noexcept
 }
 
 template <typename REF_PTR_T, typename STREAM>
-stream_read_awaitable_t<REF_PTR_T, STREAM> stream_reader_t<REF_PTR_T, STREAM>::read(uv_buf_t buf)
+stream_read_awaitable_t<REF_PTR_T, STREAM> stream_reader_t<REF_PTR_T, STREAM>::read(std::span<std::byte> buf)
 {
-  stream->read_buffer = buf;
-  stream->bytes_read = 0;
-
-  while (!stream->buffer_queue.empty() && stream->bytes_read < buf.len)
-  {
-    if (!stream->buffer_queue.front().has_value())
-    {
-      break; // an error entry -- leave it to be surfaced by the next co_await
-    }
-    auto &queued = stream->buffer_queue.front().value();
-    using to_copy_t = decltype(buf.len);
-    auto to_copy = (std::min)(queued.buf.len, buf.len - to_copy_t(stream->bytes_read));
-    std::memcpy(buf.base + stream->bytes_read, queued.buf.base, to_copy);
-    stream->bytes_read += to_copy;
-
-    if (to_copy == queued.buf.len)
-    {
-      if (queued.dealloc_cb)
-      {
-        queued.dealloc_cb(stream->user_alloc_ptr, &queued.buf);
-      }
-      stream->buffer_queue.discard_front();
-    }
-    else
-    {
-      queued.buf.base += to_copy;
-      queued.buf.len -= to_copy;
-    }
-  }
-
-  stream->on_consume();
-  return {ref_ptr, stream};
+  stream->begin_exact_fill(buf);
+  return {ref_ptr, stream, buf};
 }
-
-// ---- stream_write_awaitable_t definitions ---------------------------------
 
 template <typename REF_PTR_T, typename STREAM>
 stream_write_awaitable_t<REF_PTR_T, STREAM>::stream_write_awaitable_t(const REF_PTR_T &ref_ptr, STREAM *stream, size_t write_state_index)
@@ -1126,55 +1361,67 @@ stream_write_awaitable_t<REF_PTR_T, STREAM>::stream_write_awaitable_t(const REF_
 }
 
 template <typename REF_PTR_T, typename STREAM>
+stream_write_awaitable_t<REF_PTR_T, STREAM>::stream_write_awaitable_t(stream_write_awaitable_t &&other) noexcept
+  : ref_ptr(std::move(other.ref_ptr))
+  , stream(std::exchange(other.stream, nullptr))
+  , write_state_index(other.write_state_index)
+{
+}
+
+template <typename REF_PTR_T, typename STREAM>
+stream_write_awaitable_t<REF_PTR_T, STREAM> &stream_write_awaitable_t<REF_PTR_T, STREAM>::operator=(stream_write_awaitable_t &&other) noexcept
+{
+  if (this != &other)
+  {
+    release();
+    ref_ptr = std::move(other.ref_ptr);
+    stream = std::exchange(other.stream, nullptr);
+    write_state_index = other.write_state_index;
+  }
+  return *this;
+}
+
+template <typename REF_PTR_T, typename STREAM>
+void stream_write_awaitable_t<REF_PTR_T, STREAM>::release() noexcept
+{
+  if (!ref_ptr || stream == nullptr)
+    return;
+  if (stream->write_queue.is_active(write_state_index))
+    stream->abandon_write(write_state_index);
+  stream = nullptr;
+}
+
+template <typename REF_PTR_T, typename STREAM>
 stream_write_awaitable_t<REF_PTR_T, STREAM>::~stream_write_awaitable_t()
 {
-  if (!ref_ptr)
-  {
-    return;
-  }
-  if (!stream->write_queue.is_active(write_state_index))
-  {
-    return;
-  }
-  auto &write_state = stream->write_queue[write_state_index];
-  // Never resume a coroutine whose awaiter is going away (the write may still be
-  // in flight -- write_cb will release the op's ref and free the slot).
-  write_state.continuation = {};
-  if (--write_state.ref == 0)
-  {
-    stream->write_queue.deactivate(write_state_index);
-  }
+  release();
 }
 
 template <typename REF_PTR_T, typename STREAM>
 [[nodiscard]] bool stream_write_awaitable_t<REF_PTR_T, STREAM>::await_ready() const noexcept
 {
-  if (!ref_ptr)
+  if (!ref_ptr || stream == nullptr)
   {
     return true;
   }
-  auto &write_state = stream->write_queue[write_state_index];
-  return write_state.done || write_state.error_code != 0;
+  return stream->write_queue[write_state_index].done;
 }
 
 template <typename REF_PTR_T, typename STREAM>
 void stream_write_awaitable_t<REF_PTR_T, STREAM>::await_suspend(std::coroutine_handle<> h) noexcept
 {
-  if (!ref_ptr)
-  {
-    return;
-  }
   stream->write_queue[write_state_index].continuation = h;
 }
 
 template <typename REF_PTR_T, typename STREAM>
 std::expected<void, error_t> stream_write_awaitable_t<REF_PTR_T, STREAM>::await_resume() noexcept
 {
-  if (!ref_ptr)
+  if (!ref_ptr || stream == nullptr)
   {
-    return {};
+    return std::unexpected(error_t{.code = errc::bad_descriptor, .msg = "Can not write to a closed TLS stream"});
   }
   auto &write_state = stream->write_queue[write_state_index];
+  write_state.cancel_registration.reset();
   if (write_state.error_code != 0)
   {
     return std::unexpected(error_t{write_state.error_code, write_state.error_msg});

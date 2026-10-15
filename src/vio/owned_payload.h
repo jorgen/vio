@@ -22,14 +22,6 @@
 
 #pragma once
 
-// Keeping a caller's bytes alive for the lifetime of a write.
-//
-// A cancellable write resumes its awaiter early while the in-flight uv write is
-// still reading the buffer, so vio must own the bytes until the real write
-// callback fires. owned_payload_t type-erases the lifetime of an arbitrary
-// moved-in buffer (std::string, std::vector, or any owning contiguous byte
-// range); the write reads a uv_buf_t computed from it at submit time.
-
 #include <concepts>
 #include <ranges>
 #include <type_traits>

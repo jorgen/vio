@@ -8,17 +8,28 @@
 #include <doctest/doctest.h>
 #include <vio/cancellation.h>
 #include <vio/event_loop.h>
-#include <vio/operation/tcp.h>
 #include <vio/operation/udp.h>
 #include <vio/task.h>
 
-// The owning send_udp overload holds the caller's bytes until libuv is done
-// with them, so the payload may be a temporary and any number may be in
+// The owning send_udp overload holds the caller's bytes until the socket has
+// taken them, so the payload may be a temporary and any number may be in
 // flight. Sockets are owned inside the coroutine and the loop stopped from
-// within it, so every uv_close drains before teardown.
+// within it, so every close drains before teardown.
 
 namespace
 {
+std::expected<sockaddr_in, vio::error_t> make_ip4(const char *ip, int port)
+{
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<std::uint16_t>(port));
+  if (inet_pton(AF_INET, ip, &address.sin_addr) != 1)
+  {
+    return std::unexpected(vio::make_error(vio::errc::invalid_argument));
+  }
+  return address;
+}
+
 std::expected<std::pair<vio::udp_t, int>, vio::error_t> bound_socket(vio::event_loop_t &loop)
 {
   auto udp = vio::udp_create(loop);
@@ -26,7 +37,7 @@ std::expected<std::pair<vio::udp_t, int>, vio::error_t> bound_socket(vio::event_
   {
     return std::unexpected(udp.error());
   }
-  auto addr = vio::ip4_addr("127.0.0.1", 0);
+  auto addr = make_ip4("127.0.0.1", 0);
   auto bound = vio::udp_bind(udp.value(), reinterpret_cast<const sockaddr *>(&addr.value()));
   if (!bound.has_value())
   {
@@ -61,14 +72,14 @@ TEST_CASE("an owned payload survives a temporary going out of scope")
           auto reader = std::move(reader_or_err.value());
           auto datagram = co_await reader;
           REQUIRE_EXPECTED(datagram);
-          got.assign(datagram->data->base, datagram->data->len);
+          got.assign(datagram->data.chars(), datagram->data.size());
         }(std::move(receiver_pair->first), got);
 
         co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
         {
           auto sender_pair = bound_socket(el);
           REQUIRE_EXPECTED(sender_pair);
-          auto dest = vio::ip4_addr("127.0.0.1", p);
+          auto dest = make_ip4("127.0.0.1", p);
           auto sent = co_await vio::send_udp(sender_pair->first, std::string("owned payload"), reinterpret_cast<const sockaddr *>(&dest.value()));
           REQUIRE_EXPECTED(sent);
         }(loop, port);
@@ -118,7 +129,7 @@ TEST_CASE("many sends are in flight at once")
         {
           auto sender_pair = bound_socket(el);
           REQUIRE_EXPECTED(sender_pair);
-          auto dest = vio::ip4_addr("127.0.0.1", p);
+          auto dest = make_ip4("127.0.0.1", p);
 
           // Submitted before any is awaited: the single-slot send_udp would
           // have refused the second one.
@@ -164,7 +175,7 @@ TEST_CASE("a send cancelled before submission fails immediately")
       {
         auto sender_pair = bound_socket(loop);
         REQUIRE_EXPECTED(sender_pair);
-        auto dest = vio::ip4_addr("127.0.0.1", 9);
+        auto dest = make_ip4("127.0.0.1", 9);
 
         vio::cancellation_t cancel;
         cancel.cancel();
@@ -191,10 +202,8 @@ TEST_CASE("an abandoned send still completes without leaking")
       {
         auto sender_pair = bound_socket(loop);
         REQUIRE_EXPECTED(sender_pair);
-        auto dest = vio::ip4_addr("127.0.0.1", 9);
+        auto dest = make_ip4("127.0.0.1", 9);
 
-        // Dropped without ever being awaited: the operation must outlive the
-        // awaitable, because libuv is still reading the payload.
         {
           auto discarded = vio::send_udp(sender_pair->first, std::string("dropped on the floor"), reinterpret_cast<const sockaddr *>(&dest.value()));
         }
@@ -231,14 +240,14 @@ TEST_CASE("a vector payload is accepted")
           auto reader = std::move(reader_or_err.value());
           auto datagram = co_await reader;
           REQUIRE_EXPECTED(datagram);
-          got = datagram->data->len;
+          got = datagram->data.size();
         }(std::move(receiver_pair->first), got);
 
         co_await [](vio::event_loop_t &el, int p) -> vio::task_t<void>
         {
           auto sender_pair = bound_socket(el);
           REQUIRE_EXPECTED(sender_pair);
-          auto dest = vio::ip4_addr("127.0.0.1", p);
+          auto dest = make_ip4("127.0.0.1", p);
           std::vector<std::uint8_t> payload(37, 0x5a);
           auto sent = co_await vio::send_udp(sender_pair->first, std::move(payload), reinterpret_cast<const sockaddr *>(&dest.value()));
           REQUIRE_EXPECTED(sent);

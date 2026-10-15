@@ -521,10 +521,10 @@ namespace detail
 // Queues bytes on the sending half.
 //
 // Resolving means the transport owns every byte, not that the peer has them --
-// the same sense in which write_tcp resolving means libuv took the bytes. There
-// is no useful "sent" in QUIC, since a sent packet may be lost and sent again,
-// so the only two honest milestones are "the transport owns it" and "the peer
-// acknowledged it".
+// the same sense in which write_tcp resolving means the kernel took the bytes.
+// There is no useful "sent" in QUIC, since a sent packet may be lost and sent
+// again, so the only two honest milestones are "the transport owns it" and "the
+// peer acknowledged it".
 //
 // It resolves with void rather than a byte count, and that is a deliberate
 // narrowing rather than a lost feature: connection_t::write_stream returns
@@ -735,10 +735,8 @@ public:
         const auto readable = transport->readable_stream(self.id);
         if (!readable.empty())
         {
-          uv_buf_t buffer{};
-          default_alloc(nullptr, readable.size(), &buffer);
-          std::memcpy(buffer.base, readable.data(), readable.size());
-          buffer.len = static_cast<decltype(buffer.len)>(readable.size());
+          const auto buffer = default_alloc(nullptr, readable.size());
+          std::memcpy(buffer.data(), readable.data(), readable.size());
           // Consuming is what returns MAX_STREAM_DATA credit, which is why
           // nothing is taken until an await asks for it.
           transport->consume_stream(self.id, readable.size());

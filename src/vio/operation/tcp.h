@@ -23,17 +23,21 @@ Copyright (c) 2025 Jørgen Lind
 #pragma once
 
 #include "vio/cancellation.h"
+#include "vio/detail/sys.h"
+#include "vio/errc.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/future.h"
+#include "vio/loop/socket.h"
 #include "vio/owned_payload.h"
 #include "vio/unique_buf.h"
-#include "vio/uv_coro.h"
 
 #include <algorithm>
-#include <concepts>
+#include <array>
 #include <coroutine>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <cstdlib>
 #include <expected>
 #include <memory>
 #include <ranges>
@@ -41,412 +45,962 @@ Copyright (c) 2025 Jørgen Lind
 #include <string>
 #include <type_traits>
 #include <utility>
-#include <uv.h>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <net/if.h>
+#endif
 
 namespace vio
 {
-// The remote peer's IP address of a connected TCP handle, as a string (IPv4
-// dotted-quad or bracket-less IPv6). Empty if unavailable.
-inline std::string peer_ip(uv_tcp_t *tcp)
+struct tcp_state_t;
+struct tcp_connect_future_t;
+struct tcp_write_future_t;
+struct tcp_listen_future_t;
+
+inline constexpr std::size_t tcp_read_buffer_size = 65536;
+
+namespace detail
 {
-  if (tcp == nullptr)
-  {
-    return {};
-  }
-  sockaddr_storage storage{};
-  int namelen = static_cast<int>(sizeof(storage));
-  if (uv_tcp_getpeername(tcp, reinterpret_cast<sockaddr *>(&storage), &namelen) != 0)
-  {
-    return {};
-  }
-  char buffer[64] = {};
-  if (storage.ss_family == AF_INET)
-  {
-    uv_ip4_name(reinterpret_cast<sockaddr_in *>(&storage), buffer, sizeof(buffer));
-  }
-  else if (storage.ss_family == AF_INET6)
-  {
-    uv_ip6_name(reinterpret_cast<sockaddr_in6 *>(&storage), buffer, sizeof(buffer));
-  }
-  return std::string(buffer);
+inline void tcp_on_read_ready(io_op_t *op);
+inline void tcp_on_read_kick(posted_t *node);
+inline void tcp_on_read_kick_discard(posted_t *node);
+inline void tcp_on_write_ready(io_op_t *op);
+inline void tcp_on_connect_ready(io_op_t *op);
+inline void tcp_shutdown(tcp_state_t &state) noexcept;
+
+inline int tcp_address_length(const sockaddr *address) noexcept
+{
+  if (address == nullptr)
+    return 0;
+  if (address->sa_family == AF_INET)
+    return static_cast<int>(sizeof(sockaddr_in));
+  if (address->sa_family == AF_INET6)
+    return static_cast<int>(sizeof(sockaddr_in6));
+  return 0;
 }
 
-struct tcp_listen_state_t
+inline error_t tcp_cancelled_error()
 {
-  std::coroutine_handle<> continuation;
-  std::expected<void, error_t> result;
-  registration_t cancel_registration;
-  bool done = false;
+  return error_t{.code = vio_cancelled, .msg = "cancelled"};
+}
+} // namespace detail
+
+struct tcp_read_waiter_t
+{
+  virtual bool attempt(tcp_state_t &state) = 0;
+  virtual void fail(int code) = 0;
+
+  std::coroutine_handle<> continuation = {};
+  bool into = false;
+
+protected:
+  tcp_read_waiter_t() = default;
+  tcp_read_waiter_t(const tcp_read_waiter_t &) = default;
+  tcp_read_waiter_t &operator=(const tcp_read_waiter_t &) = default;
+  ~tcp_read_waiter_t() = default;
 };
 
-struct tcp_connect_state_t
-{
-  uv_connect_t req = {};
-  std::coroutine_handle<> continuation;
-  std::expected<void, error_t> result;
-  registration_t cancel_registration;
-  bool started = false;
-  bool done = false;
-};
-
-// owned_payload_t, owned_payload_impl_t and owned_byte_range live in
-// vio/owned_payload.h -- the udp sends need them too.
-
-struct tcp_write_state_t
-{
-  uv_write_t req = {};
-  std::coroutine_handle<> continuation;
-  std::expected<void, error_t> result;
-  registration_t cancel_registration;
-  std::unique_ptr<owned_payload_t> owned;
-  bool started = false;
-  bool done = false;
-};
 struct tcp_read_state_t
 {
+  detail::io_op_t op;
+  detail::posted_t kick;
+  tcp_read_waiter_t *waiter = nullptr;
+  alloc_cb_t alloc_buffer_cb = default_alloc;
+  dealloc_cb_t dealloc_buffer_cb = default_dealloc;
+  void *alloc_cb_data = nullptr;
   bool active = false;
   bool started = false;
   bool paused = false;
   bool is_cancelled = false;
-  std::vector<std::expected<unique_buf_t, error_t>> buffer_queue;
-  std::size_t front_consumed = 0;
-  std::coroutine_handle<> continuation;
-  alloc_cb_t alloc_buffer_cb = default_alloc;
-  dealloc_cb_t dealloc_buffer_cb = default_dealloc;
-  void *alloc_cb_data = nullptr;
 };
-struct tcp_state_t
+
+struct tcp_write_entry_t
 {
-  event_loop_t &event_loop;
-  uv_tcp_t uv_handle = {};
-  uv_tcp_t *get_tcp()
+  const std::byte *data = nullptr;
+  std::size_t size = 0;
+  std::unique_ptr<owned_payload_t> owned;
+  tcp_write_future_t *waiter = nullptr;
+  std::uint64_t id = 0;
+  bool started = false;
+};
+
+struct tcp_write_state_t
+{
+  detail::io_op_t op;
+  std::vector<tcp_write_entry_t> entries;
+  std::size_t head = 0;
+  std::size_t count = 0;
+  std::size_t queued_bytes = 0;
+  std::uint64_t next_id = 1;
+  std::uint64_t failed_from = 0;
+  int error = 0;
+
+  [[nodiscard]] std::uint64_t front_id() const noexcept
   {
-    return &uv_handle;
+    return count > 0 ? entries[head].id : next_id;
   }
 
-  uv_stream_t *get_stream()
+  [[nodiscard]] tcp_write_entry_t &at(std::size_t index) noexcept
   {
-    return reinterpret_cast<uv_stream_t *>(&uv_handle);
+    return entries[(head + index) % entries.size()];
   }
-  uv_handle_t *get_handle()
+
+  [[nodiscard]] tcp_write_entry_t &front() noexcept
   {
-    return reinterpret_cast<uv_handle_t *>(&uv_handle);
+    return entries[head];
   }
+
+  [[nodiscard]] tcp_write_entry_t *find(std::uint64_t id) noexcept
+  {
+    if (count == 0 || id < entries[head].id)
+      return nullptr;
+    auto offset = id - entries[head].id;
+    if (offset >= count)
+      return nullptr;
+    return &at(static_cast<std::size_t>(offset));
+  }
+
+  tcp_write_entry_t &push()
+  {
+    if (count == entries.size())
+    {
+      std::vector<tcp_write_entry_t> grown((std::max)(std::size_t{8}, entries.size() * 2));
+      for (std::size_t i = 0; i < count; ++i)
+        grown[i] = std::move(at(i));
+      entries.swap(grown);
+      head = 0;
+    }
+    auto &entry = entries[(head + count) % entries.size()];
+    ++count;
+    entry.id = next_id++;
+    return entry;
+  }
+
+  void pop() noexcept
+  {
+    entries[head] = tcp_write_entry_t{};
+    head = (head + 1) % entries.size();
+    if (--count == 0)
+      head = 0;
+  }
+};
+
+struct tcp_connect_state_t
+{
+  detail::io_op_t op;
+  tcp_connect_future_t *waiter = nullptr;
+  int result = 0;
+  bool in_progress = false;
+};
+
+struct tcp_listen_state_t
+{
+  detail::io_op_t op;
+  tcp_listen_future_t *head = nullptr;
+  tcp_listen_future_t *tail = nullptr;
+  std::vector<native_socket_t> accepted;
+  std::size_t accepted_head = 0;
+  std::size_t claimed = 0;
+  bool listening = false;
+
+  [[nodiscard]] std::size_t ready() const noexcept
+  {
+    return accepted.size() - accepted_head;
+  }
+
+  [[nodiscard]] std::size_t unclaimed() const noexcept
+  {
+    auto available = ready();
+    return available > claimed ? available - claimed : 0;
+  }
+
+  native_socket_t take() noexcept
+  {
+    auto socket = accepted[accepted_head++];
+    if (accepted_head == accepted.size())
+    {
+      accepted.clear();
+      accepted_head = 0;
+    }
+    if (claimed > 0)
+      --claimed;
+    return socket;
+  }
+};
+
+struct tcp_state_t
+{
+  explicit tcp_state_t(event_loop_t &loop)
+    : event_loop(loop)
+    , socket(detail::core(loop), "tcp")
+  {
+    read.op.owner = this;
+    read.op.complete = &detail::tcp_on_read_ready;
+    read.kick.run = &detail::tcp_on_read_kick;
+    read.kick.discard = &detail::tcp_on_read_kick_discard;
+    write.op.owner = this;
+    write.op.complete = &detail::tcp_on_write_ready;
+    connect.op.owner = this;
+    connect.op.complete = &detail::tcp_on_connect_ready;
+    listen.op.owner = this;
+  }
+
+  tcp_state_t(const tcp_state_t &) = delete;
+  tcp_state_t &operator=(const tcp_state_t &) = delete;
+  tcp_state_t(tcp_state_t &&) = delete;
+  tcp_state_t &operator=(tcp_state_t &&) = delete;
+
+  ~tcp_state_t()
+  {
+    detail::tcp_shutdown(*this);
+  }
+
+  event_loop_t &event_loop;
+  detail::socket_resource_t socket;
   tcp_listen_state_t listen;
   tcp_connect_state_t connect;
   tcp_write_state_t write;
   tcp_read_state_t read;
+  void *storage = nullptr;
+  bool connected = false;
+  bool closed = false;
 };
 
-template <typename State>
-struct tcp_future_t
+namespace detail
 {
-  ref_ptr_t<tcp_state_t> handle;
-  State *state;
-  tcp_future_t(ref_ptr_t<tcp_state_t> handle, State &state)
-    : handle(std::move(handle))
-    , state(&state)
+inline void tcp_shutdown(tcp_state_t &state) noexcept
+{
+  state.closed = true;
+  for (auto *op : {&state.read.op, &state.write.op, &state.connect.op, &state.listen.op})
   {
+    if (op->parked)
+      state.socket.cancel(*op);
   }
-  bool await_ready() noexcept
-  {
-    return state->done;
-  }
+  state.read.waiter = nullptr;
+  state.connect.waiter = nullptr;
+  state.connect.in_progress = false;
+  while (state.write.count > 0)
+    state.write.pop();
+  state.write.queued_bytes = 0;
+  while (state.listen.ready() > 0)
+    socket_close(state.listen.take());
+  state.listen.claimed = 0;
+}
 
-  bool await_suspend(std::coroutine_handle<> continuation) noexcept
-  {
-    if (state->done)
-    {
-      return false;
-    }
-    state->continuation = continuation;
-    return true;
-  }
-
-  auto await_resume() noexcept
-  {
-    return state->result;
-  }
-};
+inline ref_ptr_t<tcp_state_t> tcp_state_ref(tcp_state_t &state)
+{
+  auto adopted = ref_ptr_t<tcp_state_t>::from_raw(state.storage);
+  auto strong = adopted;
+  adopted.release_to_raw();
+  return strong;
+}
+} // namespace detail
 
 struct tcp_t
 {
   ref_ptr_t<tcp_state_t> handle;
-
-  uv_tcp_t *get_tcp()
-  {
-    if (handle.ref_counted() == nullptr)
-    {
-      return nullptr;
-    }
-    return handle->get_tcp();
-  }
-
-  uv_stream_t *get_stream()
-  {
-    if (handle.ref_counted() == nullptr)
-    {
-      return nullptr;
-    }
-    return handle->get_stream();
-  }
-  uv_handle_t *get_handle()
-  {
-    if (handle.ref_counted() == nullptr)
-    {
-      return nullptr;
-    }
-    return handle->get_handle();
-  }
 };
 
 inline std::expected<sockaddr_in, error_t> ip4_addr(const std::string &ip, int port)
 {
-  sockaddr_in addr;
-  const int r = uv_ip4_addr(ip.c_str(), port, &addr);
-  if (r != 0)
-  {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-  }
-  return addr;
+#if defined(_WIN32)
+  detail::ensure_winsock();
+#endif
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<std::uint16_t>(port));
+  if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) != 1)
+    return std::unexpected(make_error(errc::invalid_argument));
+  return address;
 }
 
 inline std::expected<sockaddr_in6, error_t> ip6_addr(const std::string &ip, int port)
 {
-  sockaddr_in6 addr;
-  const int r = uv_ip6_addr(ip.c_str(), port, &addr);
-  if (r != 0)
+#if defined(_WIN32)
+  detail::ensure_winsock();
+#endif
+  sockaddr_in6 address{};
+  address.sin6_family = AF_INET6;
+  address.sin6_port = htons(static_cast<std::uint16_t>(port));
+  auto zone = ip.find('%');
+  std::string host = ip.substr(0, zone);
+  if (zone != std::string::npos)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    std::string name = ip.substr(zone + 1);
+    unsigned long index = 0;
+#if !defined(_WIN32)
+    index = if_nametoindex(name.c_str());
+#endif
+    if (index == 0)
+      index = std::strtoul(name.c_str(), nullptr, 10);
+    address.sin6_scope_id = static_cast<decltype(address.sin6_scope_id)>(index);
   }
-  return addr;
+  if (inet_pton(AF_INET6, host.c_str(), &address.sin6_addr) != 1)
+    return std::unexpected(make_error(errc::invalid_argument));
+  return address;
+}
+
+inline std::string peer_ip(tcp_t &tcp)
+{
+  if (!tcp.handle || !tcp.handle->socket.is_open())
+    return {};
+  sockaddr_storage storage{};
+  int length = static_cast<int>(sizeof(storage));
+  if (detail::socket_peer_name(tcp.handle->socket.native(), storage, length) != 0)
+    return {};
+  char buffer[64] = {};
+  if (storage.ss_family == AF_INET)
+    inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in *>(&storage)->sin_addr, buffer, sizeof(buffer));
+  else if (storage.ss_family == AF_INET6)
+    inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6 *>(&storage)->sin6_addr, buffer, sizeof(buffer));
+  return std::string(buffer);
+}
+
+inline std::expected<sockaddr_storage, error_t> sockname(tcp_t &tcp)
+{
+  if (!tcp.handle || !tcp.handle->socket.is_open())
+    return std::unexpected(make_error(errc::bad_descriptor));
+  sockaddr_storage storage{};
+  int length = static_cast<int>(sizeof(storage));
+  if (int result = detail::socket_name(tcp.handle->socket.native(), storage, length); result < 0)
+    return std::unexpected(make_error(result));
+  return storage;
 }
 
 inline std::expected<tcp_t, error_t> tcp_create(event_loop_t &loop)
 {
   tcp_t tcp{ref_ptr_t<tcp_state_t>(loop)};
-  if (auto r = uv_tcp_init(loop.loop(), tcp.get_tcp()); r < 0)
+  auto &state = tcp.handle.data();
+  tcp.handle.register_resource(state.socket);
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    auto parked = tcp.handle;
+    state.storage = parked.release_to_raw();
+    auto balance = ref_ptr_t<tcp_state_t>::from_raw(state.storage);
   }
-  tcp.handle.register_handle(tcp.get_tcp());
+  tcp.handle.on_destroy([raw = &state] { detail::tcp_shutdown(*raw); });
   return tcp;
 }
 
-using tcp_connect_future_t = tcp_future_t<tcp_connect_state_t>;
-inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr, cancellation_t *cancel = nullptr)
+inline std::size_t tcp_write_queue_size(tcp_t &tcp) noexcept
 {
-  tcp_connect_future_t ret(tcp.handle, tcp.handle->connect);
+  return tcp.handle ? tcp.handle->write.queued_bytes : 0;
+}
+
+struct tcp_connect_future_t
+{
+  tcp_connect_future_t(ref_ptr_t<tcp_state_t> handle, cancellation_t *cancel) noexcept
+    : handle(std::move(handle))
+    , cancel(cancel)
+  {
+  }
+
+  tcp_connect_future_t(tcp_connect_future_t &&other) noexcept
+    : handle(std::move(other.handle))
+    , cancel(other.cancel)
+    , result(std::move(other.result))
+    , done(other.done)
+  {
+  }
+
+  tcp_connect_future_t(const tcp_connect_future_t &) = delete;
+  tcp_connect_future_t &operator=(const tcp_connect_future_t &) = delete;
+  tcp_connect_future_t &operator=(tcp_connect_future_t &&) = delete;
+
+  ~tcp_connect_future_t()
+  {
+    if (handle && handle->connect.waiter == this)
+      handle->connect.waiter = nullptr;
+  }
+
+  [[nodiscard]] bool await_ready() noexcept;
+  void await_suspend(std::coroutine_handle<> handle_to_resume) noexcept;
+  std::expected<void, error_t> await_resume() noexcept
+  {
+    cancel_registration.reset();
+    return std::move(result);
+  }
+
+  void finish(int code)
+  {
+    done = true;
+    if (code != 0)
+      result = std::unexpected(make_error(code));
+  }
+
+  ref_ptr_t<tcp_state_t> handle;
+  cancellation_t *cancel = nullptr;
+  registration_t cancel_registration;
+  std::coroutine_handle<> continuation = {};
+  std::expected<void, error_t> result = {};
+  bool done = false;
+
+private:
+  void on_cancel();
+};
+
+namespace detail
+{
+inline void tcp_read_kick(tcp_state_t &state);
+
+inline void tcp_read_rearm(tcp_state_t &state)
+{
+  auto &read = state.read;
+  if (read.waiter == nullptr || !read.op.parked)
+    return;
+  state.socket.cancel(read.op);
+  tcp_read_kick(state);
+}
+
+inline void tcp_connect_abandon(tcp_state_t &state) noexcept
+{
+  auto &connect = state.connect;
+  if (connect.op.parked)
+    state.socket.cancel(connect.op);
+  connect.in_progress = false;
+  connect.result = errc::canceled;
+  connect.waiter = nullptr;
+}
+
+inline void tcp_on_connect_ready(io_op_t *op)
+{
+  auto &state = *static_cast<tcp_state_t *>(op->owner);
+  auto socket = state.socket.native();
+  int code = socket_pending_error(socket);
+  if (code == 0)
+  {
+    sockaddr_storage peer{};
+    int length = static_cast<int>(sizeof(peer));
+    if (socket_peer_name(socket, peer, length) == errc::not_connected)
+    {
+      state.socket.wait(interest_write, state.connect.op);
+      return;
+    }
+  }
+  state.connect.in_progress = false;
+  state.connect.result = code;
+  state.connected = code == 0;
+  tcp_read_rearm(state);
+  auto *waiter = state.connect.waiter;
+  if (waiter == nullptr)
+    return;
+  state.connect.waiter = nullptr;
+  waiter->finish(code);
+  waiter->cancel_registration.reset();
+  waiter->continuation.resume();
+}
+} // namespace detail
+
+inline bool tcp_connect_future_t::await_ready() noexcept
+{
   if (cancel && cancel->is_cancelled())
   {
-    ret.handle->connect.done = true;
-    ret.handle->connect.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    if (!done)
+      detail::tcp_connect_abandon(handle.data());
+    done = true;
+    result = std::unexpected(detail::tcp_cancelled_error());
+    return true;
+  }
+  if (done)
+    return true;
+  if (!handle->connect.in_progress)
+  {
+    finish(handle->connect.result);
+    return true;
+  }
+  return false;
+}
+
+inline void tcp_connect_future_t::await_suspend(std::coroutine_handle<> handle_to_resume) noexcept
+{
+  continuation = handle_to_resume;
+  handle->connect.waiter = this;
+  if (cancel)
+    cancel_registration = cancel->register_callback([this] { on_cancel(); });
+}
+
+inline void tcp_connect_future_t::on_cancel()
+{
+  if (done)
+    return;
+  detail::tcp_connect_abandon(handle.data());
+  done = true;
+  result = std::unexpected(detail::tcp_cancelled_error());
+  cancel_registration.reset();
+  continuation.resume();
+}
+
+inline tcp_connect_future_t tcp_connect(tcp_t &tcp, const sockaddr *addr, cancellation_t *cancel = nullptr)
+{
+  tcp_connect_future_t ret(tcp.handle, cancel);
+  if (!ret.handle)
+  {
+    ret.done = true;
+    ret.result = std::unexpected(error_t{.code = errc::bad_descriptor, .msg = "It's not possible to connect a closed socket"});
     return ret;
   }
-  if (ret.handle->connect.started)
+  if (cancel && cancel->is_cancelled())
   {
-    ret.handle->connect.done = true;
-    ret.handle->connect.result = std::unexpected(error_t{.code = -1, .msg = "It's  an error to listen to more than one connect at a socket at the time"});
+    ret.done = true;
+    ret.result = std::unexpected(detail::tcp_cancelled_error());
     return ret;
   }
-  ret.handle->connect.started = true;
-  ret.handle->connect.done = false;
-  auto callback = [](uv_connect_t *req, int status)
+  auto &state = ret.handle.data();
+  if (state.connect.in_progress)
   {
-    auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
-    state_ref->connect.cancel_registration.reset();
-    if (state_ref->connect.done)
-      return;
-    if (status < 0)
-    {
-      state_ref->connect.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
-    }
-
-    state_ref->connect.done = true;
-    state_ref->connect.started = false;
-
-    if (state_ref->connect.continuation)
-    {
-      auto continuation = state_ref->connect.continuation;
-      state_ref->connect.continuation = {};
-      continuation.resume();
-    }
-  };
-  auto copy = ret.handle;
-  ret.handle->connect.req.data = copy.release_to_raw();
-  auto r = uv_tcp_connect(&ret.handle->connect.req, tcp.get_tcp(), addr, callback);
-  if (r < 0)
-  {
-    ret.handle->connect.done = true;
-    ret.handle->connect.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    ref_ptr_t<tcp_state_t>::from_raw(ret.handle->connect.req.data);
+    ret.done = true;
+    ret.result = std::unexpected(error_t{.code = errc::already_in_progress, .msg = "A connect is already in progress on this socket"});
+    return ret;
   }
-  else if (cancel)
+  int length = detail::tcp_address_length(addr);
+  if (length == 0)
   {
-    auto *state_raw = &ret.handle.data();
-    ret.handle->connect.cancel_registration = cancel->register_callback(
-      [state_raw]()
-      {
-        if (state_raw->connect.done)
-          return;
-        state_raw->connect.done = true;
-        state_raw->connect.started = false;
-        state_raw->connect.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-        state_raw->connect.cancel_registration.reset();
-        if (state_raw->connect.continuation)
-        {
-          auto cont = state_raw->connect.continuation;
-          state_raw->connect.continuation = {};
-          cont.resume();
-        }
-      });
+    ret.finish(errc::invalid_argument);
+    return ret;
   }
+  if (!state.socket.is_open())
+  {
+    if (int result = state.socket.open(addr->sa_family, SOCK_STREAM, IPPROTO_TCP); result < 0)
+    {
+      ret.finish(result);
+      return ret;
+    }
+  }
+  int result = detail::socket_connect(state.socket.native(), addr, length);
+  if (result == 0)
+  {
+    state.connected = true;
+    ret.done = true;
+    return ret;
+  }
+  if (result != errc::in_progress && result != errc::again)
+  {
+    ret.finish(result);
+    return ret;
+  }
+  state.connect.in_progress = true;
+  state.connect.result = 0;
+  state.socket.wait(detail::interest_write, state.connect.op);
   return ret;
 }
 
-inline std::expected<sockaddr_storage, error_t> sockname(tcp_t &tcp)
+struct tcp_write_future_t
 {
-  sockaddr_storage sa_storage{};
-  int name_len = sizeof(sa_storage);
-  if (auto r = uv_tcp_getsockname(tcp.get_tcp(), reinterpret_cast<sockaddr *>(&sa_storage), &name_len); r < 0)
+  tcp_write_future_t(ref_ptr_t<tcp_state_t> handle, cancellation_t *cancel) noexcept
+    : handle(std::move(handle))
+    , cancel(cancel)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
   }
-  return sa_storage;
+
+  tcp_write_future_t(tcp_write_future_t &&other) noexcept
+    : handle(std::move(other.handle))
+    , cancel(other.cancel)
+    , result(std::move(other.result))
+    , id(std::exchange(other.id, 0))
+    , done(other.done)
+  {
+  }
+
+  tcp_write_future_t(const tcp_write_future_t &) = delete;
+  tcp_write_future_t &operator=(const tcp_write_future_t &) = delete;
+  tcp_write_future_t &operator=(tcp_write_future_t &&) = delete;
+
+  ~tcp_write_future_t();
+
+  [[nodiscard]] bool await_ready() noexcept;
+  void await_suspend(std::coroutine_handle<> handle_to_resume) noexcept;
+  std::expected<void, error_t> await_resume() noexcept
+  {
+    cancel_registration.reset();
+    return std::move(result);
+  }
+
+  ref_ptr_t<tcp_state_t> handle;
+  cancellation_t *cancel = nullptr;
+  registration_t cancel_registration;
+  std::coroutine_handle<> continuation = {};
+  std::expected<void, error_t> result = {};
+  std::uint64_t id = 0;
+  bool done = false;
+
+private:
+  void on_cancel();
+};
+
+namespace detail
+{
+inline void tcp_write_resolve(tcp_write_future_t &waiter, int code)
+{
+  waiter.id = 0;
+  waiter.done = true;
+  if (code != 0)
+    waiter.result = std::unexpected(make_error(code));
+  waiter.cancel_registration.reset();
+  waiter.continuation.resume();
 }
 
-using tcp_write_future_t = tcp_future_t<tcp_write_state_t>;
-inline bool write_tcp_begin(tcp_write_future_t &ret, cancellation_t *cancel)
+inline void tcp_write_fail(tcp_state_t &state, int code)
 {
-  // tcp_state_t has a single embedded uv_write_t. Reject a second write while
-  // one is physically in flight instead of overwriting the in-flight request
-  // (UB) and leaking its parked ref. `started` is cleared only by the real
-  // uv_write callback, so a cancelled-but-still-in-flight write (done==true,
-  // started==true) is correctly rejected. For concurrent writes use
-  // socket_stream, which gives each write its own state slot.
-  if (ret.handle->write.started)
+  auto &write = state.write;
+  if (write.error == 0)
   {
-    ret.handle->write.done = true;
-    ret.handle->write.result = std::unexpected(error_t{.code = -1, .msg = "A write is already in progress on this socket"});
+    write.error = code;
+    write.failed_from = write.front_id();
+  }
+  while (write.count > 0 && !state.closed)
+  {
+    auto *waiter = write.front().waiter;
+    write.queued_bytes -= write.front().size;
+    write.pop();
+    if (waiter)
+      tcp_write_resolve(*waiter, code);
+  }
+  if (write.op.parked)
+    state.socket.cancel(write.op);
+}
+
+inline void tcp_write_trim(tcp_state_t &state) noexcept
+{
+  auto &write = state.write;
+  while (write.count > 0 && write.front().size == 0 && write.front().waiter == nullptr)
+    write.pop();
+  if (write.count == 0 && write.op.parked)
+    state.socket.cancel(write.op);
+}
+
+inline void tcp_write_abandon(tcp_state_t &state, std::uint64_t id, bool cancelled)
+{
+  auto &write = state.write;
+  auto *entry = write.find(id);
+  if (entry == nullptr)
+    return;
+  entry->waiter = nullptr;
+  if (cancelled && !entry->started)
+  {
+    write.queued_bytes -= entry->size;
+    entry->size = 0;
+    entry->data = nullptr;
+    entry->owned.reset();
+    tcp_write_trim(state);
+    return;
+  }
+  if (!entry->owned && entry->size > 0)
+  {
+    auto holder = std::make_unique<owned_payload_impl_t<std::vector<std::byte>>>(std::vector<std::byte>(entry->data, entry->data + entry->size));
+    entry->data = holder->value.data();
+    entry->owned = std::move(holder);
+  }
+}
+
+inline void tcp_write_advance(tcp_write_state_t &write, std::size_t sent) noexcept
+{
+  for (std::size_t i = 0; sent > 0 && i < write.count; ++i)
+  {
+    auto &entry = write.at(i);
+    auto take = (std::min)(entry.size, sent);
+    if (take == 0)
+      continue;
+    entry.data += take;
+    entry.size -= take;
+    entry.started = true;
+    write.queued_bytes -= take;
+    sent -= take;
+  }
+}
+
+inline void tcp_write_drain(tcp_state_t &state)
+{
+  auto keep = tcp_state_ref(state);
+  auto &write = state.write;
+  while (!state.closed)
+  {
+    if (write.count > 0 && write.front().size == 0)
+    {
+      auto *waiter = write.front().waiter;
+      write.pop();
+      if (waiter)
+        tcp_write_resolve(*waiter, 0);
+      continue;
+    }
+    if (write.count == 0)
+    {
+      if (write.op.parked)
+        state.socket.cancel(write.op);
+      return;
+    }
+    if (state.connect.in_progress)
+    {
+      if (!write.op.parked)
+        state.socket.wait(interest_write, write.op);
+      return;
+    }
+    std::array<const_bytes_t, 16> buffers;
+    std::size_t used = 0;
+    for (std::size_t i = 0; i < write.count && used < buffers.size(); ++i)
+    {
+      auto &entry = write.at(i);
+      if (entry.size > 0)
+        buffers[used++] = const_bytes_t(entry.data, entry.size);
+    }
+    auto sent = used == 1 ? socket_send(state.socket.native(), buffers[0]) : socket_sendv(state.socket.native(), buffers.data(), used);
+    if (sent == errc::again || sent == 0)
+    {
+      if (!write.op.parked)
+        state.socket.wait(interest_write, write.op);
+      return;
+    }
+    if (sent < 0)
+    {
+      tcp_write_fail(state, static_cast<int>(sent));
+      return;
+    }
+    tcp_write_advance(write, static_cast<std::size_t>(sent));
+  }
+}
+
+inline void tcp_on_write_ready(io_op_t *op)
+{
+  tcp_write_drain(*static_cast<tcp_state_t *>(op->owner));
+}
+
+inline bool tcp_write_begin(tcp_write_future_t &ret, std::size_t length)
+{
+  if (!ret.handle)
+  {
+    ret.done = true;
+    ret.result = std::unexpected(error_t{.code = errc::bad_descriptor, .msg = "It's not possible to write to a closed socket"});
     return false;
   }
-
-  ret.handle->write.started = true;
-  ret.handle->write.done = false;
-  ret.handle->write.result = {};
-
-  if (cancel && cancel->is_cancelled())
+  if (ret.cancel && ret.cancel->is_cancelled())
   {
-    ret.handle->write.started = false;
-    ret.handle->write.done = true;
-    ret.handle->write.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    ret.done = true;
+    ret.result = std::unexpected(tcp_cancelled_error());
+    return false;
+  }
+  auto &state = ret.handle.data();
+  if (state.write.error != 0)
+  {
+    ret.done = true;
+    ret.result = std::unexpected(make_error(state.write.error));
+    return false;
+  }
+  if (!state.socket.is_open() || (!state.connected && !state.connect.in_progress))
+  {
+    ret.done = true;
+    ret.result = std::unexpected(make_error(errc::not_connected));
+    return false;
+  }
+  if (length == 0)
+  {
+    ret.done = true;
     return false;
   }
   return true;
 }
 
-inline void write_tcp_arm(tcp_write_future_t &ret, tcp_t &tcp, uv_buf_t buf, cancellation_t *cancel)
+inline std::size_t tcp_write_try(tcp_write_future_t &ret, std::span<const std::byte> data)
 {
-  auto callback = [](uv_write_t *req, int status)
+  auto &state = ret.handle.data();
+  if (state.write.count > 0 || state.connect.in_progress)
+    return 0;
+  std::size_t sent = 0;
+  while (sent < data.size())
   {
-    auto state_ref = ref_ptr_t<tcp_state_t>::from_raw(req->data);
-    state_ref->write.cancel_registration.reset();
-    state_ref->write.owned.reset();
-    if (state_ref->write.done)
-      return;
-    if (status < 0)
+    auto result = socket_send(state.socket.native(), data.subspan(sent));
+    if (result == errc::again || result == 0)
+      break;
+    if (result < 0)
     {
-      state_ref->write.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
+      tcp_write_fail(state, static_cast<int>(result));
+      ret.done = true;
+      ret.result = std::unexpected(make_error(static_cast<int>(result)));
+      return sent;
     }
-    state_ref->write.done = true;
-    state_ref->write.started = false;
-    if (state_ref->write.continuation)
-    {
-      auto continuation = state_ref->write.continuation;
-      state_ref->write.continuation = {};
-      continuation.resume();
-    }
-  };
-
-  auto copy = ret.handle;
-  ret.handle->write.req.data = copy.release_to_raw();
-  auto r = uv_write(&ret.handle->write.req, tcp.get_stream(), &buf, 1, callback);
-
-  if (r < 0)
-  {
-    ret.handle->write.done = true;
-    ret.handle->write.started = false;
-    ret.handle->write.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    ref_ptr_t<tcp_state_t>::from_raw(ret.handle->write.req.data);
+    sent += static_cast<std::size_t>(result);
   }
-  else if (cancel)
+  if (sent == data.size())
+    ret.done = true;
+  return sent;
+}
+
+inline void tcp_write_enqueue(tcp_write_future_t &ret, std::span<const std::byte> rest, bool started, std::unique_ptr<owned_payload_t> owned)
+{
+  auto &state = ret.handle.data();
+  auto &entry = state.write.push();
+  entry.data = rest.data();
+  entry.size = rest.size();
+  entry.owned = std::move(owned);
+  entry.started = started;
+  state.write.queued_bytes += rest.size();
+  ret.id = entry.id;
+  if (!state.write.op.parked)
+    state.socket.wait(interest_write, state.write.op);
+}
+} // namespace detail
+
+inline tcp_write_future_t::~tcp_write_future_t()
+{
+  if (handle && id != 0)
+    detail::tcp_write_abandon(handle.data(), id, false);
+}
+
+inline bool tcp_write_future_t::await_ready() noexcept
+{
+  if (cancel && cancel->is_cancelled())
   {
-    auto *state_raw = &ret.handle.data();
-    ret.handle->write.cancel_registration = cancel->register_callback(
-      [state_raw]()
-      {
-        if (state_raw->write.done)
-          return;
-        state_raw->write.done = true;
-        state_raw->write.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-        state_raw->write.cancel_registration.reset();
-        if (state_raw->write.continuation)
-        {
-          auto cont = state_raw->write.continuation;
-          state_raw->write.continuation = {};
-          cont.resume();
-        }
-      });
+    if (id != 0)
+      detail::tcp_write_abandon(handle.data(), id, true);
+    id = 0;
+    done = true;
+    result = std::unexpected(detail::tcp_cancelled_error());
+    return true;
   }
+  if (done)
+    return true;
+  auto &write = handle->write;
+  if (id < write.front_id())
+  {
+    done = true;
+    if (write.error != 0 && id >= write.failed_from)
+      result = std::unexpected(make_error(write.error));
+    id = 0;
+    return true;
+  }
+  return false;
+}
+
+inline void tcp_write_future_t::await_suspend(std::coroutine_handle<> handle_to_resume) noexcept
+{
+  continuation = handle_to_resume;
+  if (auto *entry = handle->write.find(id))
+    entry->waiter = this;
+  if (cancel)
+    cancel_registration = cancel->register_callback([this] { on_cancel(); });
+}
+
+inline void tcp_write_future_t::on_cancel()
+{
+  if (done)
+    return;
+  detail::tcp_write_abandon(handle.data(), id, true);
+  id = 0;
+  done = true;
+  result = std::unexpected(detail::tcp_cancelled_error());
+  cancel_registration.reset();
+  continuation.resume();
+}
+
+inline tcp_write_future_t write_tcp(tcp_t &tcp, std::span<const std::byte> data, cancellation_t *cancel = nullptr)
+{
+  tcp_write_future_t ret(tcp.handle, cancel);
+  if (!detail::tcp_write_begin(ret, data.size()))
+    return ret;
+  auto sent = detail::tcp_write_try(ret, data);
+  if (!ret.done)
+    detail::tcp_write_enqueue(ret, data.subspan(sent), sent > 0, nullptr);
+  return ret;
 }
 
 inline tcp_write_future_t write_tcp(tcp_t &tcp, const uint8_t *data, std::size_t length, cancellation_t *cancel = nullptr)
 {
-  tcp_write_future_t ret(tcp.handle, tcp.handle->write);
-  if (!write_tcp_begin(ret, cancel))
-  {
-    return ret;
-  }
-
-  uv_buf_t buf;
-  if (cancel != nullptr)
-  {
-    // The pointer is borrowed, so a cancellable write must copy into an owned
-    // payload. Callers that already hold a movable buffer should use the owning
-    // overload to transfer it without the copy.
-    auto holder = std::make_unique<owned_payload_impl_t<std::string>>(std::string(reinterpret_cast<const char *>(data), length));
-    buf = uv_buf_init(holder->value.data(), static_cast<unsigned int>(holder->value.size()));
-    ret.handle->write.owned = std::move(holder);
-  }
-  else
-  {
-    buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
-  }
-  write_tcp_arm(ret, tcp, buf, cancel);
-  return ret;
+  return write_tcp(tcp, std::span<const std::byte>(reinterpret_cast<const std::byte *>(data), length), cancel);
 }
 
-// Takes ownership of any moved-in contiguous byte range (std::string,
-// std::vector<uint8_t>, std::vector<std::byte>, ...) and keeps it alive for the
-// duration of the write, with no copy. Only rvalues bind: ownership must be
-// transferred explicitly, which also keeps borrowed views (string_view, span)
-// from matching.
 template <typename Bytes>
   requires owned_byte_range<std::remove_cvref_t<Bytes>> && (!std::is_lvalue_reference_v<Bytes>) && (!std::is_const_v<std::remove_reference_t<Bytes>>)
 tcp_write_future_t write_tcp(tcp_t &tcp, Bytes &&data, cancellation_t *cancel = nullptr)
 {
-  tcp_write_future_t ret(tcp.handle, tcp.handle->write);
-  if (!write_tcp_begin(ret, cancel))
-  {
+  tcp_write_future_t ret(tcp.handle, cancel);
+  auto view = std::as_bytes(std::span(std::ranges::data(data), std::ranges::size(data)));
+  if (!detail::tcp_write_begin(ret, view.size()))
     return ret;
-  }
-
+  auto sent = detail::tcp_write_try(ret, view);
+  if (ret.done)
+    return ret;
   auto holder = std::make_unique<owned_payload_impl_t<std::remove_cvref_t<Bytes>>>(std::forward<Bytes>(data));
-  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(std::ranges::data(holder->value)), static_cast<unsigned int>(std::ranges::size(holder->value)));
-  ret.handle->write.owned = std::move(holder);
-  write_tcp_arm(ret, tcp, buf, cancel);
+  auto owned_view = std::as_bytes(std::span(std::ranges::data(holder->value), std::ranges::size(holder->value)));
+  detail::tcp_write_enqueue(ret, owned_view.subspan(sent), sent > 0, std::move(holder));
   return ret;
 }
+
+namespace detail
+{
+inline bool tcp_read_try(tcp_state_t &state, tcp_read_waiter_t &waiter)
+{
+  if (state.connect.in_progress)
+    return false;
+  return waiter.attempt(state);
+}
+
+inline void tcp_read_park(tcp_state_t &state)
+{
+  if (!state.read.op.parked)
+    state.socket.wait(interest_read, state.read.op);
+}
+
+inline void tcp_read_detach(ref_ptr_t<tcp_state_t> &state, tcp_read_waiter_t *waiter) noexcept
+{
+  if (!state || state->read.waiter != waiter)
+    return;
+  state->read.waiter = nullptr;
+  if (state->read.op.parked)
+    state->socket.cancel(state->read.op);
+}
+
+inline void tcp_read_progress(tcp_state_t &state)
+{
+  auto &read = state.read;
+  auto *waiter = read.waiter;
+  if (waiter == nullptr || read.op.parked || state.closed)
+    return;
+  if (read.is_cancelled || !read.active)
+  {
+    read.waiter = nullptr;
+    waiter->fail(errc::canceled);
+    waiter->continuation.resume();
+    return;
+  }
+  if (read.paused && !waiter->into)
+    return;
+  if (!tcp_read_try(state, *waiter))
+  {
+    tcp_read_park(state);
+    return;
+  }
+  read.waiter = nullptr;
+  waiter->continuation.resume();
+}
+
+inline void tcp_on_read_ready(io_op_t *op)
+{
+  tcp_read_progress(*static_cast<tcp_state_t *>(op->owner));
+}
+
+inline void tcp_read_kick(tcp_state_t &state)
+{
+  auto &kick = state.read.kick;
+  if (kick.queued || state.closed)
+    return;
+  auto strong = tcp_state_ref(state);
+  if (!strong)
+    return;
+  kick.owner = strong.release_to_raw();
+  state.socket.loop().defer(kick);
+}
+
+inline void tcp_on_read_kick(posted_t *node)
+{
+  auto state = ref_ptr_t<tcp_state_t>::from_raw(node->owner);
+  node->owner = nullptr;
+  tcp_read_progress(state.data());
+}
+
+inline void tcp_on_read_kick_discard(posted_t *node)
+{
+  auto state = ref_ptr_t<tcp_state_t>::from_raw(node->owner);
+  node->owner = nullptr;
+}
+} // namespace detail
 
 class tcp_reader_t
 {
@@ -456,331 +1010,271 @@ public:
 
   tcp_reader_t(tcp_reader_t &&other) noexcept
     : handle(std::move(other.handle))
-    , _is_valid(other._is_valid)
+    , _is_valid(std::exchange(other._is_valid, false))
   {
-    other._is_valid = false;
   }
 
   tcp_reader_t &operator=(tcp_reader_t &&other) noexcept
   {
     if (this != &other)
     {
+      stop();
       handle = std::move(other.handle);
-      _is_valid = other._is_valid;
-      other._is_valid = false;
+      _is_valid = std::exchange(other._is_valid, false);
     }
     return *this;
   }
 
   ~tcp_reader_t()
   {
-    if (_is_valid && handle->read.started)
-    {
-      auto state = ref_ptr_t<tcp_state_t>::from_raw(handle->get_stream()->data);
-      uv_read_stop(handle->get_stream());
-      state->read.started = false;
-      state->read.active = false;
-    }
+    stop();
   }
 
   void cancel()
   {
-    if (handle->read.is_cancelled)
-    {
+    if (!_is_valid || !handle)
       return;
-    }
-
-    handle->read.is_cancelled = true;
-
-    // Stop uv from delivering (and allocating buffers for) more data after the
-    // reader is cancelled. Mirrors the destructor's teardown so the destructor's
-    // started guard won't reclaim the parked ref a second time.
-    if (handle->read.started)
-    {
-      auto state = ref_ptr_t<tcp_state_t>::from_raw(handle->get_stream()->data);
-      uv_read_stop(handle->get_stream());
-      state->read.started = false;
-      state->read.active = false;
-    }
-
-    handle->read.buffer_queue.emplace_back(std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"}));
-
-    if (handle->read.continuation)
-    {
-      auto continuation = handle->read.continuation;
-      handle->read.continuation = nullptr;
-      continuation.resume();
-    }
+    auto &read = handle->read;
+    if (read.is_cancelled)
+      return;
+    read.is_cancelled = true;
+    read.started = false;
+    if (read.op.parked)
+      handle->socket.cancel(read.op);
+    auto *waiter = read.waiter;
+    if (waiter == nullptr)
+      return;
+    read.waiter = nullptr;
+    waiter->fail(errc::canceled);
+    waiter->continuation.resume();
   }
 
   [[nodiscard]] bool is_cancelled() const
   {
-    return handle->read.is_cancelled;
+    return handle && handle->read.is_cancelled;
   }
 
-  struct awaiter_t
+  struct awaiter_t final : tcp_read_waiter_t
   {
-    ref_ptr_t<tcp_state_t> state;
-
-    [[nodiscard]] bool await_ready() const
+    explicit awaiter_t(ref_ptr_t<tcp_state_t> state) noexcept
+      : state(std::move(state))
     {
-      return !state->read.buffer_queue.empty();
     }
 
-    void await_suspend(std::coroutine_handle<> handle)
+    awaiter_t(awaiter_t &&other) noexcept
+      : tcp_read_waiter_t(other)
+      , state(std::move(other.state))
+      , result(std::move(other.result))
     {
-      state->read.continuation = handle;
+    }
+
+    awaiter_t(const awaiter_t &) = delete;
+    awaiter_t &operator=(const awaiter_t &) = delete;
+    awaiter_t &operator=(awaiter_t &&) = delete;
+
+    ~awaiter_t()
+    {
+      detail::tcp_read_detach(state, this);
+    }
+
+    [[nodiscard]] bool await_ready()
+    {
+      if (!state)
+      {
+        fail(errc::bad_descriptor);
+        return true;
+      }
+      auto &read = state->read;
+      if (read.is_cancelled || !read.active)
+      {
+        fail(errc::canceled);
+        return true;
+      }
+      if (read.waiter != nullptr)
+      {
+        result = std::unexpected(error_t{.code = errc::already_in_progress, .msg = "A read is already pending on this socket"});
+        return true;
+      }
+      if (read.paused)
+        return false;
+      return detail::tcp_read_try(state.data(), *this);
+    }
+
+    void await_suspend(std::coroutine_handle<> handle_to_resume)
+    {
+      continuation = handle_to_resume;
+      state->read.waiter = this;
+      if (!state->read.paused)
+        detail::tcp_read_park(state.data());
     }
 
     std::expected<unique_buf_t, error_t> await_resume()
     {
-      auto &front = state->read.buffer_queue.front();
-      if (front.has_value() && state->read.front_consumed > 0)
-      {
-        // A prior read_into() partially drained this queued buffer. Hand back
-        // only the remainder as a fresh owned buffer (we cannot shift the
-        // original base pointer -- default_dealloc would delete[] the middle).
-        uv_buf_t &src = front.value().buf;
-        const std::size_t offset = state->read.front_consumed;
-        const std::size_t remaining = src.len - offset;
-        uv_buf_t copy_buf{};
-        copy_buf.base = new char[remaining];
-        copy_buf.len = static_cast<decltype(copy_buf.len)>(remaining);
-        std::memcpy(copy_buf.base, src.base + offset, remaining);
-        unique_buf_t out(copy_buf, default_dealloc, nullptr);
-        state->read.front_consumed = 0;
-        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
-        return out;
-      }
-      auto result = std::move(state->read.buffer_queue.front());
-      state->read.buffer_queue.erase(state->read.buffer_queue.begin());
-      return result;
+      return std::move(result);
     }
+
+    bool attempt(tcp_state_t &socket_state) override
+    {
+      auto &read = socket_state.read;
+      auto memory = read.alloc_buffer_cb(read.alloc_cb_data, tcp_read_buffer_size);
+      if (memory.empty())
+      {
+        if (memory.data() != nullptr)
+          read.dealloc_buffer_cb(read.alloc_cb_data, memory);
+        fail(errc::no_buffer_space);
+        return true;
+      }
+      unique_buf_t buffer(memory, read.dealloc_buffer_cb, read.alloc_cb_data);
+      auto received = detail::socket_recv(socket_state.socket.native(), memory);
+      if (received == errc::again)
+        return false;
+      if (received > 0)
+      {
+        buffer.resize(static_cast<std::size_t>(received));
+        result = std::move(buffer);
+        return true;
+      }
+      fail(received == 0 ? errc::eof : static_cast<int>(received));
+      return true;
+    }
+
+    void fail(int code) override
+    {
+      result = std::unexpected(make_error(code));
+    }
+
+    ref_ptr_t<tcp_state_t> state;
+    std::expected<unique_buf_t, error_t> result;
   };
 
   auto operator co_await()
   {
-    return awaiter_t{this->handle};
+    return awaiter_t{_is_valid ? handle : ref_ptr_t<tcp_state_t>::null()};
   }
 
-  // libuv alloc trampoline: forwards to the (swappable) read.alloc_buffer_cb.
-  // Hoisted out of tcp_create_reader so resume() can re-arm uv_read_start with
-  // the same callback pair.
-  static void alloc_cb(uv_handle_t *handle, size_t size, uv_buf_t *buf)
-  {
-    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(handle->data);
-    tcp_state->read.alloc_buffer_cb(tcp_state->read.alloc_cb_data, size, buf);
-    tcp_state.release_to_raw();
-  }
-
-  // Transient stop/start for backpressure. These MUST NOT reclaim the ref parked
-  // in stream->data by tcp_create_reader -- only teardown (dtor/cancel) does,
-  // gated on read.started, which stays true across pause/resume.
   static void pause_reading(ref_ptr_t<tcp_state_t> &handle)
   {
-    if (handle->read.started && !handle->read.paused)
-    {
-      uv_read_stop(handle->get_stream());
-      handle->read.paused = true;
-    }
+    auto &read = handle->read;
+    if (!read.started || read.paused)
+      return;
+    read.paused = true;
+    if (read.waiter != nullptr && !read.waiter->into && read.op.parked)
+      handle->socket.cancel(read.op);
   }
 
   static void resume_reading(ref_ptr_t<tcp_state_t> &handle)
   {
-    if (handle->read.started && handle->read.paused)
-    {
-      uv_read_start(handle->get_stream(), &tcp_reader_t::alloc_cb, &tcp_reader_t::read_cb);
-      handle->read.paused = false;
-    }
+    auto &read = handle->read;
+    if (!read.started || !read.paused)
+      return;
+    read.paused = false;
+    if (read.waiter != nullptr && !read.op.parked)
+      detail::tcp_read_kick(handle.data());
   }
 
   void pause()
   {
-    if (_is_valid)
-    {
+    if (_is_valid && handle)
       pause_reading(handle);
-    }
   }
 
   void resume()
   {
-    if (_is_valid)
-    {
+    if (_is_valid && handle)
       resume_reading(handle);
-    }
   }
 
-  struct read_into_ctx_t
+  struct read_into_awaiter_t final : tcp_read_waiter_t
   {
-    char *base = nullptr;
-    std::size_t len = 0;
-  };
-
-  // Alloc that hands libuv the caller's buffer, so the socket read lands there
-  // directly (true zero-copy). Paired with noop_dealloc.
-  static void alloc_into(void *user, size_t /*suggested*/, uv_buf_t *buf)
-  {
-    auto *ctx = static_cast<read_into_ctx_t *>(user);
-    buf->base = ctx->base;
-    buf->len = static_cast<decltype(buf->len)>(ctx->len);
-  }
-
-  struct read_into_awaiter_t
-  {
-    ref_ptr_t<tcp_state_t> state;
-    std::span<std::byte> dst;
-    read_into_ctx_t ctx{};
-    alloc_cb_t saved_alloc = nullptr;
-    dealloc_cb_t saved_dealloc = nullptr;
-    void *saved_alloc_data = nullptr;
-    bool armed_into = false;
-
-    [[nodiscard]] bool await_ready() const
+    read_into_awaiter_t(ref_ptr_t<tcp_state_t> state, std::span<std::byte> dst) noexcept
+      : state(std::move(state))
+      , dst(dst)
     {
-      return dst.empty() || !state->read.buffer_queue.empty();
+      into = true;
     }
 
-    void await_suspend(std::coroutine_handle<> h)
+    read_into_awaiter_t(read_into_awaiter_t &&other) noexcept
+      : tcp_read_waiter_t(other)
+      , state(std::move(other.state))
+      , dst(other.dst)
+      , result(std::move(other.result))
     {
-      state->read.continuation = h;
-      ctx.base = reinterpret_cast<char *>(dst.data());
-      ctx.len = dst.size();
-      saved_alloc = state->read.alloc_buffer_cb;
-      saved_dealloc = state->read.dealloc_buffer_cb;
-      saved_alloc_data = state->read.alloc_cb_data;
-      state->read.alloc_buffer_cb = &tcp_reader_t::alloc_into;
-      state->read.dealloc_buffer_cb = &noop_dealloc;
-      state->read.alloc_cb_data = &ctx;
-      armed_into = true;
-      resume_reading(state);
+    }
+
+    read_into_awaiter_t(const read_into_awaiter_t &) = delete;
+    read_into_awaiter_t &operator=(const read_into_awaiter_t &) = delete;
+    read_into_awaiter_t &operator=(read_into_awaiter_t &&) = delete;
+
+    ~read_into_awaiter_t()
+    {
+      detail::tcp_read_detach(state, this);
+    }
+
+    [[nodiscard]] bool await_ready()
+    {
+      if (!state)
+      {
+        fail(errc::bad_descriptor);
+        return true;
+      }
+      if (dst.empty())
+      {
+        result = std::size_t{0};
+        return true;
+      }
+      auto &read = state->read;
+      if (read.is_cancelled || !read.active)
+      {
+        fail(errc::canceled);
+        return true;
+      }
+      if (read.waiter != nullptr)
+      {
+        result = std::unexpected(error_t{.code = errc::already_in_progress, .msg = "A read is already pending on this socket"});
+        return true;
+      }
+      return detail::tcp_read_try(state.data(), *this);
+    }
+
+    void await_suspend(std::coroutine_handle<> handle_to_resume)
+    {
+      continuation = handle_to_resume;
+      state->read.waiter = this;
+      detail::tcp_read_park(state.data());
     }
 
     std::expected<std::size_t, error_t> await_resume()
     {
-      if (armed_into)
-      {
-        state->read.alloc_buffer_cb = saved_alloc;
-        state->read.dealloc_buffer_cb = saved_dealloc;
-        state->read.alloc_cb_data = saved_alloc_data;
-        pause_reading(state);
-        auto front = std::move(state->read.buffer_queue.front());
-        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
-        if (!front.has_value())
-        {
-          if (front.error().code == UV_EOF)
-          {
-            return std::size_t{0};
-          }
-          return std::unexpected(front.error());
-        }
-        return static_cast<std::size_t>(front.value().buf.len);
-      }
-
-      if (dst.empty())
-      {
-        return std::size_t{0};
-      }
-
-      auto &front = state->read.buffer_queue.front();
-      if (!front.has_value())
-      {
-        error_t err = front.error();
-        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
-        state->read.front_consumed = 0;
-        if (err.code == UV_EOF)
-        {
-          return std::size_t{0};
-        }
-        return std::unexpected(err);
-      }
-      uv_buf_t &src = front.value().buf;
-      const std::size_t offset = state->read.front_consumed;
-      const std::size_t avail = src.len - offset;
-      // Parenthesised to defeat the windows.h min() macro: vio's headers are
-      // public and a consumer may not have defined NOMINMAX.
-      const std::size_t n = (std::min)(avail, dst.size());
-      std::memcpy(dst.data(), src.base + offset, n);
-      state->read.front_consumed += n;
-      if (state->read.front_consumed >= src.len)
-      {
-        state->read.front_consumed = 0;
-        state->read.buffer_queue.erase(state->read.buffer_queue.begin());
-      }
-      return n;
+      return std::move(result);
     }
+
+    bool attempt(tcp_state_t &socket_state) override
+    {
+      auto received = detail::socket_recv(socket_state.socket.native(), dst);
+      if (received == errc::again)
+        return false;
+      if (received >= 0)
+      {
+        result = static_cast<std::size_t>(received);
+        return true;
+      }
+      fail(static_cast<int>(received));
+      return true;
+    }
+
+    void fail(int code) override
+    {
+      result = std::unexpected(make_error(code));
+    }
+
+    ref_ptr_t<tcp_state_t> state;
+    std::span<std::byte> dst;
+    std::expected<std::size_t, error_t> result = std::size_t{0};
   };
 
-  // Read up to dst.size() bytes into the caller's buffer. Returns the number of
-  // bytes written (0 == EOF). When the reader's queue is empty this reads
-  // directly into dst with no copy; if bytes are already queued it copies from
-  // the front buffer (partial-consume tracked) and returns without a socket read
-  // (the caller loops). After a direct read the reader is left paused, so libuv
-  // does not buffer ahead -- the pull cadence is the backpressure.
   read_into_awaiter_t read_into(std::span<std::byte> dst)
   {
-    return read_into_awaiter_t{this->handle, dst};
-  }
-
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
-  struct ref_ptr_releaser_t
-  {
-    explicit ref_ptr_releaser_t(ref_ptr_t<tcp_state_t> &handle)
-      : handle(handle)
-    {
-    }
-
-    ~ref_ptr_releaser_t()
-    {
-      handle.release_to_raw();
-    }
-    ref_ptr_t<tcp_state_t> &handle;
-  };
-
-  static void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
-  {
-    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(stream->data);
-    ref_ptr_releaser_t releaser(tcp_state);
-
-    if (nread == 0)
-    {
-      // Per libuv's uv_read_cb contract, nread == 0 is equivalent to EAGAIN /
-      // EWOULDBLOCK -- it does NOT indicate EOF or an error. Treat it as a
-      // no-op (just release the buffer) instead of fabricating an end-of-stream.
-      if (buf != nullptr && buf->base != nullptr)
-      {
-        tcp_state->read.dealloc_buffer_cb(tcp_state->read.alloc_cb_data, const_cast<uv_buf_t *>(buf));
-      }
-      return;
-    }
-
-    if (nread > 0)
-    {
-      uv_buf_t sized_buf = *buf;
-      sized_buf.len = static_cast<decltype(sized_buf.len)>(nread);
-      tcp_state->read.buffer_queue.emplace_back(unique_buf_t(sized_buf, tcp_state->read.dealloc_buffer_cb, tcp_state->read.alloc_cb_data));
-    }
-    else
-    {
-      int code = UV_EOF;
-      if (nread < 0)
-      {
-        code = static_cast<int>(nread);
-      }
-      auto error = std::unexpected(error_t{.code = code, .msg = uv_strerror(static_cast<int>(nread))});
-      tcp_state->read.buffer_queue.emplace_back(std::move(error));
-
-      if (buf != nullptr && buf->base != nullptr)
-      {
-        tcp_state->read.dealloc_buffer_cb(tcp_state->read.alloc_cb_data, const_cast<uv_buf_t *>(buf));
-      }
-    }
-
-    if (tcp_state->read.continuation)
-    {
-      auto continuation = tcp_state->read.continuation;
-      tcp_state->read.continuation = nullptr;
-      continuation.resume();
-    }
+    return read_into_awaiter_t{_is_valid ? handle : ref_ptr_t<tcp_state_t>::null(), dst};
   }
 
   ref_ptr_t<tcp_state_t> handle;
@@ -792,34 +1286,37 @@ private:
     , _is_valid(true)
   {
   }
+
+  void stop() noexcept
+  {
+    if (!_is_valid || !handle)
+      return;
+    _is_valid = false;
+    auto &read = handle->read;
+    read.active = false;
+    read.started = false;
+    if (read.op.parked)
+      handle->socket.cancel(read.op);
+    if (read.waiter != nullptr)
+      detail::tcp_read_kick(handle.data());
+  }
+
   bool _is_valid = false;
 };
 
 inline std::expected<tcp_reader_t, error_t> tcp_create_reader(tcp_t &tcp)
 {
-  if (tcp.handle.ref_counted() == nullptr)
-  {
-    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a closed socket"});
-  }
-  if (tcp.handle->read.active)
-  {
-    return std::unexpected(error_t{.code = 1, .msg = "Can not create multiple active readers for a socket. Destroy other reader, before making a new one."});
-  }
-
-  auto copy = tcp.handle;
-  tcp.get_stream()->data = copy.release_to_raw();
-  if (const auto r = uv_read_start(tcp.get_stream(), &tcp_reader_t::alloc_cb, &tcp_reader_t::read_cb); r >= 0)
-  {
-    tcp.handle->read.active = true;
-    tcp.handle->read.started = true;
-  }
-  else
-  {
-    auto tcp_state = ref_ptr_t<tcp_state_t>::from_raw(tcp.get_stream()->data);
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-  }
-
+  if (!tcp.handle)
+    return std::unexpected(error_t{.code = errc::bad_descriptor, .msg = "Can not create a reader for a closed socket"});
+  auto &read = tcp.handle->read;
+  if (read.active || read.waiter != nullptr)
+    return std::unexpected(error_t{.code = errc::busy, .msg = "Can not create multiple active readers for a socket. Destroy other reader, before making a new one."});
+  if (!tcp.handle->socket.is_open() || (!tcp.handle->connected && !tcp.handle->connect.in_progress))
+    return std::unexpected(make_error(errc::not_connected));
+  read.active = true;
+  read.started = true;
+  read.paused = false;
+  read.is_cancelled = false;
   return tcp_reader_t{tcp};
 }
-
 } // namespace vio

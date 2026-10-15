@@ -170,7 +170,7 @@ TEST_CASE("Work batch cancellation")
           for (size_t i = ps; i < results.size(); ++i)
           {
             CHECK(!results[i].has_value());
-            CHECK(results[i].error().code == UV_ECANCELED);
+            CHECK(results[i].error().code == vio::errc::canceled);
           }
 
           el.stop();
@@ -547,7 +547,7 @@ TEST_CASE("Work batch cancel_remaining on failure")
           for (size_t i = ps; i < results.size(); ++i)
           {
             CHECK(!results[i].has_value());
-            CHECK(results[i].error().code == UV_ECANCELED);
+            CHECK(results[i].error().code == vio::errc::canceled);
           }
 
           el.stop();
@@ -859,7 +859,7 @@ TEST_CASE("Work batch custom error type with cancel_remaining")
           for (size_t i = ps; i < results.size(); ++i)
           {
             CHECK(!results[i].has_value());
-            CHECK(results[i].error().code == UV_ECANCELED);
+            CHECK(results[i].error().code == vio::errc::canceled);
           }
 
           el.stop();

@@ -561,7 +561,8 @@ vio::task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
     // that the handshake be shorter, zerortt that data ride in the first
     // flight -- which is why early data is configured per test case above.
     std::vector<std::uint8_t> ticket;
-    ok = co_await fetch(loop, *context, {requests.front()}, directory, false, &ticket);
+    const std::vector<request_t> first{requests.front()};
+    ok = co_await fetch(loop, *context, first, directory, false, &ticket);
     if (!ok || ticket.empty())
     {
       std::printf("no session ticket to resume with\n");
@@ -576,7 +577,8 @@ vio::task_t<int> run_client(event_loop_t &loop, const std::string &testcase)
     // The point of that test is many handshakes, so each file gets its own.
     for (const auto &single : requests)
     {
-      ok = co_await fetch(loop, *context, {single}, directory, false) && ok;
+      const std::vector<request_t> one{single};
+      ok = co_await fetch(loop, *context, one, directory, false) && ok;
     }
   }
   else

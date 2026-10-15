@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <doctest/doctest.h>
 #include <optional>
 #include <vector>
@@ -122,4 +123,79 @@ TEST_CASE("finished tasks can be pruned from a container")
 
   event_loop.run();
   CHECK(completed == 4);
+}
+
+namespace
+{
+struct turn_counter_t
+{
+  vio::detail::hook_t hook;
+  int turns = 0;
+
+  turn_counter_t()
+  {
+    hook.owner = this;
+    hook.run = [](vio::detail::hook_t *raw) { ++static_cast<turn_counter_t *>(raw->owner)->turns; };
+  }
+};
+} // namespace
+
+TEST_CASE("a sleep with a negative duration returns on the next turn")
+{
+  vio::event_loop_t event_loop;
+  turn_counter_t counter;
+  vio::detail::core(event_loop).add_hook(counter.hook);
+  std::vector<int> turns_waited;
+  std::vector<bool> succeeded;
+  std::optional<vio::task_t<void>> task;
+
+  const auto start = std::chrono::steady_clock::now();
+  event_loop.run_in_loop([&] {
+    task.emplace([](vio::event_loop_t &loop, turn_counter_t &counter, std::vector<int> &waited, std::vector<bool> &ok) -> vio::task_t<void> {
+      const std::array<std::chrono::nanoseconds, 5> durations = {std::chrono::nanoseconds(-1), std::chrono::milliseconds(-50), std::chrono::hours(-1),
+                                                                 std::chrono::nanoseconds::min(), std::chrono::nanoseconds(0)};
+      for (auto duration : durations)
+      {
+        const int before = counter.turns;
+        auto result = co_await vio::sleep(loop, duration);
+        ok.push_back(result.has_value());
+        waited.push_back(counter.turns - before);
+      }
+      loop.stop();
+    }(event_loop, counter, turns_waited, succeeded));
+  });
+  event_loop.run();
+  vio::detail::core(event_loop).remove_hook(counter.hook);
+
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+  CHECK(succeeded == std::vector<bool>(5, true));
+  CHECK(turns_waited == std::vector<int>(5, 1));
+}
+
+TEST_CASE("a sleep never returns before its time")
+{
+  vio::event_loop_t event_loop;
+  std::vector<std::chrono::nanoseconds> shortfalls;
+  std::optional<vio::task_t<void>> task;
+  event_loop.run_in_loop([&] {
+    task.emplace([](vio::event_loop_t &loop, std::vector<std::chrono::nanoseconds> &shortfalls) -> vio::task_t<void> {
+      const std::array<std::chrono::nanoseconds, 6> durations = {std::chrono::microseconds(100), std::chrono::microseconds(900), std::chrono::milliseconds(1),
+                                                                 std::chrono::microseconds(1500), std::chrono::milliseconds(2), std::chrono::milliseconds(5)};
+      for (auto duration : durations)
+      {
+        for (int i = 0; i < 5; ++i)
+        {
+          const auto start = std::chrono::steady_clock::now();
+          auto result = co_await vio::sleep(loop, duration);
+          const auto elapsed = std::chrono::steady_clock::now() - start;
+          CHECK(result.has_value());
+          if (elapsed < duration)
+            shortfalls.push_back(duration - elapsed);
+        }
+      }
+      loop.stop();
+    }(event_loop, shortfalls));
+  });
+  event_loop.run();
+  CHECK(shortfalls.empty());
 }

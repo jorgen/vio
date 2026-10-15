@@ -139,9 +139,8 @@ TEST_CASE("a client and a server reach each other over a UDP socket")
         auto server_created = endpoint_t::create(loop, *server_context, server_config);
         REQUIRE(server_created.has_value());
         // Held in an optional so the socket can be closed before the loop is
-        // stopped. event_loop_t::stop() closes its own handles and then runs
-        // the loop until nothing is left; a socket still open at that point
-        // means it never returns.
+        // stopped. event_loop_t::stop() runs the loop until nothing is in
+        // flight; a socket still reading at that point means it never returns.
         std::optional<endpoint_t> server(std::move(*server_created));
 
         auto bind_address = ip4_addr("127.0.0.1", 0);
@@ -1741,8 +1740,7 @@ TEST_CASE("a connection survives its peer's address changing under it")
             // The readers live out here so the pumps below can be woken before
             // anything they hold a reference to goes away: cancel, then release
             // the reader, then the socket. A pump parked on a reader that is
-            // simply dropped never returns, and its socket's uv_close is never
-            // issued, and run() never returns.
+            // simply dropped never returns.
             auto face_reader_made = udp_create_reader(*face);
             auto up_a_reader_made = udp_create_reader(*up_a);
             auto up_b_reader_made = udp_create_reader(*up_b);
@@ -1765,7 +1763,7 @@ TEST_CASE("a connection survives its peer's address changing under it")
                 }
                 client_addr = dgram->sender_addr;
                 have_client = true;
-                const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t *>(dgram->data.buf.base), dgram->data.buf.len);
+                const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t *>(dgram->data.data()), dgram->data.size());
                 (void)udp_try_send(use_b ? b : a, bytes, reinterpret_cast<const sockaddr *>(&dest));
               }
             }(*face_reader, *up_a, *up_b, *to_server, use_b, client_addr, have_client);
@@ -1790,7 +1788,7 @@ TEST_CASE("a connection survives its peer's address changing under it")
                 {
                   continue;
                 }
-                const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t *>(dgram->data.buf.base), dgram->data.buf.len);
+                const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t *>(dgram->data.data()), dgram->data.size());
                 (void)udp_try_send(face_sock, bytes, reinterpret_cast<const sockaddr *>(&client_addr));
               }
             };
@@ -1935,7 +1933,7 @@ TEST_CASE("a dial refuses an address it cannot read")
 
     // And the socket still has no family, so a bind can choose one.
     sockaddr_in6 any6 = {};
-    REQUIRE(uv_ip6_addr("::", 0, &any6) == 0);
+    any6.sin6_family = AF_INET6;
     CHECK(endpoint->bind(reinterpret_cast<const sockaddr *>(&any6)).has_value());
   }
   event_loop.stop();

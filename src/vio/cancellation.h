@@ -58,6 +58,7 @@ public:
   {
     other._cancel = nullptr;
     other._id = 0;
+    rebind();
   }
 
   registration_t &operator=(registration_t &&other) noexcept
@@ -69,6 +70,7 @@ public:
       _id = other._id;
       other._cancel = nullptr;
       other._id = 0;
+      rebind();
     }
     return *this;
   }
@@ -83,6 +85,11 @@ public:
     deregister();
   }
 
+  [[nodiscard]] bool active() const noexcept
+  {
+    return _cancel != nullptr;
+  }
+
 private:
   friend class cancellation_t;
 
@@ -90,9 +97,17 @@ private:
     : _cancel(cancel)
     , _id(id)
   {
+    rebind();
   }
 
-  inline void deregister();
+  inline void deregister() noexcept;
+  inline void rebind() noexcept;
+
+  void detach() noexcept
+  {
+    _cancel = nullptr;
+    _id = 0;
+  }
 
   cancellation_t *_cancel = nullptr;
   uint64_t _id = 0;
@@ -106,7 +121,15 @@ public:
   cancellation_t &operator=(const cancellation_t &) = delete;
   cancellation_t(cancellation_t &&) = delete;
   cancellation_t &operator=(cancellation_t &&) = delete;
-  ~cancellation_t() = default;
+
+  ~cancellation_t()
+  {
+    for (auto &entry : _callbacks)
+    {
+      if (entry.owner)
+        entry.owner->detach();
+    }
+  }
 
   void cancel()
   {
@@ -114,6 +137,13 @@ public:
       return;
     _cancelled = true;
     auto callbacks = std::move(_callbacks);
+    _callbacks.clear();
+    for (auto &entry : callbacks)
+    {
+      if (entry.owner)
+        entry.owner->detach();
+      entry.owner = nullptr;
+    }
     for (auto &entry : callbacks)
     {
       entry.fn();
@@ -128,30 +158,41 @@ public:
   registration_t register_callback(std::function<void()> fn)
   {
     auto id = ++_next_id;
-    _callbacks.push_back({id, std::move(fn)});
+    _callbacks.push_back({id, std::move(fn), nullptr});
     return {this, id};
   }
 
 private:
   friend class registration_t;
 
-  void remove_callback(uint64_t id)
-  {
-    _callbacks.erase(std::remove_if(_callbacks.begin(), _callbacks.end(), [id](const callback_entry_t &e) { return e.id == id; }), _callbacks.end());
-  }
-
   struct callback_entry_t
   {
     uint64_t id;
     std::function<void()> fn;
+    registration_t *owner;
   };
+
+  callback_entry_t *find(uint64_t id) noexcept
+  {
+    for (auto &entry : _callbacks)
+    {
+      if (entry.id == id)
+        return &entry;
+    }
+    return nullptr;
+  }
+
+  void remove_callback(uint64_t id) noexcept
+  {
+    _callbacks.erase(std::remove_if(_callbacks.begin(), _callbacks.end(), [id](const callback_entry_t &e) { return e.id == id; }), _callbacks.end());
+  }
 
   std::vector<callback_entry_t> _callbacks;
   uint64_t _next_id = 0;
   bool _cancelled = false;
 };
 
-inline void registration_t::deregister()
+inline void registration_t::deregister() noexcept
 {
   if (_cancel)
   {
@@ -159,6 +200,16 @@ inline void registration_t::deregister()
     _cancel = nullptr;
     _id = 0;
   }
+}
+
+inline void registration_t::rebind() noexcept
+{
+  if (!_cancel)
+    return;
+  if (auto *entry = _cancel->find(_id))
+    entry->owner = this;
+  else
+    detach();
 }
 
 } // namespace vio

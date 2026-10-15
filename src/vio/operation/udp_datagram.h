@@ -22,60 +22,39 @@
 
 #pragma once
 
-// Reading datagrams ourselves, with libuv only telling us when to.
-//
-// libuv's own UDP read is fine until you want anything the kernel reports
-// alongside the payload. Its recvmsg leaves msg_control null, so it never asks
-// for control messages and cannot surface them -- and the ECN codepoint, the
-// GRO segment size, the destination address of a wildcard socket all arrive
-// exactly there. No option makes them appear; the read has to be ours.
-//
-// So the split is: libuv keeps the socket, the binding and the event loop, and
-// hands back readiness through uv_poll_t. The recvmsg is ours, and with it the
-// control messages, the batching, and later the segmentation offloads.
-//
-// This is also the seam that matters if the loop is ever replaced. Everything
-// below reads from a descriptor and is told when to look; what does the telling
-// is one call. An io_uring or IOCP backend changes that call and nothing else.
-
+#include "vio/buffer_pool.h"
+#include "vio/detail/sys_udp.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/loop/socket.h"
 #include "vio/operation/udp.h"
+#include "vio/ref_counted_wrapper.h"
 
-#include <array>
+#include <algorithm>
 #include <coroutine>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <expected>
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
-
-#if defined(_WIN32)
-#include <mswsock.h>
-#else
-#include <cerrno>
-#include <netinet/in.h>
-#include <netinet/udp.h>
-#include <sys/socket.h>
-#endif
 
 namespace vio
 {
-// What arrived, and what the kernel said about it.
 struct datagram_t
 {
-  std::vector<std::uint8_t> data;
-  sockaddr_storage from = {};
-  // RFC 3168. The codepoint the datagram carried when it reached this host,
-  // which is the whole reason for taking over the read.
+  std::span<std::uint8_t> data;
+  const sockaddr *peer = nullptr;
+  const sockaddr *local = nullptr;
   udp_ecn_t ecn = udp_ecn_t::not_ect;
+  std::size_t segment_size = 0;
+  bool truncated = false;
 
   [[nodiscard]] const sockaddr *sender() const
   {
-    return reinterpret_cast<const sockaddr *>(&from);
+    return peer;
   }
 };
 
@@ -84,7 +63,8 @@ namespace detail
 // How many datagrams one wakeup will take before yielding. A readable socket
 // usually has more than one waiting, and the syscall is the expensive part.
 inline constexpr std::size_t datagram_batch = 32;
-inline constexpr std::size_t datagram_capacity = 1500;
+inline constexpr std::size_t datagram_capacity = 2048;
+inline constexpr std::size_t coalesced_batch = 8;
 // With receive coalescing the kernel hands back many datagrams as one buffer,
 // so the read has to be able to hold them. 64 KiB is the ceiling both Linux
 // and Windows work to.
@@ -92,64 +72,369 @@ inline constexpr std::size_t coalesced_capacity = 65536;
 // Room for the control messages a datagram can carry. Generous: the kernel
 // truncates rather than fails, and a truncated control buffer silently loses
 // the codepoint.
-inline constexpr std::size_t datagram_control_capacity = 256;
+inline constexpr std::size_t datagram_control_capacity = 192;
+inline constexpr std::size_t datagram_error_budget = 32;
+inline constexpr std::size_t datagram_smallest_capacity = 512;
+
+struct alignas(16) datagram_control_t
+{
+  std::byte bytes[datagram_control_capacity];
+};
 
 struct datagram_reader_state_t
 {
-  uv_poll_t poll = {};
-  bool poll_started = false;
-  bool closing = false;
-#if defined(_WIN32)
-  SOCKET socket = INVALID_SOCKET;
-  LPFN_WSARECVMSG recvmsg_fn = nullptr;
-#else
-  int fd = -1;
-#endif
-  // Reused across reads rather than a stack buffer, because coalescing makes
-  // it far too large to put on the stack once per datagram.
-  std::vector<std::uint8_t> scratch = std::vector<std::uint8_t>(datagram_capacity);
+  explicit datagram_reader_state_t(ref_ptr_t<udp_state_t> socket)
+    : udp(std::move(socket))
+  {
+  }
+
+  datagram_reader_state_t(const datagram_reader_state_t &) = delete;
+  datagram_reader_state_t &operator=(const datagram_reader_state_t &) = delete;
+  datagram_reader_state_t(datagram_reader_state_t &&) = delete;
+  datagram_reader_state_t &operator=(datagram_reader_state_t &&) = delete;
+
+  ~datagram_reader_state_t()
+  {
+    if (arena)
+    {
+      unpoison_memory(arena.get(), slot_size * slot_count);
+    }
+  }
+
+  ref_ptr_t<udp_state_t> udp;
+  io_op_t op;
+  posted_t retry;
+  std::coroutine_handle<> continuation;
+  std::vector<datagram_t> batch;
+  std::size_t cursor = 0;
+  std::unique_ptr<std::byte[]> arena;
+  std::unique_ptr<sockaddr_storage[]> names;
+  std::unique_ptr<sockaddr_storage[]> locals;
+  std::unique_ptr<datagram_control_t[]> controls;
+  std::unique_ptr<udp_message_t[]> messages;
+  std::size_t slot_size = 0;
+  std::size_t slot_count = 0;
+  std::size_t want_slot_size = datagram_capacity;
+  std::size_t want_slot_count = datagram_batch;
+  std::size_t base_capacity = datagram_capacity;
   std::size_t coalescing = 0;
   // Calls made and datagrams they carried. The ratio is what receive
   // coalescing changes.
   std::uint64_t reads = 0;
   std::uint64_t datagrams = 0;
-  std::deque<std::expected<datagram_t, error_t>> ready;
-  std::coroutine_handle<> continuation;
+  std::uint64_t truncated = 0;
+  std::uint64_t errors = 0;
+  void *self = nullptr;
+  int pending_error = 0;
+  std::uint32_t drained_epoch = 0;
+  std::uint16_t local_port = 0;
+  bool drained = true;
+  bool drained_known = false;
   bool cancelled = false;
-  std::shared_ptr<datagram_reader_state_t> self;
+  bool stopped = false;
+  bool want_batch = false;
 };
 
-// The two bits at the bottom of the IPv4 TOS byte and the IPv6 traffic class
-// byte are the ECN field; the six above them are DSCP and none of our business.
-[[nodiscard]] inline udp_ecn_t ecn_from_traffic_class(int value)
+inline void datagram_allocate(datagram_reader_state_t &state)
 {
-  return static_cast<udp_ecn_t>(static_cast<unsigned>(value) & 0x03u);
+  if (state.arena)
+  {
+    unpoison_memory(state.arena.get(), state.slot_size * state.slot_count);
+  }
+  state.arena.reset();
+  state.slot_size = state.want_slot_size;
+  state.slot_count = state.want_slot_count;
+  state.arena = std::make_unique_for_overwrite<std::byte[]>(state.slot_size * state.slot_count);
+  state.names = std::make_unique<sockaddr_storage[]>(state.slot_count);
+  state.locals = std::make_unique<sockaddr_storage[]>(state.slot_count);
+  state.controls = std::make_unique<datagram_control_t[]>(state.slot_count);
+  state.messages = std::make_unique<udp_message_t[]>(state.slot_count);
+  state.batch.reserve(state.slot_count);
 }
 
-inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, error_t> item)
+inline void datagram_split(datagram_reader_state_t &state, std::size_t slot)
 {
-  state.ready.push_back(std::move(item));
-  if (state.continuation)
+  const auto &message = state.messages[slot];
+  const auto control = udp_parse_control(message);
+  const sockaddr *peer = message.name_length > 0 ? reinterpret_cast<const sockaddr *>(&state.names[slot]) : nullptr;
+  const sockaddr *local = nullptr;
+  if (control.has_local)
   {
-    auto continuation = state.continuation;
-    state.continuation = nullptr;
-    continuation.resume();
+    auto &stored = state.locals[slot];
+    stored = control.local;
+    if (stored.ss_family == AF_INET)
+    {
+      reinterpret_cast<sockaddr_in *>(&stored)->sin_port = htons(state.local_port);
+    }
+    else if (stored.ss_family == AF_INET6)
+    {
+      reinterpret_cast<sockaddr_in6 *>(&stored)->sin6_port = htons(state.local_port);
+    }
+    local = reinterpret_cast<const sockaddr *>(&stored);
+  }
+  const auto ecn = static_cast<udp_ecn_t>(control.ecn & 0x03u);
+  auto *base = reinterpret_cast<std::uint8_t *>(state.arena.get() + slot * state.slot_size);
+  const std::size_t length = std::min(message.length, state.slot_size);
+  if (message.truncated)
+  {
+    ++state.truncated;
+  }
+  const std::size_t segment = control.segment_size;
+  if (segment == 0 || segment >= length)
+  {
+    state.batch.push_back(datagram_t{.data = std::span<std::uint8_t>(base, length), .peer = peer, .local = local, .ecn = ecn, .segment_size = 0, .truncated = message.truncated});
+    if (!message.truncated)
+    {
+      ++state.datagrams;
+    }
+    return;
+  }
+  // Coalesced: every segment is full-length except the last. They came from
+  // one flow, so they share a sender and a codepoint.
+  for (std::size_t offset = 0; offset < length; offset += segment)
+  {
+    const std::size_t piece = std::min(segment, length - offset);
+    const bool cut = message.truncated && offset + piece >= length;
+    state.batch.push_back(datagram_t{.data = std::span<std::uint8_t>(base + offset, piece), .peer = peer, .local = local, .ecn = ecn, .segment_size = segment, .truncated = cut});
+    if (!cut)
+    {
+      ++state.datagrams;
+    }
   }
 }
+
+inline void datagram_refill(datagram_reader_state_t &state)
+{
+  state.batch.clear();
+  state.cursor = 0;
+  state.drained = false;
+  if (!state.arena || state.slot_size != state.want_slot_size || state.slot_count != state.want_slot_count)
+  {
+    datagram_allocate(state);
+  }
+  const std::size_t arena_size = state.slot_size * state.slot_count;
+  unpoison_memory(state.arena.get(), arena_size);
+  for (std::size_t i = 0; i < state.slot_count; ++i)
+  {
+    state.messages[i] = udp_message_t{.data = state.arena.get() + i * state.slot_size,
+                                      .capacity = state.slot_size,
+                                      .name = &state.names[i],
+                                      .control = state.controls[i].bytes,
+                                      .control_capacity = sizeof(state.controls[i].bytes)};
+  }
+  const native_socket_t native = state.udp->socket.native();
+  std::size_t used = 0;
+  std::size_t errors = 0;
+  while (used < state.slot_count)
+  {
+    const auto received = udp_receive(native, &state.messages[used], state.slot_count - used);
+    if (received < 0)
+    {
+      if (received == errc::again)
+      {
+        state.drained = true;
+        state.drained_known = true;
+        state.drained_epoch = state.udp->socket.watch.epoch;
+        break;
+      }
+      if (udp_is_terminal_receive_error(received))
+      {
+        state.pending_error = static_cast<int>(received);
+        break;
+      }
+      ++state.errors;
+      if (++errors >= datagram_error_budget)
+      {
+        break;
+      }
+      continue;
+    }
+    ++state.reads;
+    const auto count = std::min(static_cast<std::size_t>(received), state.slot_count - used);
+    for (std::size_t i = used; i < used + count; ++i)
+    {
+      datagram_split(state, i);
+    }
+    used += count;
+  }
+  poison_memory(state.arena.get(), arena_size);
+  for (const auto &datagram : state.batch)
+  {
+    unpoison_memory(datagram.data.data(), datagram.data.size());
+  }
+}
+
+[[nodiscard]] inline bool datagram_single_available(datagram_reader_state_t &state) noexcept
+{
+  while (state.cursor < state.batch.size() && state.batch[state.cursor].truncated)
+  {
+    ++state.cursor;
+  }
+  return state.cursor < state.batch.size();
+}
+
+[[nodiscard]] inline bool datagram_has(datagram_reader_state_t &state, bool want_batch) noexcept
+{
+  return want_batch ? state.cursor < state.batch.size() : datagram_single_available(state);
+}
+
+inline void datagram_park(datagram_reader_state_t &state)
+{
+  if (state.drained)
+  {
+    state.udp->socket.wait(interest_read, state.op);
+    return;
+  }
+  if (state.retry.queued)
+  {
+    return;
+  }
+  state.retry.owner = ref_retain<datagram_reader_state_t>(state.self);
+  core(state.udp->event_loop).defer(state.retry);
+}
+
+inline void datagram_wake(datagram_reader_state_t &state)
+{
+  if (!state.continuation || state.stopped)
+  {
+    return;
+  }
+  if (!state.cancelled)
+  {
+    datagram_refill(state);
+    if (!datagram_has(state, state.want_batch) && state.pending_error == 0)
+    {
+      datagram_park(state);
+      return;
+    }
+  }
+  auto continuation = std::exchange(state.continuation, {});
+  continuation.resume();
+}
+
+inline void datagram_on_readable(io_op_t *op)
+{
+  datagram_wake(*static_cast<datagram_reader_state_t *>(op->owner));
+}
+
+inline void datagram_on_retry(posted_t *node)
+{
+  auto owned = ref_ptr_t<datagram_reader_state_t>::from_raw(node->owner);
+  datagram_wake(owned.data());
+}
+
+inline void datagram_on_discard(posted_t *node)
+{
+  ref_ptr_t<datagram_reader_state_t>::from_raw(node->owner);
+}
+
+template <bool Batch>
+struct datagram_awaiter_t
+{
+  using value_t = std::conditional_t<Batch, std::span<const datagram_t>, datagram_t>;
+
+  ref_ptr_t<datagram_reader_state_t> state;
+  std::coroutine_handle<> waiting = {};
+  bool busy = false;
+
+  explicit datagram_awaiter_t(ref_ptr_t<datagram_reader_state_t> reader)
+    : state(std::move(reader))
+  {
+  }
+
+  datagram_awaiter_t(const datagram_awaiter_t &) = delete;
+  datagram_awaiter_t &operator=(const datagram_awaiter_t &) = delete;
+
+  ~datagram_awaiter_t()
+  {
+    if (!waiting || !state)
+    {
+      return;
+    }
+    auto &reader = state.data();
+    if (reader.continuation != waiting)
+    {
+      return;
+    }
+    reader.continuation = {};
+    if (!reader.stopped && reader.op.parked)
+    {
+      reader.udp->socket.cancel(reader.op);
+    }
+  }
+
+  [[nodiscard]] bool await_ready()
+  {
+    if (!state)
+    {
+      return true;
+    }
+    auto &reader = state.data();
+    if (reader.cancelled || reader.stopped || datagram_has(reader, Batch) || reader.pending_error != 0)
+    {
+      return true;
+    }
+    if (reader.continuation)
+    {
+      busy = true;
+      return true;
+    }
+    if (!reader.drained)
+    {
+      return false;
+    }
+    if (reader.drained_known && reader.udp->socket.watch.epoch == reader.drained_epoch)
+    {
+      return false;
+    }
+    datagram_refill(reader);
+    return datagram_has(reader, Batch) || reader.pending_error != 0;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation)
+  {
+    auto &reader = state.data();
+    waiting = continuation;
+    reader.continuation = continuation;
+    reader.want_batch = Batch;
+    datagram_park(reader);
+  }
+
+  std::expected<value_t, error_t> await_resume()
+  {
+    waiting = {};
+    if (busy)
+    {
+      return std::unexpected(error_t{.code = errc::already_in_progress, .msg = "another coroutine is already waiting on this reader"});
+    }
+    if (!state)
+    {
+      return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "reader is not open"});
+    }
+    auto &reader = state.data();
+    if (reader.cancelled || reader.stopped)
+    {
+      return std::unexpected(error_t{.code = errc::canceled, .msg = "Operation was cancelled"});
+    }
+    if (datagram_has(reader, Batch))
+    {
+      if constexpr (Batch)
+      {
+        std::span<const datagram_t> items(reader.batch.data() + reader.cursor, reader.batch.size() - reader.cursor);
+        reader.cursor = reader.batch.size();
+        return items;
+      }
+      else
+      {
+        return reader.batch[reader.cursor++];
+      }
+    }
+    const int code = std::exchange(reader.pending_error, 0);
+    return std::unexpected(make_error(code != 0 ? code : errc::again));
+  }
+};
 } // namespace detail
 
-// Sends one datagram with an explicit ECN codepoint.
-//
-// The codepoint goes in a control message, per datagram, rather than on the
-// socket. That is not a stylistic choice: Windows has no socket option for the
-// outgoing codepoint at all -- IP_ECN is a control message type there, and
-// IP_RECVECN, the only related socket option, governs receiving. Marking per
-// datagram is also the better shape, because a socket carrying several
-// connections would otherwise have to mark all of them the same way and give
-// up ECN for all of them when one path failed validation.
-//
-// RFC 3168 forbids an endpoint from setting CE itself -- only a router may --
-// and Windows enforces it with WSAEINVAL. Nothing here should ever ask for it.
 // An IPv4 destination as a dual-stack socket reports it: ::ffff:a.b.c.d. The
 // datagram leaves as IPv4, which decides which options the kernel will read
 // for it.
@@ -164,124 +449,65 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
   return std::memcmp(bytes, prefix, sizeof(prefix)) == 0;
 }
 
-[[nodiscard]] inline std::expected<std::size_t, error_t> send_datagram(udp_t &udp, std::span<const std::uint8_t> bytes, const sockaddr *address, udp_ecn_t ecn)
+namespace detail
 {
-  auto fd = udp_fileno(udp);
-  if (!fd.has_value())
-  {
-    return std::unexpected(fd.error());
-  }
+[[nodiscard]] inline std::expected<std::size_t, error_t> datagram_send(udp_t &udp, std::span<const std::uint8_t> bytes, const sockaddr *address, udp_ecn_t ecn, std::size_t segment_size)
+{
+  // RFC 3168 forbids an endpoint from setting CE itself -- only a router may --
+  // and Windows enforces it with WSAEINVAL. Nothing here should ever ask for it.
   if (ecn == udp_ecn_t::ce)
   {
-    return std::unexpected(error_t{.code = UV_EINVAL, .msg = "only a router may set the congestion experienced codepoint"});
+    return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "only a router may set the congestion experienced codepoint"});
   }
-  // A dual-stack socket cannot be handed a bare IPv4 destination: sendmsg wants
-  // the socket's family. libuv converts internally; doing our own send means
-  // doing our own conversion to the IPv4-mapped form.
-  sockaddr_storage mapped = {};
-  auto name = udp_sockname(udp);
-  if (name.has_value() && name->ss_family == AF_INET6 && address != nullptr && address->sa_family == AF_INET)
+  auto &state = udp.handle.data();
+  udp_target_t target;
+  if (int result = udp_prepare_target(state, address, target); result < 0)
   {
-    const auto *in4 = reinterpret_cast<const sockaddr_in *>(address);
-    auto *in6 = reinterpret_cast<sockaddr_in6 *>(&mapped);
-    in6->sin6_family = AF_INET6;
-    in6->sin6_port = in4->sin_port;
-    auto *bytes = reinterpret_cast<std::uint8_t *>(&in6->sin6_addr);
-    bytes[10] = 0xff;
-    bytes[11] = 0xff;
-    std::memcpy(bytes + 12, &in4->sin_addr, 4);
-    address = reinterpret_cast<const sockaddr *>(&mapped);
+    return std::unexpected(make_error(result));
   }
-
-  // The address handed to the kernel is whatever the mapping left behind, and
-  // its length has to match that.
-  const bool address_is_ipv6 = address != nullptr && address->sa_family == AF_INET6;
-  // Which control message carries the codepoint is a different question: it
-  // follows the family the datagram actually leaves as, and one addressed to
-  // an IPv4-mapped address leaves as IPv4 however the socket is bound. That
-  // path reads IP_TOS; IPV6_TCLASS is accepted there and quietly does nothing,
-  // so marking it that way puts the packets on the wire unmarked. A dual-stack
-  // socket sees every IPv4 peer in the mapped form, so this is the common case
-  // rather than a corner of one.
-  const bool ipv6 = address_is_ipv6 && !is_ipv4_mapped(address);
-  const int value = static_cast<int>(ecn);
-
-#if defined(_WIN32)
-  const auto socket_handle = reinterpret_cast<SOCKET>(*fd);
-  static LPFN_WSASENDMSG sendmsg_fn = nullptr;
-  if (sendmsg_fn == nullptr)
+  udp_send_options_t options;
+  options.ecn = static_cast<std::uint8_t>(ecn);
+  options.segment_size = static_cast<std::uint16_t>(segment_size);
+  if (ecn != udp_ecn_t::not_ect)
   {
-    GUID id = WSAID_WSASENDMSG;
-    DWORD returned = 0;
-    if (WSAIoctl(socket_handle, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id), &sendmsg_fn, sizeof(sendmsg_fn), &returned, nullptr, nullptr) != 0)
+    // Which control message carries the codepoint follows the family the
+    // datagram actually leaves as, and one addressed to an IPv4-mapped address
+    // leaves as IPv4 however the socket is bound. That path reads IP_TOS;
+    // IPV6_TCLASS is accepted there and quietly does nothing, so marking it
+    // that way puts the packets on the wire unmarked.
+    const sockaddr *leaving = target.address;
+    sockaddr_storage peer = {};
+    if (leaving == nullptr)
     {
-      return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "could not resolve WSASendMsg"});
+      int length = 0;
+      if (socket_peer_name(state.socket.native(), peer, length) == 0)
+      {
+        leaving = reinterpret_cast<const sockaddr *>(&peer);
+      }
     }
+    options.ecn_ipv6 = leaving != nullptr && leaving->sa_family == AF_INET6 && !is_ipv4_mapped(leaving);
   }
-
-  WSABUF buffer = {};
-  buffer.buf = reinterpret_cast<CHAR *>(const_cast<std::uint8_t *>(bytes.data()));
-  buffer.len = static_cast<ULONG>(bytes.size());
-
-  std::array<char, WSA_CMSG_SPACE(sizeof(INT))> control = {};
-  WSAMSG message = {};
-  message.name = const_cast<LPSOCKADDR>(address);
-  message.namelen = ipv6 ? static_cast<INT>(sizeof(sockaddr_in6)) : static_cast<INT>(sizeof(sockaddr_in));
-  message.lpBuffers = &buffer;
-  message.dwBufferCount = 1;
-
-  if (ecn != udp_ecn_t::not_ect)
-  {
-    message.Control.buf = control.data();
-    message.Control.len = static_cast<ULONG>(control.size());
-    WSACMSGHDR *header = WSA_CMSG_FIRSTHDR(&message);
-    header->cmsg_len = WSA_CMSG_LEN(sizeof(INT));
-    header->cmsg_level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
-    header->cmsg_type = ipv6 ? IPV6_ECN : IP_ECN;
-    const INT codepoint = value;
-    std::memcpy(WSA_CMSG_DATA(header), &codepoint, sizeof(codepoint));
-  }
-
-  DWORD sent = 0;
-  if (sendmsg_fn(socket_handle, &message, 0, &sent, nullptr, nullptr) != 0)
-  {
-    return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "sendmsg failed"});
-  }
-  return static_cast<std::size_t>(sent);
-#else
-  iovec vector = {};
-  vector.iov_base = const_cast<std::uint8_t *>(bytes.data());
-  vector.iov_len = bytes.size();
-
-  alignas(cmsghdr) std::array<std::uint8_t, CMSG_SPACE(sizeof(int))> control = {};
-  msghdr message = {};
-  message.msg_name = const_cast<sockaddr *>(address);
-  message.msg_namelen = address_is_ipv6 ? static_cast<socklen_t>(sizeof(sockaddr_in6)) : static_cast<socklen_t>(sizeof(sockaddr_in));
-  message.msg_iov = &vector;
-  message.msg_iovlen = 1;
-
-  if (ecn != udp_ecn_t::not_ect)
-  {
-    message.msg_control = control.data();
-    message.msg_controllen = static_cast<decltype(message.msg_controllen)>(control.size());
-    cmsghdr *header = CMSG_FIRSTHDR(&message);
-    header->cmsg_len = CMSG_LEN(sizeof(int));
-    header->cmsg_level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
-#if defined(IPV6_TCLASS)
-    header->cmsg_type = ipv6 ? IPV6_TCLASS : IP_TOS;
-#else
-    header->cmsg_type = IP_TOS;
-#endif
-    std::memcpy(CMSG_DATA(header), &value, sizeof(value));
-  }
-
-  const ssize_t sent = ::sendmsg(static_cast<int>(*fd), &message, 0);
+  const auto sent = udp_send(state.socket.native(), std::as_bytes(bytes), target.address, target.length, options);
   if (sent < 0)
   {
-    return std::unexpected(error_t{.code = -errno, .msg = "sendmsg failed"});
+    return std::unexpected(make_error(static_cast<int>(sent)));
   }
   return static_cast<std::size_t>(sent);
-#endif
+}
+} // namespace detail
+
+// Sends one datagram with an explicit ECN codepoint.
+//
+// The codepoint goes in a control message, per datagram, rather than on the
+// socket. That is not a stylistic choice: Windows has no socket option for the
+// outgoing codepoint at all -- IP_ECN is a control message type there, and
+// IP_RECVECN, the only related socket option, governs receiving. Marking per
+// datagram is also the better shape, because a socket carrying several
+// connections would otherwise have to mark all of them the same way and give
+// up ECN for all of them when one path failed validation.
+[[nodiscard]] inline std::expected<std::size_t, error_t> send_datagram(udp_t &udp, std::span<const std::uint8_t> bytes, const sockaddr *address, udp_ecn_t ecn)
+{
+  return detail::datagram_send(udp, bytes, address, ecn, 0);
 }
 
 // Sends several datagrams as one buffer, letting the kernel cut it into pieces
@@ -307,126 +533,21 @@ inline void deliver(datagram_reader_state_t &state, std::expected<datagram_t, er
   }
   if (bytes.size() <= segment_size)
   {
-    // One segment is just a datagram; the offload has nothing to do.
     return send_datagram(udp, bytes, address, ecn);
   }
-
-  auto fd = udp_fileno(udp);
-  if (!fd.has_value())
+  if (segment_size > 0xffff)
   {
-    return std::unexpected(fd.error());
+    return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "a segment cannot be larger than a datagram"});
   }
-  if (ecn == udp_ecn_t::ce)
-  {
-    return std::unexpected(error_t{.code = UV_EINVAL, .msg = "only a router may set the congestion experienced codepoint"});
-  }
-
-  sockaddr_storage mapped = {};
-  auto name = udp_sockname(udp);
-  if (name.has_value() && name->ss_family == AF_INET6 && address != nullptr && address->sa_family == AF_INET)
-  {
-    const auto *in4 = reinterpret_cast<const sockaddr_in *>(address);
-    auto *in6 = reinterpret_cast<sockaddr_in6 *>(&mapped);
-    in6->sin6_family = AF_INET6;
-    in6->sin6_port = in4->sin_port;
-    auto *raw = reinterpret_cast<std::uint8_t *>(&in6->sin6_addr);
-    raw[10] = 0xff;
-    raw[11] = 0xff;
-    std::memcpy(raw + 12, &in4->sin_addr, 4);
-    address = reinterpret_cast<const sockaddr *>(&mapped);
-  }
-  // The address handed to the kernel is whatever the mapping left behind, and
-  // its length has to match that.
-  const bool address_is_ipv6 = address != nullptr && address->sa_family == AF_INET6;
-  // Which control message carries the codepoint is a different question: it
-  // follows the family the datagram actually leaves as, and one addressed to
-  // an IPv4-mapped address leaves as IPv4 however the socket is bound. That
-  // path reads IP_TOS; IPV6_TCLASS is accepted there and quietly does nothing,
-  // so marking it that way puts the packets on the wire unmarked. A dual-stack
-  // socket sees every IPv4 peer in the mapped form, so this is the common case
-  // rather than a corner of one.
-  const bool ipv6 = address_is_ipv6 && !is_ipv4_mapped(address);
-
-#if defined(_WIN32)
-#if defined(UDP_SEND_MSG_SIZE)
-  const auto socket_handle = reinterpret_cast<SOCKET>(*fd);
-  // Windows carries the segment size as a socket option rather than a control
-  // message, so it is set for the send and cleared again -- anything else would
-  // leave the next ordinary send being cut up.
-  DWORD size = static_cast<DWORD>(segment_size);
-  if (setsockopt(socket_handle, IPPROTO_UDP, UDP_SEND_MSG_SIZE, reinterpret_cast<const char *>(&size), sizeof(size)) != 0)
-  {
-    return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "the socket would not segment sends"});
-  }
-  auto sent = send_datagram(udp, bytes, address, ecn);
-  DWORD off = 0;
-  (void)setsockopt(socket_handle, IPPROTO_UDP, UDP_SEND_MSG_SIZE, reinterpret_cast<const char *>(&off), sizeof(off));
-  return sent;
-#else
-  return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this Windows SDK has no UDP_SEND_MSG_SIZE"});
-#endif
-#else
-#if defined(UDP_SEGMENT)
-  iovec vector = {};
-  vector.iov_base = const_cast<std::uint8_t *>(bytes.data());
-  vector.iov_len = bytes.size();
-
-  alignas(cmsghdr) std::array<std::uint8_t, CMSG_SPACE(sizeof(std::uint16_t)) + CMSG_SPACE(sizeof(int))> control = {};
-  msghdr message = {};
-  message.msg_name = const_cast<sockaddr *>(address);
-  message.msg_namelen = address_is_ipv6 ? static_cast<socklen_t>(sizeof(sockaddr_in6)) : static_cast<socklen_t>(sizeof(sockaddr_in));
-  message.msg_iov = &vector;
-  message.msg_iovlen = 1;
-  message.msg_control = control.data();
-  message.msg_controllen = static_cast<decltype(message.msg_controllen)>(control.size());
-
-  cmsghdr *header = CMSG_FIRSTHDR(&message);
-  header->cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
-  header->cmsg_level = SOL_UDP;
-  header->cmsg_type = UDP_SEGMENT;
-  const std::uint16_t size = static_cast<std::uint16_t>(segment_size);
-  std::memcpy(CMSG_DATA(header), &size, sizeof(size));
-  std::size_t used = CMSG_SPACE(sizeof(std::uint16_t));
-
-  if (ecn != udp_ecn_t::not_ect)
-  {
-    cmsghdr *next = CMSG_NXTHDR(&message, header);
-    if (next != nullptr)
-    {
-      next->cmsg_len = CMSG_LEN(sizeof(int));
-      next->cmsg_level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
-#if defined(IPV6_TCLASS)
-      next->cmsg_type = ipv6 ? IPV6_TCLASS : IP_TOS;
-#else
-      next->cmsg_type = IP_TOS;
-#endif
-      const int codepoint = static_cast<int>(ecn);
-      std::memcpy(CMSG_DATA(next), &codepoint, sizeof(codepoint));
-      used += CMSG_SPACE(sizeof(int));
-    }
-  }
-  message.msg_controllen = static_cast<decltype(message.msg_controllen)>(used);
-
-  const ssize_t sent = ::sendmsg(static_cast<int>(*fd), &message, 0);
-  if (sent < 0)
-  {
-    return std::unexpected(error_t{.code = -errno, .msg = "segmented sendmsg failed"});
-  }
-  return static_cast<std::size_t>(sent);
-#else
-  return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this system has no UDP_SEGMENT"});
-#endif
-#endif
+  return detail::datagram_send(udp, bytes, address, ecn, segment_size);
 }
 
-// Reads datagrams from a socket libuv owns, using our own recvmsg so the
-// control messages survive.
-//
-// The socket must not also be read by libuv: calling udp_create_reader on the
-// same udp_t would have two readers racing for the same bytes.
 class datagram_reader_t
 {
 public:
+  using awaiter_t = detail::datagram_awaiter_t<false>;
+  using batch_awaiter_t = detail::datagram_awaiter_t<true>;
+
   datagram_reader_t(const datagram_reader_t &) = delete;
   datagram_reader_t &operator=(const datagram_reader_t &) = delete;
 
@@ -452,47 +573,39 @@ public:
 
   [[nodiscard]] static std::expected<datagram_reader_t, error_t> create(event_loop_t &loop, udp_t &udp)
   {
+    (void)loop;
     auto fd = udp_fileno(udp);
     if (!fd.has_value())
     {
       return std::unexpected(fd.error());
     }
-
-    auto state = std::make_shared<detail::datagram_reader_state_t>();
-
+    auto &socket = udp.handle.data();
+    if (socket.recv.active)
+    {
+      return std::unexpected(error_t{.code = errc::busy, .msg = "a udp_reader_t is already reading this socket"});
+    }
+    if (socket.datagram_reader)
+    {
+      return std::unexpected(error_t{.code = errc::busy, .msg = "a datagram_reader_t is already reading this socket"});
+    }
 #if defined(_WIN32)
-    state->socket = reinterpret_cast<SOCKET>(*fd);
-    // WSARecvMsg is only reachable through an extension pointer; there is no
-    // import for it.
-    GUID id = WSAID_WSARECVMSG;
-    DWORD returned = 0;
-    if (WSAIoctl(state->socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id), &state->recvmsg_fn, sizeof(state->recvmsg_fn), &returned, nullptr, nullptr) != 0)
+    if (detail::udp_wsa_recvmsg(*fd) == nullptr)
     {
-      return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "could not resolve WSARecvMsg"});
-    }
-    if (const int r = uv_poll_init_socket(loop.loop(), &state->poll, state->socket); r < 0)
-    {
-      return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    }
-#else
-    state->fd = static_cast<int>(*fd);
-    if (const int r = uv_poll_init(loop.loop(), &state->poll, state->fd); r < 0)
-    {
-      return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+      return std::unexpected(error_t{.code = errc::not_supported, .msg = "could not resolve WSARecvMsg"});
     }
 #endif
+    ref_ptr_t<detail::datagram_reader_state_t> state(udp.handle);
+    auto &reader = state.data();
+    reader.self = detail::ref_storage(state);
+    reader.op.owner = &reader;
+    reader.op.complete = &detail::datagram_on_readable;
+    reader.retry.run = &detail::datagram_on_retry;
+    reader.retry.discard = &detail::datagram_on_discard;
+    socket.datagram_reader = true;
 
-    state->poll.data = state.get();
-    if (const int r = uv_poll_start(&state->poll, UV_READABLE, &on_readable); r < 0)
-    {
-      uv_close(reinterpret_cast<uv_handle_t *>(&state->poll), nullptr);
-      return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    }
-    state->poll_started = true;
-
-    datagram_reader_t reader;
-    reader._state = std::move(state);
-    return reader;
+    datagram_reader_t created;
+    created._state = std::move(state);
+    return created;
   }
 
   // Asks the kernel to hand back several datagrams in one read, coalesced into
@@ -507,38 +620,52 @@ public:
   {
     if (!_state)
     {
-      return std::unexpected(error_t{.code = UV_EINVAL, .msg = "reader is not open"});
+      return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "reader is not open"});
     }
+    auto &reader = _state.data();
+    const auto native = reader.udp->socket.native();
     if (max_size == 0)
     {
-      _state->coalescing = 0;
-      _state->scratch.assign(detail::datagram_capacity, 0);
+      if (reader.coalescing != 0)
+      {
+        (void)detail::udp_set_receive_coalesced(native, 0);
+      }
+      reader.coalescing = 0;
+      reader.want_slot_size = reader.base_capacity;
+      reader.want_slot_count = detail::datagram_batch;
       return {};
     }
-
-    const int value = static_cast<int>((std::min)(max_size, detail::coalesced_capacity));
+    const std::size_t value = std::min(max_size, detail::coalesced_capacity);
+    if (const int result = detail::udp_set_receive_coalesced(native, value); result < 0)
+    {
+      return std::unexpected(error_t{.code = result, .msg = "the socket would not coalesce receives"});
+    }
+    reader.coalescing = value;
 #if defined(_WIN32)
-#if defined(UDP_RECV_MAX_COALESCED_SIZE)
-    if (setsockopt(_state->socket, IPPROTO_UDP, UDP_RECV_MAX_COALESCED_SIZE, reinterpret_cast<const char *>(&value), sizeof(value)) != 0)
+    reader.want_slot_size = value + reader.base_capacity;
+#else
+    reader.want_slot_size = std::max(detail::coalesced_capacity, reader.base_capacity);
+#endif
+    reader.want_slot_count = detail::coalesced_batch;
+    return {};
+  }
+
+  [[nodiscard]] std::expected<void, error_t> receive_datagram_size(std::size_t max_size)
+  {
+    if (!_state)
     {
-      return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "the socket would not coalesce receives"});
+      return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "reader is not open"});
     }
-#else
-    return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this Windows SDK has no UDP_RECV_MAX_COALESCED_SIZE"});
-#endif
-#else
-#if defined(UDP_GRO)
-    const int on = 1;
-    if (setsockopt(_state->fd, IPPROTO_UDP, UDP_GRO, &on, sizeof(on)) != 0)
+    if (max_size < detail::datagram_smallest_capacity || max_size > detail::coalesced_capacity)
     {
-      return std::unexpected(error_t{.code = -errno, .msg = "the socket would not coalesce receives"});
+      return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "a datagram buffer must hold between 512 bytes and 64 KiB"});
     }
-#else
-    return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this system has no UDP_GRO"});
-#endif
-#endif
-    _state->coalescing = static_cast<std::size_t>(value);
-    _state->scratch.assign(static_cast<std::size_t>(value) + detail::datagram_capacity, 0);
+    auto &reader = _state.data();
+    reader.base_capacity = max_size;
+    if (reader.coalescing == 0)
+    {
+      reader.want_slot_size = max_size;
+    }
     return {};
   }
 
@@ -548,37 +675,38 @@ public:
   {
     if (!_state)
     {
-      return std::unexpected(error_t{.code = UV_EINVAL, .msg = "reader is not open"});
+      return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "reader is not open"});
     }
-    const int value = on ? 1 : 0;
+    if (const int result = detail::udp_set_receive_ecn(_state.data().udp->socket.native(), on); result < 0)
+    {
+      return std::unexpected(error_t{.code = result, .msg = "could not ask for the ECN codepoint"});
+    }
+    return {};
+  }
 
-#if defined(_WIN32)
-#if defined(IP_RECVECN) && defined(IPV6_RECVECN)
-    // A dual-stack socket needs both: the option is per address family, and a
-    // wildcard bind receives on either.
-    const int v4 = setsockopt(_state->socket, IPPROTO_IP, IP_RECVECN, reinterpret_cast<const char *>(&value), sizeof(value));
-    const int v6 = setsockopt(_state->socket, IPPROTO_IPV6, IPV6_RECVECN, reinterpret_cast<const char *>(&value), sizeof(value));
-    if (v4 != 0 && v6 != 0)
+  [[nodiscard]] std::expected<void, error_t> receive_local_address(bool on)
+  {
+    if (!_state)
     {
-      return std::unexpected(error_t{.code = WSAGetLastError(), .msg = "could not ask for the ECN codepoint"});
+      return std::unexpected(error_t{.code = errc::invalid_argument, .msg = "reader is not open"});
+    }
+    auto &reader = _state.data();
+    const auto native = reader.udp->socket.native();
+    if (on)
+    {
+      sockaddr_storage name = {};
+      int length = 0;
+      if (const int result = detail::socket_name(native, name, length); result < 0)
+      {
+        return std::unexpected(make_error(result));
+      }
+      reader.local_port = name.ss_family == AF_INET6 ? ntohs(reinterpret_cast<const sockaddr_in6 *>(&name)->sin6_port) : ntohs(reinterpret_cast<const sockaddr_in *>(&name)->sin_port);
+    }
+    if (const int result = detail::udp_set_receive_local_address(native, on); result < 0)
+    {
+      return std::unexpected(error_t{.code = result, .msg = "could not ask for the local address"});
     }
     return {};
-#else
-    return std::unexpected(error_t{.code = UV_ENOTSUP, .msg = "this Windows SDK has no IP_RECVECN"});
-#endif
-#else
-    const int v4 = setsockopt(_state->fd, IPPROTO_IP, IP_RECVTOS, &value, sizeof(value));
-#if defined(IPV6_RECVTCLASS)
-    const int v6 = setsockopt(_state->fd, IPPROTO_IPV6, IPV6_RECVTCLASS, &value, sizeof(value));
-#else
-    const int v6 = -1;
-#endif
-    if (v4 != 0 && v6 != 0)
-    {
-      return std::unexpected(error_t{.code = -errno, .msg = "could not ask for the ECN codepoint"});
-    }
-    return {};
-#endif
   }
 
   // The next datagram already in hand, without suspending. One wakeup usually
@@ -586,60 +714,70 @@ public:
   // together has to be able to see the whole run first.
   [[nodiscard]] std::optional<std::expected<datagram_t, error_t>> try_next()
   {
-    if (!_state || _state->ready.empty())
+    if (!_state)
     {
       return std::nullopt;
     }
-    auto front = std::move(_state->ready.front());
-    _state->ready.pop_front();
-    return front;
+    auto &reader = _state.data();
+    if (reader.cancelled || reader.stopped || !detail::datagram_single_available(reader))
+    {
+      return std::nullopt;
+    }
+    return std::expected<datagram_t, error_t>(reader.batch[reader.cursor++]);
   }
 
   [[nodiscard]] std::uint64_t reads() const
   {
-    return _state ? _state->reads : 0;
+    return _state ? _state.data().reads : 0;
   }
 
   [[nodiscard]] std::uint64_t datagrams() const
   {
-    return _state ? _state->datagrams : 0;
+    return _state ? _state.data().datagrams : 0;
+  }
+
+  [[nodiscard]] std::uint64_t truncated() const
+  {
+    return _state ? _state.data().truncated : 0;
+  }
+
+  [[nodiscard]] std::uint64_t errors() const
+  {
+    return _state ? _state.data().errors : 0;
   }
 
   void cancel()
   {
-    if (!_state || _state->cancelled)
+    if (!_state)
     {
       return;
     }
-    _state->cancelled = true;
-    detail::deliver(*_state, std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"}));
+    auto &reader = _state.data();
+    if (reader.cancelled)
+    {
+      return;
+    }
+    reader.cancelled = true;
+    if (!reader.continuation)
+    {
+      return;
+    }
+    if (reader.op.parked)
+    {
+      reader.udp->socket.cancel(reader.op);
+    }
+    auto continuation = std::exchange(reader.continuation, {});
+    continuation.resume();
   }
-
-  struct awaiter_t
-  {
-    std::shared_ptr<detail::datagram_reader_state_t> state;
-
-    [[nodiscard]] bool await_ready() const
-    {
-      return !state->ready.empty();
-    }
-
-    void await_suspend(std::coroutine_handle<> continuation)
-    {
-      state->continuation = continuation;
-    }
-
-    std::expected<datagram_t, error_t> await_resume()
-    {
-      auto front = std::move(state->ready.front());
-      state->ready.pop_front();
-      return front;
-    }
-  };
 
   awaiter_t operator co_await()
   {
-    return awaiter_t{.state = _state};
+    return awaiter_t(_state);
+  }
+
+  batch_awaiter_t receive()
+  {
+    return batch_awaiter_t(_state);
   }
 
 private:
@@ -652,229 +790,21 @@ private:
       return;
     }
     auto state = std::move(_state);
-    if (!state->poll_started || state->closing)
+    auto &reader = state.data();
+    if (reader.stopped)
     {
       return;
     }
-    state->closing = true;
-    // The handle outlives this object: libuv only lets go of it in the close
-    // callback, so the state keeps itself alive until then.
-    state->self = state;
-    uv_close(reinterpret_cast<uv_handle_t *>(&state->poll), &on_closed);
-  }
-
-  static void on_closed(uv_handle_t *handle)
-  {
-    auto *state = static_cast<detail::datagram_reader_state_t *>(handle->data);
-    if (state != nullptr)
+    reader.stopped = true;
+    reader.continuation = {};
+    if (reader.op.parked)
     {
-      auto keep = std::move(state->self);
-      state->self.reset();
-      (void)keep;
+      reader.udp->socket.cancel(reader.op);
     }
+    reader.udp->datagram_reader = false;
+    reader.udp.release();
   }
 
-  static void on_readable(uv_poll_t *handle, int status, int events);
-
-  std::shared_ptr<detail::datagram_reader_state_t> _state;
+  ref_ptr_t<detail::datagram_reader_state_t> _state = ref_ptr_t<detail::datagram_reader_state_t>::null();
 };
-
-namespace detail
-{
-// One wakeup's worth of reading. Everything platform-specific about pulling a
-// datagram and its control messages out of the kernel is here.
-//
-// A read may come back holding several datagrams at once when receive
-// coalescing is on: the kernel concatenates consecutive datagrams from the same
-// flow and reports the segment size in a control message. Every segment is
-// full-length except possibly the last, which is what makes taking them apart
-// again unambiguous.
-inline void drain_socket(datagram_reader_state_t &state)
-{
-  for (std::size_t taken = 0; taken < datagram_batch; ++taken)
-  {
-    std::array<std::uint8_t, datagram_control_capacity> control = {};
-    sockaddr_storage from = {};
-    udp_ecn_t ecn = udp_ecn_t::not_ect;
-    std::size_t segment = 0;
-    std::size_t length = 0;
-
-#if defined(_WIN32)
-    WSABUF buffer = {};
-    buffer.buf = reinterpret_cast<CHAR *>(state.scratch.data());
-    buffer.len = static_cast<ULONG>(state.scratch.size());
-
-    WSAMSG message = {};
-    message.name = reinterpret_cast<LPSOCKADDR>(&from);
-    message.namelen = sizeof(from);
-    message.lpBuffers = &buffer;
-    message.dwBufferCount = 1;
-    message.Control.buf = reinterpret_cast<CHAR *>(control.data());
-    message.Control.len = static_cast<ULONG>(control.size());
-
-    DWORD received = 0;
-    if (state.recvmsg_fn(state.socket, &message, &received, nullptr, nullptr) != 0)
-    {
-      const int error = WSAGetLastError();
-      if (error == WSAEWOULDBLOCK)
-      {
-        return;
-      }
-      if (error == WSAECONNRESET || error == WSAEMSGSIZE)
-      {
-        // An ICMP port-unreachable reported against a previous send, or a
-        // datagram larger than the buffer. Neither says anything about the
-        // socket, so the next one is read instead.
-        continue;
-      }
-      deliver(state, std::unexpected(error_t{.code = error, .msg = "recvmsg failed"}));
-      return;
-    }
-
-    for (WSACMSGHDR *header = WSA_CMSG_FIRSTHDR(&message); header != nullptr; header = WSA_CMSG_NXTHDR(&message, header))
-    {
-#if defined(IP_ECN) && defined(IPV6_ECN)
-      const bool is_ecn = (header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_ECN) || (header->cmsg_level == IPPROTO_IPV6 && header->cmsg_type == IPV6_ECN);
-      if (is_ecn && header->cmsg_len >= WSA_CMSG_LEN(sizeof(INT)))
-      {
-        INT value = 0;
-        std::memcpy(&value, WSA_CMSG_DATA(header), sizeof(value));
-        ecn = ecn_from_traffic_class(value);
-        continue;
-      }
-#endif
-#if defined(UDP_COALESCED_INFO)
-      if (header->cmsg_level == IPPROTO_UDP && header->cmsg_type == UDP_COALESCED_INFO && header->cmsg_len >= WSA_CMSG_LEN(sizeof(DWORD)))
-      {
-        DWORD value = 0;
-        std::memcpy(&value, WSA_CMSG_DATA(header), sizeof(value));
-        segment = static_cast<std::size_t>(value);
-      }
-#endif
-    }
-    length = static_cast<std::size_t>(received);
-#else
-    iovec vector = {};
-    vector.iov_base = state.scratch.data();
-    vector.iov_len = state.scratch.size();
-
-    msghdr message = {};
-    message.msg_name = &from;
-    message.msg_namelen = sizeof(from);
-    message.msg_iov = &vector;
-    message.msg_iovlen = 1;
-    message.msg_control = control.data();
-    message.msg_controllen = static_cast<decltype(message.msg_controllen)>(control.size());
-
-    const ssize_t received = ::recvmsg(state.fd, &message, MSG_DONTWAIT);
-    if (received < 0)
-    {
-      const int error = errno;
-      if (error == EAGAIN || error == EWOULDBLOCK)
-      {
-        return;
-      }
-      if (error == EINTR)
-      {
-        continue;
-      }
-      if (error == ECONNREFUSED)
-      {
-        // An ICMP error reported against an earlier send. Not this datagram's
-        // problem, and not the socket's.
-        continue;
-      }
-      deliver(state, std::unexpected(error_t{.code = -error, .msg = "recvmsg failed"}));
-      return;
-    }
-
-    for (cmsghdr *header = CMSG_FIRSTHDR(&message); header != nullptr; header = CMSG_NXTHDR(&message, header))
-    {
-#if defined(UDP_GRO)
-      if (header->cmsg_level == IPPROTO_UDP && header->cmsg_type == UDP_GRO && header->cmsg_len == CMSG_LEN(sizeof(int)))
-      {
-        int value = 0;
-        std::memcpy(&value, CMSG_DATA(header), sizeof(value));
-        segment = value > 0 ? static_cast<std::size_t>(value) : 0;
-        continue;
-      }
-#endif
-      const bool v4 = header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_TOS;
-#if defined(IPV6_TCLASS)
-      const bool v6 = header->cmsg_level == IPPROTO_IPV6 && header->cmsg_type == IPV6_TCLASS;
-#else
-      const bool v6 = false;
-#endif
-      if (!v4 && !v6)
-      {
-        continue;
-      }
-      // IP_TOS arrives as a single byte on Linux and as an int on some other
-      // systems; IPV6_TCLASS is an int. Reading the wrong width would take the
-      // codepoint from the wrong end of the value.
-      if (header->cmsg_len == CMSG_LEN(sizeof(int)))
-      {
-        int value = 0;
-        std::memcpy(&value, CMSG_DATA(header), sizeof(value));
-        ecn = ecn_from_traffic_class(value);
-      }
-      else if (header->cmsg_len == CMSG_LEN(sizeof(std::uint8_t)))
-      {
-        std::uint8_t value = 0;
-        std::memcpy(&value, CMSG_DATA(header), sizeof(value));
-        ecn = ecn_from_traffic_class(static_cast<int>(value));
-      }
-    }
-    length = static_cast<std::size_t>(received);
-#endif
-
-    ++state.reads;
-
-    // Without a segment size the read holds exactly one datagram, which is the
-    // ordinary case and the only one when coalescing is off.
-    if (segment == 0 || segment >= length)
-    {
-      ++state.datagrams;
-      datagram_t datagram;
-      datagram.data.assign(state.scratch.begin(), state.scratch.begin() + static_cast<std::ptrdiff_t>(length));
-      datagram.from = from;
-      datagram.ecn = ecn;
-      deliver(state, std::move(datagram));
-      continue;
-    }
-
-    // Coalesced: every segment is full-length except the last. They came from
-    // one flow, so they share a sender and a codepoint.
-    for (std::size_t offset = 0; offset < length; offset += segment)
-    {
-      ++state.datagrams;
-      const std::size_t piece = (std::min)(segment, length - offset);
-      datagram_t datagram;
-      datagram.data.assign(state.scratch.begin() + static_cast<std::ptrdiff_t>(offset), state.scratch.begin() + static_cast<std::ptrdiff_t>(offset + piece));
-      datagram.from = from;
-      datagram.ecn = ecn;
-      deliver(state, std::move(datagram));
-    }
-  }
-}
-} // namespace detail
-
-inline void datagram_reader_t::on_readable(uv_poll_t *handle, int status, int events)
-{
-  auto *state = static_cast<detail::datagram_reader_state_t *>(handle->data);
-  if (state == nullptr || state->cancelled || state->closing)
-  {
-    return;
-  }
-  if (status < 0)
-  {
-    detail::deliver(*state, std::unexpected(error_t{.code = status, .msg = uv_strerror(status)}));
-    return;
-  }
-  if ((events & UV_READABLE) == 0)
-  {
-    return;
-  }
-  detail::drain_socket(*state);
-}
 } // namespace vio

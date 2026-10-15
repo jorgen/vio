@@ -64,10 +64,10 @@ int main()
           co_return;
         }
         auto &datagram = recv_result.value();
-        std::string_view msg(datagram.data->base, datagram.data->len);
+        std::string_view msg(datagram.data.chars(), datagram.data.size());
         std::println("Receiver: got \"{}\" from port {}", msg, datagram.sender_port());
 
-        auto send_result = co_await vio::send_udp(echo_sock, reinterpret_cast<const uint8_t *>(datagram.data->base), datagram.data->len, datagram.get_sender());
+        auto send_result = co_await vio::send_udp(echo_sock, reinterpret_cast<const uint8_t *>(datagram.data.data()), datagram.data.size(), datagram.get_sender());
         if (!send_result)
         {
           std::println(stderr, "Receiver echo failed: {}", send_result.error().msg);
@@ -134,7 +134,7 @@ int main()
           co_return;
         }
         auto &datagram = recv_result.value();
-        std::string_view echo(datagram.data->base, datagram.data->len);
+        std::string_view echo(datagram.data.chars(), datagram.data.size());
         std::println("Sender: received echo \"{}\"", echo);
       }
     }(event_loop, port, num_datagrams);

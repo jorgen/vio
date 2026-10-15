@@ -1,7 +1,6 @@
 #include <doctest/doctest.h>
 #include <vio/awaitable_event_pipe.h>
 #include <vio/event_loop.h>
-#include <vio/operation/dns.h>
 #include <vio/operation/sleep.h>
 #include <vio/task.h>
 

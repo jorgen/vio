@@ -1,3 +1,25 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -26,8 +48,7 @@ std::vector<uint8_t> concat_pem(std::initializer_list<const std::vector<uint8_t>
 }
 
 // Accept `count` connections on one server, driving each handshake to completion
-// (or failure) before the next. Mirrors the multi-accept pattern from
-// test_tls_server.cpp (reset listen.done, re-listen).
+// (or failure) before the next.
 vio::task_t<void> sni_accept_loop(vio::event_loop_t &event_loop, vio::tcp_server_t s, vio::ssl_config_t config, int count)
 {
   auto server_or = vio::ssl_server_create(event_loop, std::move(s), "localhost", config);
@@ -40,7 +61,6 @@ vio::task_t<void> sni_accept_loop(vio::event_loop_t &event_loop, vio::tcp_server
     auto accepted = vio::ssl_server_accept(server);
     REQUIRE_EXPECTED(accepted);
     auto client = std::move(accepted.value());
-    server.handle->tcp.tcp.handle->listen.done = false;
     co_await vio::ssl_server_client_handshake(client); // result ignored: an untrusted client fails here
   }
 }

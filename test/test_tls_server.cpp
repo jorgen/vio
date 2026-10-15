@@ -1,7 +1,30 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <ostream>
 
 #include <doctest/doctest.h>
 #include <numeric>
+#include <optional>
 #include <vio/ssl_backend.h>
 
 #include <openssl/err.h>
@@ -129,13 +152,13 @@ vio::task_t<void> test_tls_server(vio::event_loop_t &event_loop, vio::tcp_server
   auto read_result = co_await reader.value();
   REQUIRE_EXPECTED(read_result);
   auto &read_data = read_result.value();
-  const std::string_view sv(read_data->base, read_data->len);
+  const std::string_view sv(read_data.chars(), read_data.size());
   if (sv.find("Hello from client") != std::string_view::npos)
   {
     server_got_data = true;
   }
   std::string reply = "Hello from server";
-  const uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(reply.data()), reply.size());
+  auto buf = std::as_bytes(std::span(reply));
   auto write_result = co_await vio::ssl_server_client_write(client, buf);
   REQUIRE_EXPECTED(write_result);
   server_wrote_msg = true;
@@ -171,7 +194,7 @@ vio::task_t<void> test_tls_client(vio::event_loop_t &event_loop, int server_port
   REQUIRE_EXPECTED(connect_result);
 
   std::string client_message = "Hello from client";
-  const uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(client_message.data()), client_message.size());
+  auto buf = std::as_bytes(std::span(client_message));
   auto write_result = co_await vio::ssl_client_write(client_raw, buf);
   REQUIRE_EXPECTED(write_result);
   auto reader = vio::ssl_client_create_reader(client_raw);
@@ -179,7 +202,7 @@ vio::task_t<void> test_tls_client(vio::event_loop_t &event_loop, int server_port
   auto read_result = co_await reader.value();
   REQUIRE_EXPECTED(read_result);
   auto &read_data = read_result.value();
-  const std::string_view sv(read_data->base, read_data->len);
+  const std::string_view sv(read_data.chars(), read_data.size());
   if (sv.find("Hello from server") != std::string_view::npos)
   {
     client_got_server_reply = true;
@@ -238,28 +261,26 @@ TEST_CASE("test destroy server while listening")
   bool listen_cancelled = false;
 
   event_loop.run_in_loop(
-    [&]()
+    [&]
     {
-      auto server_tcp_pair = get_ephemeral_port(event_loop);
-      REQUIRE_EXPECTED(server_tcp_pair);
-
-      auto server_create_result = vio::ssl_server_create(event_loop, std::move(server_tcp_pair->first), "localhost", server_config);
-      REQUIRE_EXPECTED(server_create_result);
-
+      return [](vio::event_loop_t &el, vio::ssl_config_t sc, bool &cancelled) -> vio::task_t<void>
       {
-        auto server = std::move(server_create_result.value());
-        auto listen_future = vio::ssl_server_listen(server, server_tcp_pair->second);
+        auto server_tcp_pair = get_ephemeral_port(el);
+        REQUIRE_EXPECTED(server_tcp_pair);
+        auto server_create_result = vio::ssl_server_create(el, std::move(server_tcp_pair->first), "localhost", sc);
+        REQUIRE_EXPECTED(server_create_result);
+        std::optional<vio::ssl_server_t> server(std::move(server_create_result.value()));
 
+        auto listener = [](vio::tcp_listen_future_t listen, bool &cancelled) -> vio::task_t<void>
         {
-          auto temp_server = std::move(server);
-        }
+          auto result = co_await std::move(listen);
+          cancelled = !result.has_value();
+        }(vio::ssl_server_listen(*server, server_tcp_pair->second), cancelled);
 
-        // listen.done is set synchronously by the on_destroy callback
-        listen_cancelled = listen_future.await_ready() && !listen_future.await_resume().has_value();
-      }
-      // listen_future destroyed here — TCP handle uv_close is pending
-
-      event_loop.stop();
+        server.reset();
+        co_await std::move(listener);
+        el.stop();
+      }(event_loop, server_config, listen_cancelled);
     });
 
   event_loop.run();
@@ -310,7 +331,7 @@ TEST_CASE("tls echo multiple messages")
               sr++;
 
               auto &data = read_result.value();
-              uv_buf_t buf = uv_buf_init(data->base, data->len);
+              auto buf = std::span<const std::byte>(data.span());
               auto write_result = co_await vio::ssl_server_client_write(client, buf);
               REQUIRE_EXPECTED(write_result);
             }
@@ -332,14 +353,14 @@ TEST_CASE("tls echo multiple messages")
             for (int i = 0; i < nm; i++)
             {
               std::string msg = "tls_msg_" + std::to_string(i);
-              uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+              auto buf = std::as_bytes(std::span(msg));
               auto write_result = co_await vio::ssl_client_write(client, buf);
               REQUIRE_EXPECTED(write_result);
 
               auto read_result = co_await reader;
               REQUIRE_EXPECTED(read_result);
               auto &data = read_result.value();
-              std::string_view sv(data->base, data->len);
+              std::string_view sv(data.chars(), data.size());
               REQUIRE(sv == msg);
               cr++;
             }
@@ -401,12 +422,12 @@ TEST_CASE("tls large data round trip")
               if (!read_result.has_value())
                 break;
               auto &data = read_result.value();
-              received.insert(received.end(), data->base, data->base + data->len);
-              total_read += data->len;
+              received.insert(received.end(), data.chars(), data.chars() + data.size());
+              total_read += data.size();
             }
             REQUIRE(total_read == ds);
 
-            uv_buf_t buf = uv_buf_init(received.data(), received.size());
+            auto buf = std::as_bytes(std::span(received));
             auto write_result = co_await vio::ssl_server_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
           }(event_loop, std::move(server_tcp_pair->first), server_config, port, data_size);
@@ -423,7 +444,7 @@ TEST_CASE("tls large data round trip")
             std::vector<uint8_t> send_data(ds);
             std::iota(send_data.begin(), send_data.end(), uint8_t(0));
 
-            uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(send_data.data()), send_data.size());
+            auto buf = std::as_bytes(std::span(send_data));
             auto write_result = co_await vio::ssl_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
 
@@ -440,8 +461,8 @@ TEST_CASE("tls large data round trip")
               if (!read_result.has_value())
                 break;
               auto &data = read_result.value();
-              received.insert(received.end(), data->base, data->base + data->len);
-              total_read += data->len;
+              received.insert(received.end(), data.chars(), data.chars() + data.size());
+              total_read += data.size();
             }
             REQUIRE(total_read == ds);
             REQUIRE(std::memcmp(received.data(), send_data.data(), ds) == 0);
@@ -516,7 +537,7 @@ TEST_CASE("tls client disconnect causes server read error")
 
             // Write one message then disconnect
             std::string msg = "goodbye";
-            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto buf = std::as_bytes(std::span(msg));
             auto write_result = co_await vio::ssl_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
           }(event_loop, client_config, port);
@@ -589,7 +610,7 @@ TEST_CASE("tls server disconnect causes client read error")
             REQUIRE_EXPECTED(connect_result);
 
             std::string msg = "ping";
-            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto buf = std::as_bytes(std::span(msg));
             auto write_result = co_await vio::ssl_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
 
@@ -664,7 +685,6 @@ TEST_CASE("tls multiple clients to same server")
               auto client_or_err = vio::ssl_server_accept(server);
               REQUIRE_EXPECTED(client_or_err);
               auto client = std::move(client_or_err.value());
-              server.handle->tcp.tcp.handle->listen.done = false;
 
               auto reader_or_err = vio::ssl_server_client_create_reader(client);
               REQUIRE_EXPECTED(reader_or_err);
@@ -674,7 +694,7 @@ TEST_CASE("tls multiple clients to same server")
               cs++;
 
               auto &data = read_result.value();
-              uv_buf_t buf = uv_buf_init(data->base, data->len);
+              auto buf = std::span<const std::byte>(data.span());
               auto write_result = co_await vio::ssl_server_client_write(client, buf);
               REQUIRE_EXPECTED(write_result);
             }
@@ -692,7 +712,7 @@ TEST_CASE("tls multiple clients to same server")
               REQUIRE_EXPECTED(connect_result);
 
               std::string msg = "tls_client_" + std::to_string(i);
-              uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+              auto buf = std::as_bytes(std::span(msg));
               auto write_result = co_await vio::ssl_client_write(client, buf);
               REQUIRE_EXPECTED(write_result);
 
@@ -702,7 +722,7 @@ TEST_CASE("tls multiple clients to same server")
               auto read_result = co_await reader;
               REQUIRE_EXPECTED(read_result);
               auto &data = read_result.value();
-              std::string_view sv(data->base, data->len);
+              std::string_view sv(data.chars(), data.size());
               REQUIRE(sv == msg);
               cr++;
             }
@@ -855,7 +875,6 @@ TEST_CASE("tls reader create on unconnected client fails")
     auto reader = vio::ssl_client_create_reader(client);
     REQUIRE(!reader.has_value());
   }
-  // Stop and run event loop to process uv_close callbacks
   event_loop.stop();
   event_loop.run();
 }
@@ -892,7 +911,7 @@ TEST_CASE("tls server write then client read")
 
             // Server writes first
             std::string msg = "server_speaks_first";
-            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto buf = std::as_bytes(std::span(msg));
             auto write_result = co_await vio::ssl_server_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
 
@@ -903,7 +922,7 @@ TEST_CASE("tls server write then client read")
             auto read_result = co_await reader;
             REQUIRE_EXPECTED(read_result);
             auto &data = read_result.value();
-            std::string_view sv(data->base, data->len);
+            std::string_view sv(data.chars(), data.size());
             REQUIRE(sv == "client_ack");
           }(event_loop, std::move(server_tcp_pair->first), server_config, port);
 
@@ -923,12 +942,12 @@ TEST_CASE("tls server write then client read")
             auto read_result = co_await reader;
             REQUIRE_EXPECTED(read_result);
             auto &data = read_result.value();
-            std::string_view sv(data->base, data->len);
+            std::string_view sv(data.chars(), data.size());
             REQUIRE(sv == "server_speaks_first");
 
             // Then responds
             std::string msg = "client_ack";
-            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto buf = std::as_bytes(std::span(msg));
             auto write_result = co_await vio::ssl_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
             v = true;
@@ -977,7 +996,7 @@ TEST_CASE("tls exact buffer read with stream_reader_t::read()")
             // Send exactly 100 bytes of known pattern
             std::vector<char> data(100);
             std::iota(data.begin(), data.end(), char(0));
-            uv_buf_t buf = uv_buf_init(data.data(), data.size());
+            auto buf = std::as_bytes(std::span(data));
             auto write_result = co_await vio::ssl_server_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
           }(event_loop, std::move(server_tcp_pair->first), server_config, port);
@@ -997,10 +1016,7 @@ TEST_CASE("tls exact buffer read with stream_reader_t::read()")
 
             // Use the exact buffer read to get exactly 100 bytes
             std::vector<char> buffer(100);
-            uv_buf_t read_buf;
-            read_buf.base = buffer.data();
-            read_buf.len = buffer.size();
-            auto read_result = co_await reader.read(read_buf);
+            auto read_result = co_await reader.read(std::as_writable_bytes(std::span(buffer)));
             REQUIRE_EXPECTED(read_result);
 
             // Verify the pattern
@@ -1052,7 +1068,7 @@ TEST_CASE("tls bidirectional concurrent read and write")
 
             // Write and read at the same time (write first to avoid deadlock in coroutine)
             std::string msg = "from_server";
-            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto buf = std::as_bytes(std::span(msg));
             auto write_result = co_await vio::ssl_server_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
 
@@ -1062,7 +1078,7 @@ TEST_CASE("tls bidirectional concurrent read and write")
             auto read_result = co_await reader;
             REQUIRE_EXPECTED(read_result);
             auto &data = read_result.value();
-            std::string_view sv2(data->base, data->len);
+            std::string_view sv2(data.chars(), data.size());
             REQUIRE(sv2 == "from_client");
             sv = true;
           }(event_loop, std::move(server_tcp_pair->first), server_config, port, server_verified);
@@ -1078,7 +1094,7 @@ TEST_CASE("tls bidirectional concurrent read and write")
 
             // Write and read (write first to match server's read)
             std::string msg = "from_client";
-            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto buf = std::as_bytes(std::span(msg));
             auto write_result = co_await vio::ssl_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
 
@@ -1088,7 +1104,7 @@ TEST_CASE("tls bidirectional concurrent read and write")
             auto read_result = co_await reader;
             REQUIRE_EXPECTED(read_result);
             auto &data = read_result.value();
-            std::string_view sv2(data->base, data->len);
+            std::string_view sv2(data.chars(), data.size());
             REQUIRE(sv2 == "from_server");
             cv = true;
           }(event_loop, client_config, port, client_verified);
@@ -1159,11 +1175,11 @@ TEST_CASE("tls reader cancel")
               REQUIRE(reader.is_cancelled());
               auto cancelled_read = co_await reader;
               REQUIRE(!cancelled_read.has_value());
-              REQUIRE(cancelled_read.error().code == UV_ECANCELED);
+              REQUIRE(cancelled_read.error().code == vio::errc::canceled);
             }
 
             std::string msg = "bye";
-            uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+            auto buf = std::as_bytes(std::span(msg));
             auto write_result = co_await vio::ssl_client_write(client, buf);
             REQUIRE_EXPECTED(write_result);
             c = true;

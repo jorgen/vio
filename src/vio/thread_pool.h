@@ -24,6 +24,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <memory>
@@ -111,7 +113,7 @@ public:
 
       if (stop)
       {
-        abort(); // invalid state. Enqueing after
+        std::abort(); // invalid state. Enqueing after
       }
 
       tasks.emplace([package]() { (*package)(); });
@@ -135,7 +137,7 @@ public:
 
       if (stop)
       {
-        abort(); // invalid state. Enqueing after stop.
+        std::abort(); // invalid state. Enqueing after stop.
       }
 
       tasks.emplace(std::forward<T>(task));

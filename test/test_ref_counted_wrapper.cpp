@@ -314,7 +314,7 @@ TEST_CASE("ref_ptr_t with callbacks")
     CHECK(callback_called);
   }
 
-  SUBCASE("callback can postpone destruction (libuv style)")
+  SUBCASE("callback can postpone destruction")
   {
     destruction_tracker_t::reset();
     test_owned_t *wrapper_ptr = nullptr;
@@ -358,34 +358,64 @@ TEST_CASE("ref_ptr_t with callbacks")
   }
 }
 
-TEST_CASE("ref_ptr_t register_handle and on_destroy")
+TEST_CASE("ref_ptr_t register_resource and on_destroy")
 {
-  SUBCASE("register_handle stores handle for closing")
+  SUBCASE("register_resource stores a resource for closing")
   {
     vio::event_loop_t loop;
 
-    struct handle_data_t
+    struct closer_t final : vio::detail::resource_t
     {
-      uv_async_t async = {};
-
-      explicit handle_data_t(vio::event_loop_t &loop)
+      int *closes;
+      closer_t(vio::event_loop_t &loop, int *closes)
+        : resource_t(vio::detail::core(loop), "closer")
+        , closes(closes)
       {
-        uv_async_init(loop.loop(), &async, nullptr);
+      }
+      void do_close() noexcept override
+      {
+        ++*closes;
+        close_finished();
       }
     };
 
-    using owned_handle_t = vio::ref_ptr_t<handle_data_t>;
+    struct resource_data_t
+    {
+      closer_t closer;
+      bool *freed;
+      resource_data_t(vio::event_loop_t &loop, int *closes, bool *freed)
+        : closer(loop, closes)
+        , freed(freed)
+      {
+      }
+      resource_data_t(const resource_data_t &) = delete;
+      resource_data_t &operator=(const resource_data_t &) = delete;
+      resource_data_t(resource_data_t &&) = delete;
+      resource_data_t &operator=(resource_data_t &&) = delete;
+      ~resource_data_t()
+      {
+        *freed = true;
+      }
+    };
+
+    using owned_resource_t = vio::ref_ptr_t<resource_data_t>;
 
     bool destroyed = false;
+    bool freed = false;
+    int closes = 0;
     {
-      owned_handle_t wrapper(loop);
-      wrapper.register_handle(&wrapper->async);
+      owned_resource_t wrapper(loop, &closes, &freed);
+      wrapper.register_resource(wrapper->closer);
       wrapper.on_destroy([&destroyed]() { destroyed = true; });
     }
 
     CHECK(destroyed);
+    CHECK(closes == 1);
+    CHECK_FALSE(freed);
     loop.run_in_loop([&loop] { loop.stop(); });
     loop.run();
+    CHECK(closes == 1);
+    CHECK(freed);
   }
 
   SUBCASE("on_destroy is alias for register_destroy_callback")

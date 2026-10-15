@@ -22,6 +22,8 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include <utility>
+
 namespace vio
 {
 template <typename T, typename Closer>

@@ -1,3 +1,25 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <doctest/doctest.h>
 
 #include <vio/event_loop.h>
@@ -10,6 +32,11 @@
 
 #include <chrono>
 #include <utility>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#endif
 
 namespace
 {
@@ -32,12 +59,6 @@ std::expected<std::pair<vio::tcp_server_t, int>, vio::error_t> make_bound_server
   return std::make_pair(std::move(server.value()), static_cast<int>(ntohs(in->sin_port)));
 }
 
-// Reproduces the tcp_listen parked-ref over-release: on_connection consumes the
-// ref parked in stream->data but (pre-fix) never nulls it, so a second incoming
-// connection (before the listen is re-armed) re-consumes the same raw pointer
-// and spuriously decrements the server state's refcount. This scenario owns all
-// of its handles and does NOT stop the loop; the caller stops it after awaiting,
-// so every handle is uv_close()'d before teardown.
 vio::task_t<void> listen_overrelease_scenario(vio::event_loop_t &event_loop, long long &before, long long &after, bool &second_arrived)
 {
   auto server_and_port = make_bound_server(event_loop);
@@ -53,7 +74,6 @@ vio::task_t<void> listen_overrelease_scenario(vio::event_loop_t &event_loop, lon
   // mid-test: we want a clean refcount read, not a use-after-free crash.
   auto keepalive = server.tcp.handle;
 
-  // First connection -> on_connection #1 consumes the parked ref.
   auto first_client = vio::tcp_create(event_loop);
   REQUIRE_EXPECTED(first_client);
   auto client1 = std::move(first_client.value());
@@ -67,21 +87,16 @@ vio::task_t<void> listen_overrelease_scenario(vio::event_loop_t &event_loop, lon
   REQUIRE_EXPECTED(accepted1);
   auto client1_on_server = std::move(accepted1.value());
 
-  // Let on_connection #1 fully unwind (its parked-ref drop has happened).
   [[maybe_unused]] auto slept1 = co_await vio::sleep(event_loop, std::chrono::milliseconds(30));
 
   before = static_cast<long long>(keepalive.ref_counted()->ref_count.load());
 
-  // Second connection WITHOUT re-arming the listen: uv calls on_connection
-  // again on the still-armed socket. Pre-fix this re-consumes the parked ref.
   auto second_client = vio::tcp_create(event_loop);
   REQUIRE_EXPECTED(second_client);
   auto client2 = std::move(second_client.value());
   auto connect2 = co_await vio::tcp_connect(client2, sa);
   REQUIRE_EXPECTED(connect2);
 
-  // Poll until the second connection is acceptable, i.e. on_connection has had
-  // its chance to fire (rather than relying on a single fixed-length sleep).
   std::expected<vio::tcp_t, vio::error_t> accepted2 = std::unexpected(vio::error_t{.code = -1, .msg = "pending"});
   for (int i = 0; i < 40 && !accepted2.has_value(); ++i)
   {
@@ -99,6 +114,73 @@ vio::task_t<void> listen_overrelease_scenario(vio::event_loop_t &event_loop, lon
   {
     keepalive.ref_counted()->ref_count.fetch_add(static_cast<std::size_t>(before - after));
   }
+}
+
+vio::task_t<void> fifo_accept_scenario(vio::event_loop_t &event_loop, std::vector<int> &order, bool &nonblocking)
+{
+  auto server_and_port = make_bound_server(event_loop);
+  REQUIRE_EXPECTED(server_and_port);
+  auto server = std::move(server_and_port->first);
+  auto addr = vio::ip4_addr("127.0.0.1", server_and_port->second);
+  REQUIRE_EXPECTED(addr);
+  const auto *sa = reinterpret_cast<const sockaddr *>(&addr.value());
+
+  auto acceptor = [](vio::tcp_server_t &server, int id, std::vector<int> &order, std::vector<vio::tcp_t> &accepted) -> vio::task_t<void>
+  {
+    auto ready = co_await vio::tcp_listen(server, 16);
+    REQUIRE_EXPECTED(ready);
+    order.push_back(id);
+    auto connection = vio::tcp_accept(server);
+    REQUIRE_EXPECTED(connection);
+    accepted.push_back(std::move(connection.value()));
+  };
+
+  std::vector<vio::tcp_t> accepted;
+  auto first = acceptor(server, 1, order, accepted);
+  auto second = acceptor(server, 2, order, accepted);
+  auto third = acceptor(server, 3, order, accepted);
+
+  std::vector<vio::tcp_t> clients;
+  for (int i = 0; i < 3; ++i)
+  {
+    auto client = vio::tcp_create(event_loop);
+    REQUIRE_EXPECTED(client);
+    auto connected = co_await vio::tcp_connect(client.value(), sa);
+    REQUIRE_EXPECTED(connected);
+    clients.push_back(std::move(client.value()));
+  }
+  co_await std::move(first);
+  co_await std::move(second);
+  co_await std::move(third);
+  REQUIRE(accepted.size() == 3);
+
+  nonblocking = true;
+#if !defined(_WIN32)
+  for (auto &connection : accepted)
+  {
+    int flags = fcntl(connection.handle->socket.native(), F_GETFL, 0);
+    nonblocking = nonblocking && flags >= 0 && (flags & O_NONBLOCK) != 0;
+  }
+#endif
+}
+
+vio::task_t<void> abort_scenario(vio::event_loop_t &event_loop, int &code, bool &resolved_at_once)
+{
+  auto server_and_port = make_bound_server(event_loop);
+  REQUIRE_EXPECTED(server_and_port);
+  auto server = std::move(server_and_port->first);
+
+  auto waiter = [](vio::tcp_server_t &server, int &code) -> vio::task_t<void>
+  {
+    auto ready = co_await vio::tcp_listen(server, 4);
+    REQUIRE_FALSE(ready.has_value());
+    code = ready.error().code;
+  }(server, code);
+
+  [[maybe_unused]] auto slept = co_await vio::sleep(event_loop, std::chrono::milliseconds(10));
+  vio::tcp_listen_abort(server, vio::error_t{.code = vio::errc::canceled, .msg = "server stopped"});
+  resolved_at_once = waiter.done();
+  co_await std::move(waiter);
 }
 } // namespace
 
@@ -125,5 +207,49 @@ TEST_SUITE("tcp_listen")
 
     REQUIRE(second_arrived);
     CHECK_EQ(after, before);
+  }
+
+  TEST_CASE("concurrent listens are served in the order they waited")
+  {
+    vio::event_loop_t event_loop;
+    std::vector<int> order;
+    bool nonblocking = false;
+
+    event_loop.run_in_loop(
+      [&]
+      {
+        return [](vio::event_loop_t &el, std::vector<int> &o, bool &n) -> vio::task_t<void>
+        {
+          co_await fifo_accept_scenario(el, o, n);
+          el.stop();
+        }(event_loop, order, nonblocking);
+      });
+
+    event_loop.run();
+
+    CHECK(order == std::vector<int>{1, 2, 3});
+    CHECK(nonblocking);
+  }
+
+  TEST_CASE("tcp_listen_abort resolves a waiting listen")
+  {
+    vio::event_loop_t event_loop;
+    int code = 0;
+    bool resolved_at_once = false;
+
+    event_loop.run_in_loop(
+      [&]
+      {
+        return [](vio::event_loop_t &el, int &c, bool &r) -> vio::task_t<void>
+        {
+          co_await abort_scenario(el, c, r);
+          el.stop();
+        }(event_loop, code, resolved_at_once);
+      });
+
+    event_loop.run();
+
+    CHECK(resolved_at_once);
+    CHECK(code == vio::errc::canceled);
   }
 }

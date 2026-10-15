@@ -1,3 +1,25 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <doctest/doctest.h>
 
 #include <span>
@@ -78,7 +100,7 @@ TEST_CASE("alpn negotiates h2 and both sides observe it")
           if (auto a = vio::ssl_client_alpn_selected(c))
             ca = *a;
           std::string msg = "hi";
-          uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+          auto buf = std::as_bytes(std::span(msg));
           auto wr = co_await vio::ssl_client_write(c, buf);
           REQUIRE_EXPECTED(wr);
         }(event_loop, cc, port, ca);
@@ -143,7 +165,7 @@ TEST_CASE("alpn with no overlap still connects, no protocol selected")
           connected = true;
           client_has_alpn = vio::ssl_client_alpn_selected(c).has_value();
           std::string msg = "hi";
-          uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+          auto buf = std::as_bytes(std::span(msg));
           auto wr = co_await vio::ssl_client_write(c, buf);
           REQUIRE_EXPECTED(wr);
         }(event_loop, cc, port, connected, client_has_alpn);
@@ -195,7 +217,7 @@ TEST_CASE("two concurrent in-flight writes arrive intact and in order")
             auto rr = co_await reader;
             if (!rr.has_value())
               break;
-            received.append(rr.value()->base, rr.value()->len);
+            received.append(rr.value().chars(), rr.value().size());
           }
           verified = (received == "AAABBB");
         }(event_loop, std::move(server_tcp_pair->first), sc, port, verified);
@@ -209,9 +231,9 @@ TEST_CASE("two concurrent in-flight writes arrive intact and in order")
           REQUIRE_EXPECTED(connect_result);
           std::string a = "AAA";
           std::string b = "BBB";
-          uv_buf_t ba = uv_buf_init(a.data(), a.size());
-          uv_buf_t bb = uv_buf_init(b.data(), b.size());
-          // Submit both writes before awaiting either -> two uv_writes in flight.
+          auto ba = std::as_bytes(std::span(a));
+          auto bb = std::as_bytes(std::span(b));
+          // Submit both writes before awaiting either.
           auto w1 = vio::ssl_client_write(c, ba);
           auto w2 = vio::ssl_client_write(c, bb);
           auto r1 = co_await std::move(w1);
@@ -266,7 +288,7 @@ TEST_CASE("vectored write coalesces buffers and round-trips")
             auto rr = co_await reader;
             if (!rr.has_value())
               break;
-            received.append(rr.value()->base, rr.value()->len);
+            received.append(rr.value().chars(), rr.value().size());
           }
           verified = (received == "frame1two");
         }(event_loop, std::move(server_tcp_pair->first), sc, port, verified);
@@ -280,8 +302,8 @@ TEST_CASE("vectored write coalesces buffers and round-trips")
           REQUIRE_EXPECTED(connect_result);
           std::string f1 = "frame1";
           std::string f2 = "two";
-          uv_buf_t bufs[2] = {uv_buf_init(f1.data(), f1.size()), uv_buf_init(f2.data(), f2.size())};
-          auto wr = co_await vio::ssl_client_writev(c, std::span<const uv_buf_t>(bufs, 2));
+          std::span<const std::byte> bufs[2] = {std::as_bytes(std::span(f1)), std::as_bytes(std::span(f2))};
+          auto wr = co_await vio::ssl_client_writev(c, std::span<const std::span<const std::byte>>(bufs, 2));
           REQUIRE_EXPECTED(wr);
         }(event_loop, cc, port);
 
@@ -338,11 +360,11 @@ TEST_CASE("empty vectored write completes synchronously without hanging")
           auto connect_result = co_await vio::ssl_client_connect(c, "localhost", p, "127.0.0.1");
           REQUIRE_EXPECTED(connect_result);
           // Empty vectored write: must resolve, not hang.
-          auto ew = co_await vio::ssl_client_writev(c, std::span<const uv_buf_t>{});
+          auto ew = co_await vio::ssl_client_writev(c, std::span<const std::span<const std::byte>>{});
           REQUIRE_EXPECTED(ew);
           empty_ok = true;
           std::string msg = "done";
-          uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+          auto buf = std::as_bytes(std::span(msg));
           auto wr = co_await vio::ssl_client_write(c, buf);
           REQUIRE_EXPECTED(wr);
         }(event_loop, cc, port, empty_ok);
@@ -391,7 +413,7 @@ TEST_CASE("server write parked before a failing handshake resolves with an error
           auto client = std::move(client_or_err.value());
           // Write before the handshake finishes (parked in pending_handshake_writes).
           std::string greeting = "hello";
-          uv_buf_t buf = uv_buf_init(greeting.data(), greeting.size());
+          auto buf = std::as_bytes(std::span(greeting));
           auto wr = co_await vio::ssl_server_client_write(client, buf);
           swf = !wr.has_value(); // must resolve with an error, not hang
         }(event_loop, std::move(server_tcp_pair->first), sc, port, swf);
@@ -466,7 +488,7 @@ TEST_CASE("half-close: client close_notify surfaces as a clean read error on the
           auto connect_result = co_await vio::ssl_client_connect(c, "localhost", p, "127.0.0.1");
           REQUIRE_EXPECTED(connect_result);
           std::string msg = "hello";
-          uv_buf_t buf = uv_buf_init(msg.data(), msg.size());
+          auto buf = std::as_bytes(std::span(msg));
           auto wr = co_await vio::ssl_client_write(c, buf);
           REQUIRE_EXPECTED(wr);
           auto sh = co_await vio::ssl_client_shutdown(c);

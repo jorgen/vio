@@ -22,63 +22,40 @@
 
 #pragma once
 
-#include <uv.h>
-
-#include "vio/bit_mask.h"
+#include <algorithm>
+#include <coroutine>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <span>
+#include <string>
+#include <utility>
 
 #include "vio/auto_closer.h"
+#include "vio/bit_mask.h"
 #include "vio/cancellation.h"
+#include "vio/detail/sys_file.h"
 #include "vio/error.h"
+#include "vio/event_loop.h"
+#include "vio/future.h"
+#include "vio/loop/backend.h"
+#include "vio/loop/blocking_pool.h"
 #include "vio/ref_counted_wrapper.h"
-#include "vio/uv_coro.h"
-
-#include <coroutine>
-#include <expected>
 
 namespace vio
 {
-
-enum class file_open_flag_t
-{
-  append = UV_FS_O_APPEND,
-  creat = UV_FS_O_CREAT,
-  excl = UV_FS_O_EXCL,
-  filemap = UV_FS_O_FILEMAP,
-  random = UV_FS_O_RANDOM,
-  rdonly = UV_FS_O_RDONLY,
-  rdwr = UV_FS_O_RDWR,
-  sequential = UV_FS_O_SEQUENTIAL,
-  short_lived = UV_FS_O_SHORT_LIVED,
-  temporary = UV_FS_O_TEMPORARY,
-  trunc = UV_FS_O_TRUNC,
-  wronly = UV_FS_O_WRONLY,
-  direct = UV_FS_O_DIRECT,
-  directory = UV_FS_O_DIRECTORY,
-  dsync = UV_FS_O_DSYNC,
-  exlock = UV_FS_O_EXLOCK,
-  noatime = UV_FS_O_NOATIME,
-  noctty = UV_FS_O_NOCTTY,
-  nofollow = UV_FS_O_NOFOLLOW,
-  nonblock = UV_FS_O_NONBLOCK,
-  symlink = UV_FS_O_SYMLINK,
-  sync = UV_FS_O_SYNC,
-};
-
-using file_open_flags_t = bit_mask_t<file_open_flag_t>;
-
 struct file_t
 {
   event_loop_t *event_loop;
-  uv_file handle;
+  native_file_t handle;
 };
 
 inline void close_file(file_t *file)
 {
-  if (file->handle > 0)
+  if (file->handle >= 0)
   {
-    uv_fs_t request = {};
-    uv_fs_close(file->event_loop->loop(), &request, file->handle, nullptr);
-    uv_fs_req_cleanup(&request);
+    detail::fs_close(file->handle);
+    file->handle = invalid_native_file;
   }
 }
 
@@ -86,55 +63,36 @@ using auto_close_file_t = auto_close_t<file_t, decltype(&close_file)>;
 
 inline auto_close_file_t make_auto_close_file(file_t &&file)
 {
-  return auto_close_file_t(std::forward<file_t>(file), &close_file);
+  return auto_close_file_t(std::move(file), &close_file);
 }
 
 inline std::expected<auto_close_file_t, error_t> open_file(event_loop_t &event_loop, const std::string &path, file_open_flags_t flags, int mode)
 {
-  uv_fs_t request = {};
-  auto result = uv_fs_open(event_loop.loop(), &request, path.c_str(), flags.value(), mode, nullptr);
-
-  if (result < 0)
-  {
-    // Construct an error_t with code and a UV error message.
-    const error_t err{.code = result, .msg = uv_strerror(result)};
-    uv_fs_req_cleanup(&request);
-    return std::unexpected(err);
-  }
-
-  uv_fs_req_cleanup(&request);
-  return make_auto_close_file({&event_loop, static_cast<uv_file>(result)});
+  native_file_t handle = invalid_native_file;
+  if (int result = detail::fs_open(path, flags.value(), mode, handle); result < 0)
+    return std::unexpected(make_error(result));
+  return make_auto_close_file({&event_loop, handle});
 }
 
 inline std::expected<std::pair<auto_close_file_t, std::string>, error_t> mkstemp_file(event_loop_t &event_loop, const std::string &tpl)
 {
-  uv_fs_t request = {};
-
-  std::string local_tpl = tpl; // NOLINT(performance-unnecessary-copy-initialization) - uv_fs_mkstemp mutates the buffer
-  int result = uv_fs_mkstemp(event_loop.loop(), &request, local_tpl.data(), nullptr);
-
-  if (result < 0)
-  {
-    const error_t err{.code = result, .msg = uv_strerror(result)};
-    uv_fs_req_cleanup(&request);
-    return std::unexpected(err);
-  }
-
-  std::string generated_path;
-  if (request.path)
-  {
-    generated_path = request.path;
-  }
-
-  file_t file{&event_loop, static_cast<uv_file>(request.result)};
-  uv_fs_req_cleanup(&request);
-
-  return std::make_pair(make_auto_close_file(std::move(file)), generated_path);
+  std::string path = tpl;
+  native_file_t handle = invalid_native_file;
+  if (int result = detail::fs_mkstemp(path, handle); result < 0)
+    return std::unexpected(make_error(result));
+  return std::make_pair(make_auto_close_file({&event_loop, handle}), std::move(path));
 }
 
 struct file_io_state_t
 {
-  uv_fs_t req;
+  detail::pool_job_t job;
+  detail::file_op_t op;
+  detail::loop_core_t *loop = nullptr;
+  void *parked = nullptr;
+  native_file_t source = invalid_native_file;
+  std::int64_t outcome = errc::canceled;
+  bool copy = false;
+  bool on_backend = false;
   std::expected<std::size_t, error_t> result;
   std::coroutine_handle<> continuation = {};
   registration_t cancel_registration;
@@ -148,9 +106,7 @@ struct file_io_state_t
   bool await_suspend(std::coroutine_handle<> continuation) noexcept
   {
     if (done)
-    {
       return false;
-    }
     this->continuation = continuation;
     return true;
   }
@@ -161,282 +117,233 @@ struct file_io_state_t
   }
 };
 
-inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const uint8_t *data, std::size_t length, std::int64_t offset, cancellation_t *cancel = nullptr)
+namespace detail
 {
-  using ret_t = future_t<file_io_state_t>;
-  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
-  ret_t ret;
+inline std::int64_t file_io_perform(file_io_state_t &state) noexcept
+{
+  auto &op = state.op;
+  if (state.copy)
+    return fs_sendfile(op.file, state.source, op.offset, op.size);
+  switch (op.kind)
+  {
+  case file_op_kind::read:
+    return fs_read(op.file, std::span<std::byte>(op.data, op.size), op.offset);
+  case file_op_kind::write:
+    return fs_write(op.file, std::span<const std::byte>(op.data, op.size), op.offset);
+  case file_op_kind::fsync:
+    return fs_fsync(op.file);
+  case file_op_kind::fdatasync:
+    return fs_fdatasync(op.file);
+  }
+  return errc::invalid_argument;
+}
 
+inline void file_io_finish(file_io_state_t &state)
+{
+  auto owned = ref_ptr_t<file_io_state_t>::from_raw(std::exchange(state.parked, nullptr));
+  state.on_backend = false;
+  if (state.outcome < 0)
+    state.result = std::unexpected(make_error(static_cast<int>(state.outcome)));
+  else
+    state.result = static_cast<std::size_t>(state.outcome);
+  state.done = true;
+  state.cancel_registration.reset();
+  if (state.continuation)
+    state.continuation.resume();
+}
+
+inline void file_io_work(pool_job_t *job)
+{
+  auto *state = static_cast<file_io_state_t *>(job->owner);
+  state->outcome = file_io_perform(*state);
+}
+
+inline void file_io_pool_done(pool_job_t *job, bool)
+{
+  file_io_finish(*static_cast<file_io_state_t *>(job->owner));
+}
+
+inline void file_io_backend_done(file_op_t *op)
+{
+  auto *state = static_cast<file_io_state_t *>(op->owner);
+  state->outcome = op->result;
+  file_io_finish(*state);
+}
+
+inline void file_io_cancel(file_io_state_t &state) noexcept
+{
+  if (state.done || state.parked == nullptr)
+    return;
+  state.cancel_registration.reset();
+  if (state.on_backend)
+    state.loop->backend().cancel_file(state.op);
+  else
+    pool_cancel(state.job);
+}
+
+inline future_t<file_io_state_t> file_io_start(event_loop_t &event_loop, file_op_kind kind, native_file_t file, std::byte *data, std::size_t size, std::int64_t offset, native_file_t source, bool copy,
+                                               cancellation_t *cancel)
+{
+  future_t<file_io_state_t> ret;
+  auto &state = ret.state_ptr.data();
   if (cancel && cancel->is_cancelled())
   {
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+    state.done = true;
+    state.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
     return ret;
   }
 
-  uv_buf_t buf = uv_buf_init(std::bit_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
+  auto &core = detail::core(event_loop);
+  state.loop = &core;
+  state.source = source;
+  state.copy = copy;
+  auto &op = state.op;
+  op.owner = &state;
+  op.kind = kind;
+  op.file = file;
+  op.offset = offset;
+  op.data = data;
+  op.size = std::min(size, max_file_io);
+  op.result = 0;
 
-  auto callback = [](uv_fs_t *req_ptr)
+  auto parked = ret.state_ptr;
+  state.parked = parked.release_to_raw();
+  if (!copy && core.backend().supports_async_files())
   {
-    auto state_ref = future_ref_ptr_t::from_raw(req_ptr->data);
-
-    auto result = req_ptr->result;
-    if (result < 0)
-    {
-      state_ref->result = std::unexpected(error_t{.code = static_cast<int>(result), .msg = uv_strerror(result)});
-    }
-    else
-    {
-      state_ref->result = static_cast<std::size_t>(result);
-    }
-
-    state_ref->done = true;
-    state_ref->cancel_registration.reset();
-    uv_fs_req_cleanup(req_ptr);
-    if (state_ref->continuation)
-    {
-      state_ref->continuation.resume();
-    }
-  };
-
-  auto copy = ret.state_ptr;
-  ret.state_ptr->req.data = copy.release_to_raw();
-
-  if (int r = uv_fs_write(event_loop.loop(), &ret.state_ptr->req, file.handle, &buf, 1, offset, callback); r < 0)
+    state.on_backend = true;
+    op.complete = &file_io_backend_done;
+    op.in_flight = true;
+    core.backend().submit_file(op);
+  }
+  else
   {
-    future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    return ret;
+    state.job.owner = &state;
+    state.job.work = &file_io_work;
+    state.job.done = &file_io_pool_done;
+    pool_submit(core, state.job, pool_queue::file);
   }
 
-  if (cancel)
+  if (cancel && !state.done)
   {
-    auto *state_raw = &ret.state_ptr.data();
-    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
-    {
-      if (state_raw->done)
-        return;
-      uv_cancel((uv_req_t *)&state_raw->req);
-    });
+    auto *raw = &state;
+    state.cancel_registration = cancel->register_callback([raw]() { file_io_cancel(*raw); });
   }
-
   return ret;
 }
 
-inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &file, uint8_t *buffer, std::size_t length, std::int64_t offset, cancellation_t *cancel = nullptr)
+inline std::expected<void, error_t> file_status(int result)
 {
-  using ret_t = future_t<file_io_state_t>;
-  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
-  ret_t ret;
-
-  if (cancel && cancel->is_cancelled())
-  {
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-    return ret;
-  }
-
-  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(buffer), static_cast<unsigned int>(length));
-
-  auto callback = [](uv_fs_t *req_ptr)
-  {
-    auto state_ref = future_ref_ptr_t::from_raw(req_ptr->data);
-
-    auto result = req_ptr->result;
-    if (result < 0)
-    {
-      state_ref->result = std::unexpected(error_t{.code = static_cast<int>(result), .msg = uv_strerror(result)});
-    }
-    else
-    {
-      state_ref->result = static_cast<std::size_t>(result);
-    }
-
-    state_ref->done = true;
-    state_ref->cancel_registration.reset();
-    uv_fs_req_cleanup(req_ptr);
-    if (state_ref->continuation)
-    {
-      state_ref->continuation.resume();
-    }
-  };
-
-  auto copy = ret.state_ptr;
-  ret.state_ptr->req.data = copy.release_to_raw();
-
-  int r = uv_fs_read(event_loop.loop(), &ret.state_ptr->req, file.handle, &buf, 1, offset, callback);
-
-  if (r < 0)
-  {
-    auto state_ref = future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    return ret;
-  }
-
-  if (cancel)
-  {
-    auto *state_raw = &ret.state_ptr.data();
-    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
-    {
-      if (state_raw->done)
-        return;
-      uv_cancel((uv_req_t *)&state_raw->req);
-    });
-  }
-
-  return ret;
-}
-
-inline std::expected<void, error_t> rename_file(event_loop_t &loop, const std::string &old_path, const std::string &new_path)
-{
-  uv_fs_t req = {};
-  const int result = uv_fs_rename(loop.loop(), &req, old_path.c_str(), new_path.c_str(), nullptr);
-  uv_fs_req_cleanup(&req);
-
   if (result < 0)
-  {
-    return std::unexpected(error_t{.code = result, .msg = uv_strerror(result)});
-  }
-
+    return std::unexpected(make_error(result));
   return {};
 }
 
-inline std::expected<void, error_t> unlink_file(event_loop_t &loop, const std::string &path)
+inline std::expected<std::size_t, error_t> file_count(std::int64_t result)
 {
-  uv_fs_t req = {};
-  const int result = uv_fs_unlink(loop.loop(), &req, path.c_str(), nullptr);
-  uv_fs_req_cleanup(&req);
-
   if (result < 0)
-  {
-    return std::unexpected(error_t{.code = result, .msg = uv_strerror(result)});
-  }
+    return std::unexpected(make_error(static_cast<int>(result)));
+  return static_cast<std::size_t>(result);
+}
+} // namespace detail
 
-  return {};
+inline future_t<file_io_state_t> write_file(event_loop_t &event_loop, file_t &file, const std::uint8_t *data, std::size_t length, std::int64_t offset, cancellation_t *cancel = nullptr)
+{
+  auto *bytes = const_cast<std::byte *>(reinterpret_cast<const std::byte *>(data));
+  return detail::file_io_start(event_loop, detail::file_op_kind::write, file.handle, bytes, length, offset, invalid_native_file, false, cancel);
 }
 
-inline std::expected<void, error_t> mkdir_path(event_loop_t &loop, const std::string &path, int mode)
+inline future_t<file_io_state_t> read_file(event_loop_t &event_loop, file_t &file, std::uint8_t *buffer, std::size_t length, std::int64_t offset, cancellation_t *cancel = nullptr)
 {
-  uv_fs_t req = {};
-  const int result = uv_fs_mkdir(loop.loop(), &req, path.c_str(), mode, nullptr);
-  uv_fs_req_cleanup(&req);
-
-  if (result < 0)
-  {
-    return std::unexpected(error_t{.code = result, .msg = uv_strerror(result)});
-  }
-
-  return {};
+  return detail::file_io_start(event_loop, detail::file_op_kind::read, file.handle, reinterpret_cast<std::byte *>(buffer), length, offset, invalid_native_file, false, cancel);
 }
 
-inline std::expected<void, error_t> rmdir_path(event_loop_t &loop, const std::string &path)
+inline future_t<file_io_state_t> fsync_file(event_loop_t &event_loop, file_t &file, cancellation_t *cancel = nullptr)
 {
-  uv_fs_t req = {};
-  const int result = uv_fs_rmdir(loop.loop(), &req, path.c_str(), nullptr);
-  uv_fs_req_cleanup(&req);
-
-  if (result < 0)
-  {
-    return std::unexpected(error_t{.code = result, .msg = uv_strerror(result)});
-  }
-
-  return {};
+  return detail::file_io_start(event_loop, detail::file_op_kind::fsync, file.handle, nullptr, 0, -1, invalid_native_file, false, cancel);
 }
 
-inline std::expected<uv_stat_t, error_t> stat_file(event_loop_t &loop, const std::string &path)
+inline future_t<file_io_state_t> fdatasync_file(event_loop_t &event_loop, file_t &file, cancellation_t *cancel = nullptr)
 {
-  uv_fs_t req = {};
-  const int result = uv_fs_stat(loop.loop(), &req, path.c_str(), nullptr);
-  if (result < 0)
-  {
-    uv_fs_req_cleanup(&req);
-    return std::unexpected(error_t{.code = result, .msg = uv_strerror(result)});
-  }
-
-  const uv_stat_t stat_result = req.statbuf;
-  uv_fs_req_cleanup(&req);
-  return stat_result;
-}
-
-inline std::expected<std::string, error_t> mkdtemp_path(event_loop_t &loop, const std::string &tpl)
-{
-  uv_fs_t req = {};
-  std::string local_tpl = tpl; // NOLINT(performance-unnecessary-copy-initialization) - uv_fs_mkdtemp mutates the buffer
-  const int result = uv_fs_mkdtemp(loop.loop(), &req, local_tpl.data(), nullptr);
-
-  if (result < 0)
-  {
-    uv_fs_req_cleanup(&req);
-    return std::unexpected(error_t{.code = result, .msg = uv_strerror(result)});
-  }
-
-  std::string path = req.path;
-  uv_fs_req_cleanup(&req);
-  return path;
+  return detail::file_io_start(event_loop, detail::file_op_kind::fdatasync, file.handle, nullptr, 0, -1, invalid_native_file, false, cancel);
 }
 
 inline future_t<file_io_state_t> send_file(event_loop_t &loop, file_t &out_file, file_t &in_file, std::int64_t in_offset, std::size_t length, cancellation_t *cancel = nullptr)
 {
-  using ret_t = future_t<file_io_state_t>;
-  using future_ref_ptr_t = ret_t::future_ref_ptr_t;
-  ret_t ret;
-
-  if (cancel && cancel->is_cancelled())
-  {
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-    return ret;
-  }
-
-  auto callback = [](uv_fs_t *req_ptr)
-  {
-    auto state_ref = future_ref_ptr_t::from_raw(req_ptr->data);
-    auto result = req_ptr->result;
-
-    if (result < 0)
-    {
-      state_ref->result = std::unexpected(error_t{.code = static_cast<int>(result), .msg = uv_strerror(result)});
-    }
-    else
-    {
-      state_ref->result = static_cast<std::size_t>(result);
-    }
-
-    state_ref->done = true;
-    state_ref->cancel_registration.reset();
-    uv_fs_req_cleanup(req_ptr);
-    if (state_ref->continuation)
-    {
-      state_ref->continuation.resume();
-    }
-  };
-
-  auto copy = ret.state_ptr;
-  ret.state_ptr->req.data = copy.release_to_raw();
-  const int call_result = uv_fs_sendfile(loop.loop(), &ret.state_ptr->req, out_file.handle, in_file.handle, in_offset, length, callback);
-
-  if (call_result < 0)
-  {
-    auto state_ref = future_ref_ptr_t::from_raw(ret.state_ptr->req.data);
-    ret.state_ptr->done = true;
-    ret.state_ptr->result = std::unexpected(error_t{.code = call_result, .msg = uv_strerror(call_result)});
-    return ret;
-  }
-
-  if (cancel)
-  {
-    auto *state_raw = &ret.state_ptr.data();
-    ret.state_ptr->cancel_registration = cancel->register_callback([state_raw]()
-    {
-      if (state_raw->done)
-        return;
-      uv_cancel((uv_req_t *)&state_raw->req);
-    });
-  }
-
-  return ret;
+  return detail::file_io_start(loop, detail::file_op_kind::write, out_file.handle, nullptr, length, in_offset, in_file.handle, true, cancel);
 }
 
+inline std::expected<std::size_t, error_t> read_file_sync(file_t &file, std::uint8_t *buffer, std::size_t length, std::int64_t offset)
+{
+  return detail::file_count(detail::fs_read(file.handle, std::span<std::byte>(reinterpret_cast<std::byte *>(buffer), length), offset));
+}
+
+inline std::expected<std::size_t, error_t> write_file_sync(file_t &file, const std::uint8_t *data, std::size_t length, std::int64_t offset)
+{
+  return detail::file_count(detail::fs_write(file.handle, std::span<const std::byte>(reinterpret_cast<const std::byte *>(data), length), offset));
+}
+
+inline std::expected<void, error_t> fsync_file_sync(file_t &file)
+{
+  return detail::file_status(detail::fs_fsync(file.handle));
+}
+
+inline std::expected<void, error_t> fdatasync_file_sync(file_t &file)
+{
+  return detail::file_status(detail::fs_fdatasync(file.handle));
+}
+
+inline std::expected<void, error_t> truncate_file(file_t &file, std::int64_t size)
+{
+  return detail::file_status(detail::fs_ftruncate(file.handle, size));
+}
+
+inline std::expected<file_stat_t, error_t> fstat_file(file_t &file)
+{
+  file_stat_t status;
+  if (int result = detail::fs_fstat(file.handle, status); result < 0)
+    return std::unexpected(make_error(result));
+  return status;
+}
+
+inline std::expected<void, error_t> rename_file(event_loop_t &loop, const std::string &old_path, const std::string &new_path)
+{
+  (void)loop;
+  return detail::file_status(detail::fs_rename(old_path, new_path));
+}
+
+inline std::expected<void, error_t> unlink_file(event_loop_t &loop, const std::string &path)
+{
+  (void)loop;
+  return detail::file_status(detail::fs_unlink(path));
+}
+
+inline std::expected<void, error_t> mkdir_path(event_loop_t &loop, const std::string &path, int mode)
+{
+  (void)loop;
+  return detail::file_status(detail::fs_mkdir(path, mode));
+}
+
+inline std::expected<void, error_t> rmdir_path(event_loop_t &loop, const std::string &path)
+{
+  (void)loop;
+  return detail::file_status(detail::fs_rmdir(path));
+}
+
+inline std::expected<file_stat_t, error_t> stat_file(event_loop_t &loop, const std::string &path)
+{
+  (void)loop;
+  file_stat_t status;
+  if (int result = detail::fs_stat(path, status); result < 0)
+    return std::unexpected(make_error(result));
+  return status;
+}
+
+inline std::expected<std::string, error_t> mkdtemp_path(event_loop_t &loop, const std::string &tpl)
+{
+  (void)loop;
+  std::string path = tpl;
+  if (int result = detail::fs_mkdtemp(path); result < 0)
+    return std::unexpected(make_error(result));
+  return path;
+}
 } // namespace vio

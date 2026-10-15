@@ -18,7 +18,7 @@
 //
 // The include order is load-bearing and is also the reason to include this
 // header rather than the pieces. On Windows, wincrypt.h -- which arrives via
-// libuv via any vio header -- defines X509_NAME as a macro, so an openssl
+// any vio header -- defines X509_NAME as a macro, so an openssl
 // header included first has its declarations shredded by it. vio/ssl_backend.h
 // undoes those macros, so it must come after the vio headers and before
 // openssl. Getting it wrong produces "undeclared identifier 'name'".
@@ -194,7 +194,7 @@ inline std::string text_of(std::span<const std::uint8_t> bytes)
 // text has to be copied out of it before the buffer goes.
 inline std::string text_of(const vio::unique_buf_t &buffer)
 {
-  return {buffer.buf.base, buffer.buf.len};
+  return {buffer.chars(), buffer.size()};
 }
 
 } // namespace vio_example

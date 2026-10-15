@@ -1,5 +1,17 @@
 #include "require_expected.h"
 
+#if defined(__SANITIZE_ADDRESS__)
+#define VIO_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define VIO_TEST_ASAN 1
+#endif
+#endif
+#if defined(VIO_TEST_ASAN)
+extern "C" int __asan_address_is_poisoned(void const volatile *address);
+#endif
+
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -10,12 +22,23 @@
 #include <vio/buffer_pool.h>
 #include <vio/event_loop.h>
 #include <vio/operation/sleep.h>
-#include <vio/operation/tcp.h>
 #include <vio/operation/udp.h>
 #include <vio/task.h>
 
 namespace
 {
+std::expected<sockaddr_in, vio::error_t> make_ip4(const char *ip, int port)
+{
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<std::uint16_t>(port));
+  if (inet_pton(AF_INET, ip, &address.sin_addr) != 1)
+  {
+    return std::unexpected(vio::make_error(vio::errc::invalid_argument));
+  }
+  return address;
+}
+
 std::span<const std::uint8_t> as_bytes(std::string_view text)
 {
   return {reinterpret_cast<const std::uint8_t *>(text.data()), text.size()};
@@ -28,7 +51,7 @@ std::expected<std::pair<vio::udp_t, int>, vio::error_t> bound_socket(vio::event_
   {
     return std::unexpected(udp.error());
   }
-  auto addr = vio::ip4_addr("127.0.0.1", 0);
+  auto addr = make_ip4("127.0.0.1", 0);
   if (!addr.has_value())
   {
     return std::unexpected(addr.error());
@@ -55,24 +78,27 @@ TEST_CASE("a released block is handed out again")
   vio::buffer_pool_t pool(1024, 8);
   CHECK(pool.block_size() == 1024);
 
-  uv_buf_t first = {};
-  pool.acquire(&first);
-  REQUIRE(first.base != nullptr);
-  CHECK(first.len == 1024);
+  auto first = pool.acquire();
+  REQUIRE(first.data() != nullptr);
+  CHECK(first.size() == 1024);
   CHECK(pool.allocations() == 1);
   CHECK(pool.reuses() == 0);
 
-  char *address = first.base;
-  pool.release(&first);
-  CHECK(first.base == nullptr);
+  std::byte *address = first.data();
+  pool.release(first);
   CHECK(pool.retained() == 1);
+#if defined(VIO_TEST_ASAN)
+  CHECK(__asan_address_is_poisoned(address));
+#endif
 
-  uv_buf_t second = {};
-  pool.acquire(&second);
-  CHECK(second.base == address);
+  auto second = pool.acquire();
+  CHECK(second.data() == address);
   CHECK(pool.allocations() == 1);
   CHECK(pool.reuses() == 1);
-  pool.release(&second);
+#if defined(VIO_TEST_ASAN)
+  CHECK_FALSE(__asan_address_is_poisoned(address));
+#endif
+  pool.release(second);
 }
 
 TEST_CASE("the free list is capped")
@@ -80,17 +106,17 @@ TEST_CASE("the free list is capped")
   constexpr std::size_t retain = 4;
   vio::buffer_pool_t pool(64, retain);
 
-  std::array<uv_buf_t, retain + 6> buffers = {};
+  std::array<std::span<std::byte>, retain + 6> buffers = {};
   for (auto &buffer : buffers)
   {
-    pool.acquire(&buffer);
-    REQUIRE(buffer.base != nullptr);
+    buffer = pool.acquire();
+    REQUIRE(buffer.data() != nullptr);
   }
   CHECK(pool.allocations() == buffers.size());
 
   for (auto &buffer : buffers)
   {
-    pool.release(&buffer);
+    pool.release(buffer);
   }
   CHECK(pool.retained() == retain);
 }
@@ -102,31 +128,43 @@ TEST_CASE("zero_on_release wipes a block before it is reused")
 
   auto fill_and_release = [](vio::buffer_pool_t &pool)
   {
-    uv_buf_t buf = {};
-    pool.acquire(&buf);
-    REQUIRE(buf.base != nullptr);
-    std::memset(buf.base, 0x5a, 32);
-    char *address = buf.base;
-    pool.release(&buf);
+    auto buf = pool.acquire();
+    REQUIRE(buf.data() != nullptr);
+    std::memset(buf.data(), 0x5a, 32);
+    std::byte *address = buf.data();
+    pool.release(buf);
     return address;
   };
 
-  char *plain_block = fill_and_release(plain);
-  char *wiped_block = fill_and_release(wiping);
+  std::byte *plain_block = fill_and_release(plain);
+  std::byte *wiped_block = fill_and_release(wiping);
 
   // The same block comes back out, so this reads what release() left behind.
-  uv_buf_t reused = {};
-  plain.acquire(&reused);
-  CHECK(reused.base == plain_block);
-  CHECK(reused.base[0] == static_cast<char>(0x5a));
-  plain.release(&reused);
+  auto reused = plain.acquire();
+  CHECK(reused.data() == plain_block);
+  CHECK(reused[0] == std::byte{0x5a});
+  plain.release(reused);
 
-  uv_buf_t clean = {};
-  wiping.acquire(&clean);
-  CHECK(clean.base == wiped_block);
-  CHECK(clean.base[0] == 0);
-  CHECK(clean.base[31] == 0);
-  wiping.release(&clean);
+  auto clean = wiping.acquire();
+  CHECK(clean.data() == wiped_block);
+  CHECK(clean[0] == std::byte{0});
+  CHECK(clean[31] == std::byte{0});
+  wiping.release(clean);
+}
+
+TEST_CASE("the pool works as a unique_buf_t deallocator")
+{
+  vio::buffer_pool_t pool(128, 4);
+  {
+    vio::unique_buf_t buffer(vio::buffer_pool_t::alloc_cb(&pool, 65536), &vio::buffer_pool_t::dealloc_cb, &pool);
+    REQUIRE(buffer.data() != nullptr);
+    CHECK(buffer.capacity() == 128);
+    buffer.resize(10);
+    CHECK(buffer.size() == 10);
+    CHECK(pool.retained() == 0);
+  }
+  CHECK(pool.retained() == 1);
+  CHECK(pool.allocations() == 1);
 }
 
 TEST_CASE("a zero block size falls back to the default")
@@ -169,7 +207,7 @@ TEST_CASE("a pooled socket stops allocating once it is warm")
         {
           auto sender_pair = bound_socket(el);
           REQUIRE_EXPECTED(sender_pair);
-          auto dest = vio::ip4_addr("127.0.0.1", p);
+          auto dest = make_ip4("127.0.0.1", p);
           REQUIRE_EXPECTED(dest);
           for (int i = 0; i < datagram_count; ++i)
           {

@@ -27,6 +27,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <fcntl.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -42,6 +43,48 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio::detail
 {
+namespace
+{
+socklen_t normalized_length(const sockaddr *address, int length) noexcept
+{
+#if !defined(__linux__)
+  if (address != nullptr)
+  {
+    int exact = 0;
+    switch (address->sa_family)
+    {
+    case AF_INET:
+      exact = static_cast<int>(sizeof(sockaddr_in));
+      break;
+    case AF_INET6:
+      exact = static_cast<int>(sizeof(sockaddr_in6));
+      break;
+    case AF_UNIX:
+      exact = static_cast<int>(sizeof(sockaddr_un));
+      break;
+    default:
+      break;
+    }
+    if (exact > 0 && length > exact)
+      length = exact;
+  }
+#else
+  (void)address;
+#endif
+  return static_cast<socklen_t>(length);
+}
+
+std::size_t transfer_size(std::size_t size) noexcept
+{
+#if !defined(__linux__)
+  constexpr std::size_t max_transfer = INT_MAX;
+  if (size > max_transfer)
+    return max_transfer;
+#endif
+  return size;
+}
+} // namespace
+
 int last_socket_error() noexcept
 {
   return errc_from_errno(errno);
@@ -49,9 +92,15 @@ int last_socket_error() noexcept
 
 int socket_set_nonblocking(native_socket_t socket) noexcept
 {
+#if defined(__linux__)
   int flags = ::fcntl(socket, F_GETFL, 0);
   if (flags < 0 || ::fcntl(socket, F_SETFL, flags | O_NONBLOCK) < 0)
     return errc_from_errno(errno);
+#else
+  int nonblocking = 1;
+  if (::ioctl(socket, FIONBIO, &nonblocking) < 0)
+    return errc_from_errno(errno);
+#endif
   int fd_flags = ::fcntl(socket, F_GETFD, 0);
   if (fd_flags < 0 || ::fcntl(socket, F_SETFD, fd_flags | FD_CLOEXEC) < 0)
     return errc_from_errno(errno);
@@ -97,7 +146,7 @@ int socket_close(native_socket_t socket) noexcept
 
 int socket_bind(native_socket_t socket, const sockaddr *address, int length) noexcept
 {
-  if (::bind(socket, address, static_cast<socklen_t>(length)) != 0)
+  if (::bind(socket, address, normalized_length(address, length)) != 0)
     return errc_from_errno(errno);
   return 0;
 }
@@ -141,16 +190,11 @@ int socket_accept(native_socket_t socket, native_socket_t &out, sockaddr_storage
 
 int socket_connect(native_socket_t socket, const sockaddr *address, int length) noexcept
 {
-  for (;;)
-  {
-    if (::connect(socket, address, static_cast<socklen_t>(length)) == 0)
-      return 0;
-    if (errno == EINTR)
-      continue;
-    if (errno == EINPROGRESS)
-      return errc::in_progress;
-    return errc_from_errno(errno);
-  }
+  if (::connect(socket, address, normalized_length(address, length)) == 0)
+    return 0;
+  if (errno == EINPROGRESS || errno == EINTR)
+    return errc::in_progress;
+  return errc_from_errno(errno);
 }
 
 int socket_pending_error(native_socket_t socket) noexcept
@@ -207,7 +251,7 @@ std::int64_t socket_recv(native_socket_t socket, mutable_bytes_t buffer) noexcep
 {
   for (;;)
   {
-    auto count = ::recv(socket, buffer.data(), buffer.size(), 0);
+    auto count = ::recv(socket, buffer.data(), transfer_size(buffer.size()), 0);
     if (count >= 0)
       return count;
     if (errno == EINTR)
@@ -220,7 +264,7 @@ std::int64_t socket_send(native_socket_t socket, const_bytes_t buffer) noexcept
 {
   for (;;)
   {
-    auto count = ::send(socket, buffer.data(), buffer.size(), VIO_SEND_FLAGS);
+    auto count = ::send(socket, buffer.data(), transfer_size(buffer.size()), VIO_SEND_FLAGS);
     if (count >= 0)
       return count;
     if (errno == EINTR)
@@ -233,12 +277,24 @@ std::int64_t socket_sendv(native_socket_t socket, const const_bytes_t *buffers, 
 {
   constexpr std::size_t max_vectors = 64;
   iovec vectors[max_vectors];
-  std::size_t used = count < max_vectors ? count : max_vectors;
-  for (std::size_t i = 0; i < used; ++i)
+  std::size_t limit = count < max_vectors ? count : max_vectors;
+  std::size_t used = 0;
+#if defined(__linux__)
+  for (; used < limit; ++used)
   {
-    vectors[i].iov_base = const_cast<std::byte *>(buffers[i].data());
-    vectors[i].iov_len = buffers[i].size();
+    vectors[used].iov_base = const_cast<std::byte *>(buffers[used].data());
+    vectors[used].iov_len = buffers[used].size();
   }
+#else
+  std::size_t room = transfer_size(SIZE_MAX);
+  for (; used < limit && room > 0; ++used)
+  {
+    std::size_t size = buffers[used].size() < room ? buffers[used].size() : room;
+    vectors[used].iov_base = const_cast<std::byte *>(buffers[used].data());
+    vectors[used].iov_len = size;
+    room -= size;
+  }
+#endif
   msghdr message{};
   message.msg_iov = vectors;
   message.msg_iovlen = static_cast<decltype(message.msg_iovlen)>(used);
@@ -258,7 +314,7 @@ std::int64_t socket_recvfrom(native_socket_t socket, mutable_bytes_t buffer, soc
   socklen_t length = sizeof(sockaddr_storage);
   for (;;)
   {
-    auto count = ::recvfrom(socket, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr *>(from), from ? &length : nullptr);
+    auto count = ::recvfrom(socket, buffer.data(), transfer_size(buffer.size()), 0, reinterpret_cast<sockaddr *>(from), from ? &length : nullptr);
     if (count >= 0)
     {
       if (from_length)
@@ -275,7 +331,7 @@ std::int64_t socket_sendto(native_socket_t socket, const_bytes_t buffer, const s
 {
   for (;;)
   {
-    auto count = ::sendto(socket, buffer.data(), buffer.size(), VIO_SEND_FLAGS, to, static_cast<socklen_t>(to_length));
+    auto count = ::sendto(socket, buffer.data(), transfer_size(buffer.size()), VIO_SEND_FLAGS, to, normalized_length(to, to_length));
     if (count >= 0)
       return count;
     if (errno == EINTR)

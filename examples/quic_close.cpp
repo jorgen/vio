@@ -207,10 +207,13 @@ int main()
           std::println(stderr, "could not bind the silent socket");
           co_return 1;
         }
-        sockaddr_storage bound = {};
-        int length = sizeof(bound);
-        uv_udp_getsockname(silence->get_udp(), reinterpret_cast<sockaddr *>(&bound), &length);
-        const auto silent_port = ntohs(reinterpret_cast<const sockaddr_in *>(&bound)->sin_port);
+        const auto bound = udp_sockname(*silence);
+        if (!bound)
+        {
+          std::println(stderr, "could not read the silent socket's port");
+          co_return 1;
+        }
+        const auto silent_port = ntohs(reinterpret_cast<const sockaddr_in *>(&*bound)->sin_port);
         const auto silent = ip4_addr("127.0.0.1", silent_port);
 
         // The dial itself resolves with the failure. There is no separate

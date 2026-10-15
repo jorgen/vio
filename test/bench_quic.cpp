@@ -330,9 +330,9 @@ double socket_transfer(const certificate_t &identity, bool offload, std::size_t 
 //
 // So each shape below is run twice over the *same* real socket, once through
 // the callback API and once through the coroutine API. The absolute numbers
-// include libuv, the kernel and the loopback path and are not interesting on
-// their own; the difference between the two rows is, because everything except
-// the API is identical.
+// include the event loop, the kernel and the loopback path and are not
+// interesting on their own; the difference between the two rows is, because
+// everything except the API is identical.
 //
 // Two shapes, because they answer different questions.
 //
@@ -613,7 +613,7 @@ report_t bulk_coroutine(const certificate_t &identity, std::size_t megabytes, bo
               {
                 break;
               }
-              drained += chunk->buf.len;
+              drained += chunk->size();
             }
             else
             {
@@ -652,8 +652,8 @@ report_t bulk_coroutine(const certificate_t &identity, std::size_t megabytes, bo
 
         quic_connection_close(*connection, 0, "done");
         // Released before the loop is asked to stop, and that order is not
-        // stylistic: stop() runs the loop until nothing is open, so a socket
-        // still alive here is a run() that never returns.
+        // stylistic: stop() runs the loop until nothing is in flight, so a
+        // socket still reading here is a run() that never returns.
         {
           auto releasing_server = std::move(*server);
           auto releasing_client = std::move(*client);

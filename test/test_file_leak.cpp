@@ -10,27 +10,21 @@
 
 TEST_SUITE("file leaks")
 {
-  // open_file/close_file run uv_fs_open/uv_fs_close synchronously. On Windows
-  // uv_fs_open allocates a UTF-16 path buffer that is only freed by
-  // uv_fs_req_cleanup, so a missing cleanup leaks one buffer per open.
-  TEST_CASE("open_file does not leak the libuv request per open")
+  TEST_CASE("open_file does not leak per open")
   {
     vio::event_loop_t loop;
 
-    // A real temp file to open repeatedly.
     auto tmp = vio::mkstemp_file(loop, "test_open_file_leak_XXXXXX");
     REQUIRE(tmp.has_value());
     const std::string path = tmp->second;
-    // Release the mkstemp handle but keep the file on disk.
     tmp->first = vio::make_auto_close_file({.event_loop = &loop, .handle = -1});
 
     auto open_once = [&]() -> bool
     {
       auto file = vio::open_file(loop, path, vio::file_open_flag_t::rdonly, 0);
-      return file.has_value(); // auto-closes at scope exit
+      return file.has_value();
     };
 
-    // Warm up one-time allocations outside the measured region.
     for (int i = 0; i < 5; ++i)
     {
       REQUIRE(open_once());
@@ -46,8 +40,6 @@ TEST_SUITE("file leaks")
         ++failures;
       }
     }
-    // Pre-fix this leaks one UTF-16 path buffer per open on Windows
-    // (~`iterations` blocks); post-fix only small one-time noise remains.
     const long long leaked_blocks = guard.leaked_blocks();
 
     CHECK_EQ(failures, 0);
@@ -56,5 +48,30 @@ TEST_SUITE("file leaks")
     std::remove(path.c_str());
     loop.stop();
     loop.run();
+  }
+
+  TEST_CASE("file operations dropped without being awaited still finish and free their state")
+  {
+    vio::event_loop_t loop;
+    auto tmp = vio::mkstemp_file(loop, "test_dropped_read_XXXXXX");
+    REQUIRE(tmp.has_value());
+    const std::string path = tmp->second;
+    std::string text = "dropped";
+    REQUIRE(vio::write_file_sync(*tmp->first, reinterpret_cast<const std::uint8_t *>(text.data()), text.size(), 0).has_value());
+
+    std::string buffer(text.size(), '\0');
+    {
+      auto read = vio::read_file(loop, *tmp->first, reinterpret_cast<std::uint8_t *>(buffer.data()), buffer.size(), 0);
+      auto sync = vio::fsync_file(loop, *tmp->first);
+      vio::cancellation_t cancel;
+      auto cancelled = vio::write_file(loop, *tmp->first, reinterpret_cast<const std::uint8_t *>(text.data()), text.size(), 0, &cancel);
+      cancel.cancel();
+    }
+    loop.stop();
+    loop.run();
+    CHECK(buffer == text);
+
+    tmp->first = vio::make_auto_close_file({.event_loop = &loop, .handle = -1});
+    std::remove(path.c_str());
   }
 }

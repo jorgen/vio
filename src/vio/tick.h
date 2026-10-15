@@ -31,9 +31,7 @@
 //
 // The origin is unspecified deliberately. Two tick_t values are only
 // comparable if they came from the same producer, so the type does not convert
-// to or from std::chrono::steady_clock -- uv_hrtime() and steady_clock have
-// different zeroes, and mixing them yields differences that look plausible on
-// one machine and are wildly wrong on another.
+// to or from std::chrono::steady_clock.
 
 #include <chrono>
 #include <compare>

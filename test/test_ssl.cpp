@@ -1,3 +1,25 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <algorithm>
 #include <ostream>
 
@@ -20,10 +42,8 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
 
   {
     std::string client_message = "GET /wiki/Susan_B._Anthony HTTP/1.1\r\nHost: en.wikipedia.org\r\nUser-Agent: vio-simple-test-agent\r\nConnection: close\r\n\r\n";
-    uv_buf_t buf;
-    buf.base = client_message.data();
-    buf.len = client_message.size();
-    auto write_result = co_await vio::ssl_client_write(ssl_client.value(), buf);
+    auto write_result = co_await vio::ssl_client_write(ssl_client.value(), std::as_bytes(std::span(client_message)));
+    REQUIRE_EXPECTED(write_result);
   }
 
   {
@@ -42,7 +62,7 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
       REQUIRE_EXPECTED(read_result);
       auto &value = read_result.value();
 
-      header_buffer.insert(header_buffer.end(), value.buf.base, value.buf.base + value.buf.len);
+      header_buffer.insert(header_buffer.end(), value.chars(), value.chars() + value.size());
 
       auto header_str = std::string_view(header_buffer.data(), header_buffer.size());
       if (auto pos = header_str.find(header_end); pos != std::string::npos)
@@ -75,10 +95,8 @@ static vio::task_t<void> test_ssl_client_connect(vio::event_loop_t &event_loop)
 
     if (initial_body_size < content_length)
     {
-      uv_buf_t buf;
-      buf.base = body_buffer.data() + initial_body_size;
-      buf.len = content_length - initial_body_size;
-      auto body_read = co_await reader.read(buf);
+      auto body = std::as_writable_bytes(std::span(body_buffer)).subspan(initial_body_size);
+      auto body_read = co_await reader.read(body);
       REQUIRE_EXPECTED(body_read);
     }
 

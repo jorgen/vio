@@ -22,32 +22,35 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
-#include "vio/cancellation.h"
-#include "vio/owned_payload.h"
 #include "vio/buffer_pool.h"
+#include "vio/cancellation.h"
+#include "vio/detail/sys_udp.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/loop/socket.h"
+#include "vio/owned_payload.h"
+#include "vio/ref_counted_wrapper.h"
 #include "vio/unique_buf.h"
-#include "vio/uv_coro.h"
 
+#include <algorithm>
 #include <array>
-#include <cerrno>
-#if !defined(_WIN32)
-#include <netinet/in.h>
-#include <sys/socket.h>
-#endif
 #include <coroutine>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <ranges>
-#include <type_traits>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <utility>
-#include <uv.h>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <net/if.h>
+#endif
 
 namespace vio
 {
@@ -76,29 +79,155 @@ struct udp_datagram_t
   }
 };
 
-struct udp_send_state_t
+// RFC 3168: the two-bit ECN field, in the values it takes on the wire. It sits
+// in the low bits of the IPv4 TOS byte and the IPv6 traffic class byte.
+enum class udp_ecn_t : std::uint8_t
 {
-  uv_udp_send_t req = {};
-  std::coroutine_handle<> continuation;
-  std::expected<void, error_t> result;
-  bool started = false;
-  bool done = false;
+  not_ect = 0x00,
+  ect1 = 0x01,
+  ect0 = 0x02,
+  ce = 0x03,
+};
+
+enum class udp_bind_flags : unsigned int
+{
+  none = 0,
+  ipv6_only = 1,
+  reuseaddr = 4,
+  reuseport = 8,
+};
+
+[[nodiscard]] constexpr udp_bind_flags operator|(udp_bind_flags a, udp_bind_flags b) noexcept
+{
+  return static_cast<udp_bind_flags>(static_cast<unsigned int>(a) | static_cast<unsigned int>(b));
+}
+
+[[nodiscard]] constexpr udp_bind_flags operator&(udp_bind_flags a, udp_bind_flags b) noexcept
+{
+  return static_cast<udp_bind_flags>(static_cast<unsigned int>(a) & static_cast<unsigned int>(b));
+}
+
+enum class udp_membership_t
+{
+  leave_group = 0,
+  join_group = 1,
 };
 
 // Datagrams a reader has taken off the socket but the consumer has not yet
 // collected. Bounded: a peer that sends faster than the consumer drains must
-// cost bounded memory, so arrivals past the limit are dropped and counted
-// rather than queued. Tail drop, like the kernel's own receive buffer, so the
-// datagrams that are kept stay in arrival order.
+// cost bounded memory.
 inline constexpr std::size_t udp_default_recv_queue_limit = 1024;
+inline constexpr std::size_t udp_receive_buffer_size = 64 * 1024;
+inline constexpr std::size_t udp_recv_burst = 32;
+inline constexpr std::size_t udp_recvmmsg_batch = 16;
+inline constexpr std::size_t udp_max_batch_size = 64;
+
+namespace detail
+{
+#if defined(__linux__)
+inline constexpr bool udp_has_recvmmsg = true;
+#else
+inline constexpr bool udp_has_recvmmsg = false;
+#endif
+
+template <typename T>
+class fifo_t
+{
+public:
+  [[nodiscard]] bool empty() const noexcept
+  {
+    return _head == _items.size();
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept
+  {
+    return _items.size() - _head;
+  }
+
+  T &front() noexcept
+  {
+    return _items[_head];
+  }
+
+  void pop_front()
+  {
+    ++_head;
+    if (_head == _items.size())
+    {
+      _items.clear();
+      _head = 0;
+    }
+  }
+
+  template <typename... Args>
+  void emplace_back(Args &&...args)
+  {
+    _items.emplace_back(std::forward<Args>(args)...);
+  }
+
+  template <typename Predicate>
+  void erase_if(Predicate predicate)
+  {
+    std::vector<T> kept;
+    for (std::size_t i = _head; i < _items.size(); ++i)
+    {
+      if (!predicate(_items[i]))
+      {
+        kept.push_back(std::move(_items[i]));
+      }
+    }
+    _items = std::move(kept);
+    _head = 0;
+  }
+
+private:
+  std::vector<T> _items;
+  std::size_t _head = 0;
+};
+
+template <typename T>
+void *ref_storage(ref_ptr_t<T> &pointer) noexcept
+{
+  void *raw = pointer.release_to_raw();
+  pointer = ref_ptr_t<T>::from_raw(raw);
+  return raw;
+}
+
+template <typename T>
+void *ref_retain(void *storage) noexcept
+{
+  static_cast<typename ref_ptr_t<T>::storage_t *>(storage)->ref_count.inc();
+  return storage;
+}
+
+struct udp_target_t
+{
+  sockaddr_in6 mapped = {};
+  const sockaddr *address = nullptr;
+  int length = 0;
+};
+} // namespace detail
+
+struct udp_send_state_t
+{
+  detail::io_op_t op;
+  std::coroutine_handle<> continuation;
+  std::expected<void, error_t> result;
+  const std::uint8_t *data = nullptr;
+  std::size_t length = 0;
+  sockaddr_storage address = {};
+  int address_length = 0;
+  std::uint64_t generation = 0;
+  bool started = false;
+  bool done = false;
+};
 
 struct udp_recv_state_t
 {
   bool active = false;
   bool started = false;
   bool is_cancelled = false;
-  bool cancelled = false;
-  std::deque<std::expected<udp_datagram_t, error_t>> buffer_queue;
+  detail::fifo_t<std::expected<udp_datagram_t, error_t>> buffer_queue;
   std::size_t recv_queue_limit = udp_default_recv_queue_limit;
   std::uint64_t dropped_datagrams = 0;
   std::uint64_t truncated_datagrams = 0;
@@ -107,73 +236,303 @@ struct udp_recv_state_t
   alloc_cb_t alloc_buffer_cb = default_alloc;
   dealloc_cb_t dealloc_buffer_cb = default_dealloc;
   void *alloc_cb_data = nullptr;
-
-  // The buffer libuv is currently holding. Under recvmmsg libuv fills one
-  // allocation with a batch of datagrams and only hands it back through a
-  // final UV_UDP_MMSG_FREE callback that it skips outright when the read has
-  // been stopped mid-batch (libuv src/unix/udp.c guards that last callback on
-  // recv_cb still being set). A reader destroyed or cancelled from inside a
-  // datagram callback would therefore strand the whole chunk, so ownership is
-  // tracked here and reclaimed wherever the read stops.
-  uv_buf_t inflight_recv_buffer = {};
+  std::vector<std::span<std::byte>> spare;
+  detail::io_op_t op;
+  detail::posted_t retry;
+  std::uint32_t drained_epoch = 0;
+  bool drained = true;
+  bool drained_known = false;
 };
 
-inline void udp_reclaim_inflight_recv_buffer(udp_recv_state_t &recv)
+namespace detail
 {
-  if (recv.inflight_recv_buffer.base == nullptr)
+inline void udp_return_spares(udp_recv_state_t &recv) noexcept
+{
+  for (auto buffer : recv.spare)
   {
-    return;
+    recv.dealloc_buffer_cb(recv.alloc_cb_data, buffer);
   }
-  uv_buf_t buffer = recv.inflight_recv_buffer;
-  recv.inflight_recv_buffer = {};
-  recv.dealloc_buffer_cb(recv.alloc_cb_data, &buffer);
+  recv.spare.clear();
 }
+} // namespace detail
 
 struct udp_state_t
 {
-  // A constructor rather than aggregate initialisation: naming only the loop
-  // leaves the rest to -Wmissing-field-initializers, which prism compiles as
-  // an error.
   explicit udp_state_t(event_loop_t &loop)
     : event_loop(loop)
+    , socket(detail::core(loop), "udp")
   {
   }
 
-  event_loop_t &event_loop;
-  uv_udp_t uv_handle = {};
-
-  uv_udp_t *get_udp()
-  {
-    return &uv_handle;
-  }
-
-  uv_handle_t *get_handle()
-  {
-    return reinterpret_cast<uv_handle_t *>(&uv_handle);
-  }
+  udp_state_t(const udp_state_t &) = delete;
+  udp_state_t &operator=(const udp_state_t &) = delete;
+  udp_state_t(udp_state_t &&) = delete;
+  udp_state_t &operator=(udp_state_t &&) = delete;
 
   ~udp_state_t()
   {
-    udp_reclaim_inflight_recv_buffer(recv);
+    detail::udp_return_spares(recv);
   }
 
+  event_loop_t &event_loop;
+  detail::socket_resource_t socket;
   udp_send_state_t send;
   udp_recv_state_t recv;
+  void *self = nullptr;
+  int family = AF_UNSPEC;
+  bool connected = false;
+  bool use_recvmmsg = false;
+  bool datagram_reader = false;
 };
+
+namespace detail
+{
+[[nodiscard]] inline bool udp_flag_set(udp_bind_flags flags, udp_bind_flags flag) noexcept
+{
+  return (flags & flag) != udp_bind_flags::none;
+}
+
+[[nodiscard]] inline int udp_apply_bind_flags(native_socket_t native, int family, udp_bind_flags flags) noexcept
+{
+  if (udp_flag_set(flags, udp_bind_flags::reuseaddr))
+  {
+#if defined(SO_REUSEPORT) && !defined(__linux__) && !defined(_WIN32)
+    if (int result = udp_set_int_option(native, SOL_SOCKET, SO_REUSEPORT, 1); result < 0)
+    {
+      return result;
+    }
+#else
+    if (int result = udp_set_int_option(native, SOL_SOCKET, SO_REUSEADDR, 1); result < 0)
+    {
+      return result;
+    }
+#endif
+  }
+  if (udp_flag_set(flags, udp_bind_flags::reuseport))
+  {
+#if defined(__linux__) && defined(SO_REUSEPORT)
+    if (int result = udp_set_int_option(native, SOL_SOCKET, SO_REUSEPORT, 1); result < 0)
+    {
+      return result;
+    }
+#else
+    return errc::not_supported;
+#endif
+  }
+#if defined(IPV6_V6ONLY)
+  if (family == AF_INET6)
+  {
+    const bool only = udp_flag_set(flags, udp_bind_flags::ipv6_only);
+    if (int result = udp_set_int_option(native, IPPROTO_IPV6, IPV6_V6ONLY, only ? 1 : 0); result < 0 && only)
+    {
+      return result;
+    }
+  }
+#else
+  (void)family;
+#endif
+  return 0;
+}
+
+[[nodiscard]] inline int udp_bind_socket(udp_state_t &state, const sockaddr *address, udp_bind_flags flags) noexcept
+{
+  const int length = udp_address_length(address);
+  if (length <= 0)
+  {
+    return errc::invalid_argument;
+  }
+  const auto known = udp_bind_flags::ipv6_only | udp_bind_flags::reuseaddr | udp_bind_flags::reuseport;
+  if ((static_cast<unsigned int>(flags) & ~static_cast<unsigned int>(known)) != 0)
+  {
+    return errc::invalid_argument;
+  }
+  if (udp_flag_set(flags, udp_bind_flags::ipv6_only) && address->sa_family != AF_INET6)
+  {
+    return errc::invalid_argument;
+  }
+#if !defined(__linux__)
+  if (udp_flag_set(flags, udp_bind_flags::reuseport))
+  {
+    return errc::not_supported;
+  }
+#endif
+  native_socket_t native = state.socket.native();
+  const bool fresh = native == invalid_native_socket;
+  if (fresh)
+  {
+    if (int result = socket_open(address->sa_family, SOCK_DGRAM, 0, native); result < 0)
+    {
+      return result;
+    }
+  }
+  int result = udp_apply_bind_flags(native, address->sa_family, flags);
+  if (result == 0)
+  {
+    result = socket_bind(native, address, length);
+  }
+  if (result < 0)
+  {
+    if (fresh)
+    {
+      (void)socket_close(native);
+    }
+    return result;
+  }
+  if (fresh)
+  {
+    if (int adopted = state.socket.adopt(native); adopted < 0)
+    {
+      (void)socket_close(native);
+      state.socket.watch.socket = invalid_native_socket;
+      return adopted;
+    }
+    state.family = address->sa_family;
+  }
+  return 0;
+}
+
+[[nodiscard]] inline int udp_ensure_socket(udp_state_t &state, int family, udp_bind_flags flags = udp_bind_flags::none) noexcept
+{
+  if (state.socket.native() != invalid_native_socket)
+  {
+    return 0;
+  }
+  sockaddr_storage any = {};
+  if (family == AF_INET6)
+  {
+    reinterpret_cast<sockaddr_in6 *>(&any)->sin6_family = AF_INET6;
+  }
+  else
+  {
+    auto *in = reinterpret_cast<sockaddr_in *>(&any);
+    in->sin_family = AF_INET;
+    in->sin_addr.s_addr = htonl(INADDR_ANY);
+  }
+  return udp_bind_socket(state, reinterpret_cast<const sockaddr *>(&any), flags);
+}
+
+[[nodiscard]] inline int udp_require_socket(const udp_state_t &state) noexcept
+{
+  return state.socket.native() == invalid_native_socket ? errc::bad_descriptor : 0;
+}
+
+inline void udp_map_ipv4(const sockaddr *address, sockaddr_in6 &mapped) noexcept
+{
+  const auto *in4 = reinterpret_cast<const sockaddr_in *>(address);
+  mapped = {};
+  mapped.sin6_family = AF_INET6;
+  mapped.sin6_port = in4->sin_port;
+  auto *bytes = reinterpret_cast<std::uint8_t *>(&mapped.sin6_addr);
+  bytes[10] = 0xff;
+  bytes[11] = 0xff;
+  std::memcpy(bytes + 12, &in4->sin_addr, 4);
+}
+
+[[nodiscard]] inline int udp_prepare_target(udp_state_t &state, const sockaddr *address, udp_target_t &target) noexcept
+{
+  if (address == nullptr)
+  {
+    if (!state.connected)
+    {
+      return errc::destination_address_required;
+    }
+    target.address = nullptr;
+    target.length = 0;
+    return 0;
+  }
+  const int length = udp_address_length(address);
+  if (length <= 0)
+  {
+    return errc::address_family_not_supported;
+  }
+  if (state.connected)
+  {
+    return errc::already_connected;
+  }
+  if (int result = udp_ensure_socket(state, address->sa_family); result < 0)
+  {
+    return result;
+  }
+  if (address->sa_family == AF_INET && state.family == AF_INET6)
+  {
+    udp_map_ipv4(address, target.mapped);
+    target.address = reinterpret_cast<const sockaddr *>(&target.mapped);
+    target.length = static_cast<int>(sizeof(sockaddr_in6));
+    return 0;
+  }
+  target.address = address;
+  target.length = length;
+  return 0;
+}
+
+[[nodiscard]] inline std::expected<void, error_t> udp_result(int code)
+{
+  if (code < 0)
+  {
+    return std::unexpected(make_error(code));
+  }
+  return {};
+}
+
+[[nodiscard]] inline std::expected<void, error_t> udp_send_result(std::int64_t sent)
+{
+  if (sent < 0)
+  {
+    return std::unexpected(make_error(static_cast<int>(sent)));
+  }
+  return {};
+}
+
+inline void udp_on_send_ready(io_op_t *op);
+inline void udp_abandon_send(udp_state_t &state, std::uint64_t generation);
+} // namespace detail
 
 template <typename State>
 struct udp_future_t
 {
   ref_ptr_t<udp_state_t> handle;
   State *state;
+  std::optional<error_t> rejected;
+  std::uint64_t generation = 0;
+  bool pending = false;
+
   udp_future_t(ref_ptr_t<udp_state_t> socket, State &operation_state)
     : handle(std::move(socket))
     , state(&operation_state)
   {
   }
+
+  udp_future_t(ref_ptr_t<udp_state_t> socket, State &operation_state, error_t error)
+    : handle(std::move(socket))
+    , state(&operation_state)
+    , rejected(std::move(error))
+  {
+  }
+
+  udp_future_t(const udp_future_t &) = delete;
+  udp_future_t &operator=(const udp_future_t &) = delete;
+  udp_future_t &operator=(udp_future_t &&) = delete;
+
+  udp_future_t(udp_future_t &&other) noexcept
+    : handle(std::move(other.handle))
+    , state(other.state)
+    , rejected(std::move(other.rejected))
+    , generation(other.generation)
+    , pending(std::exchange(other.pending, false))
+  {
+  }
+
+  ~udp_future_t()
+  {
+    if (pending && handle)
+    {
+      detail::udp_abandon_send(handle.data(), generation);
+    }
+  }
+
   bool await_ready() noexcept
   {
-    return state->done;
+    return rejected.has_value() || state->done;
   }
 
   bool await_suspend(std::coroutine_handle<> continuation) noexcept
@@ -186,8 +545,13 @@ struct udp_future_t
     return true;
   }
 
-  auto await_resume() noexcept
+  std::expected<void, error_t> await_resume() noexcept
   {
+    pending = false;
+    if (rejected.has_value())
+    {
+      return std::unexpected(std::move(*rejected));
+    }
     return state->result;
   }
 };
@@ -195,29 +559,11 @@ struct udp_future_t
 struct udp_t
 {
   ref_ptr_t<udp_state_t> handle;
-
-  uv_udp_t *get_udp()
-  {
-    if (handle.ref_counted() == nullptr)
-    {
-      return nullptr;
-    }
-    return handle->get_udp();
-  }
-
-  uv_handle_t *get_handle()
-  {
-    if (handle.ref_counted() == nullptr)
-    {
-      return nullptr;
-    }
-    return handle->get_handle();
-  }
 };
 
-// recvmmsg reads several datagrams per syscall. It is a Linux/BSD facility;
-// libuv ignores the request elsewhere, so asking for it unconditionally is
-// safe and uv_udp_using_recvmmsg reports what was actually obtained.
+// recvmmsg reads several datagrams per syscall. It is a Linux facility; the
+// request is ignored elsewhere, so asking for it unconditionally is safe and
+// udp_using_recvmmsg reports what was actually obtained.
 enum class udp_recvmmsg_t : std::uint8_t
 {
   off,
@@ -227,166 +573,395 @@ enum class udp_recvmmsg_t : std::uint8_t
 inline std::expected<udp_t, error_t> udp_create(event_loop_t &loop, udp_recvmmsg_t recvmmsg = udp_recvmmsg_t::off)
 {
   udp_t udp{ref_ptr_t<udp_state_t>(loop)};
-  const int r = recvmmsg == udp_recvmmsg_t::on ? uv_udp_init_ex(loop.loop(), udp.get_udp(), AF_UNSPEC | UV_UDP_RECVMMSG) : uv_udp_init(loop.loop(), udp.get_udp());
-  if (r < 0)
-  {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-  }
-  udp.handle.register_handle(udp.get_udp());
+  udp.handle->self = detail::ref_storage(udp.handle);
+  udp.handle->use_recvmmsg = recvmmsg == udp_recvmmsg_t::on;
+  udp.handle.register_resource(udp.handle->socket);
   return udp;
 }
 
 inline bool udp_using_recvmmsg(udp_t &udp)
 {
-  return uv_udp_using_recvmmsg(udp.get_udp()) != 0;
+  return detail::udp_has_recvmmsg && udp.handle->use_recvmmsg;
 }
 
-// libuv slices a recvmmsg buffer into fixed 64 KiB chunks and reads
-// buf.len / 64 KiB datagrams at a time (src/unix/udp.c, UV__UDP_DGRAM_MAXSIZE).
-// An allocator handing back less than one chunk yields zero slots, so the
-// socket reads nothing at all -- silently, and forever. This is the minimum,
-// not the useful size: a buffer of exactly one chunk batches a single datagram
-// per syscall, which is all of the cost of recvmmsg and none of the benefit.
-// Size a pool to a multiple of it, up to the 20 slots libuv reads at once.
-inline constexpr std::size_t udp_recvmmsg_chunk_size = 64 * 1024;
-
-inline std::expected<void, error_t> udp_bind(udp_t &udp, const sockaddr *addr, unsigned int flags = 0)
+inline std::expected<void, error_t> udp_bind(udp_t &udp, const sockaddr *addr, udp_bind_flags flags = udp_bind_flags::none)
 {
-  auto r = uv_udp_bind(udp.get_udp(), addr, flags);
-  if (r < 0)
+  return detail::udp_result(detail::udp_bind_socket(udp.handle.data(), addr, flags));
+}
+
+inline std::expected<void, error_t> udp_disconnect(udp_t &udp)
+{
+  auto &state = udp.handle.data();
+  if (!state.connected)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(errc::not_connected));
   }
+  sockaddr_storage none = {};
+#if !defined(_WIN32)
+  none.ss_family = AF_UNSPEC;
+#endif
+  const int result = detail::socket_connect(state.socket.native(), reinterpret_cast<const sockaddr *>(&none), static_cast<int>(sizeof(sockaddr)));
+#if defined(_WIN32)
+  const bool ignored = false;
+#elif defined(__linux__)
+  const bool ignored = result == errc::address_family_not_supported;
+#else
+  const bool ignored = result == errc::address_family_not_supported || result == errc::invalid_argument;
+#endif
+  if (result < 0 && !ignored)
+  {
+    return std::unexpected(make_error(result));
+  }
+  state.connected = false;
   return {};
 }
 
 inline std::expected<void, error_t> udp_connect(udp_t &udp, const sockaddr *addr)
 {
-  auto r = uv_udp_connect(udp.get_udp(), addr);
-  if (r < 0)
+  if (addr == nullptr)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return udp_disconnect(udp);
   }
-  return {};
-}
-
-inline std::expected<void, error_t> udp_disconnect(udp_t &udp)
-{
-  auto r = uv_udp_connect(udp.get_udp(), nullptr);
-  if (r < 0)
+  auto &state = udp.handle.data();
+  if (state.connected)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(errc::already_connected));
   }
+  if (detail::udp_address_length(addr) <= 0)
+  {
+    return std::unexpected(make_error(errc::address_family_not_supported));
+  }
+  if (int result = detail::udp_ensure_socket(state, addr->sa_family); result < 0)
+  {
+    return std::unexpected(make_error(result));
+  }
+  sockaddr_in6 mapped = {};
+  const sockaddr *target = addr;
+  int length = detail::udp_address_length(addr);
+  if (addr->sa_family == AF_INET && state.family == AF_INET6)
+  {
+    detail::udp_map_ipv4(addr, mapped);
+    target = reinterpret_cast<const sockaddr *>(&mapped);
+    length = static_cast<int>(sizeof(mapped));
+  }
+  if (int result = detail::socket_connect(state.socket.native(), target, length); result < 0)
+  {
+    return std::unexpected(make_error(result));
+  }
+  state.connected = true;
   return {};
 }
 
 inline std::expected<sockaddr_storage, error_t> udp_sockname(udp_t &udp)
 {
-  sockaddr_storage sa_storage{};
-  int name_len = sizeof(sa_storage);
-  if (auto r = uv_udp_getsockname(udp.get_udp(), reinterpret_cast<sockaddr *>(&sa_storage), &name_len); r < 0)
+  if (int result = detail::udp_require_socket(udp.handle.data()); result < 0)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(result));
   }
-  return sa_storage;
+  sockaddr_storage address = {};
+  int length = 0;
+  if (int result = detail::socket_name(udp.handle->socket.native(), address, length); result < 0)
+  {
+    return std::unexpected(make_error(result));
+  }
+  return address;
 }
+
+namespace detail
+{
+[[nodiscard]] inline int udp_set_small_option(native_socket_t native, int level, int name, int value) noexcept
+{
+#if defined(__OpenBSD__) || defined(__sun) || defined(_AIX)
+  const unsigned char small = static_cast<unsigned char>(value);
+  return socket_set_option(native, level, name, &small, static_cast<int>(sizeof(small)));
+#else
+  return udp_set_int_option(native, level, name, value);
+#endif
+}
+
+[[nodiscard]] inline std::expected<void, error_t> udp_option(udp_t &udp, int level, int name, int value)
+{
+  if (int result = udp_require_socket(udp.handle.data()); result < 0)
+  {
+    return std::unexpected(make_error(result));
+  }
+  return udp_result(udp_set_int_option(udp.handle->socket.native(), level, name, value));
+}
+
+[[nodiscard]] inline bool udp_parse_ipv6(const char *text, in6_addr &address, std::uint32_t &scope)
+{
+  std::string host(text);
+  std::string zone;
+  if (const auto percent = host.find('%'); percent != std::string::npos)
+  {
+    zone = host.substr(percent + 1);
+    host.resize(percent);
+  }
+  if (inet_pton(AF_INET6, host.c_str(), &address) != 1)
+  {
+    return false;
+  }
+  scope = 0;
+  if (!zone.empty())
+  {
+    char *end = nullptr;
+    const unsigned long number = std::strtoul(zone.c_str(), &end, 10);
+    if (end != nullptr && *end == '\0')
+    {
+      scope = static_cast<std::uint32_t>(number);
+    }
+#if !defined(_WIN32)
+    else
+    {
+      scope = if_nametoindex(zone.c_str());
+      if (scope == 0)
+      {
+        return false;
+      }
+    }
+#else
+    else
+    {
+      return false;
+    }
+#endif
+  }
+  return true;
+}
+} // namespace detail
 
 inline std::expected<void, error_t> udp_set_broadcast(udp_t &udp, bool on)
 {
-  auto r = uv_udp_set_broadcast(udp.get_udp(), on ? 1 : 0);
-  if (r < 0)
-  {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-  }
-  return {};
+  return detail::udp_option(udp, SOL_SOCKET, SO_BROADCAST, on ? 1 : 0);
 }
 
 inline std::expected<void, error_t> udp_set_ttl(udp_t &udp, int ttl)
 {
-  auto r = uv_udp_set_ttl(udp.get_udp(), ttl);
-  if (r < 0)
+  if (ttl < 1 || ttl > 255)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(errc::invalid_argument));
   }
-  return {};
+  if (udp.handle->family == AF_INET6)
+  {
+    return detail::udp_option(udp, IPPROTO_IPV6, IPV6_UNICAST_HOPS, ttl);
+  }
+  return detail::udp_option(udp, IPPROTO_IP, IP_TTL, ttl);
 }
 
 inline std::expected<void, error_t> udp_set_multicast_loop(udp_t &udp, bool on)
 {
-  auto r = uv_udp_set_multicast_loop(udp.get_udp(), on ? 1 : 0);
-  if (r < 0)
+  if (int result = detail::udp_require_socket(udp.handle.data()); result < 0)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(result));
   }
-  return {};
+  const auto native = udp.handle->socket.native();
+  if (udp.handle->family == AF_INET6)
+  {
+    return detail::udp_result(detail::udp_set_int_option(native, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, on ? 1 : 0));
+  }
+  return detail::udp_result(detail::udp_set_small_option(native, IPPROTO_IP, IP_MULTICAST_LOOP, on ? 1 : 0));
 }
 
 inline std::expected<void, error_t> udp_set_multicast_ttl(udp_t &udp, int ttl)
 {
-  auto r = uv_udp_set_multicast_ttl(udp.get_udp(), ttl);
-  if (r < 0)
+  if (int result = detail::udp_require_socket(udp.handle.data()); result < 0)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(result));
   }
-  return {};
+  const auto native = udp.handle->socket.native();
+  if (udp.handle->family == AF_INET6)
+  {
+    if (ttl < -1 || ttl > 255)
+    {
+      return std::unexpected(make_error(errc::invalid_argument));
+    }
+    return detail::udp_result(detail::udp_set_int_option(native, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, ttl));
+  }
+  if (ttl < 0 || ttl > 255)
+  {
+    return std::unexpected(make_error(errc::invalid_argument));
+  }
+  return detail::udp_result(detail::udp_set_small_option(native, IPPROTO_IP, IP_MULTICAST_TTL, ttl));
 }
 
-inline std::expected<void, error_t> udp_set_membership(udp_t &udp, const char *multicast_addr, const char *interface_addr, uv_membership membership)
+inline std::expected<void, error_t> udp_set_membership(udp_t &udp, const char *multicast_addr, const char *interface_addr, udp_membership_t membership)
 {
-  auto r = uv_udp_set_membership(udp.get_udp(), multicast_addr, interface_addr, membership);
-  if (r < 0)
+  if (multicast_addr == nullptr)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(errc::invalid_argument));
   }
-  return {};
+  auto &state = udp.handle.data();
+  const bool join = membership == udp_membership_t::join_group;
+  in_addr group4 = {};
+  if (inet_pton(AF_INET, multicast_addr, &group4) == 1)
+  {
+    if (int result = detail::udp_ensure_socket(state, AF_INET, udp_bind_flags::reuseaddr); result < 0)
+    {
+      return std::unexpected(make_error(result));
+    }
+    ip_mreq request = {};
+    request.imr_multiaddr = group4;
+    request.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (interface_addr != nullptr && inet_pton(AF_INET, interface_addr, &request.imr_interface) != 1)
+    {
+      return std::unexpected(make_error(errc::invalid_argument));
+    }
+    return detail::udp_result(detail::socket_set_option(state.socket.native(), IPPROTO_IP, join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP, &request, static_cast<int>(sizeof(request))));
+  }
+  in6_addr group6 = {};
+  std::uint32_t ignored_scope = 0;
+  if (!detail::udp_parse_ipv6(multicast_addr, group6, ignored_scope))
+  {
+    return std::unexpected(make_error(errc::invalid_argument));
+  }
+  if (int result = detail::udp_ensure_socket(state, AF_INET6, udp_bind_flags::reuseaddr); result < 0)
+  {
+    return std::unexpected(make_error(result));
+  }
+  ipv6_mreq request = {};
+  request.ipv6mr_multiaddr = group6;
+  if (interface_addr != nullptr)
+  {
+    in6_addr interface_address = {};
+    std::uint32_t scope = 0;
+    if (!detail::udp_parse_ipv6(interface_addr, interface_address, scope))
+    {
+      return std::unexpected(make_error(errc::invalid_argument));
+    }
+    request.ipv6mr_interface = scope;
+  }
+  return detail::udp_result(detail::socket_set_option(state.socket.native(), IPPROTO_IPV6, join ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP, &request, static_cast<int>(sizeof(request))));
 }
+
+inline std::expected<void, error_t> udp_set_send_buffer_size(udp_t &udp, int bytes)
+{
+  if (bytes <= 0)
+  {
+    return std::unexpected(make_error(errc::invalid_argument));
+  }
+  return detail::udp_option(udp, SOL_SOCKET, SO_SNDBUF, bytes);
+}
+
+inline std::expected<void, error_t> udp_set_recv_buffer_size(udp_t &udp, int bytes)
+{
+  if (bytes <= 0)
+  {
+    return std::unexpected(make_error(errc::invalid_argument));
+  }
+  return detail::udp_option(udp, SOL_SOCKET, SO_RCVBUF, bytes);
+}
+
+namespace detail
+{
+[[nodiscard]] inline std::expected<int, error_t> udp_int_option(udp_t &udp, int level, int name)
+{
+  if (int result = udp_require_socket(udp.handle.data()); result < 0)
+  {
+    return std::unexpected(make_error(result));
+  }
+  int value = 0;
+  int length = static_cast<int>(sizeof(value));
+  if (int result = socket_get_option(udp.handle->socket.native(), level, name, &value, length); result < 0)
+  {
+    return std::unexpected(make_error(result));
+  }
+  return value;
+}
+} // namespace detail
+
+inline std::expected<int, error_t> udp_send_buffer_size(udp_t &udp)
+{
+  return detail::udp_int_option(udp, SOL_SOCKET, SO_SNDBUF);
+}
+
+inline std::expected<int, error_t> udp_recv_buffer_size(udp_t &udp)
+{
+  return detail::udp_int_option(udp, SOL_SOCKET, SO_RCVBUF);
+}
+
+namespace detail
+{
+inline void udp_on_send_ready(io_op_t *op)
+{
+  auto owned = ref_ptr_t<udp_state_t>::from_raw(op->owner);
+  auto &state = owned.data();
+  auto &send = state.send;
+  const auto *to = send.address_length > 0 ? reinterpret_cast<const sockaddr *>(&send.address) : nullptr;
+  const auto sent = socket_sendto(state.socket.native(), std::as_bytes(std::span(send.data, send.length)), to, send.address_length);
+  if (sent == errc::again)
+  {
+    op->owner = owned.release_to_raw();
+    state.socket.wait(interest_write, *op);
+    return;
+  }
+  send.started = false;
+  send.done = true;
+  send.result = udp_send_result(sent);
+  if (send.continuation)
+  {
+    auto continuation = std::exchange(send.continuation, {});
+    continuation.resume();
+  }
+}
+
+inline void udp_abandon_send(udp_state_t &state, std::uint64_t generation)
+{
+  auto &send = state.send;
+  if (!send.started || send.done || send.generation != generation)
+  {
+    return;
+  }
+  state.socket.cancel(send.op);
+  send.started = false;
+  send.done = true;
+  send.continuation = {};
+  send.result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+  ref_ptr_t<udp_state_t>::from_raw(send.op.owner);
+}
+} // namespace detail
 
 using udp_send_future_t = udp_future_t<udp_send_state_t>;
 inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t length, const sockaddr *addr)
 {
-  udp_send_future_t ret(udp.handle, udp.handle->send);
-  if (ret.handle->send.started)
+  auto &state = udp.handle.data();
+  auto &send = state.send;
+  if (send.started)
   {
-    ret.handle->send.done = true;
-    ret.handle->send.result = std::unexpected(error_t{.code = -1, .msg = "It's an error to have more than one send in flight at a time"});
-    return ret;
+    return udp_send_future_t(udp.handle, send, error_t{.code = errc::already_in_progress, .msg = "It's an error to have more than one send in flight at a time"});
   }
-  ret.handle->send.started = true;
-  ret.handle->send.done = false;
-  ret.handle->send.result = {};
-
-  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(data)), static_cast<unsigned int>(length));
-
-  auto callback = [](uv_udp_send_t *req, int status)
+  detail::udp_target_t target;
+  if (int result = detail::udp_prepare_target(state, addr, target); result < 0)
   {
-    auto state_ref = ref_ptr_t<udp_state_t>::from_raw(req->data);
-    if (status < 0)
-    {
-      state_ref->send.result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
-    }
-    state_ref->send.done = true;
-    state_ref->send.started = false;
-    if (state_ref->send.continuation)
-    {
-      auto continuation = state_ref->send.continuation;
-      state_ref->send.continuation = {};
-      continuation.resume();
-    }
-  };
-
-  auto copy = ret.handle;
-  ret.handle->send.req.data = copy.release_to_raw();
-  auto r = uv_udp_send(&ret.handle->send.req, udp.get_udp(), &buf, 1, addr, callback);
-
-  if (r < 0)
-  {
-    ret.handle->send.done = true;
-    ret.handle->send.started = false;
-    ret.handle->send.result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    ref_ptr_t<udp_state_t>::from_raw(ret.handle->send.req.data);
+    return udp_send_future_t(udp.handle, send, make_error(result));
   }
-
-  return ret;
+  const auto sent = detail::socket_sendto(state.socket.native(), std::as_bytes(std::span(data, length)), target.address, target.length);
+  send.continuation = {};
+  if (sent != errc::again)
+  {
+    send.done = true;
+    send.result = detail::udp_send_result(sent);
+    return udp_send_future_t(udp.handle, send);
+  }
+  send.started = true;
+  send.done = false;
+  send.result = {};
+  send.data = data;
+  send.length = length;
+  send.address = {};
+  send.address_length = target.length;
+  if (target.address != nullptr)
+  {
+    std::memcpy(&send.address, target.address, static_cast<std::size_t>(target.length));
+  }
+  ++send.generation;
+  auto parked = udp.handle;
+  send.op.owner = parked.release_to_raw();
+  send.op.complete = &detail::udp_on_send_ready;
+  state.socket.wait(detail::interest_write, send.op);
+  udp_send_future_t future(udp.handle, send);
+  future.generation = send.generation;
+  future.pending = true;
+  return future;
 }
 
 inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t length)
@@ -396,16 +971,14 @@ inline udp_send_future_t send_udp(udp_t &udp, const uint8_t *data, std::size_t l
 
 // An owning, awaitable send. Unlike send_udp above there is one of these per
 // call rather than one per socket, so any number may be in flight at once.
-//
-// The payload is moved in and held until libuv's completion callback fires,
-// which is what makes early resumption safe: a cancelled send hands its
-// awaiter an answer immediately while uv is still reading the bytes, and the
-// operation stays alive underneath until uv is done with them.
 struct udp_send_op_t
 {
-  uv_udp_send_t req = {};
+  detail::io_op_t io;
   ref_ptr_t<udp_state_t> socket = ref_ptr_t<udp_state_t>::null();
   std::unique_ptr<owned_payload_t> payload;
+  std::span<const std::byte> bytes;
+  sockaddr_storage address = {};
+  int address_length = 0;
   std::coroutine_handle<> continuation;
   std::expected<void, error_t> result;
   registration_t cancel_registration;
@@ -416,8 +989,8 @@ struct udp_send_op_t
 namespace detail
 {
 // The op outlives whichever of the two finishes first. Whoever is last to let
-// go frees it: the callback when the awaiter has already been answered or
-// abandoned, the awaiter when the callback has already fired.
+// go frees it: the completion when the awaiter has already been abandoned, the
+// awaiter when the completion has already happened.
 inline void udp_send_release(udp_send_op_t *op)
 {
   if (op->completed)
@@ -428,9 +1001,17 @@ inline void udp_send_release(udp_send_op_t *op)
   op->detached = true;
 }
 
-inline void udp_send_cb(uv_udp_send_t *req, int status)
+inline void udp_send_op_ready(io_op_t *io)
 {
-  auto *op = static_cast<udp_send_op_t *>(req->data);
+  auto *op = static_cast<udp_send_op_t *>(io->owner);
+  auto &state = op->socket.data();
+  const auto *to = op->address_length > 0 ? reinterpret_cast<const sockaddr *>(&op->address) : nullptr;
+  const auto sent = socket_sendto(state.socket.native(), op->bytes, to, op->address_length);
+  if (sent == errc::again)
+  {
+    state.socket.wait(interest_write, *io);
+    return;
+  }
   op->completed = true;
   op->cancel_registration.reset();
   if (op->detached)
@@ -438,14 +1019,31 @@ inline void udp_send_cb(uv_udp_send_t *req, int status)
     delete op;
     return;
   }
-  if (status < 0)
+  op->result = udp_send_result(sent);
+  if (op->continuation)
   {
-    op->result = std::unexpected(error_t{.code = status, .msg = uv_strerror(status)});
+    auto continuation = std::exchange(op->continuation, {});
+    continuation.resume();
+  }
+}
+
+inline void udp_send_op_cancel(udp_send_op_t *op)
+{
+  if (op->completed)
+  {
+    return;
+  }
+  op->socket->socket.cancel(op->io);
+  op->completed = true;
+  op->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
+  if (op->detached)
+  {
+    delete op;
+    return;
   }
   if (op->continuation)
   {
-    auto continuation = op->continuation;
-    op->continuation = {};
+    auto continuation = std::exchange(op->continuation, {});
     continuation.resume();
   }
 }
@@ -455,9 +1053,15 @@ inline void udp_send_cb(uv_udp_send_t *req, int status)
 struct udp_send_awaitable_t
 {
   udp_send_op_t *op = nullptr;
+  std::expected<void, error_t> immediate;
 
   explicit udp_send_awaitable_t(udp_send_op_t *operation)
     : op(operation)
+  {
+  }
+
+  explicit udp_send_awaitable_t(std::expected<void, error_t> result)
+    : immediate(std::move(result))
   {
   }
 
@@ -466,6 +1070,7 @@ struct udp_send_awaitable_t
 
   udp_send_awaitable_t(udp_send_awaitable_t &&other) noexcept
     : op(std::exchange(other.op, nullptr))
+    , immediate(std::move(other.immediate))
   {
   }
 
@@ -479,7 +1084,7 @@ struct udp_send_awaitable_t
 
   [[nodiscard]] bool await_ready() const noexcept
   {
-    return op->completed || op->detached;
+    return op == nullptr || op->completed;
   }
 
   void await_suspend(std::coroutine_handle<> continuation) noexcept
@@ -489,6 +1094,10 @@ struct udp_send_awaitable_t
 
   std::expected<void, error_t> await_resume() noexcept
   {
+    if (op == nullptr)
+    {
+      return std::move(immediate);
+    }
     auto result = std::move(op->result);
     detail::udp_send_release(op);
     op = nullptr;
@@ -496,73 +1105,71 @@ struct udp_send_awaitable_t
   }
 };
 
-// Cancelling does not stop the datagram; it stops the caller waiting for it.
 template <typename Bytes>
   requires owned_byte_range<Bytes>
 udp_send_awaitable_t send_udp(udp_t &udp, Bytes &&bytes, const sockaddr *addr, cancellation_t *cancel = nullptr)
 {
   using payload_t = std::remove_cvref_t<Bytes>;
-  auto *op = new udp_send_op_t();
-  op->socket = udp.handle;
-
+  using value_t = std::ranges::range_value_t<payload_t>;
   if (cancel != nullptr && cancel->is_cancelled())
   {
-    op->completed = true;
-    op->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-    return udp_send_awaitable_t(op);
+    return udp_send_awaitable_t(std::expected<void, error_t>(std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"})));
   }
-
-  auto owned = std::make_unique<owned_payload_impl_t<payload_t>>(std::forward<Bytes>(bytes));
-  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<char *>(reinterpret_cast<const char *>(std::ranges::data(owned->value)))), static_cast<unsigned int>(std::ranges::size(owned->value)));
-  op->payload = std::move(owned);
-  op->req.data = op;
-
-  if (const int r = uv_udp_send(&op->req, udp.get_udp(), &buf, 1, addr, &detail::udp_send_cb); r < 0)
+  auto &state = udp.handle.data();
+  detail::udp_target_t target;
+  if (int result = detail::udp_prepare_target(state, addr, target); result < 0)
   {
-    op->completed = true;
-    op->result = std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-    return udp_send_awaitable_t(op);
+    return udp_send_awaitable_t(std::expected<void, error_t>(std::unexpected(make_error(result))));
   }
+  const auto view = std::as_bytes(std::span<const value_t>(std::ranges::data(bytes), std::ranges::size(bytes)));
+  const auto sent = detail::socket_sendto(state.socket.native(), view, target.address, target.length);
+  if (sent != errc::again)
+  {
+    return udp_send_awaitable_t(detail::udp_send_result(sent));
+  }
+
+  auto *op = new udp_send_op_t();
+  op->socket = udp.handle;
+  auto owned = std::make_unique<owned_payload_impl_t<payload_t>>(std::forward<Bytes>(bytes));
+  op->bytes = std::as_bytes(std::span<const value_t>(std::ranges::data(owned->value), std::ranges::size(owned->value)));
+  op->payload = std::move(owned);
+  op->address_length = target.length;
+  if (target.address != nullptr)
+  {
+    std::memcpy(&op->address, target.address, static_cast<std::size_t>(target.length));
+  }
+  op->io.owner = op;
+  op->io.complete = &detail::udp_send_op_ready;
+  state.socket.wait(detail::interest_write, op->io);
 
   if (cancel != nullptr)
   {
-    op->cancel_registration = cancel->register_callback(
-      [op]()
-      {
-        if (op->completed || op->detached)
-        {
-          return;
-        }
-        op->result = std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"});
-        op->detached = true;
-        if (op->continuation)
-        {
-          auto continuation = op->continuation;
-          op->continuation = {};
-          continuation.resume();
-        }
-      });
+    op->cancel_registration = cancel->register_callback([op]() { detail::udp_send_op_cancel(op); });
   }
-
   return udp_send_awaitable_t(op);
 }
 
-// Synchronous send. Unlike send_udp above there is no request object, no completion
-// callback and no reference parked for the duration, so any number of these
-// may be issued back to back -- which is what a server talking to many peers
-// from one socket needs, and what send_udp explicitly refuses.
+// Synchronous send. Unlike send_udp above there is no operation and no
+// reference parked for the duration, so any number of these may be issued back
+// to back -- which is what a server talking to many peers from one socket
+// needs, and what send_udp explicitly refuses.
 //
-// A full socket buffer surfaces as an error with code UV_EAGAIN; that is the
+// A full socket buffer surfaces as an error with code errc::again; that is the
 // caller's signal to stop draining and retry later, not a failure.
 inline std::expected<std::size_t, error_t> udp_try_send(udp_t &udp, std::span<const uint8_t> bytes, const sockaddr *addr)
 {
-  uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(bytes.data())), static_cast<unsigned int>(bytes.size()));
-  const int r = uv_udp_try_send(udp.get_udp(), &buf, 1, addr);
-  if (r < 0)
+  auto &state = udp.handle.data();
+  detail::udp_target_t target;
+  if (int result = detail::udp_prepare_target(state, addr, target); result < 0)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(result));
   }
-  return static_cast<std::size_t>(r);
+  const auto sent = detail::socket_sendto(state.socket.native(), std::as_bytes(bytes), target.address, target.length);
+  if (sent < 0)
+  {
+    return std::unexpected(make_error(static_cast<int>(sent)));
+  }
+  return static_cast<std::size_t>(sent);
 }
 
 struct udp_out_datagram_t
@@ -570,8 +1177,6 @@ struct udp_out_datagram_t
   std::span<const uint8_t> bytes;
   const sockaddr *addr = nullptr;
 };
-
-inline constexpr std::size_t udp_max_batch_size = 64;
 
 // Sends up to udp_max_batch_size datagrams in one call, mapping to sendmmsg
 // where the platform has it. Returns how many were accepted, which may be
@@ -582,74 +1187,59 @@ inline std::expected<unsigned int, error_t> udp_try_send_batch(udp_t &udp, std::
   {
     return 0u;
   }
-  const unsigned int count = static_cast<unsigned int>(datagrams.size() < udp_max_batch_size ? datagrams.size() : udp_max_batch_size);
-
-  std::array<uv_buf_t, udp_max_batch_size> storage = {};
-  std::array<uv_buf_t *, udp_max_batch_size> bufs = {};
-  std::array<unsigned int, udp_max_batch_size> nbufs = {};
-  std::array<struct sockaddr *, udp_max_batch_size> addrs = {};
-
-  for (unsigned int i = 0; i < count; ++i)
+  auto &state = udp.handle.data();
+  std::size_t count = datagrams.size() < udp_max_batch_size ? datagrams.size() : udp_max_batch_size;
+  std::array<detail::udp_target_t, udp_max_batch_size> targets;
+  std::array<detail::udp_out_message_t, udp_max_batch_size> messages;
+  for (std::size_t i = 0; i < count; ++i)
   {
-    storage[i] = uv_buf_init(reinterpret_cast<char *>(const_cast<uint8_t *>(datagrams[i].bytes.data())), static_cast<unsigned int>(datagrams[i].bytes.size()));
-    bufs[i] = &storage[i];
-    nbufs[i] = 1;
-    addrs[i] = const_cast<struct sockaddr *>(datagrams[i].addr);
+    if (int result = detail::udp_prepare_target(state, datagrams[i].addr, targets[i]); result < 0)
+    {
+      if (i == 0)
+      {
+        return std::unexpected(make_error(result));
+      }
+      count = i;
+      break;
+    }
+    messages[i].bytes = std::as_bytes(datagrams[i].bytes);
+    messages[i].to = targets[i].address;
+    messages[i].to_length = targets[i].length;
   }
-
-  const int r = uv_udp_try_send2(udp.get_udp(), count, bufs.data(), nbufs.data(), addrs.data(), 0);
-  if (r < 0)
+  const auto sent = detail::udp_send_many(state.socket.native(), messages.data(), count);
+  if (sent < 0)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(static_cast<int>(sent)));
   }
-  return static_cast<unsigned int>(r);
+  return static_cast<unsigned int>(sent);
 }
 
-inline std::expected<uv_os_fd_t, error_t> udp_fileno(udp_t &udp)
+inline std::expected<native_socket_t, error_t> udp_fileno(udp_t &udp)
 {
-  uv_os_fd_t fd = {};
-  const int r = uv_fileno(udp.get_handle(), &fd);
-  if (r < 0)
+  if (int result = detail::udp_require_socket(udp.handle.data()); result < 0)
   {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
+    return std::unexpected(make_error(result));
   }
-  return fd;
+  return udp.handle->socket.native();
 }
 
-// RFC 3168: the two-bit ECN field, in the values it takes on the wire. It sits
-// in the low bits of the IPv4 TOS byte and the IPv6 traffic class byte.
-enum class udp_ecn_t : std::uint8_t
-{
-  not_ect = 0x00,
-  ect1 = 0x01,
-  ect0 = 0x02,
-  ce = 0x03,
-};
-
-// Binds one socket that accepts both IPv6 and IPv4-mapped peers. libuv clears
-// IPV6_V6ONLY when UV_UDP_IPV6ONLY is absent, so binding [::] is enough; hosts
-// without IPv6 fall back to 0.0.0.0.
+// Binds one socket that accepts both IPv6 and IPv4-mapped peers. IPV6_V6ONLY
+// is cleared unless udp_bind_flags::ipv6_only is given, so binding [::] is
+// enough; hosts without IPv6 fall back to 0.0.0.0.
 inline std::expected<void, error_t> udp_bind_dual_stack(udp_t &udp, std::uint16_t port)
 {
-  sockaddr_in6 addr6 = {};
-  if (const int r = uv_ip6_addr("::", static_cast<int>(port), &addr6); r == 0)
+  sockaddr_in6 any6 = {};
+  any6.sin6_family = AF_INET6;
+  any6.sin6_port = htons(port);
+  if (udp_bind(udp, reinterpret_cast<const sockaddr *>(&any6)).has_value())
   {
-    if (const int bound = uv_udp_bind(udp.get_udp(), reinterpret_cast<const sockaddr *>(&addr6), 0); bound == 0)
-    {
-      return {};
-    }
+    return {};
   }
-
-  sockaddr_in addr4 = {};
-  if (const int r = uv_ip4_addr("0.0.0.0", static_cast<int>(port), &addr4); r < 0)
-  {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-  }
-  if (const int r = uv_udp_bind(udp.get_udp(), reinterpret_cast<const sockaddr *>(&addr4), 0); r < 0)
-  {
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-  }
-  return {};
+  sockaddr_in any4 = {};
+  any4.sin_family = AF_INET;
+  any4.sin_port = htons(port);
+  any4.sin_addr.s_addr = htonl(INADDR_ANY);
+  return udp_bind(udp, reinterpret_cast<const sockaddr *>(&any4));
 }
 
 // Refused once a reader is running, and that refusal is the point: buffers
@@ -661,7 +1251,7 @@ inline std::expected<void, error_t> udp_set_allocator(udp_t &udp, alloc_cb_t all
 {
   if (udp.handle->recv.started || udp.handle->recv.active)
   {
-    return std::unexpected(error_t{.code = UV_EBUSY, .msg = "the allocator cannot change while a reader is active; set it before udp_create_reader"});
+    return std::unexpected(error_t{.code = errc::busy, .msg = "the allocator cannot change while a reader is active; set it before udp_create_reader"});
   }
   udp.handle->recv.alloc_buffer_cb = alloc;
   udp.handle->recv.dealloc_buffer_cb = dealloc;
@@ -699,6 +1289,188 @@ inline udp_recv_stats_t udp_recv_stats(udp_t &udp)
                           .recv_errors = udp.handle->recv.recv_errors};
 }
 
+namespace detail
+{
+[[nodiscard]] inline std::span<std::byte> udp_take_spare(udp_recv_state_t &recv)
+{
+  if (!recv.spare.empty())
+  {
+    auto buffer = recv.spare.back();
+    recv.spare.pop_back();
+    return buffer;
+  }
+  return recv.alloc_buffer_cb(recv.alloc_cb_data, udp_receive_buffer_size);
+}
+
+inline void udp_recv_fill(udp_state_t &state)
+{
+  auto &recv = state.recv;
+  const std::size_t limit = recv.recv_queue_limit == 0 ? 1 : recv.recv_queue_limit;
+  const std::size_t queued = recv.buffer_queue.size();
+  std::size_t budget = queued < limit ? std::min(limit - queued, udp_recv_burst) : 0;
+  recv.drained = false;
+  const native_socket_t native = state.socket.native();
+  std::size_t errors = 0;
+  bool probe = false;
+  while (budget > 0)
+  {
+    const std::size_t want = udp_has_recvmmsg && state.use_recvmmsg && !probe ? std::min(budget, udp_recvmmsg_batch) : 1;
+    std::array<udp_message_t, udp_recvmmsg_batch> messages;
+    std::array<sockaddr_storage, udp_recvmmsg_batch> names;
+    std::array<std::span<std::byte>, udp_recvmmsg_batch> buffers;
+    std::size_t prepared = 0;
+    for (; prepared < want; ++prepared)
+    {
+      auto buffer = udp_take_spare(recv);
+      if (buffer.data() == nullptr || buffer.empty())
+      {
+        break;
+      }
+      buffers[prepared] = buffer;
+      messages[prepared] = udp_message_t{.data = buffer.data(), .capacity = buffer.size(), .name = &names[prepared]};
+    }
+    if (prepared == 0)
+    {
+      recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = errc::no_buffer_space, .msg = "the receive allocator returned no buffer"}));
+      return;
+    }
+    const auto received = udp_receive(native, messages.data(), prepared);
+    if (received < 0)
+    {
+      for (std::size_t i = 0; i < prepared; ++i)
+      {
+        recv.spare.push_back(buffers[i]);
+      }
+      if (received == errc::again)
+      {
+        recv.drained = true;
+        recv.drained_known = true;
+        recv.drained_epoch = state.socket.watch.epoch;
+        return;
+      }
+      if (udp_is_terminal_receive_error(received))
+      {
+        recv.buffer_queue.emplace_back(std::unexpected(make_error(static_cast<int>(received))));
+        return;
+      }
+      ++recv.recv_errors;
+      if (++errors >= udp_recv_burst)
+      {
+        return;
+      }
+      continue;
+    }
+    const auto count = static_cast<std::size_t>(received);
+    for (std::size_t i = 0; i < prepared; ++i)
+    {
+      if (i >= count)
+      {
+        recv.spare.push_back(buffers[i]);
+        continue;
+      }
+      const auto &message = messages[i];
+      if (message.truncated)
+      {
+        ++recv.truncated_datagrams;
+        recv.spare.push_back(buffers[i]);
+        continue;
+      }
+      udp_datagram_t datagram;
+      datagram.data = unique_buf_t(buffers[i], recv.dealloc_buffer_cb, recv.alloc_cb_data);
+      datagram.data.resize(message.length);
+      if (message.name_length > 0)
+      {
+        std::memcpy(&datagram.sender_addr, &names[i], std::min(static_cast<std::size_t>(message.name_length), sizeof(sockaddr_storage)));
+      }
+      recv.buffer_queue.emplace_back(std::move(datagram));
+    }
+    probe = count < prepared;
+    budget -= std::min(budget, count);
+  }
+}
+
+inline void udp_recv_park(udp_state_t &state);
+
+inline void udp_recv_wake(udp_state_t &state)
+{
+  auto &recv = state.recv;
+  if (!recv.continuation)
+  {
+    return;
+  }
+  if (recv.started && !recv.is_cancelled)
+  {
+    udp_recv_fill(state);
+    if (recv.buffer_queue.empty())
+    {
+      udp_recv_park(state);
+      return;
+    }
+  }
+  auto continuation = std::exchange(recv.continuation, {});
+  continuation.resume();
+}
+
+inline void udp_recv_on_readable(io_op_t *op)
+{
+  udp_recv_wake(*static_cast<udp_state_t *>(op->owner));
+}
+
+inline void udp_recv_on_retry(posted_t *node)
+{
+  auto owned = ref_ptr_t<udp_state_t>::from_raw(node->owner);
+  udp_recv_wake(owned.data());
+}
+
+inline void udp_recv_on_discard(posted_t *node)
+{
+  ref_ptr_t<udp_state_t>::from_raw(node->owner);
+}
+
+inline void udp_recv_park(udp_state_t &state)
+{
+  auto &recv = state.recv;
+  if (recv.drained)
+  {
+    state.socket.wait(interest_read, recv.op);
+    return;
+  }
+  if (recv.retry.queued)
+  {
+    return;
+  }
+  recv.retry.owner = ref_retain<udp_state_t>(state.self);
+  core(state.event_loop).defer(recv.retry);
+}
+
+[[nodiscard]] inline bool udp_recv_try(udp_state_t &state)
+{
+  auto &recv = state.recv;
+  if (!recv.drained)
+  {
+    return false;
+  }
+  if (recv.drained_known && state.socket.watch.epoch == recv.drained_epoch)
+  {
+    return false;
+  }
+  udp_recv_fill(state);
+  return !recv.buffer_queue.empty();
+}
+
+inline void udp_recv_stop(udp_state_t &state)
+{
+  auto &recv = state.recv;
+  recv.started = false;
+  recv.active = false;
+  if (recv.op.parked)
+  {
+    state.socket.cancel(recv.op);
+  }
+  udp_return_spares(recv);
+}
+} // namespace detail
+
 class udp_reader_t
 {
 public:
@@ -716,14 +1488,7 @@ public:
   {
     if (this != &other)
     {
-      if (_is_valid && handle->recv.started)
-      {
-        auto state = ref_ptr_t<udp_state_t>::from_raw(handle->get_udp()->data);
-        uv_udp_recv_stop(handle->get_udp());
-        udp_reclaim_inflight_recv_buffer(state->recv);
-        state->recv.started = false;
-        state->recv.active = false;
-      }
+      stop();
       handle = std::move(other.handle);
       _is_valid = other._is_valid;
       other._is_valid = false;
@@ -733,43 +1498,22 @@ public:
 
   ~udp_reader_t()
   {
-    if (_is_valid && handle->recv.started)
-    {
-      auto state = ref_ptr_t<udp_state_t>::from_raw(handle->get_udp()->data);
-      uv_udp_recv_stop(handle->get_udp());
-      udp_reclaim_inflight_recv_buffer(state->recv);
-      state->recv.started = false;
-      state->recv.active = false;
-    }
+    stop();
   }
 
   void cancel()
   {
-    if (handle->recv.is_cancelled)
+    auto &recv = handle->recv;
+    if (recv.is_cancelled)
     {
       return;
     }
-
-    handle->recv.is_cancelled = true;
-
-    // Stop uv from delivering (and allocating buffers for) more datagrams after
-    // the reader is cancelled. Mirrors the destructor so its started guard won't
-    // reclaim the parked ref a second time.
-    if (handle->recv.started)
+    recv.is_cancelled = true;
+    detail::udp_recv_stop(handle.data());
+    recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = errc::canceled, .msg = "Operation was cancelled"}));
+    if (recv.continuation)
     {
-      auto state = ref_ptr_t<udp_state_t>::from_raw(handle->get_udp()->data);
-      uv_udp_recv_stop(handle->get_udp());
-      udp_reclaim_inflight_recv_buffer(state->recv);
-      state->recv.started = false;
-      state->recv.active = false;
-    }
-
-    handle->recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = UV_ECANCELED, .msg = "Operation was cancelled"}));
-
-    if (handle->recv.continuation)
-    {
-      auto continuation = handle->recv.continuation;
-      handle->recv.continuation = nullptr;
+      auto continuation = std::exchange(recv.continuation, {});
       continuation.resume();
     }
   }
@@ -782,175 +1526,72 @@ public:
   struct awaiter_t
   {
     ref_ptr_t<udp_state_t> state;
+    std::coroutine_handle<> waiting = {};
+    bool busy = false;
 
-    [[nodiscard]] bool await_ready() const
+    explicit awaiter_t(ref_ptr_t<udp_state_t> socket)
+      : state(std::move(socket))
     {
-      return !state->recv.buffer_queue.empty();
+    }
+
+    awaiter_t(const awaiter_t &) = delete;
+    awaiter_t &operator=(const awaiter_t &) = delete;
+
+    ~awaiter_t()
+    {
+      if (waiting && state->recv.continuation == waiting)
+      {
+        state->recv.continuation = {};
+        if (state->recv.op.parked)
+        {
+          state->socket.cancel(state->recv.op);
+        }
+      }
+    }
+
+    [[nodiscard]] bool await_ready()
+    {
+      auto &recv = state->recv;
+      if (!recv.buffer_queue.empty() || recv.is_cancelled || !recv.started)
+      {
+        return true;
+      }
+      if (recv.continuation)
+      {
+        busy = true;
+        return true;
+      }
+      return detail::udp_recv_try(state.data());
     }
 
     void await_suspend(std::coroutine_handle<> h)
     {
+      waiting = h;
       state->recv.continuation = h;
+      detail::udp_recv_park(state.data());
     }
 
     std::expected<udp_datagram_t, error_t> await_resume()
     {
-      auto result = std::move(state->recv.buffer_queue.front());
-      state->recv.buffer_queue.pop_front();
+      waiting = {};
+      if (busy)
+      {
+        return std::unexpected(error_t{.code = errc::already_in_progress, .msg = "another coroutine is already waiting on this reader"});
+      }
+      auto &queue = state->recv.buffer_queue;
+      if (queue.empty())
+      {
+        return std::unexpected(error_t{.code = errc::canceled, .msg = "Operation was cancelled"});
+      }
+      auto result = std::move(queue.front());
+      queue.pop_front();
       return result;
     }
   };
 
-  auto operator co_await()
+  awaiter_t operator co_await()
   {
-    return awaiter_t{this->handle};
-  }
-
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
-  struct ref_ptr_releaser_t
-  {
-    explicit ref_ptr_releaser_t(ref_ptr_t<udp_state_t> &socket)
-      : handle(socket)
-    {
-    }
-
-    ~ref_ptr_releaser_t()
-    {
-      handle.release_to_raw();
-    }
-    ref_ptr_t<udp_state_t> &handle;
-  };
-
-  static void alloc_cb(uv_handle_t *h, size_t size, uv_buf_t *buf)
-  {
-    auto udp_state = ref_ptr_t<udp_state_t>::from_raw(h->data);
-    udp_state->recv.alloc_buffer_cb(udp_state->recv.alloc_cb_data, size, buf);
-    udp_state->recv.inflight_recv_buffer = *buf;
-    udp_state.release_to_raw();
-  }
-
-  // Under recvmmsg libuv fills one allocation with several datagrams and hands
-  // each out as a slice tagged UV_UDP_MMSG_CHUNK, then asks for the whole
-  // allocation back once with UV_UDP_MMSG_FREE. A slice must therefore never
-  // be adopted by a unique_buf_t -- N datagrams would each free the same
-  // block. Slices are copied into a buffer of their own; the copy comes from
-  // the same allocator, so a pooled socket still does not reach the heap.
-  static void recv_cb(uv_udp_t *udp_handle, ssize_t nread, const uv_buf_t *buf, const sockaddr *addr, unsigned int flags)
-  {
-    auto udp_state = ref_ptr_t<udp_state_t>::from_raw(udp_handle->data);
-    ref_ptr_releaser_t releaser(udp_state);
-
-    const bool is_chunk = (flags & UV_UDP_MMSG_CHUNK) != 0;
-    const bool owns_buffer = !is_chunk;
-
-    auto release_buffer = [&]()
-    {
-      if (owns_buffer && buf != nullptr && buf->base != nullptr)
-      {
-        udp_state->recv.inflight_recv_buffer = {};
-        udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
-      }
-    };
-
-    if ((flags & UV_UDP_MMSG_FREE) != 0)
-    {
-      if (buf != nullptr && buf->base != nullptr)
-      {
-        udp_state->recv.inflight_recv_buffer = {};
-        udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
-      }
-      return;
-    }
-
-    if (nread == 0 && addr == nullptr)
-    {
-      release_buffer();
-      return;
-    }
-
-    if (nread > 0)
-    {
-      // A truncated datagram is not a short datagram; the remainder is gone.
-      // Handing back a prefix would have the caller parse garbage.
-      if ((flags & UV_UDP_PARTIAL) != 0)
-      {
-        ++udp_state->recv.truncated_datagrams;
-        release_buffer();
-        return;
-      }
-
-      if (udp_state->recv.buffer_queue.size() >= udp_state->recv.recv_queue_limit)
-      {
-        ++udp_state->recv.dropped_datagrams;
-        release_buffer();
-        return;
-      }
-
-      udp_datagram_t datagram;
-      if (is_chunk)
-      {
-        uv_buf_t copy = {};
-        udp_state->recv.alloc_buffer_cb(udp_state->recv.alloc_cb_data, static_cast<size_t>(nread), &copy);
-        if (copy.base == nullptr || copy.len < static_cast<decltype(copy.len)>(nread))
-        {
-          ++udp_state->recv.dropped_datagrams;
-          if (copy.base != nullptr)
-          {
-            udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, &copy);
-          }
-          return;
-        }
-        std::memcpy(copy.base, buf->base, static_cast<size_t>(nread));
-        copy.len = static_cast<decltype(copy.len)>(nread);
-        datagram.data = unique_buf_t(copy, udp_state->recv.dealloc_buffer_cb, udp_state->recv.alloc_cb_data);
-      }
-      else
-      {
-        uv_buf_t sized_buf = *buf;
-        sized_buf.len = static_cast<decltype(sized_buf.len)>(nread);
-        udp_state->recv.inflight_recv_buffer = {};
-        datagram.data = unique_buf_t(sized_buf, udp_state->recv.dealloc_buffer_cb, udp_state->recv.alloc_cb_data);
-      }
-
-      if (addr != nullptr)
-      {
-        std::memcpy(&datagram.sender_addr, addr, addr->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in));
-      }
-      udp_state->recv.buffer_queue.emplace_back(std::move(datagram));
-    }
-    else
-    {
-      // One peer must not be able to kill the socket. libuv stops the read
-      // before reporting a real error, so recovery means restarting it; the
-      // error is counted, not delivered. Only a failed restart is terminal,
-      // and that leaves recv.started alone so the destructor still reclaims
-      // the reference parked in the handle.
-      ++udp_state->recv.recv_errors;
-      if (buf != nullptr && buf->base != nullptr)
-      {
-        udp_state->recv.inflight_recv_buffer = {};
-        udp_state->recv.dealloc_buffer_cb(udp_state->recv.alloc_cb_data, const_cast<uv_buf_t *>(buf));
-      }
-
-      if (udp_state->recv.is_cancelled || !udp_state->recv.started)
-      {
-        return;
-      }
-
-      const int restarted = uv_udp_recv_start(udp_handle, udp_reader_t::alloc_cb, &udp_reader_t::recv_cb);
-      if (restarted >= 0 || restarted == UV_EALREADY)
-      {
-        return;
-      }
-      udp_state->recv.buffer_queue.emplace_back(std::unexpected(error_t{.code = restarted, .msg = uv_strerror(restarted)}));
-    }
-
-    if (udp_state->recv.continuation)
-    {
-      auto continuation = udp_state->recv.continuation;
-      udp_state->recv.continuation = nullptr;
-      continuation.resume();
-    }
+    return awaiter_t(this->handle);
   }
 
   ref_ptr_t<udp_state_t> handle;
@@ -962,6 +1603,21 @@ private:
     , _is_valid(true)
   {
   }
+
+  void stop()
+  {
+    if (!_is_valid || !handle)
+    {
+      return;
+    }
+    _is_valid = false;
+    if (handle->recv.started)
+    {
+      detail::udp_recv_stop(handle.data());
+      handle->recv.continuation = {};
+    }
+  }
+
   bool _is_valid = false;
 };
 
@@ -971,7 +1627,16 @@ private:
 // should co_await the reader.
 inline std::size_t udp_reader_take_batch(udp_reader_t &reader, std::span<std::expected<udp_datagram_t, error_t>> out)
 {
-  auto &queue = reader.handle->recv.buffer_queue;
+  auto &state = reader.handle.data();
+  auto &recv = state.recv;
+  if (recv.buffer_queue.empty() && recv.started && !recv.is_cancelled && !recv.continuation)
+  {
+    if (!recv.drained || !recv.drained_known || state.socket.watch.epoch != recv.drained_epoch)
+    {
+      detail::udp_recv_fill(state);
+    }
+  }
+  auto &queue = recv.buffer_queue;
   std::size_t taken = 0;
   while (taken < out.size() && !queue.empty())
   {
@@ -984,47 +1649,36 @@ inline std::size_t udp_reader_take_batch(udp_reader_t &reader, std::span<std::ex
 
 inline std::expected<udp_reader_t, error_t> udp_create_reader(udp_t &udp)
 {
-  if (udp.handle.ref_counted() == nullptr)
+  if (!udp.handle)
   {
-    return std::unexpected(error_t{.code = 1, .msg = "Can not create a reader for a closed udp socket"});
+    return std::unexpected(error_t{.code = errc::bad_descriptor, .msg = "Can not create a reader for a closed udp socket"});
   }
-  if (udp.handle->recv.active)
+  auto &state = udp.handle.data();
+  auto &recv = state.recv;
+  if (recv.active)
   {
-    return std::unexpected(error_t{.code = 1, .msg = "Can not create multiple active readers for a udp socket. Destroy other reader, before making a new one."});
+    return std::unexpected(error_t{.code = errc::busy, .msg = "Can not create multiple active readers for a udp socket. Destroy other reader, before making a new one."});
   }
-
-  // Fail here rather than let the socket go quiet: ask the allocator for what
-  // libuv is about to ask for, and refuse if it cannot cover a single chunk.
-  if (uv_udp_using_recvmmsg(udp.get_udp()) != 0)
+  if (state.datagram_reader)
   {
-    uv_buf_t probe = {};
-    udp.handle->recv.alloc_buffer_cb(udp.handle->recv.alloc_cb_data, udp_recvmmsg_chunk_size, &probe);
-    const std::size_t offered = probe.base == nullptr ? 0 : static_cast<std::size_t>(probe.len);
-    if (probe.base != nullptr)
-    {
-      udp.handle->recv.dealloc_buffer_cb(udp.handle->recv.alloc_cb_data, &probe);
-    }
-    if (offered < udp_recvmmsg_chunk_size)
-    {
-      return std::unexpected(error_t{.code = UV_ENOBUFS,
-                                     .msg = "recvmmsg needs an allocator that yields at least " + std::to_string(udp_recvmmsg_chunk_size) + " bytes per buffer, but it offered " + std::to_string(offered) +
-                                            "; size the buffer pool to a multiple of the chunk size or create the socket without recvmmsg"});
-    }
+    return std::unexpected(error_t{.code = errc::busy, .msg = "a datagram_reader_t is already reading this socket"});
   }
-
-  auto copy = udp.handle;
-  udp.get_udp()->data = copy.release_to_raw();
-  if (const auto r = uv_udp_recv_start(udp.get_udp(), &udp_reader_t::alloc_cb, &udp_reader_t::recv_cb); r >= 0)
+  if (int result = detail::udp_ensure_socket(state, AF_INET); result < 0)
   {
-    udp.handle->recv.active = true;
-    udp.handle->recv.started = true;
+    return std::unexpected(make_error(result));
   }
-  else
-  {
-    auto udp_state = ref_ptr_t<udp_state_t>::from_raw(udp.get_udp()->data);
-    return std::unexpected(error_t{.code = r, .msg = uv_strerror(r)});
-  }
-
+  recv.buffer_queue.erase_if([](const std::expected<udp_datagram_t, error_t> &entry) { return !entry.has_value(); });
+  recv.active = true;
+  recv.started = true;
+  recv.is_cancelled = false;
+  recv.drained = true;
+  recv.drained_known = false;
+  recv.continuation = {};
+  recv.op.owner = &state;
+  recv.op.complete = &detail::udp_recv_on_readable;
+  recv.retry.run = &detail::udp_recv_on_retry;
+  recv.retry.discard = &detail::udp_recv_on_discard;
+  recv.spare.reserve(udp_recvmmsg_batch);
   return udp_reader_t{udp};
 }
 

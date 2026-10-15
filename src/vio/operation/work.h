@@ -22,21 +22,19 @@
 
 #pragma once
 
+#include "vio/errc.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
+#include "vio/future.h"
 #include "vio/thread_pool.h"
-#include "vio/uv_coro.h"
 
 #include <atomic>
-#include <cstdint>
 #include <coroutine>
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <vector>
-
-#ifndef __EMSCRIPTEN__
-#include <uv.h> // only for UV_ECANCELED / uv_strerror in the cancellation branch below
-#endif
 
 namespace vio
 {
@@ -89,7 +87,6 @@ future_t<work_batch_state_t<T, E>> schedule_work(event_loop_t &event_loop, threa
 {
   using state_t = work_batch_state_t<T, E>;
   using ret_t = future_t<state_t>;
-  using future_ref_ptr_t = typename ret_t::future_ref_ptr_t;
 
   ret_t ret;
   ret.state_ptr->event_loop = &event_loop;
@@ -115,11 +112,7 @@ future_t<work_batch_state_t<T, E>> schedule_work(event_loop_t &event_loop, threa
     {
       if (state_copy->cancelled.load(std::memory_order_acquire))
       {
-#ifdef __EMSCRIPTEN__
-        state_copy->results[i] = std::unexpected(E(error_t{.code = -1, .msg = "operation canceled"}));
-#else
-        state_copy->results[i] = std::unexpected(E(error_t{.code = UV_ECANCELED, .msg = uv_strerror(UV_ECANCELED)}));
-#endif
+        state_copy->results[i] = std::unexpected(E(error_t{.code = errc::canceled, .msg = "operation canceled"}));
       }
       else
       {

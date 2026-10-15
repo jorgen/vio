@@ -1,3 +1,25 @@
+/*
+Copyright (c) 2025 Jørgen Lind
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <doctest/doctest.h>
 
 #include <vio/event_loop.h>
@@ -84,7 +106,7 @@ vio::task_t<void> tcp_cancel_scenario(vio::event_loop_t &event_loop, bool &start
     after = reader.handle->read.started;
 
     auto read_result = co_await reader;
-    cancelled = !read_result.has_value() && read_result.error().code == UV_ECANCELED;
+    cancelled = !read_result.has_value() && read_result.error().code == vio::errc::canceled;
   }(event_loop, reinterpret_cast<const sockaddr *>(&addr.value()), started_before, started_after, got_cancelled);
 
   co_await std::move(server_task);
@@ -105,15 +127,12 @@ vio::task_t<void> udp_cancel_scenario(vio::event_loop_t &event_loop, bool &start
   started_after = reader.handle->recv.started;
 
   auto recv_result = co_await reader;
-  got_cancelled = !recv_result.has_value() && recv_result.error().code == UV_ECANCELED;
+  got_cancelled = !recv_result.has_value() && recv_result.error().code == vio::errc::canceled;
 }
 } // namespace
 
 TEST_SUITE("reader cancel")
 {
-  // cancel() must stop uv delivery (uv_read_stop / uv_udp_recv_stop) so no more
-  // buffers are allocated after cancellation -- observable as read.started /
-  // recv.started becoming false.
   TEST_CASE("tcp reader cancel stops delivery")
   {
     vio::event_loop_t event_loop;
@@ -133,8 +152,8 @@ TEST_SUITE("reader cancel")
 
     event_loop.run();
 
-    CHECK(started_before);     // reader was actively reading
-    CHECK_FALSE(started_after); // cancel() called uv_read_stop
+    CHECK(started_before);
+    CHECK_FALSE(started_after);
     CHECK(got_cancelled);
   }
 

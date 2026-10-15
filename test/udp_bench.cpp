@@ -1,13 +1,5 @@
 // What the datagram path costs, per API, in the shape QUIC uses it.
 //
-// The QUIC endpoint does not send through libuv: `send_datagram` and
-// `send_segments` call ::sendmsg directly, and the reader is a uv_poll
-// readiness watch around a ::recvmsg loop. So the question "is libuv the
-// bottleneck" is really three questions -- what a raw syscall costs, what
-// libuv's own UDP request machinery adds on top of it, and whether the batching
-// each side does is the batching the kernel rewards -- and they need separate
-// answers.
-//
 // Both directions are measured against a partner running the fastest method
 // available, so a number here is the cost of the method under test rather than
 // of the slower of a pair. Datagrams are 1200 bytes, which is what a QUIC
@@ -26,11 +18,15 @@ int main()
 }
 #else
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
+#include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,7 +38,11 @@ int main()
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <uv.h>
+#include <vio/buffer_pool.h>
+#include <vio/event_loop.h>
+#include <vio/operation/udp.h>
+#include <vio/operation/udp_datagram.h>
+#include <vio/task.h>
 
 namespace
 {
@@ -240,12 +240,15 @@ result_t send_many(int fd, const sockaddr_in &to, std::uint64_t count, std::size
   return out;
 }
 
-// libuv's synchronous send: the same ::sendmsg underneath, reached through the
-// handle. Whatever this costs above the raw call is what the wrapper costs.
-result_t send_uv_try(uv_udp_t *handle, const sockaddr_in &to, std::uint64_t count)
+[[nodiscard]] std::span<const std::uint8_t> bytes_of(const std::vector<std::uint8_t> &payload)
 {
-  std::vector<char> payload(datagram_size, 'a');
-  uv_buf_t buffer = uv_buf_init(payload.data(), static_cast<unsigned>(payload.size()));
+  return {payload.data(), payload.size()};
+}
+
+result_t send_vio_try(vio::udp_t &udp, const sockaddr_in &to, std::uint64_t count)
+{
+  std::vector<std::uint8_t> payload(datagram_size, 0x61);
+  const auto *address = reinterpret_cast<const sockaddr *>(&to);
 
   result_t out;
   const auto cpu = thread_cpu_seconds();
@@ -253,7 +256,7 @@ result_t send_uv_try(uv_udp_t *handle, const sockaddr_in &to, std::uint64_t coun
   for (std::uint64_t i = 0; i < count; ++i)
   {
     ++out.syscalls;
-    if (uv_udp_try_send(handle, &buffer, 1, reinterpret_cast<const sockaddr *>(&to)) > 0)
+    if (vio::udp_try_send(udp, bytes_of(payload), address).has_value())
     {
       ++out.datagrams;
     }
@@ -263,82 +266,91 @@ result_t send_uv_try(uv_udp_t *handle, const sockaddr_in &to, std::uint64_t coun
   return out;
 }
 
-struct async_send_t
+result_t send_vio_batch(vio::udp_t &udp, const sockaddr_in &to, std::uint64_t count, std::size_t depth)
 {
-  uv_udp_t *handle = nullptr;
-  sockaddr_in to = {};
-  std::uint64_t remaining = 0;
-  std::uint64_t completed = 0;
-  std::uint64_t issued = 0;
-  std::vector<char> payload;
-  uv_buf_t buffer = {};
-};
-
-void on_async_sent(uv_udp_send_t *request, int status);
-
-void issue_async(async_send_t &state, uv_udp_send_t *request)
-{
-  if (state.remaining == 0)
+  std::vector<std::uint8_t> payload(datagram_size, 0x61);
+  std::vector<vio::udp_out_datagram_t> datagrams(depth);
+  for (auto &datagram : datagrams)
   {
-    delete request;
-    return;
-  }
-  --state.remaining;
-  ++state.issued;
-  request->data = &state;
-  if (uv_udp_send(request, state.handle, &state.buffer, 1, reinterpret_cast<const sockaddr *>(&state.to), on_async_sent) != 0)
-  {
-    ++state.completed;
-    delete request;
-  }
-}
-
-void on_async_sent(uv_udp_send_t *request, int status)
-{
-  auto &state = *static_cast<async_send_t *>(request->data);
-  ++state.completed;
-  if (status < 0 || state.remaining == 0)
-  {
-    delete request;
-    return;
-  }
-  issue_async(state, request);
-}
-
-// The way libuv means a datagram to be sent: a request object per send, queued
-// on the loop, completed through a callback. A fixed number are kept in flight.
-result_t send_uv_async(uv_loop_t *loop, uv_udp_t *handle, const sockaddr_in &to, std::uint64_t count, std::size_t depth)
-{
-  async_send_t state;
-  state.handle = handle;
-  state.to = to;
-  state.remaining = count;
-  state.payload.assign(datagram_size, 'a');
-  state.buffer = uv_buf_init(state.payload.data(), static_cast<unsigned>(state.payload.size()));
-
-  const auto cpu = thread_cpu_seconds();
-  const auto start = clock_t_::now();
-  for (std::size_t i = 0; i < depth; ++i)
-  {
-    issue_async(state, new uv_udp_send_t());
-  }
-  // UV_RUN_NOWAIT rather than UV_RUN_ONCE: the latter blocks when the loop has
-  // nothing queued, and a send the kernel dropped never produces the callback
-  // that would wake it, so the deadline below would never be reached.
-  while (state.completed < count && seconds_since(start) < 20.0)
-  {
-    if (uv_run(loop, UV_RUN_NOWAIT) == 0 && state.remaining == 0)
-    {
-      break;
-    }
+    datagram.bytes = bytes_of(payload);
+    datagram.addr = reinterpret_cast<const sockaddr *>(&to);
   }
 
   result_t out;
+  const auto cpu = thread_cpu_seconds();
+  const auto start = clock_t_::now();
+  for (std::uint64_t sent = 0; sent < count; sent += depth)
+  {
+    ++out.syscalls;
+    if (auto done = vio::udp_try_send_batch(udp, datagrams); done.has_value())
+    {
+      out.datagrams += *done;
+    }
+  }
   out.seconds = seconds_since(start);
   out.cpu_seconds = thread_cpu_seconds() - cpu;
-  out.datagrams = state.completed;
-  out.syscalls = state.issued;
   return out;
+}
+
+result_t send_vio_datagram(vio::udp_t &udp, const sockaddr_in &to, std::uint64_t count)
+{
+  std::vector<std::uint8_t> payload(datagram_size, 0x61);
+  const auto *address = reinterpret_cast<const sockaddr *>(&to);
+
+  result_t out;
+  const auto cpu = thread_cpu_seconds();
+  const auto start = clock_t_::now();
+  for (std::uint64_t i = 0; i < count; ++i)
+  {
+    ++out.syscalls;
+    if (vio::send_datagram(udp, bytes_of(payload), address, vio::udp_ecn_t::ect0).has_value())
+    {
+      ++out.datagrams;
+    }
+  }
+  out.seconds = seconds_since(start);
+  out.cpu_seconds = thread_cpu_seconds() - cpu;
+  return out;
+}
+
+result_t send_vio_segments(vio::udp_t &udp, const sockaddr_in &to, std::uint64_t count, std::size_t segments)
+{
+  std::vector<std::uint8_t> payload(datagram_size * segments, 0x61);
+  const auto *address = reinterpret_cast<const sockaddr *>(&to);
+
+  result_t out;
+  const auto cpu = thread_cpu_seconds();
+  const auto start = clock_t_::now();
+  for (std::uint64_t sent = 0; sent < count; sent += segments)
+  {
+    ++out.syscalls;
+    if (vio::send_segments(udp, bytes_of(payload), datagram_size, address, vio::udp_ecn_t::not_ect).has_value())
+    {
+      out.datagrams += segments;
+    }
+  }
+  out.seconds = seconds_since(start);
+  out.cpu_seconds = thread_cpu_seconds() - cpu;
+  return out;
+}
+
+vio::task_t<void> send_vio_awaited(vio::udp_t &udp, const sockaddr_in &to, std::uint64_t count, result_t &out)
+{
+  std::vector<std::uint8_t> payload(datagram_size, 0x61);
+  const auto *address = reinterpret_cast<const sockaddr *>(&to);
+
+  const auto cpu = thread_cpu_seconds();
+  const auto start = clock_t_::now();
+  for (std::uint64_t i = 0; i < count; ++i)
+  {
+    ++out.syscalls;
+    if ((co_await vio::send_udp(udp, payload.data(), payload.size(), address)).has_value())
+    {
+      ++out.datagrams;
+    }
+  }
+  out.seconds = seconds_since(start);
+  out.cpu_seconds = thread_cpu_seconds() - cpu;
 }
 
 // ---- receive methods ------------------------------------------------------
@@ -351,9 +363,9 @@ struct drain_t
   double cpu_seconds = 0;
 };
 
-// One datagram per syscall, which is what the QUIC reader does today. GRO can
-// still hand back a coalesced run, so the datagram count is derived from the
-// bytes returned rather than assumed to be one.
+// One datagram per syscall. GRO can still hand back a coalesced run, so the
+// datagram count is derived from the bytes returned rather than assumed to be
+// one.
 void drain_one_per_call(int fd, drain_t &state)
 {
   std::vector<std::uint8_t> buffer(64 * 1024);
@@ -428,72 +440,105 @@ void drain_many(int fd, drain_t &state, std::size_t depth)
   state.cpu_seconds = thread_cpu_seconds() - cpu;
 }
 
-struct uv_drain_t
+enum class vio_drain_kind_t
 {
-  drain_t *state = nullptr;
-  std::vector<char> storage;
+  reader,
+  reader_mmsg,
+  datagram,
+  datagram_batch,
 };
 
-void on_alloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
+struct vio_drain_t
 {
-  auto &drain = *static_cast<uv_drain_t *>(handle->data);
-  if (drain.storage.size() < suggested)
-  {
-    drain.storage.resize(suggested);
-  }
-  *buffer = uv_buf_init(drain.storage.data(), static_cast<unsigned>(drain.storage.size()));
+  vio::udp_reader_t *reader = nullptr;
+  vio::datagram_reader_t *datagram = nullptr;
+};
+
+[[nodiscard]] bool use_gro()
+{
+  return std::getenv("VIO_UDP_BENCH_NO_GRO") == nullptr;
 }
 
-void on_read(uv_udp_t *handle, ssize_t read, const uv_buf_t *buffer, const sockaddr *from, unsigned flags)
+vio::task_t<void> drain_vio(vio::event_loop_t &loop, std::uint16_t port, drain_t &state, vio_drain_t &context, vio_drain_kind_t kind, vio::buffer_pool_t &pool)
 {
-  (void)buffer;
-  (void)from;
-  (void)flags;
-  auto &drain = *static_cast<uv_drain_t *>(handle->data);
-  if (read > 0)
+  auto created = vio::udp_create(loop, kind == vio_drain_kind_t::reader_mmsg ? vio::udp_recvmmsg_t::on : vio::udp_recvmmsg_t::off);
+  if (!created.has_value())
   {
-    const auto length = static_cast<std::size_t>(read);
-    const auto whole = length > datagram_size ? (length + datagram_size - 1) / datagram_size : 1;
-    drain.state->datagrams.fetch_add(whole, std::memory_order_relaxed);
-    drain.state->syscalls.fetch_add(1, std::memory_order_relaxed);
+    co_return;
   }
-}
-
-// libuv's own receive path, with and without the recvmmsg it can be asked for.
-void drain_uv(std::uint16_t port, drain_t &state, bool use_recvmmsg)
-{
-  uv_loop_t loop = {};
-  uv_loop_init(&loop);
-  uv_udp_t handle = {};
-  if (use_recvmmsg)
+  auto udp = std::move(*created);
+  const auto address = loopback(port);
+  if (!vio::udp_bind(udp, reinterpret_cast<const sockaddr *>(&address)).has_value())
   {
-    uv_udp_init_ex(&loop, &handle, AF_UNSPEC | UV_UDP_RECVMMSG);
+    co_return;
+  }
+  (void)vio::udp_set_recv_buffer_size(udp, 16 * 1024 * 1024);
+
+  const auto cpu = thread_cpu_seconds();
+  if (kind == vio_drain_kind_t::reader || kind == vio_drain_kind_t::reader_mmsg)
+  {
+    (void)vio::udp_use_buffer_pool(udp, pool);
+    auto reader = vio::udp_create_reader(udp);
+    if (!reader.has_value())
+    {
+      co_return;
+    }
+    context.reader = &*reader;
+    std::array<std::expected<vio::udp_datagram_t, vio::error_t>, batch> taken;
+    for (;;)
+    {
+      auto datagram = co_await *reader;
+      if (!datagram.has_value())
+      {
+        break;
+      }
+      const auto more = vio::udp_reader_take_batch(*reader, taken);
+      state.datagrams.fetch_add(1 + more, std::memory_order_relaxed);
+    }
+    context.reader = nullptr;
   }
   else
   {
-    uv_udp_init(&loop, &handle);
-  }
-  const auto address = loopback(port);
-  uv_udp_bind(&handle, reinterpret_cast<const sockaddr *>(&address), 0);
-  int buffer = 16 * 1024 * 1024;
-  uv_recv_buffer_size(reinterpret_cast<uv_handle_t *>(&handle), &buffer);
-
-  uv_drain_t drain;
-  drain.state = &state;
-  drain.storage.assign(64 * 1024 * (use_recvmmsg ? 20 : 1), 0);
-  handle.data = &drain;
-
-  const auto cpu = thread_cpu_seconds();
-  uv_udp_recv_start(&handle, on_alloc, on_read);
-  while (!state.stop.load(std::memory_order_relaxed))
-  {
-    uv_run(&loop, UV_RUN_NOWAIT);
+    auto reader = vio::datagram_reader_t::create(loop, udp);
+    if (!reader.has_value())
+    {
+      co_return;
+    }
+    if (use_gro())
+    {
+      (void)reader->receive_coalesced(64 * 1024);
+    }
+    context.datagram = &*reader;
+    for (;;)
+    {
+      if (kind == vio_drain_kind_t::datagram_batch)
+      {
+        auto received = co_await reader->receive();
+        if (!received.has_value())
+        {
+          break;
+        }
+        state.datagrams.fetch_add(received->size(), std::memory_order_relaxed);
+      }
+      else
+      {
+        auto first = co_await *reader;
+        if (!first.has_value())
+        {
+          break;
+        }
+        std::uint64_t taken = 1;
+        while (reader->try_next().has_value())
+        {
+          ++taken;
+        }
+        state.datagrams.fetch_add(taken, std::memory_order_relaxed);
+      }
+      state.syscalls.store(reader->reads(), std::memory_order_relaxed);
+    }
+    context.datagram = nullptr;
   }
   state.cpu_seconds = thread_cpu_seconds() - cpu;
-  uv_udp_recv_stop(&handle);
-  uv_close(reinterpret_cast<uv_handle_t *>(&handle), nullptr);
-  uv_run(&loop, UV_RUN_DEFAULT);
-  uv_loop_close(&loop);
 }
 
 // ---- reporting ------------------------------------------------------------
@@ -502,14 +547,19 @@ void report(const char *label, const result_t &r)
 {
   if (r.datagrams == 0 || r.seconds <= 0)
   {
-    std::printf("  %-26s unavailable\n", label);
+    std::printf("  %-28s unavailable\n", label);
     return;
   }
   const double pps = static_cast<double>(r.datagrams) / r.seconds;
   const double per_datagram_ns = r.seconds * 1e9 / static_cast<double>(r.datagrams);
   const double gbps = pps * datagram_size * 8 / 1e9;
-  const double per_syscall = r.syscalls == 0 ? 0 : static_cast<double>(r.datagrams) / static_cast<double>(r.syscalls);
-  std::printf("  %-26s %8.0f kpps  %6.2f Gbit/s  %7.0f ns/dgram  %5.1f dgram/syscall  cpu %.2fs\n", label, pps / 1000.0, gbps, per_datagram_ns, per_syscall, r.cpu_seconds);
+  if (r.syscalls == 0)
+  {
+    std::printf("  %-28s %8.0f kpps  %6.2f Gbit/s  %7.0f ns/dgram  %5s dgram/syscall  cpu %.2fs\n", label, pps / 1000.0, gbps, per_datagram_ns, "-", r.cpu_seconds);
+    return;
+  }
+  const double per_syscall = static_cast<double>(r.datagrams) / static_cast<double>(r.syscalls);
+  std::printf("  %-28s %8.0f kpps  %6.2f Gbit/s  %7.0f ns/dgram  %5.1f dgram/syscall  cpu %.2fs\n", label, pps / 1000.0, gbps, per_datagram_ns, per_syscall, r.cpu_seconds);
 }
 } // namespace
 
@@ -535,17 +585,36 @@ int main(int argc, char **argv)
     report("::sendmsg + UDP_SEGMENT", send_gso(send_fd, to, count, batch));
     report("::sendmmsg", send_many(send_fd, to, count, batch));
 
-    uv_loop_t loop = {};
-    uv_loop_init(&loop);
-    uv_udp_t handle = {};
-    uv_udp_init(&loop, &handle);
-    int buffer = 16 * 1024 * 1024;
-    uv_send_buffer_size(reinterpret_cast<uv_handle_t *>(&handle), &buffer);
-    report("uv_udp_try_send", send_uv_try(&handle, to, count));
-    report("uv_udp_send (queued)", send_uv_async(&loop, &handle, to, count, batch));
-    uv_close(reinterpret_cast<uv_handle_t *>(&handle), nullptr);
-    uv_run(&loop, UV_RUN_DEFAULT);
-    uv_loop_close(&loop);
+    vio::event_loop_t loop;
+    std::optional<vio::task_t<void>> task;
+    loop.run_in_loop(
+      [&]
+      {
+        task.emplace(
+          [](vio::event_loop_t &event_loop, const sockaddr_in &destination, std::uint64_t total) -> vio::task_t<void>
+          {
+            {
+              auto created = vio::udp_create(event_loop);
+              if (created.has_value())
+              {
+                auto udp = std::move(*created);
+                const auto any = loopback(0);
+                (void)vio::udp_bind(udp, reinterpret_cast<const sockaddr *>(&any));
+                (void)vio::udp_set_send_buffer_size(udp, 16 * 1024 * 1024);
+                report("vio udp_try_send", send_vio_try(udp, destination, total));
+                report("vio udp_try_send_batch", send_vio_batch(udp, destination, total, batch));
+                report("vio send_datagram (ECN)", send_vio_datagram(udp, destination, total));
+                report("vio send_segments", send_vio_segments(udp, destination, total, batch));
+                result_t awaited;
+                co_await send_vio_awaited(udp, destination, total, awaited);
+                report("vio send_udp (awaited)", awaited);
+              }
+            }
+            event_loop.stop();
+          }(loop, to, count));
+      });
+    loop.run();
+    task.reset();
 
     drain.stop.store(true);
     drainer.join();
@@ -562,7 +631,12 @@ int main(int argc, char **argv)
       const char *label;
       int kind;
     };
-    const case_t cases[] = {{"::recvmsg, one at a time", 0}, {"::recvmmsg", 1}, {"uv_udp_recv_start", 2}, {"uv_udp_recv_start + mmsg", 3}};
+    const case_t cases[] = {{"::recvmsg, one at a time", 0},
+                            {"::recvmmsg", 1},
+                            {"vio udp_reader_t, pooled", 2},
+                            {"vio udp_reader_t, pooled+mmsg", 3},
+                            {"vio datagram_reader_t", 4},
+                            {"vio datagram_reader_t batch", 5}};
 
     for (const auto &item : cases)
     {
@@ -570,6 +644,10 @@ int main(int argc, char **argv)
       drain_t drain;
       int receive_fd = -1;
       std::thread drainer;
+      vio::buffer_pool_t pool(vio::default_pool_block_size, 256);
+      std::optional<vio::thread_with_event_loop_t> worker;
+      std::optional<vio::task_t<void>> task;
+      vio_drain_t context;
       if (item.kind == 0 || item.kind == 1)
       {
         receive_fd = open_socket(case_port, true);
@@ -584,7 +662,11 @@ int main(int argc, char **argv)
       }
       else
       {
-        drainer = std::thread([&] { drain_uv(case_port, drain, item.kind == 3); });
+        const vio_drain_kind_t kinds[] = {vio_drain_kind_t::reader, vio_drain_kind_t::reader_mmsg, vio_drain_kind_t::datagram, vio_drain_kind_t::datagram_batch};
+        const auto kind = kinds[item.kind - 2];
+        worker.emplace();
+        auto &loop = worker->event_loop();
+        loop.run_in_loop([&, kind] { task.emplace(drain_vio(loop, case_port, drain, context, kind, pool)); });
       }
 
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -612,7 +694,28 @@ int main(int argc, char **argv)
       sending.store(false);
       sender.join();
       drain.stop.store(true);
-      drainer.join();
+      if (drainer.joinable())
+      {
+        drainer.join();
+      }
+      if (worker.has_value())
+      {
+        worker->event_loop().run_in_loop(
+          [&context]
+          {
+            if (context.reader != nullptr)
+            {
+              context.reader->cancel();
+            }
+            if (context.datagram != nullptr)
+            {
+              context.datagram->cancel();
+            }
+          });
+        worker->stop_and_join();
+        task.reset();
+        worker.reset();
+      }
       if (receive_fd >= 0)
       {
         ::close(receive_fd);
