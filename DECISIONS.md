@@ -183,8 +183,9 @@ filler writes until one is pending.
 
 ## Status
 
-CI run 92 (commit `8dc7ee9`) is green on all nine jobs: Linux debug, ASan, TSan and UBSan, each
-on epoll and on io_uring; macOS debug and ASan on kqueue; Windows debug and ASan on IOCP. Locally,
+CI run 93 (commit `4abd446`) is green on all ten jobs: Linux debug, ASan, TSan and UBSan, each
+on epoll and on io_uring; macOS debug and ASan on kqueue; Windows debug and ASan on IOCP; and a
+wasm build whose smoke test runs under Node. Locally,
 739 of 746 test cases pass on both Linux backends; the other seven need outside network or IPv6
 loopback, which this container lacks, and pass in CI.
 
