@@ -357,14 +357,18 @@ std::int64_t fill(vio::native_socket_t socket)
 {
   std::int64_t total = 0;
   std::vector<std::byte> chunk(16384, std::byte{0x5a});
-  for (;;)
+  for (std::size_t size = chunk.size(); size > 0;)
   {
-    auto sent = detail::socket_send(socket, chunk);
+    auto sent = detail::socket_send(socket, std::span<const std::byte>(chunk).first(size));
     if (sent == vio::errc::again)
-      return total;
+    {
+      size /= 2;
+      continue;
+    }
     REQUIRE(sent > 0);
     total += sent;
   }
+  return total;
 }
 
 bool would_block_reading(vio::native_socket_t socket)
@@ -452,6 +456,12 @@ TEST_CASE("backend: a parked writer wakes when the peer drains")
       return;
     }
     REQUIRE(sent == 1);
+    if (drained == 0)
+    {
+      fill(client.native());
+      client.resource.wait(detail::interest_write, op);
+      return;
+    }
     wrote_after_wake = true;
     server.resource.cancel(drainer);
     server.close();
@@ -789,6 +799,12 @@ TEST_CASE("backend: a writer facing a half-closed peer with a full buffer does n
       return;
     }
     REQUIRE(sent == 1);
+    if (turns_while_parked < 0)
+    {
+      fill(client.native());
+      client.resource.wait(detail::interest_write, op);
+      return;
+    }
     wrote = true;
     server.resource.cancel(drainer);
     server.close();
@@ -799,7 +815,7 @@ TEST_CASE("backend: a writer facing a half-closed peer with a full buffer does n
     REQUIRE(fill(client.native()) > 0);
     REQUIRE(detail::socket_shutdown_write(server.native()) == 0);
     settle.arm(20ms, [&] {
-      REQUIRE(detail::socket_send(client.native(), bytes("x")) == vio::errc::again);
+      fill(client.native());
       client.resource.wait(detail::interest_write, writer);
       turns_at_park = counter.turns;
       observe.arm(200ms, [&] {

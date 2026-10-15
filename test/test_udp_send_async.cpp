@@ -284,14 +284,13 @@ TEST_CASE("an immediate send result belongs to its own future")
         {
           auto sender_pair = bound_socket(loop);
           REQUIRE_EXPECTED(sender_pair);
-          auto refused = make_ip4("127.0.0.1", 0);
-          REQUIRE_EXPECTED(refused);
           auto accepted = make_ip4("127.0.0.1", 9);
           REQUIRE_EXPECTED(accepted);
           static const std::string payload = "which result";
+          static const std::vector<std::uint8_t> oversized(65536, 0x5a);
           const auto *bytes = reinterpret_cast<const std::uint8_t *>(payload.data());
 
-          auto first = vio::send_udp(sender_pair->first, bytes, payload.size(), reinterpret_cast<const sockaddr *>(&refused.value()));
+          auto first = vio::send_udp(sender_pair->first, oversized.data(), oversized.size(), reinterpret_cast<const sockaddr *>(&accepted.value()));
           auto second = vio::send_udp(sender_pair->first, bytes, payload.size(), reinterpret_cast<const sockaddr *>(&accepted.value()));
           auto first_result = co_await first;
           auto second_result = co_await second;
