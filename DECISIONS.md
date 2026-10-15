@@ -70,6 +70,13 @@ backend wait for about 292 years while every other timer on the loop starved. Th
 takes any duration too; browsers and Node treat a timeout above 2^31-1 ms as 1 ms, so it waits in
 chunks of that size.
 
+**D49. A TCP or TLS connection dropped with writes still queued delivers them first.** It lingers
+for up to 10 s, and reads and discards what the peer sends while it does, so two lingering ends
+drain each other. `run()` after `stop()` and `thread_with_event_loop_t::stop_and_join()` wait for a
+linger: they return once the writes drain, or after 10 s if the peer never reads. The discarding
+read does not keep the loop alive; the linger timer and the queued write do. Under libuv a dropped
+TCP handle with queued writes lost them and the peer saw a clean end of stream.
+
 **D48. epoll watches for writability only while a writer waits.** A socket is registered for
 reading, edge-triggered. When a write would block, the writer parks and the backend adds `EPOLLOUT`
 with `EPOLL_CTL_MOD`, which re-checks readiness, so no edge is lost. A write edge that finds no writer
@@ -96,7 +103,9 @@ prototypes that did not help.
 **D14. io_uring needs Linux 6.1 or newer, and vio talks to it through raw system calls.** 6.1 brings
 everything vio wants. Older kernels use epoll. vio carries a small ring class instead of depending
 on liburing, which has no CMake build and lags the kernel. libuv, Zig's standard library and
-TigerBeetle take the same approach.
+TigerBeetle take the same approach. When the kernel refuses submissions with `EAGAIN`, the ring
+backs off for up to 30 s and then aborts naming `EAGAIN`; only submissions that make no progress
+count toward the attempt limit, so a ring that recovers never aborts.
 
 **D15. A ring is created with its loop, so create loops after dropping privileges.** Rings
 capture the credentials of the thread that creates them; Node's CVE-2024-22017 came from a ring
@@ -179,11 +188,16 @@ no longer keeps the loop alive, which is safe because the endpoint's reader keep
 the loop has stopped. A pipe may also outlive its loop, as it could under libuv: a class that
 declares its pipes before its `thread_with_event_loop_t` destroys the loop first. The loop owns a
 small shared anchor that each pipe holds; destroying the loop clears it, and a pipe destroyed after
-that touches nothing. Posting to a pipe whose loop is gone is still a bug.
+that touches nothing. Posting to a pipe whose loop is gone is still a bug. Destroying a loop takes
+queued work out one node at a time under the post lock and runs each discard callback outside it,
+so a pipe that an earlier discard destroys is unlinked rather than walked.
 
 **D36. Destroying a socket that was never closed aborts with a message.** Sockets live in
 reference-counted storage that closes them, so this only fires on a real lifetime bug, and the
-alternative is a backend holding a pointer to freed memory.
+alternative is a backend holding a pointer to freed memory. The same holds for an operation
+destroyed while the loop or the kernel still holds it. Closing a socket does not complete the
+operations parked on it; their owner cancels them before the close finishes. A socket whose
+registration with the backend fails is left closed, so a retry opens a fresh one.
 
 **D37. The blocking pool starts 4 file threads and 2 DNS threads, on first use.**
 `VIO_FILE_THREADS` and `VIO_DNS_THREADS` override the counts.
@@ -205,7 +219,15 @@ approval, so its design is in the plan and the repository does not exist yet.
 **D44. A write whose token fires before it is awaited reports `vio_cancelled`, even if its bytes
 went out.** libuv behaved this way and the `tcp write cancel` test holds it. Cancelled therefore
 means "you gave up on this write", not "the peer never saw it"; a caller that cancels a write
-should treat the stream as broken. TLS writes follow the same rule.
+should treat the stream as broken. TLS writes and owning `send_udp` follow the same rule. A write
+that completed while it was awaited keeps its success. The token must outlive the await on every
+path, as it must for `write_tcp`.
+
+**D50. A send parked on a connected UDP socket is never sent after the connection changes.**
+`udp_connect` and `udp_disconnect` move the socket to a new connection; a parked send without an
+explicit address that was made for the old one completes with `errc::not_connected`, and a
+cancelled or abandoned one is dropped. Sending it would deliver a datagram to a peer it was not
+written for. Sends with an explicit address are unaffected.
 
 **D46. Public headers build with exceptions off.** vio has always promised a build with
 `-fno-exceptions -fno-rtti`. The port added `try`/`catch` around allocations in five headers, which

@@ -721,7 +721,8 @@ The symptom has two faces, and the second one does not look like a lifetime prob
   assertion passed.
 - **`run()` never returns.** An operation still parked on a handle keeps the loop alive after
   `stop()`. A test that calls `loop.stop()` while a read or accept is still waiting hangs rather
-  than aborting.
+  than aborting. A dropped TCP or TLS connection with writes still queued also keeps it alive,
+  for up to 10 s, while it delivers them (D49).
 
 The fix is always to shorten the handle's life, not to lengthen the loop's:
 
@@ -857,7 +858,10 @@ branch on the kind of close (defined in `ssl_engine.h`):
 `tls_client.h` and `tls_server.h` `on_destroy` callbacks call `tls_stream_t::begin_teardown()`:
 it cancels a parked read and sends a best-effort one-way `close_notify`. If the socket cannot take
 it all at once, the stream holds a ref and arms a linger timer (`teardown_linger_ns`, 10 s) that
-defers final destruction until the flush completes or the timer gives up. The `SSL*` and its BIOs
+defers final destruction until the flush completes or the timer gives up. Plain TCP does the same
+through `detail::tcp_begin_teardown` when a dropped `tcp_t` still has writes queued
+(`tcp_teardown_linger_ns`). Both keep reading and discarding inbound bytes while they linger, so
+two lingering ends drain each other instead of stalling until the timer (D49). The `SSL*` and its BIOs
 are freed by the `ssl_engine_t` destructor when the state's storage is deleted — after the
 close_notify has left the engine. Guarded to be a no-op when the engine was never initialized
 (e.g. a client dropped before connecting). `ssl_server_create`'s `on_destroy` aborts a pending
