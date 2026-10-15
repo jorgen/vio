@@ -17,9 +17,9 @@ already waiting costs one call and no wait.
 batched sends, zero-copy sends and overlapped `WSARecvMsg` with coalescing are all good candidates.
 None goes in without a `vio_bench` row that shows the gain.
 
-**D3. Files are asynchronous where the kernel allows.** io_uring ring operations on Linux; overlapped
-`ReadFile`/`WriteFile` through IOCP on Windows. Everything else goes to vio's blocking pool. macOS
-has no usable asynchronous file API, so it uses the pool for all file work.
+**D3. Files are asynchronous where the kernel allows.** On Linux with io_uring, reads, writes and
+`fsync` are ring operations. Everything else goes to vio's blocking pool: all file work on epoll and
+macOS, and on Windows for now (D17). macOS has no usable asynchronous file API.
 
 **D4. vio owns a blocking pool, separate from `thread_pool_t`.** It has one queue for files and one
 for DNS, so a slow lookup cannot starve file work. The application's `thread_pool_t` aborts on
@@ -72,8 +72,10 @@ created before `setuid()`. A ring is also not safe across `fork()`. The ring doe
 (`thread_with_event_loop_t`), and those flags bind the ring to its creator. It uses
 `COOP_TASKRUN` instead.
 
-**D16. Windows sockets use AFD polling for readiness.** It is undocumented, but libuv's `uv_poll`
-uses it, and vio already depends on `uv_poll` on Windows, as do mio and wepoll. No new risk.
+**D16. Windows sockets use AFD polling for readiness.** It is undocumented, but libuv's `uv_poll`,
+mio and wepoll all use it, and vio's datagram reader and QUIC endpoint ran on `uv_poll` on Windows
+before this change.
+No new risk.
 
 **D17. Windows files use the blocking pool for now.** Overlapped I/O needs a handle opened with
 `FILE_FLAG_OVERLAPPED`, and vio's file API hands out CRT file descriptors, as libuv did. Switching
@@ -81,6 +83,11 @@ means changing what `native_file_t` is on Windows, so it is a follow-up with its
 Linux gets real asynchronous file I/O through io_uring now.
 
 **D18. macOS uses kqueue with `EV_CLEAR` and `EVFILT_USER` for wakes.** Sockets get `SO_NOSIGPIPE`.
+
+**D42. A thread that posts to a loop wakes it before releasing the post lock.** Waking after the
+unlock left a gap: the loop could drain the work, finish, and be destroyed while the poster was
+still about to touch it. CI's ASan job caught this through a blocking-pool job. Holding the lock
+costs one system call inside it, and only the first post after a drain makes that call.
 
 ## Public API
 
