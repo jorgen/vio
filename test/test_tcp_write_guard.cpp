@@ -84,7 +84,7 @@ vio::task_t<std::optional<connected_pair_t>> connect_pair(vio::event_loop_t &loo
   co_return connected_pair_t{std::move(client.value()), std::move(accepted.value())};
 }
 
-vio::task_t<void> read_all(vio::tcp_t connection, std::string &received)
+vio::task_t<void> read_to_eof(vio::tcp_t &connection, std::string &received)
 {
   auto reader = vio::tcp_create_reader(connection);
   REQUIRE_EXPECTED(reader);
@@ -98,6 +98,11 @@ vio::task_t<void> read_all(vio::tcp_t connection, std::string &received)
     }
     received.append(chunk->chars(), chunk->size());
   }
+}
+
+vio::task_t<void> read_all(vio::tcp_t connection, std::string &received)
+{
+  co_await read_to_eof(connection, received);
 }
 
 vio::task_t<void> ordered_writes_scenario(vio::event_loop_t &loop, std::string &received, std::size_t &queued_after_issue, std::size_t &queued_after_done, int &results)
@@ -305,6 +310,30 @@ vio::task_t<void> upload_then_read_scenario(vio::event_loop_t &loop, const std::
   co_await read_all(std::move(peer), received);
 }
 
+vio::task_t<void> write_after_eof_scenario(vio::event_loop_t &loop, const std::string &response, std::size_t &filled, std::string &received, int &late_writes,
+                                           std::chrono::steady_clock::time_point &peer_closed)
+{
+  auto pair = co_await connect_pair(loop);
+  REQUIRE(pair.has_value());
+  {
+    auto peer = std::move(pair->client);
+    {
+      auto server = std::move(pair->server);
+      std::vector<vio::tcp_write_future_t> fillers;
+      filled = stall_writes(server, fillers);
+      auto dropped = vio::write_tcp(server, std::string(response));
+    }
+    co_await read_to_eof(peer, received);
+    for (int i = 0; i < 3; ++i)
+    {
+      auto written = co_await vio::write_tcp(peer, std::string(1024, 'x'));
+      late_writes += int(written.has_value());
+      [[maybe_unused]] auto slept = co_await vio::sleep(loop, std::chrono::milliseconds(20));
+    }
+  }
+  peer_closed = std::chrono::steady_clock::now();
+}
+
 template <typename Scenario>
 void run_scenario(Scenario &&scenario)
 {
@@ -413,6 +442,21 @@ TEST_SUITE("tcp write queue")
     CHECK(received.compare(0, filled, std::string(filled, 'f')) == 0);
     CHECK(received.compare(filled, response.size(), response) == 0);
     CHECK(elapsed < std::chrono::seconds(5));
+  }
+
+  TEST_CASE("a lingering connection sends its end of stream and stays open until the peer closes")
+  {
+    const std::string response = make_pattern(chunk_size + 5);
+    std::size_t filled = 0;
+    std::string received;
+    int late_writes = 0;
+    std::chrono::steady_clock::time_point peer_closed;
+    run_scenario([&](vio::event_loop_t &loop) { return write_after_eof_scenario(loop, response, filled, received, late_writes, peer_closed); });
+    auto linger_after_peer = std::chrono::steady_clock::now() - peer_closed;
+    REQUIRE(received.size() == filled + response.size());
+    CHECK(received.compare(filled, response.size(), response) == 0);
+    CHECK(late_writes == 3);
+    CHECK(linger_after_peer < std::chrono::seconds(1));
   }
 
   TEST_CASE("a write to a vanished peer fails, and later writes fail the same way")

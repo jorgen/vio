@@ -60,6 +60,7 @@ struct tcp_listen_future_t;
 
 inline constexpr std::size_t tcp_read_buffer_size = 65536;
 inline constexpr std::int64_t tcp_teardown_linger_ns = 10'000'000'000;
+inline constexpr std::int64_t tcp_linger_after_fin_ns = 2'000'000'000;
 inline constexpr std::size_t tcp_linger_discard_chunk = 16384;
 inline constexpr int tcp_linger_discard_budget = 64;
 
@@ -279,6 +280,7 @@ struct tcp_state_t
   bool connected = false;
   bool closed = false;
   bool lingering = false;
+  bool linger_fin_sent = false;
 };
 
 namespace detail
@@ -287,6 +289,7 @@ inline void tcp_shutdown(tcp_state_t &state) noexcept
 {
   state.closed = true;
   state.lingering = false;
+  state.linger_fin_sent = false;
   if (state.linger.armed())
     state.socket.loop().remove_timer(state.linger);
   for (auto *op : {&state.read.op, &state.write.op, &state.connect.op, &state.listen.op})
@@ -355,9 +358,33 @@ inline void tcp_linger_discard(tcp_state_t &state)
       return;
     }
     if (received <= 0)
+    {
+      if (state.linger_fin_sent)
+        tcp_end_linger(state);
       return;
+    }
   }
   tcp_read_kick(state);
+}
+
+inline void tcp_linger_send_fin(tcp_state_t &state)
+{
+  if (!state.lingering || state.linger_fin_sent)
+    return;
+  state.linger_fin_sent = true;
+  if (socket_shutdown_write(state.socket.native()) != 0)
+  {
+    tcp_end_linger(state);
+    return;
+  }
+  auto &loop = state.socket.loop();
+  auto deadline = loop_core_t::deadline_after(tcp_linger_after_fin_ns);
+  if (state.linger.armed() && deadline < state.linger.deadline)
+  {
+    loop.remove_timer(state.linger);
+    loop.add_timer(state.linger, deadline);
+  }
+  tcp_linger_discard(state);
 }
 } // namespace detail
 
@@ -791,7 +818,7 @@ inline void tcp_write_drain(tcp_state_t &state)
     {
       if (write.op.parked)
         state.socket.cancel(write.op);
-      tcp_end_linger(state);
+      tcp_linger_send_fin(state);
       return;
     }
     if (state.connect.in_progress)
