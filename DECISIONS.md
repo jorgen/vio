@@ -169,6 +169,13 @@ Orwell's six rules.
 the library and puts the doctest implementation in the library, so the tests run inside
 `vio_tests`. Shared builds and builds where vio is a subproject leave the macro unset.
 
+**D43. A test that depends on what a kernel does checks for it instead of assuming it.** Three tests
+passed on Linux only because of Linux behaviour: one passed a length larger than its buffer and
+relied on Linux touching only the pages it fills; one assumed every platform segments UDP sends;
+two assumed a 4 MiB send cannot finish at once, which a Windows non-blocking send can. They now
+use a buffer as large as the length they claim, probe for segmentation, and stall the socket with
+filler writes until one is pending.
+
 ## Open questions
 
 - How clocks treat system sleep, per platform. Windows waits skip time spent suspended, and libuv
