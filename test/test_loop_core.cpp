@@ -1004,6 +1004,9 @@ void enter_child(child_pipe_t &pipe)
   std::signal(SIGABRT, SIG_DFL);
   rlimit no_core{0, 0};
   ::setrlimit(RLIMIT_CORE, &no_core);
+#if defined(__linux__)
+  ::setenv("VIO_BACKEND", "epoll", 1);
+#endif
   ::dup2(pipe.ends[1], 2);
   ::close(pipe.ends[0]);
 }
