@@ -2117,7 +2117,10 @@ TEST_CASE("destroying an inherited loop in the child is not stalled by a lock an
       },
       2s);
     if (!exited_quietly(child))
+    {
+      MESSAGE("child " << i << ": " << describe(child));
       break;
+    }
     ++quiet;
   }
   done = true;
