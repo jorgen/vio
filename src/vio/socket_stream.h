@@ -362,7 +362,7 @@ struct tls_stream_t
     if (_pooled)
     {
       auto &pool = detail::ssl_output_pool();
-      if (pool.release_trim(this))
+      if (pool.release_trim(this) && pool.period_elapsed(output_trim_ns))
         pool.trim();
       pool.detach();
     }

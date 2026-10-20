@@ -24,6 +24,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -164,6 +165,11 @@ public:
     drop_oldest((std::min)(_untouched, surplus()));
   }
 
+  [[nodiscard]] bool period_elapsed(std::int64_t period) const noexcept
+  {
+    return clock_now() - _period_start >= period;
+  }
+
   [[nodiscard]] bool claim_trim(const void *owner) noexcept
   {
     if (_trimmer != nullptr || surplus() == 0)
@@ -199,14 +205,21 @@ public:
   }
 
 private:
+  [[nodiscard]] static std::int64_t clock_now() noexcept
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
   void drop_oldest(std::size_t count) noexcept
   {
     _spares.erase(_spares.begin(), _spares.begin() + static_cast<std::ptrdiff_t>(count));
     _untouched = _spares.size();
+    _period_start = clock_now();
   }
 
   std::vector<std::vector<std::byte>> _spares;
   std::size_t _untouched = 0;
+  std::int64_t _period_start = 0;
   std::ptrdiff_t _users = 0;
   const void *_trimmer = nullptr;
 };

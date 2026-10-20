@@ -1596,6 +1596,8 @@ TEST_CASE("the output pool frees only buffers untouched for a whole period, neve
   }
   pool.trim();
   REQUIRE(pool.size() == 3 * kept);
+  CHECK_FALSE(pool.period_elapsed(vio::tls_stream_t::output_trim_ns));
+  CHECK(pool.period_elapsed(0));
 
   std::vector<std::vector<std::byte>> lent;
   for (std::size_t i = 0; i < 3 * kept; ++i)
@@ -1665,6 +1667,7 @@ TEST_CASE("the output pool frees only buffers untouched for a whole period, neve
   CHECK(pool.size() == 2 * kept + 1);
   pool.detach();
   CHECK(pool.size() == kept);
+  CHECK_FALSE(pool.period_elapsed(vio::tls_stream_t::output_trim_ns));
 }
 
 TEST_CASE("an idle TLS connection holds no output buffer and the pool returns to its floor once writes stop")
@@ -1724,7 +1727,7 @@ TEST_CASE("an idle TLS connection holds no output buffer and the pool returns to
   CHECK_FALSE(claimed_when_idle);
 }
 
-TEST_CASE("closing the connection that holds the output trim frees what went untouched while another stays open")
+TEST_CASE("closing the connection that holds the output trim a period after the last trim frees what went untouched while another stays open")
 {
   constexpr auto kept = vio::detail::ssl_output_pool_t::spare_floor;
   auto config = make_pair_config();
@@ -1733,6 +1736,73 @@ TEST_CASE("closing the connection that holds the output trim frees what went unt
   bool claimed_by_first = false;
   std::size_t pooled_after_first = 0;
   bool claimed_after_first = true;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto first_pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(first_pair);
+      const int first_port = first_pair->second;
+      auto second_pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(second_pair);
+      const int second_port = second_pair->second;
+      auto first_server = echo_server(el, std::move(first_pair->first), config.server, first_port, true);
+      auto second_server = echo_server(el, std::move(second_pair->first), config.server, second_port, true);
+
+      auto exchange = [](vio::event_loop_t &el, vio::ssl_config_t cc, int port, vio::ssl_client_t &client) -> vio::task_t<void>
+      {
+        auto created = vio::ssl_client_create(el, cc);
+        REQUIRE_EXPECTED(created);
+        client = std::move(created.value());
+        auto connected = co_await vio::ssl_client_connect(client, "localhost", static_cast<uint16_t>(port), "127.0.0.1");
+        REQUIRE_EXPECTED(connected);
+        auto reader = vio::ssl_client_create_reader(client);
+        REQUIRE_EXPECTED(reader);
+        std::string msg = "ping";
+        auto written = co_await vio::ssl_client_write(client, std::as_bytes(std::span(msg)));
+        REQUIRE_EXPECTED(written);
+        auto echoed = co_await reader.value();
+        REQUIRE_EXPECTED(echoed);
+      };
+
+      auto period = vio::sleep(el, std::chrono::nanoseconds(vio::tls_stream_t::output_trim_ns + 100'000'000));
+      co_await period;
+      vio::ssl_client_t second_client{vio::ref_ptr_t<vio::ssl_client_state_t>::null()};
+      {
+        vio::ssl_client_t first_client{vio::ref_ptr_t<vio::ssl_client_state_t>::null()};
+        co_await exchange(el, config.client, first_port, first_client);
+        claimed_by_first = vio::detail::ssl_output_pool().trim_claimed();
+        co_await exchange(el, config.client, second_port, second_client);
+        auto closed = co_await vio::ssl_client_shutdown(first_client);
+        REQUIRE_EXPECTED(closed);
+      }
+      co_await std::move(first_server);
+      for (int i = 0; i < 20; ++i)
+      {
+        auto tick = vio::sleep(el, std::chrono::milliseconds(5));
+        co_await tick;
+      }
+      pooled_after_first = vio::detail::ssl_output_pool().size();
+      claimed_after_first = vio::detail::ssl_output_pool().trim_claimed();
+      auto closed = co_await vio::ssl_client_shutdown(second_client);
+      REQUIRE_EXPECTED(closed);
+      { auto drop = std::move(second_client); }
+      co_await std::move(second_server);
+      el.stop();
+    });
+  CHECK(claimed_by_first);
+  CHECK(pooled_after_first == kept);
+  CHECK_FALSE(claimed_after_first);
+}
+
+TEST_CASE("closing the connection that holds the output trim within a period frees no spare the next connections need")
+{
+  constexpr auto kept = vio::detail::ssl_output_pool_t::spare_floor;
+  auto config = make_pair_config();
+  seed_output_pool(3 * kept);
+  REQUIRE_FALSE(vio::detail::ssl_output_pool().trim_claimed());
+  bool claimed_by_first = false;
+  std::size_t pooled_after_first = 0;
 
   run_loop(
     [&](vio::event_loop_t &el) -> vio::task_t<void>
@@ -1778,7 +1848,6 @@ TEST_CASE("closing the connection that holds the output trim frees what went unt
         co_await tick;
       }
       pooled_after_first = vio::detail::ssl_output_pool().size();
-      claimed_after_first = vio::detail::ssl_output_pool().trim_claimed();
       auto closed = co_await vio::ssl_client_shutdown(second_client);
       REQUIRE_EXPECTED(closed);
       { auto drop = std::move(second_client); }
@@ -1786,8 +1855,7 @@ TEST_CASE("closing the connection that holds the output trim frees what went unt
       el.stop();
     });
   CHECK(claimed_by_first);
-  CHECK(pooled_after_first == kept);
-  CHECK_FALSE(claimed_after_first);
+  CHECK(pooled_after_first == 3 * kept);
 }
 
 TEST_CASE("an armed output trim does not keep run() going after stop()")
