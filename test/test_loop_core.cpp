@@ -54,6 +54,9 @@ Copyright (c) 2025 Jørgen Lind
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -1001,6 +1004,9 @@ void enter_child(child_pipe_t &pipe)
   std::signal(SIGABRT, SIG_DFL);
   rlimit no_core{0, 0};
   ::setrlimit(RLIMIT_CORE, &no_core);
+#if defined(__linux__)
+  ::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
   ::dup2(pipe.ends[1], 2);
   ::close(pipe.ends[0]);
 }
