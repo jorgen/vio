@@ -40,7 +40,10 @@ datagram the kernel accepts at once. That is the whole claim. These allocate on 
   `udp_send_op_t` for UDP);
 - `sleep`, every file operation and every DNS lookup (one reference-counted state through
   `future_t`);
-- every operation of the QUIC coroutine layer (a per-call heap operation, by design). `BASELINE.md` counts what that adds up to: 15 to 25 allocations per QUIC request. An
+- every operation of the QUIC coroutine layer (a per-call heap operation, by design).
+
+Warm TLS writes take their output buffer from a per-thread pool, so they allocate nothing for any
+number of connections (D53). `BASELINE.md` counts what that adds up to: 15 to 25 allocations per QUIC request. An
 operation that the kernel still holds when it is destroyed aborts the process with a message, in
 every build.
 
@@ -50,7 +53,9 @@ vio code depends on it: an object may drop its own last reference inside its own
 **D8. `run()` after `stop()` returns once nothing is in flight.** In flight means a parked
 operation, an armed timer that keeps the loop alive, a blocking-pool job or an unfinished close.
 Posted work keeps running until then. An open but idle socket does not keep the loop alive; the
-destructor still names it as leaked.
+destructor still names it as leaked. A `udp_reader_t` keeps the loop alive only while a consumer
+awaits it. One nobody awaits still reads ahead when datagrams arrive, but it parks its read, which
+does not keep the loop alive, instead of queuing a retry that would.
 
 **D9. about-to-block listeners stop firing after `stop()`.** That matches libuv, where the
 listener handle is closed by `stop()`. Adding and removing listeners stays posted and in order with
@@ -117,7 +122,7 @@ count toward the attempt limit, so a ring that recovers never aborts.
 
 **D15. A ring is created with its loop, so create loops after dropping privileges.** Rings
 capture the credentials of the thread that creates them; Node's CVE-2024-22017 came from a ring
-created before `setuid()`. A ring is also not safe across `fork()`. The ring does not use
+created before `setuid()`. A ring is also not safe across `fork()` (D51). The ring does not use
 `SINGLE_ISSUER` or `DEFER_TASKRUN`: vio builds a loop on one thread and runs it on another
 (`thread_with_event_loop_t`), and those flags bind the ring to its creator. It uses
 `COOP_TASKRUN` instead.
@@ -138,6 +143,79 @@ Linux gets real asynchronous file I/O through io_uring now.
 unlock left a gap: the loop could drain the work, finish, and be destroyed while the poster was
 still about to touch it. CI's ASan job caught this through a blocking-pool job. Holding the lock
 costs one system call inside it, and only the first post after a drain makes that call.
+
+**D51. A loop created before `fork()` may only be destroyed in the child, never run.** Its epoll
+set, wake eventfd and io_uring ring are shared with the parent, and kqueue is not inherited at all.
+In the child, `run()`, `stop()` followed by `run()`, returning into the loop from a callback that
+forked, adopting a socket, giving it blocking work, waiting on one of its sockets and starting a
+ring operation all abort with a message naming the rule:
+
+```
+vio: an event loop created before fork() was run in the child; its epoll backend belongs to the
+parent, so a child may only destroy a loop it inherited and must create its own
+```
+
+A child may drop the handles of an inherited loop and then destroy the loop, in that order, without
+a report. An inherited socket reports `is_open()` false, so dropping its handle sends and reads
+nothing: no `close_notify`, no linger, no resend. Destroying the loop abandons everything in it
+(pool jobs, ring file operations, closes, timers, parked operations) and leaves the parent's
+registrations alone; the parent still finishes all of it. A destroyed `thread_with_event_loop_t`
+does not stop or join the parent's thread, which does not exist in the child. A loop created in the
+child works normally, with the blocking pool restarted. A `pthread_atfork` handler counts forks.
+
+Two limits. A read through a reader created before the fork still takes bytes already waiting on
+the shared socket, and UDP sends, including QUIC's, still reach it, so use an inherited handle in
+the child only to drop it. And a fork can land while the loop thread is moving work between its
+queues; the child then repairs a lock it finds held, forgets what that lock guarded without
+freeing it, and leaks it. Taking every loop's lock in a `pthread_atfork` prepare handler would
+close that, and is not done.
+
+**D52. A callback that throws leaves the loop able to carry on, with nothing lost.** The exception
+leaves `run()`; calling `run()` again continues. Work queued behind the callback stays queued. The
+rest of a backend's batch survives: epoll and kqueue keep a retry list of watches, because raw
+events would outlive a watch closed in the meantime; io_uring and IOCP keep the remaining
+completions. Completions io_uring set aside while the kernel reported the ring busy are delivered
+before newer ones. An event pipe keeps the events it had not reached, in order.
+
+**D53. TLS output buffers go back to a per-thread pool whenever a connection drains.** An idle
+connection holds none. The pool keeps every buffer returned to it, so it never holds more than the
+peak in use at once, and warm writes allocate nothing for any number of connections. One stream
+per loop holds a trim timer that does not keep the loop alive; once a second it frees spares
+nobody took during the whole second, down to a floor of 4. When that stream closes it hands the
+timer, at the same deadline, to another TLS stream on the loop, so the pool shrinks even while
+every remaining connection is idle. When the thread's last TLS stream goes, the pool drops to its
+floor at once, so a client whose connections all close between bursts allocates again on the next
+burst; keeping spares across that would need a timer owned by the loop. Inbound buffers keep a
+fixed pool of 4.
+
+**D54. A lookup whose blocking-pool job is cancelled fails with `errc::canceled`.** That covers
+`get_addrinfo`, `get_nameinfo` and a TLS client's resolve; they used to succeed with no data. Jobs
+abandoned at a fork never complete in the child (D51). A TLS client whose cancelled connect is still resolving refuses a new
+`ssl_client_connect` with `errc::already_in_progress`; a connect after the lookup ends, usually
+the next turn, works. Resubmitting the running job corrupted the pool's lists.
+
+**D55. TLS keeps BoringSSL's record layer, so io_uring cannot make it faster.** Measured on
+`tls_bulk` (one connection, 64 KiB writes, 16 KiB records, loopback, 4-vCPU VM, no VAES): AES-GCM
+takes 35 to 49% of the CPU and the kernel copies 12 to 25%; the copies between vio and BoringSSL
+take 5 to 7%, plus a malloc and free per record each way. Receiving costs one kernel copy, two
+user copies and the decrypt; sending, the encrypt, one user copy and one kernel copy. io_uring's
+`RECV` and `SEND` make the same kernel copies, and per 16 KiB they cost the same CPU as `recv` and
+`send` (more at one per submission; provided buffer rings 3 to 13% more). What it saves is system
+calls: 0.3 to 0.7% of the CPU by count times cost, 1 to 2% by profile. Many small messages on many
+connections were not measured.
+
+What would remove copies, and why each is not done:
+- A vio-owned TLS 1.3 record layer after the handshake, from `bssl::SSL_get_traffic_secrets` and
+  the sequence numbers, with the QUIC key schedule and AEAD: no user copies, no per-record malloc,
+  9 to 16% of the CPU here. vio would then own KeyUpdate, alerts, `close_notify` and, on a client,
+  session tickets, since BoringSSL cannot take a record back. The owner declined it for now.
+- Kernel TLS: needs the same key handover, Linux only, `CONFIG_TLS`, and Linux 6.14 for KeyUpdate.
+  This VM's kernel has no `tls` module.
+- Zero-copy send (`MSG_ZEROCOPY`, `SEND_ZC`) and zero-copy receive (io_uring zcrx): they remove
+  the kernel copies, which cost about four times a user copy per byte here. Together with an owned
+  record layer and BoringSSL's scatter-gather AEAD each direction becomes one pass. They need a
+  real network card (zcrx: Linux 6.15, bnxt, gve, mlx5 or fbnic with header split), buffers held
+  until the kernel lets go, and give nothing on loopback.
 
 ## Public API
 

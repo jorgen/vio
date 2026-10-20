@@ -559,7 +559,9 @@ coroutine layer's pre-resolved operations survived a full ASan run there and was
 first time LeakSanitizer saw it -- and glibc declares `error_t`, so `using namespace vio` in a
 test that is only ever built on Windows will not compile on Linux. The reverse trap: Windows
 headers define `small` as a macro, so a variable named `small` builds everywhere except MSVC. It
-has broken the Windows build twice.
+has broken the Windows build three times. The MinGW syntax check cannot catch it, because MinGW's
+`rpcndr.h` defines `small` only under `RC_INVOKED`; add `-include` of a header holding
+`#define small char` to reproduce the MSVC failure.
 
 TSan needs ASLR off on a modern kernel or it aborts with "unexpected memory
 mapping" before running a line: `docker run --privileged ... setarch $(uname -m)
@@ -640,6 +642,11 @@ Two rules that cost a sanitizer run each to learn. A thread that posts wakes the
 releases the post lock: otherwise the loop can drain the post, finish and be destroyed while the
 poster is still about to touch it. And `unpost` on the loop thread also clears the node from the
 batch being drained, because work earlier in the same batch may have destroyed its owner.
+
+Two more rules. A loop created before `fork()` may only be destroyed in the child: running it, or
+giving it work, aborts with a message (D51). A child drops the inherited handles first, then the
+loop; that abandons the parent's work in flight without a report. And a callback that throws
+leaves `run()`, but nothing queued or batched is lost, so calling `run()` again carries on (D52).
 
 ### task_t coroutine lifecycle
 
