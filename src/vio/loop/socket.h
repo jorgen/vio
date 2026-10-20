@@ -71,7 +71,7 @@ public:
   [[nodiscard]] int adopt(native_socket_t socket) noexcept
   {
     watch.socket = socket;
-    if (int result = loop().backend().add_watch(watch); result < 0)
+    if (int result = loop().backend().open_watch(watch); result < 0)
       return result;
     _registered = true;
     return 0;
@@ -105,7 +105,7 @@ private:
     if (_registered)
     {
       _registered = false;
-      loop().backend().remove_watch(watch, _removed);
+      loop().backend().close_watch(watch, _removed);
     }
     else
     {

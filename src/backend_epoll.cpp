@@ -108,20 +108,32 @@ public:
   {
     epoll_event events[max_events];
     int count = wait_for_events(events, timeout_ns);
-    for (int i = 0; i < count; ++i)
+    struct interrupted_t
     {
-      auto *watch = static_cast<io_watch_t *>(events[i].data.ptr);
+      epoll_backend_t &backend;
+      const epoll_event *events;
+      int count;
+      int next = 0;
+      ~interrupted_t()
+      {
+        for (; next < count; ++next)
+        {
+          if (auto *watch = static_cast<io_watch_t *>(events[next].data.ptr))
+            backend.retry_later(*watch, readable(events[next].events), writable(events[next].events));
+        }
+      }
+    } batch{*this, events, count};
+    while (batch.next < count)
+    {
+      const auto &event = events[batch.next++];
+      auto *watch = static_cast<io_watch_t *>(event.data.ptr);
       if (!watch)
       {
         drain_wake();
         continue;
       }
-      auto flags = events[i].events;
-      bool failed = (flags & (EPOLLERR | EPOLLHUP)) != 0;
-      bool readable = failed || (flags & (EPOLLIN | EPOLLRDHUP | EPOLLPRI)) != 0;
-      bool writable = failed || (flags & EPOLLOUT) != 0;
-      bool unwanted_write = (flags & EPOLLOUT) != 0 && watch->writers.empty();
-      dispatch(*watch, readable, writable);
+      bool unwanted_write = (event.events & EPOLLOUT) != 0 && watch->writers.empty();
+      dispatch(*watch, readable(event.events), writable(event.events));
       if (unwanted_write && !watch->closed && watch->writers.empty() && (watch->armed & interest_write))
       {
         modify(*watch, read_events);
@@ -140,6 +152,16 @@ protected:
   }
 
 private:
+  static bool readable(std::uint32_t flags) noexcept
+  {
+    return (flags & (EPOLLERR | EPOLLHUP | EPOLLIN | EPOLLRDHUP | EPOLLPRI)) != 0;
+  }
+
+  static bool writable(std::uint32_t flags) noexcept
+  {
+    return (flags & (EPOLLERR | EPOLLHUP | EPOLLOUT)) != 0;
+  }
+
   void modify(io_watch_t &watch, std::uint32_t mask)
   {
     epoll_event event{};

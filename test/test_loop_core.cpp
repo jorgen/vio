@@ -46,6 +46,7 @@ Copyright (c) 2025 Jørgen Lind
 #if !defined(_WIN32)
 #include <cerrno>
 #include <csignal>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -968,39 +969,36 @@ struct death_t
   std::string message;
 };
 
-template <typename F>
-death_t run_in_child(F &&body)
+struct child_pipe_t
+{
+  int ends[2] = {-1, -1};
+};
+
+void enter_child(child_pipe_t &pipe)
+{
+  std::signal(SIGABRT, SIG_DFL);
+  ::dup2(pipe.ends[1], 2);
+  ::close(pipe.ends[0]);
+}
+
+death_t watch_child(pid_t child, child_pipe_t &pipe, std::chrono::milliseconds limit)
 {
   death_t result;
-  int pipe_ends[2];
-  if (::pipe(pipe_ends) != 0)
-    return result;
-  pid_t child = ::fork();
-  if (child < 0)
-    return result;
-  if (child == 0)
-  {
-    std::signal(SIGABRT, SIG_DFL);
-    ::dup2(pipe_ends[1], 2);
-    ::close(pipe_ends[0]);
-    body();
-    ::_exit(0);
-  }
-  ::close(pipe_ends[1]);
-  const auto give_up = std::chrono::steady_clock::now() + 20s;
+  ::close(pipe.ends[1]);
+  const auto give_up = std::chrono::steady_clock::now() + limit;
   char buffer[512];
   for (;;)
   {
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(give_up - std::chrono::steady_clock::now());
     if (left.count() <= 0)
       break;
-    pollfd readable{pipe_ends[0], POLLIN, 0};
+    pollfd readable{pipe.ends[0], POLLIN, 0};
     int ready = ::poll(&readable, 1, static_cast<int>(left.count()));
     if (ready < 0 && errno == EINTR)
       continue;
     if (ready <= 0)
       break;
-    auto got = ::read(pipe_ends[0], buffer, sizeof(buffer));
+    auto got = ::read(pipe.ends[0], buffer, sizeof(buffer));
     if (got > 0)
     {
       result.message.append(buffer, static_cast<std::size_t>(got));
@@ -1010,16 +1008,50 @@ death_t run_in_child(F &&body)
       continue;
     break;
   }
-  ::close(pipe_ends[0]);
+  ::close(pipe.ends[0]);
   const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(give_up - std::chrono::steady_clock::now());
   result.status = wait_for_child(child, left.count() > 0 ? left : 0ms);
   return result;
+}
+
+template <typename F>
+death_t run_in_child(F &&body, std::chrono::milliseconds limit = 20s)
+{
+  child_pipe_t pipe;
+  if (::pipe(pipe.ends) != 0)
+    return {};
+  pid_t child = ::fork();
+  if (child < 0)
+  {
+    ::close(pipe.ends[0]);
+    ::close(pipe.ends[1]);
+    return {};
+  }
+  if (child == 0)
+  {
+    enter_child(pipe);
+    body();
+    ::_exit(0);
+  }
+  return watch_child(child, pipe, limit);
 }
 
 bool aborted_with_message(const death_t &death)
 {
   return death.status != -1 && WIFSIGNALED(death.status) && WTERMSIG(death.status) == SIGABRT &&
          death.message.find("destroyed while the loop or the kernel still held it") != std::string::npos;
+}
+
+bool aborted_by_fork_rule(const death_t &death, const char *action)
+{
+  return death.status != -1 && WIFSIGNALED(death.status) && WTERMSIG(death.status) == SIGABRT &&
+         death.message.find(std::string("an event loop created before fork() was ") + action + " in the child") != std::string::npos &&
+         death.message.find("a child may only destroy a loop it inherited and must create its own") != std::string::npos;
+}
+
+bool exited_quietly(const death_t &death)
+{
+  return death.status != -1 && WIFEXITED(death.status) && WEXITSTATUS(death.status) == 0 && death.message.empty();
 }
 
 struct parked_probe_t : vio::detail::io_op_t
@@ -1108,7 +1140,80 @@ TEST_CASE("the blocking pool runs work in a process forked after it started")
   CHECK(WEXITSTATUS(child.status) == 0);
 }
 
-TEST_CASE("pool work in flight at a fork finishes as cancelled in the child and runs once, in the parent")
+TEST_CASE("pool work in flight at a fork is abandoned when the child destroys the loop it inherited, and runs once, in the parent")
+{
+  settle_file_pool();
+  std::optional<vio::event_loop_t> loop;
+  loop.emplace();
+  auto &core = vio::detail::core(*loop);
+  std::atomic<bool> gate{false};
+  std::atomic<int> started{0};
+  const int count = file_pool_threads() + 8;
+  std::vector<std::unique_ptr<gated_job_t>> jobs;
+  for (int i = 0; i < count; ++i)
+  {
+    jobs.push_back(std::make_unique<gated_job_t>(gate, started));
+    vio::detail::pool_submit(core, jobs.back()->job, vio::detail::pool_queue::file);
+  }
+  wait_for_started(started, file_pool_threads());
+  REQUIRE(started.load() == file_pool_threads());
+
+  auto child = run_in_child([&] {
+    const int started_at_fork = started.load();
+    loop.reset();
+    for (auto &job : jobs)
+    {
+      if (job->finished || job->ran)
+        ::_exit(1);
+      if (job->job.state.load() != vio::detail::pool_job_finished)
+        ::_exit(2);
+    }
+    if (!run_one_pool_job())
+      ::_exit(3);
+    ::_exit(started.load() == started_at_fork ? 0 : 4);
+  });
+  gate = true;
+  loop->stop();
+  loop->run();
+  CHECK(exited_quietly(child));
+  CHECK(child.message == "");
+  CHECK(started.load() == count);
+  for (auto &job : jobs)
+  {
+    CHECK(job->finished);
+    CHECK_FALSE(job->canceled);
+    CHECK(job->ran);
+  }
+  CHECK(core.in_flight() == 0);
+}
+
+TEST_CASE("pool work that finished but was not yet delivered at a fork is abandoned with the loop in the child")
+{
+  std::optional<vio::event_loop_t> loop;
+  loop.emplace();
+  auto &core = vio::detail::core(*loop);
+  pool_probe_t probe;
+  vio::detail::pool_submit(core, probe.job, vio::detail::pool_queue::file);
+  const auto give_up = std::chrono::steady_clock::now() + 10s;
+  while (probe.job.state.load(std::memory_order_acquire) != vio::detail::pool_job_finished && std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(1ms);
+  REQUIRE(probe.job.state.load(std::memory_order_acquire) == vio::detail::pool_job_finished);
+  REQUIRE(core.in_flight() == 1);
+
+  auto child = run_in_child([&] {
+    loop.reset();
+    ::_exit(probe.finished ? 1 : 0);
+  });
+  CHECK(exited_quietly(child));
+  CHECK(child.message == "");
+  loop->run();
+  CHECK(probe.ran);
+  CHECK(probe.finished);
+  CHECK_FALSE(probe.canceled);
+  CHECK(core.in_flight() == 0);
+}
+
+TEST_CASE("pool work in flight at a fork runs once, in the parent, and running the inherited loop in the child aborts naming the rule before any of its work runs")
 {
   settle_file_pool();
   vio::event_loop_t loop;
@@ -1124,28 +1229,26 @@ TEST_CASE("pool work in flight at a fork finishes as cancelled in the child and 
   }
   wait_for_started(started, file_pool_threads());
   REQUIRE(started.load() == file_pool_threads());
+  const pid_t parent = ::getpid();
+  bool ran = false;
+  loop.run_in_loop([&] {
+    ran = true;
+    static const char marker[] = "posted work ran in the child\n";
+    if (::getpid() != parent)
+      (void)!::write(2, marker, sizeof(marker) - 1);
+  });
 
   auto child = run_in_child([&] {
-    const int started_at_fork = started.load();
     loop.stop();
     loop.run();
-    for (auto &job : jobs)
-    {
-      if (!job->finished || !job->canceled || job->ran)
-        ::_exit(1);
-    }
-    if (core.in_flight() != 0)
-      ::_exit(2);
-    if (!run_one_pool_job())
-      ::_exit(3);
-    ::_exit(started.load() == started_at_fork ? 0 : 4);
+    ::_exit(5);
   });
+  CHECK(aborted_by_fork_rule(child, "run"));
+  CHECK(child.message.find("posted work ran in the child") == std::string::npos);
   gate = true;
   loop.stop();
   loop.run();
-  REQUIRE(child.status != -1);
-  CHECK(WIFEXITED(child.status));
-  CHECK(WEXITSTATUS(child.status) == 0);
+  CHECK(ran);
   CHECK(started.load() == count);
   for (auto &job : jobs)
   {
@@ -1153,6 +1256,535 @@ TEST_CASE("pool work in flight at a fork finishes as cancelled in the child and 
     CHECK_FALSE(job->canceled);
     CHECK(job->ran);
   }
+  CHECK(core.in_flight() == 0);
+}
+
+namespace
+{
+struct fork_site_t
+{
+  pid_t parent = ::getpid();
+  death_t child;
+  int second_ran = 0;
+  bool forked = false;
+
+  void fork_here()
+  {
+    if (forked)
+      return;
+    forked = true;
+    child_pipe_t pipe;
+    if (::pipe(pipe.ends) != 0)
+      return;
+    pid_t pid = ::fork();
+    if (pid == 0)
+    {
+      enter_child(pipe);
+      return;
+    }
+    child = watch_child(pid, pipe, 20s);
+  }
+
+  void leave_if_child() const
+  {
+    if (::getpid() != parent)
+      ::_exit(7);
+  }
+
+  void second()
+  {
+    ++second_ran;
+    static const char marker[] = "the second callback ran in the child\n";
+    if (::getpid() != parent)
+      (void)!::write(2, marker, sizeof(marker) - 1);
+  }
+
+  void check() const
+  {
+    CHECK(forked);
+    CHECK(aborted_by_fork_rule(child, "run"));
+    CHECK(child.message.find("the second callback ran in the child") == std::string::npos);
+    CHECK(second_ran >= 1);
+  }
+};
+
+struct fork_site_node_t
+{
+  vio::detail::posted_t posted;
+  vio::detail::hook_t hook;
+  fork_site_t *site = nullptr;
+  bool forks = false;
+
+  fork_site_node_t(fork_site_t &site, bool forks)
+    : site(&site)
+    , forks(forks)
+  {
+    posted.owner = this;
+    posted.run = [](vio::detail::posted_t *raw) { static_cast<fork_site_node_t *>(raw->owner)->fire(); };
+    hook.owner = this;
+    hook.run = [](vio::detail::hook_t *raw) { static_cast<fork_site_node_t *>(raw->owner)->fire(); };
+  }
+
+  void fire()
+  {
+    if (forks)
+      site->fork_here();
+    else
+      site->second();
+  }
+};
+
+struct fork_site_op_t : vio::detail::io_op_t
+{
+  fork_site_node_t *node = nullptr;
+
+  explicit fork_site_op_t(fork_site_node_t &node)
+    : node(&node)
+  {
+    owner = this;
+    complete = [](vio::detail::io_op_t *raw) { static_cast<fork_site_op_t *>(raw->owner)->node->fire(); };
+  }
+};
+
+struct fork_site_file_t
+{
+  vio::detail::file_op_t op;
+  fork_site_node_t *node = nullptr;
+  char bytes[8] = {};
+
+  fork_site_file_t(fork_site_node_t &node, int file)
+    : node(&node)
+  {
+    op.owner = this;
+    op.kind = vio::detail::file_op_kind::read;
+    op.file = file;
+    op.offset = 0;
+    op.data = reinterpret_cast<std::byte *>(bytes);
+    op.size = sizeof(bytes);
+    op.complete = [](vio::detail::file_op_t *raw) { static_cast<fork_site_file_t *>(raw->owner)->node->fire(); };
+  }
+};
+} // namespace
+
+TEST_CASE("a child that returns from any loop callback it forked in aborts before the next callback runs")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  fork_site_t site;
+  fork_site_node_t first(site, true);
+  fork_site_node_t second(site, false);
+
+  SUBCASE("posted work")
+  {
+    core.post(first.posted);
+    core.post(second.posted);
+    loop.stop();
+    loop.run();
+    site.leave_if_child();
+    site.check();
+  }
+  SUBCASE("deferred work")
+  {
+    loop.run_in_loop([&] {
+      core.defer(first.posted);
+      core.defer(second.posted);
+    });
+    loop.stop();
+    loop.run();
+    site.leave_if_child();
+    site.check();
+  }
+  SUBCASE("hooks")
+  {
+    vio::detail::timer_node_t linger;
+    linger.fire = [](vio::detail::timer_node_t *) {};
+    core.add_hook(first.hook);
+    core.add_hook(second.hook);
+    core.add_timer(linger, vio::detail::loop_core_t::deadline_after(std::int64_t{20} * 1000000));
+    loop.stop();
+    loop.run();
+    site.leave_if_child();
+    core.remove_hook(first.hook);
+    core.remove_hook(second.hook);
+    site.check();
+  }
+  SUBCASE("socket completions")
+  {
+    int ends[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) == 0);
+    REQUIRE(vio::detail::socket_set_nonblocking(ends[0]) == 0);
+    vio::detail::socket_resource_t socket(core);
+    REQUIRE(socket.adopt(ends[0]) == 0);
+    fork_site_op_t forking(first);
+    fork_site_op_t following(second);
+    socket.wait(vio::detail::interest_read, forking);
+    socket.wait(vio::detail::interest_read, following);
+    std::byte ping{0x42};
+    REQUIRE(vio::detail::socket_send(ends[1], vio::detail::const_bytes_t(&ping, 1)) == 1);
+    loop.stop();
+    loop.run();
+    site.leave_if_child();
+    socket.close(nullptr, nullptr);
+    loop.run();
+    ::close(ends[1]);
+    site.check();
+  }
+  SUBCASE("event pipe events")
+  {
+    vio::event_pipe_t<int> pipe(loop, [&](int &&value) {
+      if (value == 1)
+        first.fire();
+      else
+        second.fire();
+    });
+    pipe.post_event(1);
+    pipe.post_event(2);
+    loop.stop();
+    loop.run();
+    site.leave_if_child();
+    site.check();
+  }
+  SUBCASE("ring file completions")
+  {
+    if (!core.backend().supports_async_files())
+    {
+      MESSAGE("the backend has no ring file operations; skipped");
+      return;
+    }
+    int file = ::open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    REQUIRE(file >= 0);
+    fork_site_file_t forking(first, file);
+    fork_site_file_t following(second, file);
+    loop.run_in_loop([&] {
+      core.backend().submit_file(forking.op);
+      core.backend().submit_file(following.op);
+    });
+    loop.stop();
+    loop.run();
+    site.leave_if_child();
+    ::close(file);
+    site.check();
+  }
+}
+
+TEST_CASE("a child that returns from a loop callback it forked in aborts before the loop runs anything else")
+{
+  settle_file_pool();
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  struct fork_point_t
+  {
+    vio::detail::timer_node_t forking;
+    vio::detail::timer_node_t next;
+    std::atomic<bool> gate{false};
+    std::atomic<int> started{0};
+    std::vector<std::unique_ptr<gated_job_t>> jobs;
+    death_t child;
+    pid_t parent = ::getpid();
+    int next_fired = 0;
+  } point;
+  const int count = file_pool_threads() + 2;
+  for (int i = 0; i < count; ++i)
+  {
+    point.jobs.push_back(std::make_unique<gated_job_t>(point.gate, point.started));
+    vio::detail::pool_submit(core, point.jobs.back()->job, vio::detail::pool_queue::file);
+  }
+  wait_for_started(point.started, file_pool_threads());
+  REQUIRE(point.started.load() == file_pool_threads());
+  point.forking.owner = &point;
+  point.forking.keeps_alive = false;
+  point.forking.fire = [](vio::detail::timer_node_t *raw) {
+    auto &self = *static_cast<fork_point_t *>(raw->owner);
+    child_pipe_t pipe;
+    if (::pipe(pipe.ends) != 0)
+      return;
+    pid_t child = ::fork();
+    if (child == 0)
+    {
+      enter_child(pipe);
+      return;
+    }
+    self.child = watch_child(child, pipe, 20s);
+    self.gate = true;
+  };
+  point.next.owner = &point;
+  point.next.keeps_alive = false;
+  point.next.fire = [](vio::detail::timer_node_t *raw) {
+    auto &self = *static_cast<fork_point_t *>(raw->owner);
+    ++self.next_fired;
+    static const char marker[] = "the next callback ran in the child\n";
+    if (::getpid() != self.parent)
+      (void)!::write(2, marker, sizeof(marker) - 1);
+  };
+  const auto deadline = vio::detail::loop_core_t::deadline_after(std::int64_t{20} * 1000000);
+  core.add_timer(point.forking, deadline);
+  core.add_timer(point.next, deadline);
+  loop.stop();
+  loop.run();
+  if (::getpid() != point.parent)
+    ::_exit(7);
+  CHECK(aborted_by_fork_rule(point.child, "run"));
+  CHECK(point.child.message.find("the next callback ran in the child") == std::string::npos);
+  CHECK(point.next_fired == 1);
+  for (auto &job : point.jobs)
+  {
+    CHECK(job->finished);
+    CHECK_FALSE(job->canceled);
+    CHECK(job->ran);
+  }
+  CHECK(core.in_flight() == 0);
+}
+
+TEST_CASE("a child that gives an inherited loop a socket or blocking work, or waits on one of its sockets, aborts naming the rule")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  int ends[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) == 0);
+  REQUIRE(vio::detail::socket_set_nonblocking(ends[0]) == 0);
+  REQUIRE(vio::detail::socket_set_nonblocking(ends[1]) == 0);
+  vio::detail::socket_resource_t inherited(core);
+  REQUIRE(inherited.adopt(ends[0]) == 0);
+
+  SUBCASE("giving it a socket")
+  {
+    auto child = run_in_child([&] {
+      int spare[2];
+      if (::socketpair(AF_UNIX, SOCK_STREAM, 0, spare) != 0)
+        ::_exit(3);
+      vio::detail::socket_resource_t added(core);
+      (void)added.adopt(spare[0]);
+      ::_exit(5);
+    });
+    CHECK(aborted_by_fork_rule(child, "given a socket"));
+  }
+  SUBCASE("giving it blocking work")
+  {
+    auto child = run_in_child([&] {
+      pool_probe_t probe;
+      vio::detail::pool_submit(core, probe.job, vio::detail::pool_queue::file);
+      ::_exit(5);
+    });
+    CHECK(aborted_by_fork_rule(child, "given blocking work"));
+  }
+  SUBCASE("waiting on one of its sockets")
+  {
+    auto child = run_in_child([&] {
+      parked_probe_t reader;
+      inherited.wait(vio::detail::interest_read, reader);
+      ::_exit(5);
+    });
+    CHECK(aborted_by_fork_rule(child, "used to wait on a socket"));
+  }
+  SUBCASE("starting a ring file operation on it")
+  {
+    if (core.backend().supports_async_files())
+    {
+      auto child = run_in_child([&] {
+        int file = ::open("/dev/zero", O_RDONLY | O_CLOEXEC);
+        if (file < 0)
+          ::_exit(3);
+        vio::detail::file_op_t op;
+        std::byte byte{};
+        op.kind = vio::detail::file_op_kind::read;
+        op.file = file;
+        op.offset = 0;
+        op.data = &byte;
+        op.size = 1;
+        op.complete = [](vio::detail::file_op_t *) {};
+        core.backend().submit_file(op);
+        ::_exit(5);
+      });
+      CHECK(aborted_by_fork_rule(child, "used to start an operation"));
+    }
+    else
+    {
+      MESSAGE("the backend has no ring file operations; skipped");
+    }
+  }
+  inherited.close(nullptr, nullptr);
+  ::close(ends[1]);
+  loop.stop();
+  loop.run();
+  CHECK(core.open_resources() == 0);
+}
+
+TEST_CASE("a child that closes an inherited loop's socket leaves the parent's registration of it in place")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  int ends[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) == 0);
+  REQUIRE(vio::detail::socket_set_nonblocking(ends[0]) == 0);
+  REQUIRE(vio::detail::socket_set_nonblocking(ends[1]) == 0);
+  vio::detail::socket_resource_t shared(core);
+  REQUIRE(shared.adopt(ends[0]) == 0);
+
+  struct reader_t : vio::detail::io_op_t
+  {
+    vio::detail::loop_core_t *core = nullptr;
+    vio::detail::socket_resource_t *socket = nullptr;
+    vio::detail::timer_node_t bail;
+    std::int64_t got = 0;
+  } reader;
+  reader.core = &core;
+  reader.socket = &shared;
+  reader.owner = &reader;
+  reader.complete = [](vio::detail::io_op_t *raw) {
+    auto &self = *static_cast<reader_t *>(raw->owner);
+    std::byte buffer[16];
+    self.got = vio::detail::socket_recv(self.socket->native(), buffer);
+    if (self.got == vio::errc::again)
+    {
+      self.socket->wait(vio::detail::interest_read, self);
+      return;
+    }
+    self.core->remove_timer(self.bail);
+    self.socket->close(nullptr, nullptr);
+    self.core->stop();
+  };
+  reader.bail.owner = &reader;
+  reader.bail.keeps_alive = false;
+  reader.bail.fire = [](vio::detail::timer_node_t *raw) {
+    auto &self = *static_cast<reader_t *>(raw->owner);
+    self.socket->cancel(self);
+    self.socket->close(nullptr, nullptr);
+    self.core->stop();
+  };
+  shared.wait(vio::detail::interest_read, reader);
+
+  auto child = run_in_child([&] {
+    shared.close(nullptr, nullptr);
+    ::_exit(0);
+  });
+  CHECK(exited_quietly(child));
+  CHECK(child.message == "");
+
+  std::byte ping{0x42};
+  REQUIRE(vio::detail::socket_send(ends[1], vio::detail::const_bytes_t(&ping, 1)) == 1);
+  core.add_timer(reader.bail, vio::detail::loop_core_t::deadline_after(std::int64_t{5000} * 1000000));
+  loop.run();
+  CHECK(reader.got == 1);
+  CHECK_FALSE(reader.parked);
+  ::close(ends[1]);
+  CHECK(core.open_resources() == 0);
+}
+
+TEST_CASE("destroying an inherited loop in the child is not stalled by a lock another thread held at the fork")
+{
+  std::optional<vio::event_loop_t> loop;
+  loop.emplace();
+  auto &core = vio::detail::core(*loop);
+  vio::detail::posted_t node;
+  node.run = [](vio::detail::posted_t *) {};
+  std::atomic<bool> done{false};
+  std::thread poster([&] {
+    while (!done.load(std::memory_order_relaxed))
+      core.post(node);
+  });
+  std::thread piper([&] {
+    while (!done.load(std::memory_order_relaxed))
+      vio::event_pipe_t<int> pipe(*loop, [](int &&) {});
+  });
+  int quiet = 0;
+  constexpr int forks = 40;
+  for (int i = 0; i < forks; ++i)
+  {
+    auto child = run_in_child(
+      [&] {
+        loop.reset();
+        ::_exit(0);
+      },
+      2s);
+    if (!exited_quietly(child))
+      break;
+    ++quiet;
+  }
+  done = true;
+  poster.join();
+  piper.join();
+  CHECK(quiet == forks);
+  loop->stop();
+  loop->run();
+}
+
+TEST_CASE("destroying an inherited io_uring loop in the child leaves the parent's ring file operations alone")
+{
+  std::optional<vio::event_loop_t> loop;
+  loop.emplace();
+  auto &core = vio::detail::core(*loop);
+  if (!core.backend().supports_async_files())
+  {
+    MESSAGE("the backend has no ring file operations; skipped");
+    return;
+  }
+  int ends[2];
+  REQUIRE(::pipe(ends) == 0);
+  struct read_t
+  {
+    vio::detail::file_op_t op;
+    vio::detail::timer_node_t forking;
+    vio::detail::timer_node_t bail;
+    std::optional<vio::event_loop_t> *loop = nullptr;
+    vio::detail::loop_core_t *core = nullptr;
+    int writer = -1;
+    char bytes[8] = {};
+    std::int64_t result = 0;
+    bool completed = false;
+    death_t child;
+  } read;
+  read.loop = &loop;
+  read.core = &core;
+  read.writer = ends[1];
+  read.op.owner = &read;
+  read.op.kind = vio::detail::file_op_kind::read;
+  read.op.file = ends[0];
+  read.op.offset = -1;
+  read.op.data = reinterpret_cast<std::byte *>(read.bytes);
+  read.op.size = sizeof(read.bytes);
+  read.op.complete = [](vio::detail::file_op_t *raw) {
+    auto &self = *static_cast<read_t *>(raw->owner);
+    self.completed = true;
+    self.result = raw->result;
+    self.core->remove_timer(self.bail);
+    self.core->stop();
+  };
+  read.forking.owner = &read;
+  read.forking.keeps_alive = false;
+  read.forking.fire = [](vio::detail::timer_node_t *raw) {
+    auto &self = *static_cast<read_t *>(raw->owner);
+    child_pipe_t pipe;
+    if (::pipe(pipe.ends) != 0)
+      return;
+    pid_t child = ::fork();
+    if (child == 0)
+    {
+      enter_child(pipe);
+      self.loop->reset();
+      ::_exit(self.op.in_flight ? 1 : 0);
+    }
+    self.child = watch_child(child, pipe, 20s);
+    (void)!::write(self.writer, "ring", 4);
+  };
+  read.bail.owner = &read;
+  read.bail.keeps_alive = false;
+  read.bail.fire = [](vio::detail::timer_node_t *raw) {
+    auto &self = *static_cast<read_t *>(raw->owner);
+    self.core->backend().cancel_file(self.op);
+  };
+  loop->run_in_loop([&] {
+    core.backend().submit_file(read.op);
+    core.add_timer(read.forking, vio::detail::loop_core_t::deadline_after(std::int64_t{50} * 1000000));
+    core.add_timer(read.bail, vio::detail::loop_core_t::deadline_after(std::int64_t{10000} * 1000000));
+  });
+  loop->run();
+  ::close(ends[0]);
+  ::close(ends[1]);
+  CHECK(exited_quietly(read.child));
+  CHECK(read.child.message == "");
+  CHECK(read.completed);
+  CHECK(read.result == 4);
+  CHECK(std::string(read.bytes, 4) == "ring");
   CHECK(core.in_flight() == 0);
 }
 

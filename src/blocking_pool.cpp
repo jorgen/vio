@@ -161,7 +161,7 @@ public:
     _stopped = false;
   }
 
-  void reclaim(loop_core_t &loop) noexcept
+  void abandon(loop_core_t &loop) noexcept
   {
     std::lock_guard lock(_mutex);
     job_list_t kept;
@@ -174,7 +174,7 @@ public:
       }
       job->canceled = true;
       job->state.store(pool_job_finished, std::memory_order_relaxed);
-      loop.defer(job->finished);
+      loop.release();
     }
     _orphaned = kept;
   }
@@ -272,7 +272,6 @@ struct pools_t
       return;
     pools->file.orphan_after_fork();
     pools->dns.orphan_after_fork();
-    loop_core_t::note_fork_in_child();
   }
 
   static inline std::atomic<pools_t *> current{nullptr};
@@ -294,13 +293,21 @@ void on_finished(posted_t *node)
   loop->release();
   job->done(job, job->canceled);
 }
+
+void on_discarded(posted_t *node)
+{
+  static_cast<pool_job_t *>(node->owner)->loop->release();
+}
 } // namespace
 
 void pool_submit(loop_core_t &loop, pool_job_t &job, pool_queue queue)
 {
+  if (loop.inherited()) [[unlikely]]
+    loop.abort_inherited("given blocking work");
   job.loop = &loop;
   job.canceled = false;
   job.finished.run = &on_finished;
+  job.finished.discard = &on_discarded;
   job.finished.owner = &job;
   job.queue = queue;
   job.state.store(pool_job_queued, std::memory_order_relaxed);
@@ -326,12 +333,12 @@ void pool_shutdown() noexcept
   queue_for(pool_queue::dns).shutdown();
 }
 
-void pool_reclaim_after_fork(loop_core_t &loop) noexcept
+void pool_abandon_after_fork(loop_core_t &loop) noexcept
 {
   auto *pools = pools_t::current.load(std::memory_order_acquire);
   if (!pools)
     return;
-  pools->file.reclaim(loop);
-  pools->dns.reclaim(loop);
+  pools->file.abandon(loop);
+  pools->dns.abandon(loop);
 }
 } // namespace vio::detail

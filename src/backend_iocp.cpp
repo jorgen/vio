@@ -352,6 +352,17 @@ public:
 
   ~iocp_backend_t() override
   {
+    for (; _entries_next < _entries_count; ++_entries_next)
+    {
+      const auto &entry = _entries[_entries_next];
+      if (entry.lpCompletionKey != afd_key || entry.lpOverlapped == nullptr)
+        continue;
+      auto *state = state_from(entry.lpOverlapped);
+      if (state->status == poll_status::idle)
+        continue;
+      state->status = poll_status::idle;
+      --_outstanding;
+    }
     for (auto *state = _all; state; state = state->all_next)
     {
       if (state->status == poll_status::pending)
@@ -443,17 +454,23 @@ public:
   {
     release_retired();
     flush_updates();
+    if (_entries_next < _entries_count)
+    {
+      deliver();
+      dispatch_failed();
+      return;
+    }
     if (!_failed.empty())
       timeout_ns = 0;
     const std::int64_t deadline = timeout_ns > 0 ? deadline_after(timeout_ns) : 0;
-    OVERLAPPED_ENTRY entries[max_entries];
     for (unsigned repeat = 0;; ++repeat)
     {
       ULONG count = 0;
-      if (::GetQueuedCompletionStatusEx(_port, entries, max_entries, &count, wait_milliseconds(timeout_ns, repeat), FALSE))
+      if (::GetQueuedCompletionStatusEx(_port, _entries, max_entries, &count, wait_milliseconds(timeout_ns, repeat), FALSE))
       {
-        for (ULONG i = 0; i < count; ++i)
-          handle(entries[i]);
+        _entries_next = 0;
+        _entries_count = count;
+        deliver();
         break;
       }
       const DWORD error = ::GetLastError();
@@ -601,6 +618,15 @@ private:
       update(*state);
   }
 
+  void deliver()
+  {
+    while (_entries_next < _entries_count)
+    {
+      const auto entry = _entries[_entries_next++];
+      handle(entry);
+    }
+  }
+
   void handle(const OVERLAPPED_ENTRY &entry)
   {
     if (entry.lpCompletionKey != afd_key || entry.lpOverlapped == nullptr)
@@ -738,6 +764,9 @@ private:
   state_list_t _retired{list_id::retired};
   poll_state_t *_all = nullptr;
   std::size_t _outstanding = 0;
+  OVERLAPPED_ENTRY _entries[max_entries] = {};
+  ULONG _entries_next = 0;
+  ULONG _entries_count = 0;
 };
 } // namespace
 

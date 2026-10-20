@@ -123,7 +123,13 @@ public:
       ::close(_wake_read);
     if (_wake_write >= 0)
       ::close(_wake_write);
-    ::close(_kqueue_fd);
+    if (_kqueue_fd >= 0)
+      ::close(_kqueue_fd);
+  }
+
+  void abandon_after_fork() noexcept override
+  {
+    _kqueue_fd = -1;
   }
 
   [[nodiscard]] const char *name() const noexcept override
@@ -189,9 +195,30 @@ public:
       timeout_pointer = &timeout;
     }
     int count = ::kevent(_kqueue_fd, nullptr, 0, events, max_events, timeout_pointer);
-    for (int i = 0; i < count; ++i)
+    struct interrupted_t
     {
-      auto *watch = watch_of(events[i]);
+      kqueue_backend_t &backend;
+      const kevent_t *events;
+      int count;
+      int next = 0;
+      ~interrupted_t()
+      {
+        for (; next < count; ++next)
+        {
+          auto *watch = watch_of(events[next]);
+          if (!watch)
+            continue;
+          bool readable = false;
+          bool writable = false;
+          collect(events[next], readable, writable);
+          backend.retry_later(*watch, readable, writable);
+        }
+      }
+    } batch{*this, events, count};
+    while (batch.next < count)
+    {
+      const auto &event = events[batch.next++];
+      auto *watch = watch_of(event);
       if (!watch)
       {
         drain_wake();
@@ -199,12 +226,17 @@ public:
       }
       bool readable = false;
       bool writable = false;
-      collect(events[i], readable, writable);
-      while (i + 1 < count && watch_of(events[i + 1]) == watch)
-        collect(events[++i], readable, writable);
+      collect(event, readable, writable);
+      while (batch.next < count && watch_of(events[batch.next]) == watch)
+        collect(events[batch.next++], readable, writable);
       if (readable || writable)
         dispatch(*watch, readable, writable);
     }
+  }
+
+  [[nodiscard]] int queue() const noexcept
+  {
+    return _kqueue_fd;
   }
 
 private:
@@ -334,6 +366,8 @@ std::unique_ptr<backend_t> make_kqueue_backend(loop_core_t &loop, int &error)
 
 #include <climits>
 #include <string>
+
+#include <sys/wait.h>
 
 #include "vio/errc.h"
 #include "vio/loop/socket.h"
@@ -740,6 +774,32 @@ TEST_CASE("kqueue backend: registering a descriptor that is not open fails and l
   loop.stop();
   loop.run();
   CHECK(loop.open_resources() == 0);
+}
+
+TEST_CASE("kqueue backend: destroying a loop inherited across fork() leaves alone the descriptor the child reused")
+{
+  auto *loop = new loop_core_t(backend_kind::kqueue);
+  const int queue = static_cast<kqueue_backend_t &>(loop->backend()).queue();
+  REQUIRE(queue >= 0);
+  pid_t child = ::fork();
+  REQUIRE(child >= 0);
+  if (child == 0)
+  {
+    int file = ::open("/dev/null", O_RDONLY);
+    if (file < 0)
+      ::_exit(3);
+    if (file != queue && ::dup2(file, queue) != queue)
+      ::_exit(4);
+    delete loop;
+    ::_exit(::fcntl(queue, F_GETFD) != -1 ? 0 : 1);
+  }
+  int status = 0;
+  while (::waitpid(child, &status, 0) < 0 && errno == EINTR)
+  {
+  }
+  CHECK(WIFEXITED(status));
+  CHECK(WEXITSTATUS(status) == 0);
+  delete loop;
 }
 } // namespace vio::detail
 #endif

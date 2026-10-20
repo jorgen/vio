@@ -44,6 +44,8 @@ namespace vio::detail
 {
 class loop_core_t;
 
+extern VIO_EXPORT std::atomic<unsigned> fork_epoch;
+
 struct hook_t
 {
   using run_fn_t = void (*)(hook_t *hook);
@@ -187,14 +189,26 @@ public:
     return _pipe_anchor.anchor();
   }
 
+  [[nodiscard]] bool inherited() const noexcept
+  {
+    return _fork_epoch != fork_epoch.load(std::memory_order_relaxed);
+  }
+  void refuse_if_inherited() const noexcept
+  {
+    if (inherited()) [[unlikely]]
+      abort_inherited("run");
+  }
+  [[noreturn]] void abort_inherited(const char *action) const noexcept;
+
   [[nodiscard]] static std::int64_t now() noexcept;
   [[nodiscard]] static std::int64_t deadline_after(std::int64_t delay) noexcept;
-  static void note_fork_in_child() noexcept;
 
 private:
   static void on_stop(posted_t *node);
+  static void note_fork_in_child() noexcept;
 
-  void reclaim_after_fork() noexcept;
+  void abandon_after_fork() noexcept;
+  void discard_queued() noexcept;
   void run_timers();
   void drain_posted();
   void requeue_draining(std::size_t from) noexcept;

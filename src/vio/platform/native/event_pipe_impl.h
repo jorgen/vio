@@ -81,15 +81,40 @@ public:
       _core->post(_node);
       return;
     }
-    _draining = true;
     {
       std::lock_guard lock(_mutex);
-      std::swap(_events, _drain_buffer);
+      if (_drain_next == _drain_buffer.size())
+      {
+        std::swap(_events, _drain_buffer);
+      }
+      else if (!_events.empty())
+      {
+        _drain_buffer.insert(_drain_buffer.end(), std::make_move_iterator(_events.begin()), std::make_move_iterator(_events.end()));
+        _events.clear();
+      }
     }
-    for (auto &event : _drain_buffer)
+    struct interrupted_t
+    {
+      event_pipe_t &pipe;
+      ~interrupted_t()
+      {
+        pipe._draining = false;
+        if (pipe._drain_next < pipe._drain_buffer.size())
+        {
+          pipe._core->post(pipe._node);
+          return;
+        }
+        pipe._drain_buffer.clear();
+        pipe._drain_next = 0;
+      }
+    } drain{*this};
+    _draining = true;
+    while (_drain_next < _drain_buffer.size())
+    {
+      auto &event = _drain_buffer[_drain_next++];
       std::apply(_event_callback, std::move(event));
-    _drain_buffer.clear();
-    _draining = false;
+      _core->refuse_if_inherited();
+    }
   }
 
 private:
@@ -105,6 +130,7 @@ private:
   std::mutex _mutex;
   std::vector<tuple_t> _events;
   std::vector<tuple_t> _drain_buffer;
+  std::size_t _drain_next = 0;
   bool _draining = false;
 };
 

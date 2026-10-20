@@ -66,5 +66,5 @@ struct pool_job_t
 VIO_EXPORT void pool_submit(loop_core_t &loop, pool_job_t &job, pool_queue queue);
 VIO_EXPORT bool pool_cancel(pool_job_t &job) noexcept;
 VIO_EXPORT void pool_shutdown() noexcept;
-VIO_EXPORT void pool_reclaim_after_fork(loop_core_t &loop) noexcept;
+VIO_EXPORT void pool_abandon_after_fork(loop_core_t &loop) noexcept;
 } // namespace vio::detail

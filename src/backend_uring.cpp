@@ -66,6 +66,8 @@ struct uring_submit_fault_t
   unsigned refusals = 0;
   unsigned refused = 0;
   std::int64_t paused_ns = 0;
+  unsigned busy_on = 0;
+  unsigned entries = 0;
 };
 uring_submit_fault_t *uring_submit_fault = nullptr;
 #endif
@@ -139,6 +141,17 @@ public:
       abandon_files();
     if (_wake_fd >= 0)
       ::close(_wake_fd);
+  }
+
+  void abandon_after_fork() noexcept override
+  {
+    while (auto *op = _files)
+    {
+      untrack(*op);
+      op->in_flight = false;
+      _loop.release();
+    }
+    _files_in_flight = 0;
   }
 
   [[nodiscard]] int init() noexcept
@@ -224,7 +237,7 @@ public:
     if (!_wake_armed || _wake_thread != token)
       arm_wake(token);
 
-    bool block = timeout_ns != 0 && _backlog.empty() && _ring.ready() == 0;
+    bool block = timeout_ns != 0 && !backlogged() && _ring.ready() == 0;
     bool enter = block || _ring.pending() > 0 || _enter_to_reap || (_ring.sq_flags() & (IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW));
     if (enter)
       submit_and_wait(block ? timeout_ns : 0);
@@ -260,6 +273,7 @@ public:
     sqe->user_data = reinterpret_cast<std::uintptr_t>(&op) | tag_file;
     op.in_flight = true;
     op.result = 0;
+    track(op);
     ++_files_in_flight;
     _loop.retain();
   }
@@ -300,6 +314,8 @@ private:
 
   io_uring_sqe *acquire_sqe()
   {
+    if (_loop.inherited()) [[unlikely]]
+      _loop.abort_inherited("used to start an operation");
     long pause_ns = first_submit_pause_ns;
     std::int64_t stalled_ns = 0;
     int futile = 0;
@@ -331,10 +347,15 @@ private:
   int enter_for_space() noexcept
   {
 #if defined(VIO_INTERNAL_TESTS)
-    if (uring_submit_fault && uring_submit_fault->refused < uring_submit_fault->refusals)
+    if (uring_submit_fault)
     {
-      ++uring_submit_fault->refused;
-      return -EAGAIN;
+      if (++uring_submit_fault->entries == uring_submit_fault->busy_on)
+        return -EBUSY;
+      if (uring_submit_fault->refused < uring_submit_fault->refusals)
+      {
+        ++uring_submit_fault->refused;
+        return -EAGAIN;
+      }
     }
 #endif
     return _ring.enter(0, 0, nullptr);
@@ -431,35 +452,49 @@ private:
     }
   }
 
+  [[nodiscard]] bool backlogged() const noexcept
+  {
+    return _batch_next < _batch_count || _backlog_next < _backlog.size();
+  }
+
+  void deliver_backlog()
+  {
+    while (_batch_next < _batch_count)
+    {
+      auto completion = _batch[_batch_next++];
+      handle(completion);
+    }
+    while (_backlog_next < _backlog.size())
+    {
+      auto completion = _backlog[_backlog_next++];
+      handle(completion);
+    }
+    _backlog.clear();
+    _backlog_next = 0;
+  }
+
   void reap()
   {
-    if (!_backlog.empty())
-    {
-      std::vector<uring_completion_t> backlog;
-      backlog.swap(_backlog);
-      for (const auto &completion : backlog)
-        handle(completion);
-    }
     unsigned budget = _ring.cq_entries() * 2;
-    uring_completion_t batch[completion_batch];
-    while (budget > 0)
+    for (;;)
     {
-      auto count = _ring.take(batch, completion_batch < budget ? completion_batch : budget);
-      if (count == 0)
-      {
-        if (!(_ring.sq_flags() & IORING_SQ_CQ_OVERFLOW))
-          return;
-        io_uring_getevents_arg arg{};
-        int result = _ring.enter(0, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &arg);
-        if (result == -EBADR)
-          fatal("dropped completions", EBADR);
-        if (_ring.ready() == 0)
-          return;
-        continue;
-      }
+      deliver_backlog();
+      if (budget == 0)
+        return;
+      auto count = _ring.take(_batch, completion_batch < budget ? completion_batch : budget);
+      _batch_next = 0;
+      _batch_count = count;
       budget -= count;
-      for (unsigned i = 0; i < count; ++i)
-        handle(batch[i]);
+      if (count > 0)
+        continue;
+      if (!(_ring.sq_flags() & IORING_SQ_CQ_OVERFLOW))
+        return;
+      io_uring_getevents_arg arg{};
+      int result = _ring.enter(0, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &arg);
+      if (result == -EBADR)
+        fatal("dropped completions", EBADR);
+      if (_ring.ready() == 0)
+        return;
     }
   }
 
@@ -527,32 +562,63 @@ private:
 
   void on_file(file_op_t &op, std::int32_t result)
   {
+    untrack(op);
     op.in_flight = false;
     op.result = result < 0 ? errc_from_errno(-result) : result;
     --_files_in_flight;
     _loop.release();
     op.complete(&op);
+    _loop.refuse_if_inherited();
+  }
+
+  void track(file_op_t &op) noexcept
+  {
+    op.prev = nullptr;
+    op.next = _files;
+    if (_files)
+      _files->prev = &op;
+    _files = &op;
+  }
+
+  void untrack(file_op_t &op) noexcept
+  {
+    if (op.prev)
+      op.prev->next = op.next;
+    else
+      _files = op.next;
+    if (op.next)
+      op.next->prev = op.prev;
+    op.prev = nullptr;
+    op.next = nullptr;
   }
 
   void abandon_files() noexcept
   {
-    cancel(0, IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL);
+    auto drain = [&](const uring_completion_t &completion) {
+      if ((completion.user_data & tag_mask) != tag_file)
+        return;
+      auto *op = reinterpret_cast<file_op_t *>(completion.user_data & ~tag_mask);
+      untrack(*op);
+      op->in_flight = false;
+      --_files_in_flight;
+    };
+    for (; _batch_next < _batch_count; ++_batch_next)
+      drain(_batch[_batch_next]);
+    if (_files_in_flight > 0)
+      cancel(0, IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL);
     uring_completion_t batch[completion_batch];
-    while (_files_in_flight > 0)
+    for (;;)
     {
+      for (; _backlog_next < _backlog.size(); ++_backlog_next)
+        drain(_backlog[_backlog_next]);
+      _backlog.clear();
+      _backlog_next = 0;
+      if (_files_in_flight == 0)
+        return;
       io_uring_getevents_arg arg{};
       int result = _ring.enter(1, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &arg);
       if (result < 0 && result != -EINTR && result != -ETIME && result != -EAGAIN && result != -EBUSY)
         fatal("could not wait for file operations at shutdown", -result);
-      auto drain = [&](const uring_completion_t &completion) {
-        if ((completion.user_data & tag_mask) != tag_file)
-          return;
-        reinterpret_cast<file_op_t *>(completion.user_data & ~tag_mask)->in_flight = false;
-        --_files_in_flight;
-      };
-      for (const auto &completion : _backlog)
-        drain(completion);
-      _backlog.clear();
       for (unsigned count; (count = _ring.take(batch, completion_batch)) > 0;)
         for (unsigned i = 0; i < count; ++i)
           drain(batch[i]);
@@ -560,7 +626,12 @@ private:
   }
 
   uring_ring_t _ring;
+  uring_completion_t _batch[completion_batch];
+  unsigned _batch_next = 0;
+  unsigned _batch_count = 0;
   std::vector<uring_completion_t> _backlog;
+  std::size_t _backlog_next = 0;
+  file_op_t *_files = nullptr;
   int _wake_fd = -1;
   std::uint64_t _wake_generation = 0;
   std::uint64_t _wake_thread = 0;
@@ -755,6 +826,85 @@ bool uring_test_skipped_in(const uring_test_child_t &child)
 {
   return child.status != -1 && WIFEXITED(child.status) && WEXITSTATUS(child.status) == uring_test_skipped;
 }
+
+struct uring_test_order_t
+{
+  uring_test_order_t(loop_core_t &loop, int file, uring_submit_fault_t &fault)
+    : loop(loop)
+    , file(file)
+    , fault(fault)
+    , ops(submission_entries * 3)
+    , rounds(ops.size(), 0)
+    , bytes(ops.size())
+  {
+  }
+
+  void start(std::size_t index)
+  {
+    auto &op = ops[index];
+    op.owner = this;
+    op.complete = index == 0 ? &uring_test_order_t::on_first : &uring_test_order_t::on_read;
+    op.kind = file_op_kind::read;
+    op.file = file;
+    op.offset = 0;
+    op.data = &bytes[index];
+    op.size = 1;
+    loop.backend().submit_file(op);
+    rounds[index] = fault.entries;
+    ++started;
+  }
+
+  static void on_first(file_op_t *op)
+  {
+    auto &self = *static_cast<uring_test_order_t *>(op->owner);
+    self.finish(*op);
+    for (std::size_t i = 1; i < self.ops.size() && self.fault.entries < 2; ++i)
+      self.start(i);
+  }
+
+  static void on_read(file_op_t *op)
+  {
+    static_cast<uring_test_order_t *>(op->owner)->finish(*op);
+  }
+
+  void finish(file_op_t &op)
+  {
+    if (op.result != 1)
+      ++failed;
+    order.push_back(static_cast<std::size_t>(&op - ops.data()));
+  }
+
+  [[nodiscard]] std::size_t in_round(unsigned round) const
+  {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < started; ++i)
+      count += rounds[i] == round ? 1 : 0;
+    return count;
+  }
+
+  [[nodiscard]] bool rounds_in_order(unsigned earlier, unsigned later) const
+  {
+    bool seen_later = false;
+    for (auto index : order)
+    {
+      if (rounds[index] == later)
+        seen_later = true;
+      else if (rounds[index] == earlier && seen_later)
+        return false;
+    }
+    return true;
+  }
+
+  loop_core_t &loop;
+  int file;
+  uring_submit_fault_t &fault;
+  std::vector<file_op_t> ops;
+  std::vector<unsigned> rounds;
+  std::vector<std::byte> bytes;
+  std::vector<std::size_t> order;
+  std::size_t started = 0;
+  std::size_t failed = 0;
+};
 } // namespace
 
 TEST_CASE("io_uring: a submission queue the kernel refuses for over a thousand pauses still submits once it recovers")
@@ -783,6 +933,35 @@ TEST_CASE("io_uring: a submission queue the kernel refuses past the stall budget
   CHECK(WIFSIGNALED(child.status));
   CHECK(WTERMSIG(child.status) == SIGABRT);
   CHECK(child.message.find(std::string("submission queue stays full (") + std::strerror(EAGAIN) + ")") != std::string::npos);
+}
+
+TEST_CASE("io_uring: completions set aside while the kernel reported the ring busy are delivered before newer ones")
+{
+  loop_core_t loop(backend_kind::io_uring);
+  if (std::string(loop.backend_name()) != "io_uring" || !loop.backend().supports_async_files())
+  {
+    MESSAGE("io_uring with file operations is not available here; skipped");
+    return;
+  }
+  int file = ::open("/dev/zero", O_RDONLY | O_CLOEXEC);
+  REQUIRE(file >= 0);
+  uring_submit_fault_t fault;
+  fault.busy_on = 2;
+  uring_submit_fault = &fault;
+  uring_test_order_t test(loop, file, fault);
+  test.start(0);
+  loop.stop();
+  loop.run();
+  uring_submit_fault = nullptr;
+  ::close(file);
+  CHECK(fault.entries == 2);
+  CHECK(test.order.size() == test.started);
+  CHECK(test.failed == 0);
+  CHECK(test.in_round(0) > 1);
+  CHECK(test.in_round(1) > 1);
+  CHECK(test.rounds_in_order(0, 1));
+  CHECK(test.rounds_in_order(1, 2));
+  CHECK(loop.in_flight() == 0);
 }
 } // namespace vio::detail
 #endif

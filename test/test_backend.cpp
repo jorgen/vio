@@ -994,6 +994,133 @@ TEST_CASE("backend: a test that outlives its deadline ends with its sockets clos
   CHECK(core.open_resources() == 0);
 }
 
+namespace
+{
+struct thrown_once_t
+{
+};
+
+struct throwing_readers_t
+{
+  explicit throwing_readers_t(harness_t &harness)
+    : bail(harness)
+  {
+    for (auto *reader : {&first, &second})
+    {
+      reader->on_complete = [this](probe_op_t &op) {
+        if (op.completions != 1)
+          return;
+        ++thrown;
+        throw thrown_once_t{};
+      };
+    }
+  }
+
+  void arm_bail(vio::event_loop_t &loop, std::vector<test_socket_t *> sockets)
+  {
+    bail.arm(5s, [this, &loop, sockets] {
+      timed_out = true;
+      for (auto *socket : sockets)
+        socket->release();
+      loop.stop();
+    });
+  }
+
+  probe_op_t first;
+  probe_op_t second;
+  alarm_t bail;
+  int thrown = 0;
+  bool timed_out = false;
+};
+} // namespace
+
+TEST_CASE("backend: a completion that throws leaves the rest of its batch for the next run")
+{
+  vio::event_loop_t loop;
+  auto &core = detail::core(loop);
+  harness_t harness(loop);
+  MESSAGE("backend: " << std::string(loop.backend_name()));
+  auto first_pair = make_tcp_pair();
+  auto second_pair = make_tcp_pair();
+  test_socket_t first_server(harness);
+  test_socket_t first_client(harness);
+  test_socket_t second_server(harness);
+  test_socket_t second_client(harness);
+  REQUIRE(first_server.resource.adopt(first_pair.server) == 0);
+  REQUIRE(first_client.resource.adopt(first_pair.client) == 0);
+  REQUIRE(second_server.resource.adopt(second_pair.server) == 0);
+  REQUIRE(second_client.resource.adopt(second_pair.client) == 0);
+
+  throwing_readers_t readers(harness);
+  readers.arm_bail(loop, {&first_server, &first_client, &second_server, &second_client});
+  loop.run_in_loop([&] {
+    REQUIRE(would_block_reading(first_server.native()));
+    REQUIRE(would_block_reading(second_server.native()));
+    first_server.resource.wait(detail::interest_read, readers.first);
+    second_server.resource.wait(detail::interest_read, readers.second);
+    loop.run_in_loop([&] {
+      CHECK(detail::socket_send(first_client.native(), bytes("a")) == 1);
+      CHECK(detail::socket_send(second_client.native(), bytes("b")) == 1);
+    });
+  });
+  CHECK_THROWS_AS(loop.run(), thrown_once_t);
+  CHECK(readers.thrown == 1);
+  CHECK_THROWS_AS(loop.run(), thrown_once_t);
+  CHECK(readers.thrown == 2);
+  CHECK_FALSE(readers.timed_out);
+  CHECK(readers.first.completions == 1);
+  CHECK(readers.second.completions == 1);
+  CHECK_FALSE(readers.first.parked);
+  CHECK_FALSE(readers.second.parked);
+  core.remove_timer(readers.bail.node);
+  first_server.close();
+  first_client.close();
+  second_server.close();
+  second_client.close();
+  loop.stop();
+  CHECK(harness.run());
+  CHECK(core.in_flight() == 0);
+  CHECK(core.open_resources() == 0);
+}
+
+TEST_CASE("backend: a completion that throws leaves the other operations parked on its socket to be woken")
+{
+  vio::event_loop_t loop;
+  auto &core = detail::core(loop);
+  harness_t harness(loop);
+  MESSAGE("backend: " << std::string(loop.backend_name()));
+  auto pair = make_tcp_pair();
+  test_socket_t server(harness);
+  test_socket_t client(harness);
+  REQUIRE(server.resource.adopt(pair.server) == 0);
+  REQUIRE(client.resource.adopt(pair.client) == 0);
+
+  throwing_readers_t readers(harness);
+  readers.arm_bail(loop, {&server, &client});
+  loop.run_in_loop([&] {
+    REQUIRE(would_block_reading(server.native()));
+    server.resource.wait(detail::interest_read, readers.first);
+    server.resource.wait(detail::interest_read, readers.second);
+    loop.run_in_loop([&] { CHECK(detail::socket_send(client.native(), bytes("a")) == 1); });
+  });
+  CHECK_THROWS_AS(loop.run(), thrown_once_t);
+  CHECK(readers.thrown == 1);
+  CHECK_THROWS_AS(loop.run(), thrown_once_t);
+  CHECK(readers.thrown == 2);
+  CHECK_FALSE(readers.timed_out);
+  CHECK(readers.first.completions == 1);
+  CHECK(readers.second.completions == 1);
+  CHECK_FALSE(readers.first.parked);
+  CHECK_FALSE(readers.second.parked);
+  core.remove_timer(readers.bail.node);
+  server.close();
+  client.close();
+  loop.stop();
+  CHECK(harness.run());
+  CHECK(core.in_flight() == 0);
+  CHECK(core.open_resources() == 0);
+}
+
 #if !defined(_WIN32)
 namespace
 {

@@ -150,4 +150,62 @@ TEST_SUITE("event_pipe drain")
     loop.run();
     CHECK(calls == 0);
   }
+
+  TEST_CASE("a callback that throws leaves the pipe working and the events it did not reach queued in order")
+  {
+    struct failure_t
+    {
+    };
+    struct state_t
+    {
+      vio::event_loop_t loop;
+      std::unique_ptr<vio::event_pipe_t<int>> pipe;
+      std::vector<int> received;
+      std::size_t stop_at = 0;
+      vio::detail::timer_node_t watchdog;
+      bool timed_out = false;
+    } state;
+    state.pipe = std::make_unique<vio::event_pipe_t<int>>(state.loop, [&state](int value) {
+      if (value == 7)
+        state.pipe->post_event(9);
+      if (value == 2 || value == 7)
+        throw failure_t{};
+      state.received.push_back(value);
+      if (state.received.size() == state.stop_at)
+        state.loop.stop();
+    });
+    state.watchdog.owner = &state;
+    state.watchdog.keeps_alive = false;
+    state.watchdog.fire = [](vio::detail::timer_node_t *raw) {
+      auto &self = *static_cast<state_t *>(raw->owner);
+      self.timed_out = true;
+      self.pipe.reset();
+      self.loop.stop();
+    };
+    auto &core = vio::detail::core(state.loop);
+    auto run_watched = [&](std::size_t stop_at) {
+      state.stop_at = stop_at;
+      core.add_timer(state.watchdog, vio::detail::loop_core_t::deadline_after(std::int64_t{5000} * 1000000));
+      state.loop.run();
+      core.remove_timer(state.watchdog);
+    };
+
+    for (int value : {1, 2, 3, 4})
+      state.pipe->post_event(int{value});
+    CHECK_THROWS_AS(state.loop.run(), failure_t);
+    CHECK(state.received == std::vector<int>{1});
+    run_watched(3);
+    CHECK_FALSE(state.timed_out);
+    CHECK(state.received == std::vector<int>{1, 3, 4});
+    REQUIRE(state.pipe);
+
+    state.pipe->post_event(7);
+    state.pipe->post_event(8);
+    CHECK_THROWS_AS(state.loop.run(), failure_t);
+    CHECK(state.received == std::vector<int>{1, 3, 4});
+    state.pipe->post_event(10);
+    run_watched(6);
+    CHECK_FALSE(state.timed_out);
+    CHECK(state.received == std::vector<int>{1, 3, 4, 8, 9, 10});
+  }
 }

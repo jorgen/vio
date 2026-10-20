@@ -28,7 +28,12 @@ Copyright (c) 2025 Jørgen Lind
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <new>
 #include <utility>
+
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 #include "backends.h"
 #include "vio/about_to_block.h"
@@ -37,10 +42,7 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio::detail
 {
-namespace
-{
 std::atomic<unsigned> fork_epoch{0};
-}
 
 void abort_destroyed_in_flight(const char *what) noexcept
 {
@@ -101,12 +103,93 @@ void backend_t::cancel_file(file_op_t &) noexcept
 {
 }
 
+void backend_t::abandon_after_fork() noexcept
+{
+}
+
 void backend_t::arm(io_watch_t &, std::uint8_t)
 {
 }
 
+int backend_t::open_watch(io_watch_t &watch)
+{
+  if (_loop.inherited()) [[unlikely]]
+    _loop.abort_inherited("given a socket");
+  return add_watch(watch);
+}
+
+void backend_t::close_watch(io_watch_t &watch, posted_t &done)
+{
+  forget_retry(watch);
+  if (_loop.inherited())
+  {
+    watch.closed = true;
+    watch.armed = 0;
+    _loop.defer(done);
+    return;
+  }
+  remove_watch(watch, done);
+}
+
+void backend_t::retry_later(io_watch_t &watch, bool readable, bool writable) noexcept
+{
+  if (watch.closed)
+    return;
+  auto interest = static_cast<std::uint8_t>((readable ? interest_read : 0) | (writable ? interest_write : 0));
+  if (interest == 0)
+    return;
+  if (watch.retry == 0)
+  {
+    watch.retry_next = nullptr;
+    if (_retry_tail)
+      _retry_tail->retry_next = &watch;
+    else
+      _retry_head = &watch;
+    _retry_tail = &watch;
+  }
+  watch.retry |= interest;
+  _loop.defer(_retry);
+}
+
+void backend_t::forget_retry(io_watch_t &watch) noexcept
+{
+  if (watch.retry == 0)
+    return;
+  io_watch_t *previous = nullptr;
+  for (auto *it = _retry_head; it; previous = it, it = it->retry_next)
+  {
+    if (it != &watch)
+      continue;
+    if (previous)
+      previous->retry_next = it->retry_next;
+    else
+      _retry_head = it->retry_next;
+    if (_retry_tail == it)
+      _retry_tail = previous;
+    break;
+  }
+  watch.retry_next = nullptr;
+  watch.retry = 0;
+}
+
+void backend_t::on_retry(posted_t *node)
+{
+  auto &self = *static_cast<backend_t *>(node->owner);
+  while (auto *watch = self._retry_head)
+  {
+    self._retry_head = watch->retry_next;
+    if (!self._retry_head)
+      self._retry_tail = nullptr;
+    watch->retry_next = nullptr;
+    auto interest = std::exchange(watch->retry, std::uint8_t{0});
+    self.dispatch(*watch, (interest & interest_read) != 0, (interest & interest_write) != 0);
+  }
+}
+
 void backend_t::wait(io_watch_t &watch, std::uint8_t interest, io_op_t &op)
 {
+  if (_loop.inherited()) [[unlikely]]
+    _loop.abort_inherited("used to wait on a socket");
   op.interest = interest;
   op.epoch = watch.epoch;
   op.parked = true;
@@ -146,6 +229,7 @@ static void complete_older_than(loop_core_t &loop, io_watch_t &watch, op_list_t 
     if (op->keeps_alive)
       loop.release();
     op->complete(op);
+    loop.refuse_if_inherited();
   }
 }
 
@@ -154,16 +238,38 @@ void backend_t::dispatch(io_watch_t &watch, bool readable, bool writable)
   if (watch.closed)
     return;
   auto epoch = ++watch.epoch;
+  struct interrupted_t
+  {
+    backend_t &backend;
+    io_watch_t &watch;
+    bool readable;
+    bool writable;
+    ~interrupted_t()
+    {
+      if (readable || writable)
+        backend.retry_later(watch, readable, writable);
+    }
+  } pending{*this, watch, readable, writable};
   if (readable)
     complete_older_than(_loop, watch, watch.readers, epoch);
+  pending.readable = false;
   if (writable)
     complete_older_than(_loop, watch, watch.writers, epoch);
+  pending.writable = false;
 }
 
 loop_core_t::loop_core_t(backend_kind kind)
   : _thread_id(std::this_thread::get_id())
   , _fork_epoch(fork_epoch.load(std::memory_order_relaxed))
 {
+#if !defined(_WIN32)
+  static const bool fork_watched = ::pthread_atfork(nullptr, nullptr, &loop_core_t::note_fork_in_child) == 0;
+  if (!fork_watched)
+  {
+    std::fprintf(stderr, "vio: event loop could not register its fork handler\n");
+    std::abort();
+  }
+#endif
   _stop_node.run = &loop_core_t::on_stop;
   _stop_node.owner = this;
   _backend = make_backend(*this, kind, _init_error);
@@ -176,6 +282,8 @@ loop_core_t::loop_core_t(backend_kind kind)
 
 loop_core_t::~loop_core_t()
 {
+  if (inherited())
+    abandon_after_fork();
   if (_resource_count > 0 || _alive > 0)
   {
     std::fprintf(stderr, "vio: ~event_loop_t: %zu resource(s) still open, %zu operation(s) in flight\n", _resource_count, _alive);
@@ -185,12 +293,16 @@ loop_core_t::~loop_core_t()
                          "owning it inside a coroutine that completes, or in a scope that ends, before stop() is the usual fix.\n");
     assert(_resource_count == 0 && _alive == 0);
   }
+  discard_queued();
+  _backend.reset();
+}
+
+void loop_core_t::discard_queued() noexcept
+{
   {
     std::lock_guard lock(_post_mutex);
     set_thread(std::this_thread::get_id());
   }
-  if (_fork_epoch != fork_epoch.load(std::memory_order_relaxed))
-    reclaim_after_fork();
   for (;;)
   {
     posted_t *node;
@@ -208,7 +320,6 @@ loop_core_t::~loop_core_t()
     if (discard)
       discard(node);
   }
-  _backend.reset();
 }
 
 void loop_core_t::note_fork_in_child() noexcept
@@ -216,10 +327,21 @@ void loop_core_t::note_fork_in_child() noexcept
   fork_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
-void loop_core_t::reclaim_after_fork() noexcept
+void loop_core_t::abort_inherited(const char *action) const noexcept
 {
-  _fork_epoch = fork_epoch.load(std::memory_order_relaxed);
-  pool_reclaim_after_fork(*this);
+  std::fprintf(stderr,
+               "vio: an event loop created before fork() was %s in the child; its %s backend belongs to the parent, so a child may only destroy a loop it inherited and must create its own\n",
+               action, backend_name());
+  std::abort();
+}
+
+void loop_core_t::abandon_after_fork() noexcept
+{
+  new (&_post_mutex) std::mutex();
+  new (&_pipe_anchor.anchor()->mutex) std::mutex();
+  pool_abandon_after_fork(*this);
+  discard_queued();
+  _backend->abandon_after_fork();
 }
 
 std::int64_t loop_core_t::now() noexcept
@@ -254,12 +376,11 @@ void loop_core_t::set_thread(std::thread::id id) noexcept
 
 int loop_core_t::run()
 {
+  refuse_if_inherited();
   set_thread(std::this_thread::get_id());
   _running = true;
   for (;;)
   {
-    if (_fork_epoch != fork_epoch.load(std::memory_order_relaxed)) [[unlikely]]
-      reclaim_after_fork();
     run_timers();
     drain_posted();
     drain_deferred();
@@ -366,7 +487,10 @@ void loop_core_t::drain_posted()
   for (; drain.next < _draining.size(); ++drain.next)
   {
     if (auto *node = std::exchange(_draining[drain.next], nullptr))
+    {
       node->run(node);
+      refuse_if_inherited();
+    }
   }
   _draining.clear();
 }
@@ -407,6 +531,7 @@ void loop_core_t::drain_deferred()
     node->next = nullptr;
     node->queued = false;
     node->run(node);
+    refuse_if_inherited();
   }
 }
 
@@ -443,6 +568,7 @@ void loop_core_t::run_timers()
     if (top->keeps_alive)
       release();
     top->fire(top);
+    refuse_if_inherited();
   }
 }
 
@@ -451,10 +577,16 @@ void loop_core_t::run_before_block()
   if (!_stopping)
   {
     for (std::size_t i = 0; i < _listeners.size(); ++i)
+    {
       _listeners[i]->about_to_block();
+      refuse_if_inherited();
+    }
   }
   for (std::size_t i = 0; i < _hooks.size(); ++i)
+  {
     _hooks[i]->run(_hooks[i]);
+    refuse_if_inherited();
+  }
 }
 
 std::int64_t loop_core_t::wait_timeout() noexcept

@@ -54,6 +54,8 @@ struct io_watch_t
   std::uint32_t epoch = 0;
   bool closed = true;
   std::uint8_t armed = 0;
+  std::uint8_t retry = 0;
+  io_watch_t *retry_next = nullptr;
   void *backend_state = nullptr;
 };
 
@@ -84,6 +86,8 @@ struct file_op_t
   std::size_t size = 0;
   std::int64_t result = 0;
   bool in_flight = false;
+  file_op_t *prev = nullptr;
+  file_op_t *next = nullptr;
   alignas(16) unsigned char backend_storage[64] = {};
 };
 
@@ -93,6 +97,8 @@ public:
   explicit backend_t(loop_core_t &loop) noexcept
     : _loop(loop)
   {
+    _retry.owner = this;
+    _retry.run = &backend_t::on_retry;
   }
   backend_t(const backend_t &) = delete;
   backend_t &operator=(const backend_t &) = delete;
@@ -103,6 +109,7 @@ public:
   virtual void remove_watch(io_watch_t &watch, posted_t &done) = 0;
   virtual void wake() noexcept = 0;
   virtual void poll(std::int64_t timeout_ns) = 0;
+  virtual void abandon_after_fork() noexcept;
 
   [[nodiscard]] virtual bool supports_async_files() const noexcept
   {
@@ -111,14 +118,25 @@ public:
   virtual void submit_file(file_op_t &op);
   virtual void cancel_file(file_op_t &op) noexcept;
 
+  [[nodiscard]] int open_watch(io_watch_t &watch);
+  void close_watch(io_watch_t &watch, posted_t &done);
   void wait(io_watch_t &watch, std::uint8_t interest, io_op_t &op);
   void cancel_wait(io_watch_t &watch, io_op_t &op) noexcept;
 
 protected:
   virtual void arm(io_watch_t &watch, std::uint8_t interest);
   void dispatch(io_watch_t &watch, bool readable, bool writable);
+  void retry_later(io_watch_t &watch, bool readable, bool writable) noexcept;
 
   loop_core_t &_loop;
+
+private:
+  static void on_retry(posted_t *node);
+  void forget_retry(io_watch_t &watch) noexcept;
+
+  posted_t _retry;
+  io_watch_t *_retry_head = nullptr;
+  io_watch_t *_retry_tail = nullptr;
 };
 
 VIO_EXPORT std::unique_ptr<backend_t> make_backend(loop_core_t &loop, backend_kind kind, int &error);
