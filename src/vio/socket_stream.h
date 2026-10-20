@@ -357,13 +357,18 @@ struct tls_stream_t
     }
     if (_core != nullptr && _linger.armed())
       _core->remove_timer(_linger);
+    std::int64_t trim_due = 0;
     if (_core != nullptr && _output_trim.armed())
+    {
+      trim_due = _output_trim.deadline;
       _core->remove_timer(_output_trim);
+    }
     if (_pooled)
     {
+      unlink_pooled();
       auto &pool = detail::ssl_output_pool();
-      if (pool.release_trim(this) && pool.period_elapsed(output_trim_ns))
-        pool.trim();
+      if (pool.release_trim(this) && _pooled_core->tls_streams() != nullptr)
+        static_cast<tls_stream_t *>(_pooled_core->tls_streams())->arm_output_trim(trim_due);
       pool.detach();
     }
   }
@@ -378,6 +383,17 @@ struct tls_stream_t
       _pooled = true;
       detail::ssl_output_pool().attach();
     }
+    else if (_pooled_core == _core)
+      return;
+    else
+      unlink_pooled();
+    _pooled_core = _core;
+    auto *head = static_cast<tls_stream_t *>(_core->tls_streams());
+    _pooled_prev = nullptr;
+    _pooled_next = head;
+    if (head != nullptr)
+      head->_pooled_prev = this;
+    _core->tls_streams() = this;
   }
 
   [[nodiscard]] bool has_front_data() const
@@ -1087,11 +1103,21 @@ private:
     complete_inflight();
   }
 
-  void arm_output_trim()
+  void arm_output_trim(std::int64_t due = 0)
   {
     if (_core == nullptr || !detail::ssl_output_pool().claim_trim(this))
       return;
-    _core->add_timer(_output_trim, detail::loop_core_t::deadline_after(output_trim_ns));
+    _core->add_timer(_output_trim, due != 0 ? due : detail::loop_core_t::deadline_after(output_trim_ns));
+  }
+
+  void unlink_pooled() noexcept
+  {
+    if (_pooled_prev != nullptr)
+      _pooled_prev->_pooled_next = _pooled_next;
+    else
+      _pooled_core->tls_streams() = _pooled_next;
+    if (_pooled_next != nullptr)
+      _pooled_next->_pooled_prev = _pooled_prev;
   }
 
   void complete_inflight()
@@ -1354,6 +1380,9 @@ private:
   detail::posted_t _kick;
   detail::timer_node_t _linger;
   detail::timer_node_t _output_trim;
+  detail::loop_core_t *_pooled_core = nullptr;
+  tls_stream_t *_pooled_prev = nullptr;
+  tls_stream_t *_pooled_next = nullptr;
   stream_index_fifo_t _backlog;
   stream_index_fifo_t _inflight;
   stream_index_fifo_t _completed;

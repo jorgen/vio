@@ -346,8 +346,21 @@ void loop_core_t::abort_inherited(const char *action) const noexcept
 
 void loop_core_t::reclaim_after_fork() noexcept
 {
-  new (&_post_mutex) std::mutex();
-  new (&_pipe_anchor.anchor()->mutex) std::mutex();
+  if (_post_mutex.try_lock())
+  {
+    _post_mutex.unlock();
+  }
+  else
+  {
+    new (&_post_mutex) std::mutex();
+    (void)_posted.take_all();
+    new (&_draining) std::vector<posted_t *>();
+  }
+  auto &anchor = _pipe_anchor.anchor()->mutex;
+  if (anchor.try_lock())
+    anchor.unlock();
+  else
+    new (&anchor) std::mutex();
   set_thread(std::this_thread::get_id());
 }
 
@@ -438,6 +451,8 @@ int loop_core_t::run()
 
 void loop_core_t::stop()
 {
+  if (inherited()) [[unlikely]]
+    return;
   post(_stop_node);
 }
 

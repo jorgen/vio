@@ -68,6 +68,20 @@ Copyright (c) 2025 Jørgen Lind
 #endif
 #endif
 
+#if defined(__SANITIZE_ADDRESS__)
+#define VIO_LOOP_TEST_UNDER_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define VIO_LOOP_TEST_UNDER_ASAN 1
+#endif
+#endif
+
+#if defined(VIO_LOOP_TEST_UNDER_ASAN)
+constexpr bool allocator_survives_fork_while_others_allocate = false;
+#else
+constexpr bool allocator_survives_fork_while_others_allocate = true;
+#endif
+
 using namespace std::chrono_literals;
 
 namespace
@@ -2429,4 +2443,96 @@ TEST_CASE("destroying an operation the loop or the kernel still holds aborts wit
     CHECK(aborted_with_message(death));
   }
 }
+
+TEST_CASE("a child destroys an inherited thread_with_event_loop_t without stopping or joining the parent's loop thread")
+{
+  auto owner = std::make_unique<vio::thread_with_event_loop_t>();
+  auto &loop = owner->event_loop();
+
+  SUBCASE("while other threads post to it")
+  {
+    if (!allocator_survives_fork_while_others_allocate)
+      return;
+    std::atomic<bool> done{false};
+    std::vector<std::thread> posters;
+    for (int i = 0; i < 3; ++i)
+      posters.emplace_back([&done, &loop] {
+        while (!done.load(std::memory_order_relaxed))
+          loop.run_in_loop([] {});
+      });
+    int quiet = 0;
+    constexpr int forks = 60;
+    for (int i = 0; i < forks; ++i)
+    {
+      auto child = run_in_child(
+        [&] {
+          owner.reset();
+          ::_exit(0);
+        },
+        2s);
+      if (!exited_quietly(child))
+        break;
+      ++quiet;
+    }
+    done = true;
+    for (auto &poster : posters)
+      poster.join();
+    CHECK(quiet == forks);
+  }
+  SUBCASE("after the child started a loop thread of its own")
+  {
+    auto child = run_in_child(
+      [&] {
+        auto own = std::make_unique<vio::thread_with_event_loop_t>();
+        owner.reset();
+        own.reset();
+        ::_exit(0);
+      },
+      2s);
+    CHECK(exited_quietly(child));
+  }
+  owner.reset();
+}
+
+
+TEST_CASE("a child that stops an inherited loop and runs it is refused by the fork rule even when another thread held the post lock at the fork")
+{
+  std::optional<vio::event_loop_t> loop;
+  loop.emplace();
+  auto &core = vio::detail::core(*loop);
+  std::vector<vio::detail::posted_t> nodes(3);
+  for (auto &node : nodes)
+    node.run = [](vio::detail::posted_t *) {};
+  std::atomic<bool> done{false};
+  std::thread runner([&] { loop->run(); });
+  std::vector<std::thread> posters;
+  for (auto &node : nodes)
+    posters.emplace_back([&done, &core, &node] {
+      while (!done.load(std::memory_order_relaxed))
+        core.post(node);
+    });
+  int refused = 0;
+  constexpr int forks = 60;
+  for (int i = 0; i < forks; ++i)
+  {
+    auto child = run_in_child(
+      [&] {
+        loop->stop();
+        loop->run();
+        ::_exit(5);
+      },
+      2s);
+    if (!aborted_by_fork_rule(child, "run"))
+      break;
+    ++refused;
+  }
+  done = true;
+  for (auto &poster : posters)
+    poster.join();
+  loop->stop();
+  runner.join();
+  CHECK(refused == forks);
+  CHECK(core.in_flight() == 0);
+}
+
 #endif

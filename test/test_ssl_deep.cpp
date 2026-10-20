@@ -1596,8 +1596,6 @@ TEST_CASE("the output pool frees only buffers untouched for a whole period, neve
   }
   pool.trim();
   REQUIRE(pool.size() == 3 * kept);
-  CHECK_FALSE(pool.period_elapsed(vio::tls_stream_t::output_trim_ns));
-  CHECK(pool.period_elapsed(0));
 
   std::vector<std::vector<std::byte>> lent;
   for (std::size_t i = 0; i < 3 * kept; ++i)
@@ -1667,7 +1665,6 @@ TEST_CASE("the output pool frees only buffers untouched for a whole period, neve
   CHECK(pool.size() == 2 * kept + 1);
   pool.detach();
   CHECK(pool.size() == kept);
-  CHECK_FALSE(pool.period_elapsed(vio::tls_stream_t::output_trim_ns));
 }
 
 TEST_CASE("an idle TLS connection holds no output buffer and the pool returns to its floor once writes stop")
@@ -1727,7 +1724,7 @@ TEST_CASE("an idle TLS connection holds no output buffer and the pool returns to
   CHECK_FALSE(claimed_when_idle);
 }
 
-TEST_CASE("closing the connection that holds the output trim a period after the last trim frees what went untouched while another stays open")
+TEST_CASE("closing the connection that holds the output trim hands it to one that stays open, which frees what went untouched")
 {
   constexpr auto kept = vio::detail::ssl_output_pool_t::spare_floor;
   auto config = make_pair_config();
@@ -1765,8 +1762,6 @@ TEST_CASE("closing the connection that holds the output trim a period after the 
         REQUIRE_EXPECTED(echoed);
       };
 
-      auto period = vio::sleep(el, std::chrono::nanoseconds(vio::tls_stream_t::output_trim_ns + 100'000'000));
-      co_await period;
       vio::ssl_client_t second_client{vio::ref_ptr_t<vio::ssl_client_state_t>::null()};
       {
         vio::ssl_client_t first_client{vio::ref_ptr_t<vio::ssl_client_state_t>::null()};
@@ -1777,9 +1772,9 @@ TEST_CASE("closing the connection that holds the output trim a period after the 
         REQUIRE_EXPECTED(closed);
       }
       co_await std::move(first_server);
-      for (int i = 0; i < 20; ++i)
+      for (int i = 0; i < 60 && vio::detail::ssl_output_pool().size() > kept; ++i)
       {
-        auto tick = vio::sleep(el, std::chrono::milliseconds(5));
+        auto tick = vio::sleep(el, std::chrono::milliseconds(50));
         co_await tick;
       }
       pooled_after_first = vio::detail::ssl_output_pool().size();

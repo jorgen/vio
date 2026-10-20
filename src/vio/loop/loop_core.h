@@ -192,6 +192,11 @@ public:
     return _pipe_anchor.anchor();
   }
 
+  [[nodiscard]] void *&tls_streams() noexcept
+  {
+    return _tls_streams;
+  }
+
   [[nodiscard]] bool inherited() const noexcept
   {
     return _fork_epoch != fork_epoch.load(std::memory_order_relaxed);
@@ -244,6 +249,7 @@ private:
   posted_t _stop_node;
   std::atomic<std::thread::id> _thread_id;
   unsigned _fork_epoch = 0;
+  void *_tls_streams = nullptr;
   bool _stopping = false;
   bool _running = false;
   pipe_anchor_owner_t _pipe_anchor{this, _fork_epoch};

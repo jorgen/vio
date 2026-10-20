@@ -175,6 +175,11 @@ public:
   {
     if (_thread && _thread->joinable())
     {
+      if (detail::core(_event_loop).inherited()) [[unlikely]]
+      {
+        std::construct_at(_thread.get());
+        return;
+      }
       _event_loop.stop();
       _thread->join();
     }
