@@ -208,6 +208,8 @@ private:
   static void note_fork_in_child() noexcept;
 
   void abandon_after_fork() noexcept;
+  void discard_draining() noexcept;
+  void abandon_closes() noexcept;
   void discard_queued() noexcept;
   void run_timers();
   void drain_posted();

@@ -175,6 +175,15 @@ void backend_t::forget_retry(io_watch_t &watch) noexcept
 void backend_t::on_retry(posted_t *node)
 {
   auto &self = *static_cast<backend_t *>(node->owner);
+  struct interrupted_t
+  {
+    backend_t &self;
+    ~interrupted_t()
+    {
+      if (self._retry_head)
+        self._loop.defer(self._retry);
+    }
+  } pending{self};
   while (auto *watch = self._retry_head)
   {
     self._retry_head = watch->retry_next;
@@ -339,9 +348,45 @@ void loop_core_t::abandon_after_fork() noexcept
 {
   new (&_post_mutex) std::mutex();
   new (&_pipe_anchor.anchor()->mutex) std::mutex();
+  set_thread(std::this_thread::get_id());
   pool_abandon_after_fork(*this);
+  discard_draining();
   discard_queued();
+  abandon_closes();
   _backend->abandon_after_fork();
+}
+
+void loop_core_t::discard_draining() noexcept
+{
+  for (std::size_t i = 0; i < _draining.size(); ++i)
+  {
+    auto *node = std::exchange(_draining[i], nullptr);
+    if (node && !node->queued && node->discard)
+      node->discard(node);
+  }
+  _draining.clear();
+  while (auto *node = _deferred_draining)
+  {
+    _deferred_draining = node->next;
+    node->next = nullptr;
+    node->queued = false;
+    if (node->discard)
+      node->discard(node);
+  }
+}
+
+void loop_core_t::abandon_closes() noexcept
+{
+  for (auto *it = _resources; it;)
+  {
+    auto *next = it->_next;
+    if (it->_closing)
+    {
+      untrack(*it);
+      release();
+    }
+    it = next;
+  }
 }
 
 std::int64_t loop_core_t::now() noexcept

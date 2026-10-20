@@ -39,15 +39,22 @@ Copyright (c) 2025 Jørgen Lind
 #include <vio/loop/blocking_pool.h>
 #include <vio/loop/socket.h>
 #include <vio/operation/sleep.h>
+#include <vio/operation/tcp.h>
+#include <vio/operation/tcp_server.h>
 #include <vio/operation/timer.h>
+#include <vio/operation/tls_client.h>
+#include <vio/operation/tls_server.h>
 #include <vio/ref_counted_wrapper.h>
 #include <vio/task.h>
+
+#include "tls_test_helpers.h"
 
 #if !defined(_WIN32)
 #include <cerrno>
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1668,6 +1675,382 @@ TEST_CASE("a child that closes an inherited loop's socket leaves the parent's re
   CHECK_FALSE(reader.parked);
   ::close(ends[1]);
   CHECK(core.open_resources() == 0);
+}
+
+TEST_CASE("a socket of a loop inherited across fork() is not open in the child, so a handle dropped there neither sends nor reads")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  int ends[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) == 0);
+  REQUIRE(vio::detail::socket_set_nonblocking(ends[0]) == 0);
+  REQUIRE(vio::detail::socket_set_nonblocking(ends[1]) == 0);
+  vio::detail::socket_resource_t shared(core);
+  REQUIRE(shared.adopt(ends[0]) == 0);
+  REQUIRE(shared.is_open());
+
+  auto child = run_in_child([&] { ::_exit(shared.is_open() ? 1 : 0); });
+  CHECK(exited_quietly(child));
+  CHECK(shared.is_open());
+
+  shared.close(nullptr, nullptr);
+  ::close(ends[1]);
+  loop.stop();
+  loop.run();
+  CHECK(core.open_resources() == 0);
+}
+
+namespace
+{
+struct forked_tcp_drop_t
+{
+  bool ready = false;
+  std::size_t queued = 0;
+  death_t child;
+  int owed_bytes = -1;
+  std::string client_read;
+};
+
+vio::task_t<void> drop_tcp_in_child(vio::event_loop_t &loop, forked_tcp_drop_t &result)
+{
+  auto listener = vio_test::get_ephemeral_port(loop);
+  if (!listener)
+  {
+    loop.stop();
+    co_return;
+  }
+  const int port = listener->second;
+  std::optional<vio::tcp_t> peer;
+  auto server_task = [](vio::tcp_server_t server, std::optional<vio::tcp_t> &out) -> vio::task_t<void> {
+    auto listening = co_await vio::tcp_listen(server, 10);
+    if (!listening)
+      co_return;
+    auto accepted = vio::tcp_accept(server);
+    if (accepted)
+      out.emplace(std::move(accepted.value()));
+  }(std::move(listener->first), peer);
+  std::optional<vio::tcp_t> client;
+  client.emplace(std::move(vio::tcp_create(loop).value()));
+  auto target = vio::ip4_addr("127.0.0.1", port);
+  auto connected = co_await vio::tcp_connect(*client, reinterpret_cast<const sockaddr *>(&target.value()));
+  co_await std::move(server_task);
+  if (!connected || !peer)
+  {
+    loop.stop();
+    co_return;
+  }
+  const std::string owed = "data-for-the-parent";
+  auto pushed = co_await vio::write_tcp(*peer, reinterpret_cast<const std::uint8_t *>(owed.data()), owed.size());
+  if (!pushed)
+  {
+    loop.stop();
+    co_return;
+  }
+  std::this_thread::sleep_for(50ms);
+  {
+    auto dropped = vio::write_tcp(*client, std::vector<std::byte>(std::size_t{32} << 20));
+  }
+  result.queued = client->handle->write.count;
+  result.ready = true;
+
+  result.child = run_in_child([&] { client.reset(); });
+
+  int pending = 0;
+  if (::ioctl(client->handle->socket.native(), FIONREAD, &pending) == 0)
+    result.owed_bytes = pending;
+  if (result.owed_bytes > 0)
+  {
+    auto reader = vio::tcp_create_reader(*client);
+    auto got = co_await reader.value();
+    if (got)
+      result.client_read.assign(got->chars(), got->size());
+  }
+  peer.reset();
+  loop.stop();
+}
+
+struct forked_tls_drop_t
+{
+  bool ready = false;
+  death_t child;
+  int owed_bytes = -1;
+  std::string server_read;
+  std::string client_read;
+};
+
+vio::task_t<void> drop_tls_in_child(vio::event_loop_t &loop, vio::ssl_config_t server_config, vio::ssl_config_t client_config, forked_tls_drop_t &result)
+{
+  auto listener = vio_test::get_ephemeral_port(loop);
+  if (!listener)
+  {
+    loop.stop();
+    co_return;
+  }
+  const int port = listener->second;
+  auto server = vio::ssl_server_create(loop, std::move(listener->first), "localhost", server_config);
+  if (!server)
+  {
+    loop.stop();
+    co_return;
+  }
+  std::optional<vio::ssl_server_client_t> accepted;
+  auto server_task = [](vio::ssl_server_t &server, int port, std::optional<vio::ssl_server_client_t> &out) -> vio::task_t<void> {
+    auto listening = co_await vio::ssl_server_listen(server, port);
+    if (!listening)
+      co_return;
+    auto client = vio::ssl_server_accept(server);
+    if (client)
+      out.emplace(std::move(client.value()));
+  }(*server, port, accepted);
+  std::optional<vio::ssl_client_t> client;
+  client.emplace(std::move(vio::ssl_client_create(loop, client_config).value()));
+  auto connected = co_await vio::ssl_client_connect(*client, "localhost", port, "127.0.0.1");
+  co_await std::move(server_task);
+  if (!connected || !accepted)
+  {
+    loop.stop();
+    co_return;
+  }
+  auto peer = std::move(*accepted);
+  accepted.reset();
+  auto server_reader = vio::ssl_server_client_create_reader(peer);
+  const std::string hello = "hello";
+  auto hello_written = co_await vio::ssl_client_write(*client, hello.data(), hello.size());
+  auto hello_read = co_await server_reader.value();
+  const std::string owed = "data-for-the-parent";
+  auto owed_written = co_await vio::ssl_server_client_write(peer, owed.data(), owed.size());
+  if (!hello_written || !hello_read || !owed_written)
+  {
+    loop.stop();
+    co_return;
+  }
+  std::this_thread::sleep_for(50ms);
+  result.ready = true;
+
+  result.child = run_in_child([&] { client.reset(); });
+
+  int pending = 0;
+  if (::ioctl(client->state->socket_stream.socket->native(), FIONREAD, &pending) == 0)
+    result.owed_bytes = pending;
+  const std::string ping = "ping";
+  auto pinged = co_await vio::ssl_client_write(*client, ping.data(), ping.size());
+  auto got = co_await server_reader.value();
+  if (pinged && got)
+    result.server_read.assign(got->chars(), got->size());
+  if (result.owed_bytes > 0)
+  {
+    auto client_reader = vio::ssl_client_create_reader(*client);
+    auto from_server = co_await client_reader.value();
+    if (from_server)
+      result.client_read.assign(from_server->chars(), from_server->size());
+  }
+  loop.stop();
+}
+} // namespace
+
+TEST_CASE("a TCP connection with writes queued, dropped in a child forked from its loop, leaves the parent's connection and its bytes alone")
+{
+  forked_tcp_drop_t result;
+  {
+    vio::event_loop_t loop;
+    std::optional<vio::task_t<void>> task;
+    loop.run_in_loop([&] { task.emplace(drop_tcp_in_child(loop, result)); });
+    loop.run();
+  }
+  REQUIRE(result.ready);
+  CHECK(result.queued > 0);
+  CHECK(exited_quietly(result.child));
+  CHECK(result.child.message == "");
+  CHECK(result.owed_bytes == 19);
+  CHECK(result.client_read == "data-for-the-parent");
+}
+
+TEST_CASE("a TLS client dropped in a child forked from its loop sends nothing on the parent's connection and reads nothing from it")
+{
+  auto certs = vio_test::make_cert_set("localhost");
+  const vio::ssl_config_t server_config{.ca_mem = certs.ca_cert, .cert_mem = certs.cert, .key_mem = certs.key};
+  const vio::ssl_config_t client_config{.ca_mem = certs.ca_cert};
+  forked_tls_drop_t result;
+  {
+    vio::event_loop_t loop;
+    std::optional<vio::task_t<void>> task;
+    loop.run_in_loop([&] { task.emplace(drop_tls_in_child(loop, server_config, client_config, result)); });
+    loop.run();
+  }
+  REQUIRE(result.ready);
+  CHECK(exited_quietly(result.child));
+  CHECK(result.child.message == "");
+  CHECK(result.owed_bytes > 0);
+  CHECK(result.server_read == "ping");
+  CHECK(result.client_read == "data-for-the-parent");
+}
+
+TEST_CASE("a child that closes an inherited loop's handles and then destroys the loop exits quietly")
+{
+  SUBCASE("a socket closed in the child")
+  {
+    std::optional<vio::event_loop_t> loop;
+    loop.emplace();
+    auto &core = vio::detail::core(*loop);
+    int ends[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) == 0);
+    REQUIRE(vio::detail::socket_set_nonblocking(ends[0]) == 0);
+    vio::detail::socket_resource_t shared(core);
+    REQUIRE(shared.adopt(ends[0]) == 0);
+    auto child = run_in_child([&] {
+      shared.close(nullptr, nullptr);
+      loop.reset();
+    });
+    CHECK(exited_quietly(child));
+    CHECK(child.message == "");
+    shared.close(nullptr, nullptr);
+    ::close(ends[1]);
+    loop->stop();
+    loop->run();
+    CHECK(core.open_resources() == 0);
+    CHECK(core.in_flight() == 0);
+  }
+  SUBCASE("timer and TCP handles dropped in the child")
+  {
+    std::optional<vio::event_loop_t> loop;
+    loop.emplace();
+    auto &core = vio::detail::core(*loop);
+    std::optional<vio::timer_t> timer;
+    timer.emplace(make_timer(*loop));
+    REQUIRE(vio::timer_rearm(*timer, 60s).has_value());
+    std::optional<vio::tcp_t> tcp;
+    tcp.emplace(std::move(vio::tcp_create(*loop).value()));
+    auto child = run_in_child([&] {
+      timer.reset();
+      tcp.reset();
+      loop.reset();
+    });
+    CHECK(exited_quietly(child));
+    CHECK(child.message == "");
+    timer.reset();
+    tcp.reset();
+    loop->stop();
+    loop->run();
+    CHECK(core.open_resources() == 0);
+    CHECK(core.in_flight() == 0);
+  }
+  SUBCASE("a close the parent started before the fork")
+  {
+    std::optional<vio::event_loop_t> loop;
+    loop.emplace();
+    auto &core = vio::detail::core(*loop);
+    int ends[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, ends) == 0);
+    REQUIRE(vio::detail::socket_set_nonblocking(ends[0]) == 0);
+    vio::detail::socket_resource_t shared(core);
+    REQUIRE(shared.adopt(ends[0]) == 0);
+    bool closed = false;
+    shared.close([](void *raw) { *static_cast<bool *>(raw) = true; }, &closed);
+    REQUIRE(core.open_resources() == 1);
+    auto child = run_in_child([&] { loop.reset(); });
+    CHECK(exited_quietly(child));
+    CHECK(child.message == "");
+    ::close(ends[1]);
+    loop->stop();
+    loop->run();
+    CHECK(closed);
+    CHECK(core.open_resources() == 0);
+    CHECK(core.in_flight() == 0);
+  }
+}
+
+namespace
+{
+struct mid_drain_fork_t
+{
+  std::optional<vio::event_loop_t> loop;
+  std::atomic<int> phase{0};
+  std::atomic<bool> gate{false};
+  death_t child;
+  vio::detail::posted_t holder;
+
+  mid_drain_fork_t()
+  {
+    loop.emplace();
+    holder.owner = this;
+    holder.run = [](vio::detail::posted_t *node) {
+      auto &self = *static_cast<mid_drain_fork_t *>(node->owner);
+      self.phase = 1;
+      while (self.phase.load() != 2)
+        std::this_thread::sleep_for(1ms);
+      self.gate = true;
+    };
+  }
+
+  std::thread forker()
+  {
+    return std::thread([this] {
+      while (phase.load() != 1)
+        std::this_thread::sleep_for(1ms);
+      child = run_in_child([this] { loop.reset(); });
+      phase = 2;
+    });
+  }
+};
+} // namespace
+
+TEST_CASE("a child that destroys a loop it inherited in the middle of a drain abandons the work the drain had not reached")
+{
+  SUBCASE("posted work")
+  {
+    mid_drain_fork_t fork;
+    auto &core = vio::detail::core(*fork.loop);
+    pool_probe_t probe;
+    core.post(fork.holder);
+    vio::detail::pool_submit(core, probe.job, vio::detail::pool_queue::file);
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (probe.job.state.load(std::memory_order_acquire) != vio::detail::pool_job_finished && std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(1ms);
+    REQUIRE(probe.job.state.load(std::memory_order_acquire) == vio::detail::pool_job_finished);
+    std::this_thread::sleep_for(20ms);
+    REQUIRE(core.in_flight() == 1);
+    auto forker = fork.forker();
+    fork.loop->run();
+    forker.join();
+    CHECK(exited_quietly(fork.child));
+    CHECK(fork.child.message == "");
+    CHECK(probe.finished);
+    CHECK_FALSE(probe.canceled);
+    CHECK(core.in_flight() == 0);
+  }
+  SUBCASE("deferred work")
+  {
+    settle_file_pool();
+    mid_drain_fork_t fork;
+    auto &core = vio::detail::core(*fork.loop);
+    pool_probe_t probe;
+    std::atomic<int> started{0};
+    std::vector<std::unique_ptr<gated_job_t>> blockers;
+    const int count = file_pool_threads();
+    for (int i = 0; i < count; ++i)
+    {
+      blockers.push_back(std::make_unique<gated_job_t>(fork.gate, started));
+      vio::detail::pool_submit(core, blockers.back()->job, vio::detail::pool_queue::file);
+    }
+    wait_for_started(started, count);
+    REQUIRE(started.load() == count);
+    bool cancelled = false;
+    fork.loop->run_in_loop([&] {
+      core.defer(fork.holder);
+      vio::detail::pool_submit(core, probe.job, vio::detail::pool_queue::file);
+      cancelled = vio::detail::pool_cancel(probe.job);
+    });
+    auto forker = fork.forker();
+    fork.loop->stop();
+    fork.loop->run();
+    forker.join();
+    CHECK(cancelled);
+    CHECK(exited_quietly(fork.child));
+    CHECK(fork.child.message == "");
+    CHECK(probe.finished);
+    CHECK(probe.canceled);
+    CHECK(core.in_flight() == 0);
+  }
 }
 
 TEST_CASE("destroying an inherited loop in the child is not stalled by a lock another thread held at the fork")

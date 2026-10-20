@@ -84,7 +84,7 @@ public:
 
   [[nodiscard]] bool is_open() const noexcept
   {
-    return watch.socket != invalid_native_socket && !closing();
+    return watch.socket != invalid_native_socket && !closing() && !loop().inherited();
   }
 
   void wait(std::uint8_t interest, io_op_t &op)

@@ -1121,6 +1121,88 @@ TEST_CASE("backend: a completion that throws leaves the other operations parked 
   CHECK(core.open_resources() == 0);
 }
 
+TEST_CASE("backend: a retried completion that closes its own socket and throws leaves the rest of the retries for the next run")
+{
+  vio::event_loop_t loop;
+  auto &core = detail::core(loop);
+  harness_t harness(loop);
+  MESSAGE("backend: " << std::string(loop.backend_name()));
+  auto first_pair = make_tcp_pair();
+  auto second_pair = make_tcp_pair();
+  auto third_pair = make_tcp_pair();
+  test_socket_t first_server(harness);
+  test_socket_t first_client(harness);
+  test_socket_t second_server(harness);
+  test_socket_t second_client(harness);
+  test_socket_t third_server(harness);
+  test_socket_t third_client(harness);
+  REQUIRE(first_server.resource.adopt(first_pair.server) == 0);
+  REQUIRE(first_client.resource.adopt(first_pair.client) == 0);
+  REQUIRE(second_server.resource.adopt(second_pair.server) == 0);
+  REQUIRE(second_client.resource.adopt(second_pair.client) == 0);
+  REQUIRE(third_server.resource.adopt(third_pair.server) == 0);
+  REQUIRE(third_client.resource.adopt(third_pair.client) == 0);
+
+  alarm_t bail(harness);
+  bool timed_out = false;
+  int thrown = 0;
+  probe_op_t first;
+  probe_op_t second;
+  probe_op_t third;
+  first.on_complete = [&](probe_op_t &op) {
+    if (op.completions != 1)
+      return;
+    ++thrown;
+    throw thrown_once_t{};
+  };
+  second.on_complete = [&](probe_op_t &op) {
+    if (op.completions != 1)
+      return;
+    second_server.close();
+    ++thrown;
+    throw thrown_once_t{};
+  };
+  third.on_complete = [&](probe_op_t &) { core.remove_timer(bail.node); };
+  bail.arm(5s, [&] {
+    timed_out = true;
+    for (auto *socket : {&first_server, &first_client, &second_server, &second_client, &third_server, &third_client})
+      socket->release();
+    loop.stop();
+  });
+  loop.run_in_loop([&] {
+    REQUIRE(would_block_reading(first_server.native()));
+    REQUIRE(would_block_reading(second_server.native()));
+    REQUIRE(would_block_reading(third_server.native()));
+    first_server.resource.wait(detail::interest_read, first);
+    second_server.resource.wait(detail::interest_read, second);
+    third_server.resource.wait(detail::interest_read, third);
+    loop.run_in_loop([&] {
+      CHECK(detail::socket_send(first_client.native(), bytes("a")) == 1);
+      CHECK(detail::socket_send(second_client.native(), bytes("b")) == 1);
+      CHECK(detail::socket_send(third_client.native(), bytes("c")) == 1);
+    });
+  });
+  CHECK_THROWS_AS(loop.run(), thrown_once_t);
+  CHECK_THROWS_AS(loop.run(), thrown_once_t);
+  CHECK(thrown == 2);
+  loop.stop();
+  CHECK(harness.run());
+  CHECK_FALSE(timed_out);
+  CHECK(first.completions == 1);
+  CHECK(second.completions == 1);
+  CHECK(third.completions == 1);
+  CHECK_FALSE(third.parked);
+  core.remove_timer(bail.node);
+  first_server.close();
+  first_client.close();
+  second_client.close();
+  third_server.close();
+  third_client.close();
+  CHECK(harness.run());
+  CHECK(core.in_flight() == 0);
+  CHECK(core.open_resources() == 0);
+}
+
 #if !defined(_WIN32)
 namespace
 {
