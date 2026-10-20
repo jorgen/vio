@@ -544,9 +544,10 @@ before the application could accept any of it.
 What has actually been run against the QUIC stack, so the next person knows what
 a green build does and does not cover.
 
-**On the native event loop.** CI run 93 (commit `4abd446`) is green on all ten jobs: Linux
-debug, ASan, TSan and UBSan, each on epoll and on io_uring; macOS debug and ASan on kqueue;
-Windows debug and ASan on IOCP; and the wasm smoke test under Node. `DECISIONS.md` keeps that
+**On the native event loop.** CI run 106 (commit `a087e08`) is green on every job: Linux debug,
+ASan, TSan and UBSan, each on epoll and on io_uring, and a shared build; macOS debug and ASan on
+kqueue; Windows debug and ASan on IOCP; the wasm smoke test under Node; and an installed-package
+build. `DECISIONS.md` keeps that
 status current. Interop with picoquic has **not** been rerun since the move off libuv, although
 `src/quic_endpoint.cpp` and `operation/quic_endpoint.h` were rewritten for the native loop; treat
 the interop results below as history until it is.

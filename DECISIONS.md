@@ -170,8 +170,9 @@ Limits. A read through a reader created before the fork still takes bytes alread
 shared socket, and UDP sends, including QUIC's, still reach it, so use an inherited handle in the
 child only to drop it. A lock another thread held at the fork is replaced, not unlocked. And POSIX
 lets a child of a multithreaded process call only async-signal-safe functions, which destroying a
-loop is not; glibc makes it work in practice, and under ASan the child can block in the
-sanitizer's own allocator, so the test that forks while other threads post skips ASan.
+loop is not. glibc and macOS make it work in practice (the test that forks while other threads post
+passes on both), but under ASan the child can block in the sanitizer's own allocator, so that test
+skips ASan.
 
 **D52. A callback that throws leaves the loop able to carry on, with nothing lost.** The exception
 leaves `run()`; calling `run()` again continues. Work queued behind the callback stays queued. The
@@ -370,13 +371,12 @@ filler writes until one is pending.
 
 ## Status
 
-CI run 93 (commit `4abd446`) is green on all ten jobs: Linux debug, ASan, TSan and UBSan, each
-on epoll and on io_uring; macOS debug and ASan on kqueue; Windows debug and ASan on IOCP; and a
-wasm build whose smoke test runs under Node. Locally,
-every test case passes on both Linux backends except seven that need outside network or IPv6
-loopback, which this container lacks, and which pass in CI. That suite now includes the sixteen
-backend tests of `test/test_backend.cpp`, which sat in the tree without being built and so were
-not part of run 93: kqueue and IOCP have not run them yet.
+CI run 106 (commit `a087e08`) is green on every job: Linux debug, ASan, TSan and UBSan, each on
+epoll and on io_uring, and a shared-library build; macOS debug and ASan on kqueue; Windows debug and
+ASan on IOCP; a wasm build whose smoke test runs under Node; and a build of an installed vio from
+outside the tree. Locally every test case passes on both Linux backends, in debug, ASan and TSan,
+except seven that need outside network or IPv6 loopback, which this container lacks, and which pass
+in CI.
 
 | backend | sockets | files | state |
 |---------|---------|-------|-------|
