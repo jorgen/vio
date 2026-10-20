@@ -154,7 +154,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./${{ matrix.tests || 'build/test/vio_tests' }} 2>&1 | tee test-epoll.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-epoll.log | head -400; exit 1; }
+          ./${{ matrix.tests || 'build/test/vio_tests' }} 2>&1 | tee test-epoll.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-epoll.log | head -400; exit 1; }
 
       - name: Test on io_uring
         env:
@@ -162,7 +162,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./${{ matrix.tests || 'build/test/vio_tests' }} 2>&1 | tee test-io_uring.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-io_uring.log | head -400; exit 1; }
+          ./${{ matrix.tests || 'build/test/vio_tests' }} 2>&1 | tee test-io_uring.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-io_uring.log | head -400; exit 1; }
 
   install:
     needs: docker
@@ -318,7 +318,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./build/test/vio_tests 2>&1 | tee test.log || { grep -n -A12 -E "ERROR|FATAL|CRASHED|AddressSanitizer" test.log | head -400; exit 1; }
+          ./build/test/vio_tests 2>&1 | tee test.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|AddressSanitizer" test.log | head -400; exit 1; }
 
   windows-msvc:
     runs-on: windows-2025
