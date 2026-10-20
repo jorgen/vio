@@ -157,22 +157,21 @@ parent, so a child may only destroy a loop it inherited and must create its own
 
 A child may drop the handles of an inherited loop and then destroy the loop, in that order, without
 a report. An inherited socket reports `is_open()` false, so dropping its handle sends and reads
-nothing: no `close_notify`, no linger, no resend. Destroying the loop abandons everything in it
-(pool jobs, ring file operations, closes, timers, parked operations) and leaves the parent's
-registrations alone; the parent still finishes all of it. A destroyed `thread_with_event_loop_t`
-does not stop or join the parent's thread, which does not exist in the child. A loop created in the
-child works normally, with the blocking pool restarted. A `pthread_atfork` handler counts forks.
+nothing: no `close_notify`, no linger, no resend. Destroying the loop forgets everything in it
+(queued work, closes, parked operations, pool jobs, ring file operations) without visiting it and
+leaves the parent's registrations alone; the parent still finishes all of it. Forgetting rather than
+freeing is the point: the parent's loop thread changes those lists without a lock, so a fork can
+catch one half rewritten, and walking it in the child spun forever on a cycle in CI. The child leaks
+what they held. A destroyed `thread_with_event_loop_t` does not stop or join the parent's thread,
+which does not exist in the child. A loop created in the child works normally, with the blocking
+pool restarted. A `pthread_atfork` handler counts forks.
 
-Two limits. A read through a reader created before the fork still takes bytes already waiting on
-the shared socket, and UDP sends, including QUIC's, still reach it, so use an inherited handle in
-the child only to drop it. And a fork can land while the loop thread is moving work between its
-queues; the child then repairs a lock it finds held, forgets what that lock guarded without
-freeing it, and leaks it. Taking every loop's lock in a `pthread_atfork` prepare handler would
-close that, and is not done. Destroying the loop frees memory in the child, which glibc allows
-because it keeps `malloc` consistent across `fork()`, but POSIX does not promise: on macOS a child
-that destroyed an inherited `thread_with_event_loop_t` while other threads were posting to it died
-of `SIGBUS` in CI, and under ASan the child can block in the sanitizer's allocator. Neither was
-investigated further; the stress test runs on Linux without ASan only.
+Limits. A read through a reader created before the fork still takes bytes already waiting on the
+shared socket, and UDP sends, including QUIC's, still reach it, so use an inherited handle in the
+child only to drop it. A lock another thread held at the fork is replaced, not unlocked. And POSIX
+lets a child of a multithreaded process call only async-signal-safe functions, which destroying a
+loop is not; glibc makes it work in practice, and under ASan the child can block in the
+sanitizer's own allocator, so the test that forks while other threads post skips ASan.
 
 **D52. A callback that throws leaves the loop able to carry on, with nothing lost.** The exception
 leaves `run()`; calling `run()` again continues. Work queued behind the callback stays queued. The

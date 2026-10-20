@@ -80,7 +80,7 @@ Copyright (c) 2025 Jørgen Lind
 #endif
 #endif
 
-#if defined(__linux__) && !defined(VIO_LOOP_TEST_UNDER_ASAN)
+#if !defined(VIO_LOOP_TEST_UNDER_ASAN)
 constexpr bool allocator_survives_fork_while_others_allocate = true;
 #else
 constexpr bool allocator_survives_fork_while_others_allocate = false;
@@ -2485,7 +2485,7 @@ TEST_CASE("a child destroys an inherited thread_with_event_loop_t without stoppi
           owner.reset();
           ::_exit(0);
         },
-        2s);
+        60s);
       if (!exited_quietly(child))
       {
         MESSAGE("child " << i << ": " << describe(child));

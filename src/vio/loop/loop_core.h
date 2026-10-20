@@ -217,8 +217,6 @@ private:
 
   void reclaim_after_fork() noexcept;
   void abandon_after_fork() noexcept;
-  void discard_draining() noexcept;
-  void abandon_resources() noexcept;
   void discard_queued() noexcept;
   void run_timers();
   void drain_posted();

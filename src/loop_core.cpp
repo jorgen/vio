@@ -368,35 +368,13 @@ void loop_core_t::abandon_after_fork() noexcept
 {
   reclaim_after_fork();
   pool_abandon_after_fork(*this);
-  discard_draining();
-  discard_queued();
+  (void)_posted.take_all();
+  (void)_deferred.take_all();
+  _deferred_draining = nullptr;
+  new (&_draining) std::vector<posted_t *>();
   _backend->abandon_after_fork();
-  abandon_resources();
-}
-
-void loop_core_t::discard_draining() noexcept
-{
-  for (std::size_t i = 0; i < _draining.size(); ++i)
-  {
-    auto *node = std::exchange(_draining[i], nullptr);
-    if (node && !node->queued && node->discard)
-      node->discard(node);
-  }
-  _draining.clear();
-  while (auto *node = _deferred_draining)
-  {
-    _deferred_draining = node->next;
-    node->next = nullptr;
-    node->queued = false;
-    if (node->discard)
-      node->discard(node);
-  }
-}
-
-void loop_core_t::abandon_resources() noexcept
-{
-  while (auto *it = _resources)
-    untrack(*it);
+  _resources = nullptr;
+  _resource_count = 0;
   _alive = 0;
 }
 
