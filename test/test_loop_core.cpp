@@ -478,6 +478,68 @@ TEST_CASE("blocking pool work runs off the loop and completes on it")
   CHECK(job.worker != std::this_thread::get_id());
 }
 
+namespace
+{
+struct blocking_job_t
+{
+  vio::detail::pool_job_t job;
+  std::atomic<bool> started{false};
+  std::atomic<bool> released{false};
+  std::atomic<bool> gave_up{false};
+};
+
+struct quick_job_t
+{
+  vio::detail::pool_job_t job;
+  blocking_job_t *blocker = nullptr;
+  std::atomic<bool> ran{false};
+  std::atomic<bool> ran_while_blocked{false};
+};
+} // namespace
+
+TEST_CASE("a pool job submitted while another is stuck runs on a sleeping worker at once")
+{
+  vio::event_loop_t loop;
+  blocking_job_t blocker;
+  blocker.job.owner = &blocker;
+  blocker.job.work = [](vio::detail::pool_job_t *raw) {
+    auto *self = static_cast<blocking_job_t *>(raw->owner);
+    self->started = true;
+    const auto give_up = std::chrono::steady_clock::now() + 5s;
+    while (!self->released && std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(1ms);
+    self->gave_up = !self->released;
+  };
+  blocker.job.done = [](vio::detail::pool_job_t *, bool) {};
+  quick_job_t quick;
+  quick.blocker = &blocker;
+  quick.job.owner = &quick;
+  quick.job.work = [](vio::detail::pool_job_t *raw) {
+    auto *self = static_cast<quick_job_t *>(raw->owner);
+    self->ran_while_blocked = !self->blocker->gave_up;
+    self->ran = true;
+  };
+  quick.job.done = [](vio::detail::pool_job_t *raw, bool) { static_cast<quick_job_t *>(raw->owner)->blocker->released = true; };
+
+  std::optional<vio::task_t<void>> task;
+  loop.run_in_loop([&] {
+    task.emplace([](vio::event_loop_t &loop, blocking_job_t &blocker, quick_job_t &quick) -> vio::task_t<void> {
+      auto &core = vio::detail::core(loop);
+      vio::detail::pool_submit(core, blocker.job, vio::detail::pool_queue::file);
+      while (!blocker.started)
+      {
+        [[maybe_unused]] auto waited = co_await vio::sleep(loop, std::chrono::milliseconds(1));
+      }
+      [[maybe_unused]] auto settled = co_await vio::sleep(loop, std::chrono::milliseconds(200));
+      vio::detail::pool_submit(core, quick.job, vio::detail::pool_queue::file);
+    }(loop, blocker, quick));
+  });
+  loop.stop();
+  loop.run();
+  CHECK(quick.ran);
+  CHECK(quick.ran_while_blocked);
+}
+
 TEST_CASE("the backend named in VIO_BACKEND is the one that runs")
 {
   vio::event_loop_t loop;

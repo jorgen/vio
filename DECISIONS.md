@@ -223,22 +223,30 @@ What would remove copies, and why each is not done:
   real network card (zcrx: Linux 6.15, bnxt, gve, mlx5 or fbnic with header split), buffers held
   until the kernel lets go, and give nothing on loopback.
 
-**D56. A blocking-pool worker spins for 50 µs before it sleeps.** A 4 KiB read from the page cache
-takes about 1 µs, so workers emptied the queue and slept after every job, and the loop thread paid a
-cross-CPU wakeup on every submit: `pthread_cond_signal` took most of its 72% of a CPU on the
-`file_rand` bench (epoll, four threads). Spinning keeps a worker awake across that gap. A submit
-wakes a sleeping worker only when the queued jobs outnumber the spinning ones, a finished job is
-posted to the loop outside the pool lock, and a slot per worker replaces the shared list of running
-jobs that fork needs. Median of five alternated runs on a 4-vCPU VM:
+**D56. Blocking-pool workers spin for 50 µs before they sleep, and wake each other.** A 4 KiB read
+from the page cache takes about 1 µs, so workers emptied the queue and slept after every job, and
+the loop thread paid a cross-CPU wakeup on every submit: `pthread_cond_signal` took most of its 72%
+of a CPU on the `file_rand` bench (epoll, four threads). Now:
 
-| `file_rand`, 4 KiB | before | after |
-|--------------------|--------|-------|
-| depth 1 | 23k reads/s | 39.5k |
-| depth 32 | 49k reads/s | 106k |
+- a worker spins for 50 µs after its last job before it sleeps;
+- the loop wakes one sleeping worker only when none is spinning and no wake is already on its way;
+- a worker that takes a job and sees more waiting, with nobody spinning, wakes the next one itself,
+  so the loop thread rarely pays for a wakeup;
+- a finished job is posted to the loop outside the pool lock, and a slot per worker replaces the
+  shared list of running jobs that fork needs.
 
-Letting only one worker spin was slower (88k at depth 32). The cost is up to 50 µs of CPU after each
-job when work arrives more slowly than that. Tokio's pool still does 247k at depth 32; what is left
-is contention on the pool lock and on the loop's post lock.
+Median of five alternated runs on a 4-vCPU VM:
+
+| `file_rand`, 4 KiB | before | after | libuv | Tokio |
+|--------------------|--------|-------|-------|-------|
+| depth 1 | 23k reads/s | 41k | 19k | 20k |
+| depth 32 | 49k reads/s | 213k | 79k | 247k |
+
+Process CPU per read at depth 32 fell from 22 to 12.5 µs. Variants measured and dropped: one
+spinner at a time (88k at depth 32), spins of 100 and 200 µs (159k and 150k against 175k at 50), and
+a loop that woke a worker only when every worker slept (203k, and a job submitted while another was
+stuck in a slow call waited for it; the test that catches that is in `test_loop_core.cpp`). The
+cost is up to 50 µs of CPU after each job when work arrives more slowly than that.
 
 ## Public API
 

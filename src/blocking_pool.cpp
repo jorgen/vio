@@ -138,7 +138,9 @@ public:
         start();
       _queued.push_back(job);
       _queued_count.store(_queued_count.load(std::memory_order_relaxed) + 1, std::memory_order_release);
-      wake = _idle > 0 && _queued_count.load(std::memory_order_relaxed) > _spinning;
+      wake = _idle > 0 && _spinning == 0 && _waking == 0;
+      if (wake)
+        ++_waking;
     }
     if (wake)
       _ready.notify_one();
@@ -185,6 +187,7 @@ public:
     new (&_threads) std::vector<std::thread>();
     _idle = 0;
     _spinning = 0;
+    _waking = 0;
     _queued_count.store(0, std::memory_order_relaxed);
     for (unsigned i = 0; i < _thread_count; ++i)
     {
@@ -237,14 +240,21 @@ private:
         ++_idle;
         _ready.wait(lock);
         --_idle;
+        if (_waking > 0)
+          --_waking;
       }
       auto *job = _queued.pop_front();
       if (!job)
         return;
       _queued_count.store(_queued_count.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+      const bool wake_next = !_queued.empty() && _spinning == 0 && _idle > _waking;
+      if (wake_next)
+        ++_waking;
       job->state.store(pool_job_running, std::memory_order_relaxed);
       current.store(job, std::memory_order_relaxed);
       lock.unlock();
+      if (wake_next)
+        _ready.notify_one();
       job->work(job);
       current.store(nullptr, std::memory_order_relaxed);
       job->state.store(pool_job_finished, std::memory_order_release);
@@ -278,6 +288,7 @@ private:
   std::atomic<std::size_t> _queued_count{0};
   unsigned _idle = 0;
   unsigned _spinning = 0;
+  unsigned _waking = 0;
   bool _stopped = false;
 };
 
