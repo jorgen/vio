@@ -1166,6 +1166,90 @@ TEST_CASE("an exact read larger than many records completes")
   REQUIRE((std::string_view(received.data(), received.size()) == payload));
 }
 
+namespace
+{
+struct counted_alloc_t
+{
+  int calls = 0;
+};
+
+std::span<std::byte> counting_alloc(void *user, std::size_t size)
+{
+  ++static_cast<counted_alloc_t *>(user)->calls;
+  return vio::default_alloc(nullptr, size);
+}
+
+vio::task_t<void> go_then_send(vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, const std::string &payload)
+{
+  auto server = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+  REQUIRE_EXPECTED(server);
+  auto srv = std::move(server.value());
+  auto listen_result = co_await vio::ssl_server_listen(srv, p);
+  REQUIRE_EXPECTED(listen_result);
+  auto client_or_err = vio::ssl_server_accept(srv);
+  REQUIRE_EXPECTED(client_or_err);
+  auto client = std::move(client_or_err.value());
+  auto reader = vio::ssl_server_client_create_reader(client);
+  REQUIRE_EXPECTED(reader);
+  auto go = co_await reader.value();
+  REQUIRE_EXPECTED(go);
+  auto wr = co_await vio::ssl_server_client_write(client, std::as_bytes(std::span(payload)));
+  REQUIRE_EXPECTED(wr);
+  while ((co_await reader.value()).has_value())
+  {
+  }
+}
+} // namespace
+
+TEST_CASE("exact reads do not read ahead between fills, so no bytes pass through the read queue")
+{
+  auto config = make_pair_config();
+  const std::string payload = make_pattern(256 * 1024, 31);
+  std::string received;
+  counted_alloc_t allocations;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = go_then_send(el, std::move(pair->first), config.server, port, payload);
+      auto client_task = [](vio::event_loop_t &el, vio::ssl_config_t cc, int p, std::size_t total, std::string &received, counted_alloc_t &allocations) -> vio::task_t<void>
+      {
+        auto c = vio::ssl_client_create(el, cc, &counting_alloc, vio::default_dealloc, &allocations);
+        REQUIRE_EXPECTED(c);
+        auto client = std::move(c.value());
+        auto cr = co_await vio::ssl_client_connect(client, "localhost", p, "127.0.0.1");
+        REQUIRE_EXPECTED(cr);
+        auto reader_or_err = vio::ssl_client_create_reader(client);
+        REQUIRE_EXPECTED(reader_or_err);
+        auto reader = std::move(reader_or_err.value());
+        std::array<char, 4096> chunk{};
+        auto first = reader.read(std::as_writable_bytes(std::span(chunk)));
+        std::string go = "go";
+        auto sent = co_await vio::ssl_client_write(client, std::as_bytes(std::span(go)));
+        REQUIRE_EXPECTED(sent);
+        auto got = co_await std::move(first);
+        REQUIRE_EXPECTED(got);
+        received.append(chunk.data(), chunk.size());
+        [[maybe_unused]] auto slept = co_await vio::sleep(el, std::chrono::milliseconds(30));
+        while (received.size() < total)
+        {
+          auto next = co_await reader.read(std::as_writable_bytes(std::span(chunk)));
+          REQUIRE_EXPECTED(next);
+          received.append(chunk.data(), chunk.size());
+        }
+      }(el, config.client, port, payload.size(), received, allocations);
+      co_await std::move(client_task);
+      { auto destroy = std::move(client_task); }
+      co_await std::move(server_task);
+      el.stop();
+    });
+  CHECK(received == payload);
+  CHECK(allocations.calls == 0);
+}
+
 TEST_CASE("cancelling the reader resolves a pending exact read")
 {
   auto config = make_pair_config();
@@ -1526,6 +1610,54 @@ void seed_output_pool(std::size_t count)
   pool.trim();
 }
 } // namespace
+
+TEST_CASE("an output buffer grown under backpressure goes back to the pool and is reused for the next backlog")
+{
+  auto &pool = vio::detail::ssl_output_pool();
+  auto config = make_pair_config();
+  vio::ssl_context_t server_context;
+  REQUIRE(server_context.init(true, config.server, std::string{}).code == 0);
+  vio::ssl_context_t client_context;
+  REQUIRE(client_context.init(false, config.client, std::string{}).code == 0);
+  vio::ssl_engine_t server;
+  REQUIRE(server.init(server_context, true, std::string{}).code == 0);
+  vio::ssl_engine_t client;
+  REQUIRE(client.init(client_context, false, "localhost").code == 0);
+  REQUIRE(pump_handshake(client, server));
+  while (pool.size() > 0)
+  {
+    [[maybe_unused]] auto dropped = pool.take();
+  }
+
+  const std::string slice(vio::tls_stream_t::write_slice, 'b');
+  auto queue_backlog = [&] {
+    for (int i = 0; i < 8; ++i)
+    {
+      client.reserve_output(slice.size() + slice.size() / 16 + 1024);
+      int written = 0;
+      REQUIRE(client.write_plaintext(slice.data(), static_cast<int>(slice.size()), written) == vio::ssl_status::ok);
+    }
+    return std::pair{client.pending_output().data(), client.output_capacity()};
+  };
+  auto [first, grown] = queue_backlog();
+  REQUIRE(grown > vio::ssl_engine_t::output_retain);
+  client.consume_output(client.output_size());
+  CHECK(client.output_capacity() == 0);
+  REQUIRE(pool.size() == 1);
+
+  auto [second, regrown] = queue_backlog();
+  CHECK(second == first);
+  CHECK(regrown == grown);
+  client.consume_output(client.output_size());
+  CHECK(pool.size() == 1);
+  CHECK(pool.trimmable());
+
+  pool.trim();
+  CHECK(pool.size() == 1);
+  pool.trim();
+  CHECK(pool.size() == 0);
+  CHECK_FALSE(pool.trimmable());
+}
 
 TEST_CASE("warm writes on more than four connections at once take every output buffer from the pool")
 {

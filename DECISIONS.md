@@ -185,8 +185,10 @@ nobody took during the whole second, down to a floor of 4. When that stream clos
 timer, at the same deadline, to another TLS stream on the loop, so the pool shrinks even while
 every remaining connection is idle. When the thread's last TLS stream goes, the pool drops to its
 floor at once, so a client whose connections all close between bursts allocates again on the next
-burst; keeping spares across that would need a timer owned by the loop. Inbound buffers keep a
-fixed pool of 4.
+burst; keeping spares across that would need a timer owned by the loop. A buffer that grew under
+backpressure, up to 4 MiB, goes back to the pool too, so the next backlog reuses memory that is
+already mapped instead of growing and faulting it in again; the trim frees a grown spare left
+untouched for a second, even below the floor. Inbound buffers keep a fixed pool of 4.
 
 **D54. A lookup whose blocking-pool job is cancelled fails with `errc::canceled`.** That covers
 `get_addrinfo`, `get_nameinfo` and a TLS client's resolve; they used to succeed with no data. Jobs

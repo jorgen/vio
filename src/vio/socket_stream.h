@@ -307,6 +307,7 @@ struct tls_stream_t
   reference_counted_t *rc = nullptr;
 
   bool reader_active = false;
+  bool exact_reads = false;
   bool read_cancelled = false;
   std::coroutine_handle<> read_continuation = {};
   std::coroutine_handle<> read_buffer_continuation = {};
@@ -451,6 +452,7 @@ struct tls_stream_t
   void on_reader_gone()
   {
     reader_active = false;
+    exact_reads = false;
     read_continuation = {};
     abandon_exact_fill();
     stop_reading_if_unwanted();
@@ -504,6 +506,7 @@ struct tls_stream_t
 
   void begin_exact_fill(std::span<std::byte> target)
   {
+    exact_reads = true;
     read_buffer = target;
     bytes_read = 0;
     while (bytes_read < target.size() && has_front_data())
@@ -743,7 +746,7 @@ private:
       return false;
     if (handshaking || _write_wants_read || exact_fill_pending())
       return true;
-    return reader_active && !read_cancelled && !buffer_queue.full();
+    return reader_active && !read_cancelled && !exact_reads && !buffer_queue.full();
   }
 
   [[nodiscard]] bool in_flight(size_t idx) const noexcept
@@ -939,7 +942,7 @@ private:
         bytes_read += static_cast<size_t>(count);
         continue;
       }
-      if (!reader_active || read_cancelled)
+      if (!reader_active || read_cancelled || exact_reads)
         return;
       if (!buffer_queue.empty() && buffer_queue.back().size() < buffer_queue.back().capacity())
       {
@@ -1441,6 +1444,7 @@ template <typename REF_PTR_T, typename STREAM>
 bool stream_reader_t<REF_PTR_T, STREAM>::await_ready() noexcept
 {
   assert(ref_ptr && "Invalid state in await_ready");
+  stream->exact_reads = false;
   return stream->read_cancelled || stream->has_buffer_with_data_or_error();
 }
 

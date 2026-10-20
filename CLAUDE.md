@@ -771,7 +771,9 @@ prism cancels one and reuses the buffer at once.
 
 TLS (`stream_reader_t`, `socket_stream.h`) decrypts directly into a caller buffer
 (`read(std::span<std::byte>)`) and stops reading the socket when nobody waits; it cannot be truly
-zero-copy since the socket only carries ciphertext. (These vio APIs back prism's streaming request
+zero-copy since the socket only carries ciphertext. A reader that uses `read(span)` does not read
+ahead between fills, as `read_into` does not on TCP; awaiting the reader itself turns read-ahead
+back on. (These vio APIs back prism's streaming request
 bodies.)
 
 ## Writing Tests

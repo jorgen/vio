@@ -123,6 +123,9 @@ inline ssl_spare_pool_t<std::unique_ptr<std::byte[]>> &ssl_inbound_pool() noexce
   return pool;
 }
 
+inline constexpr std::size_t ssl_output_retain = 65536 + 65536 / 16 + 1024;
+inline constexpr std::size_t ssl_output_pool_limit = std::size_t{4} << 20;
+
 class ssl_output_pool_t
 {
 public:
@@ -161,12 +164,24 @@ public:
 
   void trim() noexcept
   {
-    drop_oldest((std::min)(_untouched, surplus()));
+    drop_untouched((std::min)(_untouched, _spares.size()));
+  }
+
+  [[nodiscard]] bool trimmable() const noexcept
+  {
+    if (surplus() > 0)
+      return true;
+    for (const auto &spare : _spares)
+    {
+      if (spare.capacity() > ssl_output_retain)
+        return true;
+    }
+    return false;
   }
 
   [[nodiscard]] bool claim_trim(const void *owner) noexcept
   {
-    if (_trimmer != nullptr || surplus() == 0)
+    if (_trimmer != nullptr || !trimmable())
       return false;
     _trimmer = owner;
     return true;
@@ -195,13 +210,28 @@ public:
     if (--_users > 0)
       return;
     _users = 0;
-    drop_oldest(surplus());
+    drop_untouched(_spares.size());
   }
 
 private:
-  void drop_oldest(std::size_t count) noexcept
+  void drop_untouched(std::size_t untouched) noexcept
   {
-    _spares.erase(_spares.begin(), _spares.begin() + static_cast<std::ptrdiff_t>(count));
+    auto surplus_left = surplus();
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < _spares.size(); ++i)
+    {
+      const bool oversized = _spares[i].capacity() > ssl_output_retain;
+      if (i < untouched && (surplus_left > 0 || oversized))
+      {
+        if (surplus_left > 0)
+          --surplus_left;
+        continue;
+      }
+      if (kept != i)
+        _spares[kept] = std::move(_spares[i]);
+      ++kept;
+    }
+    _spares.resize(kept);
     _untouched = _spares.size();
   }
 
@@ -221,7 +251,7 @@ inline ssl_output_pool_t &ssl_output_pool() noexcept
 struct ssl_engine_t
 {
   static constexpr std::size_t inbound_capacity = 65536;
-  static constexpr std::size_t output_retain = 65536 + 65536 / 16 + 1024;
+  static constexpr std::size_t output_retain = detail::ssl_output_retain;
 
   SSL *ssl = nullptr;
   BIO *rbio = nullptr;
@@ -681,7 +711,7 @@ private:
   {
     _out_head = 0;
     _out.clear();
-    if (_out.capacity() == output_retain)
+    if (_out.capacity() >= output_retain && _out.capacity() <= detail::ssl_output_pool_limit)
       detail::ssl_output_pool().give(std::move(_out));
     std::vector<std::byte>().swap(_out);
   }
