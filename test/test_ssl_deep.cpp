@@ -1571,11 +1571,11 @@ TEST_CASE("warm writes on more than four connections at once take every output b
   const auto pooled = pool.size();
   REQUIRE(pooled >= connections);
 
-  const std::string small = "a short response";
+  const std::string brief = "a short response";
   for (int round = 0; round < 3; ++round)
   {
     CAPTURE(round);
-    write_all(round == 0 ? small : slice);
+    write_all(round == 0 ? brief : slice);
     CHECK(pool.size() == pooled - connections);
     drain_all();
     CHECK(pool.size() == pooled);
