@@ -168,7 +168,11 @@ the shared socket, and UDP sends, including QUIC's, still reach it, so use an in
 the child only to drop it. And a fork can land while the loop thread is moving work between its
 queues; the child then repairs a lock it finds held, forgets what that lock guarded without
 freeing it, and leaks it. Taking every loop's lock in a `pthread_atfork` prepare handler would
-close that, and is not done.
+close that, and is not done. Destroying the loop frees memory in the child, which glibc allows
+because it keeps `malloc` consistent across `fork()`, but POSIX does not promise: on macOS a child
+that destroyed an inherited `thread_with_event_loop_t` while other threads were posting to it died
+of `SIGBUS` in CI, and under ASan the child can block in the sanitizer's allocator. Neither was
+investigated further; the stress test runs on Linux without ASan only.
 
 **D52. A callback that throws leaves the loop able to carry on, with nothing lost.** The exception
 leaves `run()`; calling `run()` again continues. Work queued behind the callback stays queued. The

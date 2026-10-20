@@ -55,6 +55,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -76,10 +77,10 @@ Copyright (c) 2025 Jørgen Lind
 #endif
 #endif
 
-#if defined(VIO_LOOP_TEST_UNDER_ASAN)
-constexpr bool allocator_survives_fork_while_others_allocate = false;
-#else
+#if defined(__linux__) && !defined(VIO_LOOP_TEST_UNDER_ASAN)
 constexpr bool allocator_survives_fork_while_others_allocate = true;
+#else
+constexpr bool allocator_survives_fork_while_others_allocate = false;
 #endif
 
 using namespace std::chrono_literals;
@@ -998,6 +999,8 @@ struct child_pipe_t
 void enter_child(child_pipe_t &pipe)
 {
   std::signal(SIGABRT, SIG_DFL);
+  rlimit no_core{0, 0};
+  ::setrlimit(RLIMIT_CORE, &no_core);
   ::dup2(pipe.ends[1], 2);
   ::close(pipe.ends[0]);
 }
