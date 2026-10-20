@@ -1004,9 +1004,6 @@ void enter_child(child_pipe_t &pipe)
   std::signal(SIGABRT, SIG_DFL);
   rlimit no_core{0, 0};
   ::setrlimit(RLIMIT_CORE, &no_core);
-#if defined(__linux__)
-  ::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
   ::dup2(pipe.ends[1], 2);
   ::close(pipe.ends[0]);
 }
@@ -2539,6 +2536,9 @@ TEST_CASE("a child that stops an inherited loop and runs it is refused by the fo
   {
     auto child = run_in_child(
       [&] {
+#if defined(__linux__)
+        ::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
         loop->stop();
         loop->run();
         ::_exit(5);
