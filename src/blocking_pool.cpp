@@ -23,8 +23,10 @@ Copyright (c) 2025 Jørgen Lind
 #include "vio/loop/blocking_pool.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -34,6 +36,9 @@ Copyright (c) 2025 Jørgen Lind
 #if !defined(_WIN32)
 #include <pthread.h>
 #endif
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #include "vio/loop/loop_core.h"
 
@@ -41,6 +46,21 @@ namespace vio::detail
 {
 namespace
 {
+constexpr std::chrono::microseconds worker_spin{50};
+
+inline void cpu_relax() noexcept
+{
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+  _mm_pause();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+  __yield();
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  asm volatile("yield");
+#endif
+}
+
 struct job_list_t
 {
   pool_job_t *head = nullptr;
@@ -96,9 +116,12 @@ struct job_list_t
 class job_queue_t
 {
 public:
-  explicit job_queue_t(unsigned thread_count) noexcept
+  explicit job_queue_t(unsigned thread_count)
     : _thread_count(thread_count)
+    , _current(new std::atomic<pool_job_t *>[thread_count])
   {
+    for (unsigned i = 0; i < thread_count; ++i)
+      _current[i].store(nullptr, std::memory_order_relaxed);
   }
 
   ~job_queue_t()
@@ -108,19 +131,28 @@ public:
 
   void push(pool_job_t &job)
   {
+    bool wake;
     {
       std::lock_guard lock(_mutex);
       if (_threads.empty() && !_stopped)
         start();
       _queued.push_back(job);
+      _queued_count.store(_queued_count.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+      wake = _idle > 0 && _queued_count.load(std::memory_order_relaxed) > _spinning;
     }
-    _ready.notify_one();
+    if (wake)
+      _ready.notify_one();
   }
 
   bool remove(pool_job_t &job) noexcept
   {
     std::lock_guard lock(_mutex);
-    return _queued.remove(job) || _orphaned.remove(job);
+    if (_queued.remove(job))
+    {
+      _queued_count.store(_queued_count.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+      return true;
+    }
+    return _orphaned.remove(job);
   }
 
   void shutdown() noexcept
@@ -151,8 +183,14 @@ public:
     new (&_mutex) std::mutex();
     new (&_ready) std::condition_variable();
     new (&_threads) std::vector<std::thread>();
-    while (auto *job = _running.pop_front())
+    _idle = 0;
+    _spinning = 0;
+    _queued_count.store(0, std::memory_order_relaxed);
+    for (unsigned i = 0; i < _thread_count; ++i)
     {
+      auto *job = _current[i].exchange(nullptr, std::memory_order_relaxed);
+      if (!job)
+        continue;
       job->state.store(pool_job_queued, std::memory_order_relaxed);
       _orphaned.push_back(*job);
     }
@@ -184,30 +222,50 @@ private:
   {
     _threads.reserve(_thread_count);
     for (unsigned i = 0; i < _thread_count; ++i)
-      _threads.emplace_back([this] { work(); });
+      _threads.emplace_back([this, i] { work(_current[i]); });
   }
 
-  void work()
+  void work(std::atomic<pool_job_t *> &current)
   {
+    std::unique_lock lock(_mutex);
     for (;;)
     {
-      pool_job_t *job;
+      if (!_stopped && _queued.empty())
+        spin(lock);
+      while (!_stopped && _queued.empty())
       {
-        std::unique_lock lock(_mutex);
-        _ready.wait(lock, [this] { return _stopped || !_queued.empty(); });
-        job = _queued.pop_front();
-        if (!job)
-          return;
-        job->state.store(pool_job_running, std::memory_order_relaxed);
-        _running.push_back(*job);
+        ++_idle;
+        _ready.wait(lock);
+        --_idle;
       }
+      auto *job = _queued.pop_front();
+      if (!job)
+        return;
+      _queued_count.store(_queued_count.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+      job->state.store(pool_job_running, std::memory_order_relaxed);
+      current.store(job, std::memory_order_relaxed);
+      lock.unlock();
       job->work(job);
-      std::lock_guard lock(_mutex);
-      if (!_running.remove(*job))
-        continue;
+      current.store(nullptr, std::memory_order_relaxed);
       job->state.store(pool_job_finished, std::memory_order_release);
       job->loop->post(job->finished);
+      lock.lock();
     }
+  }
+
+  void spin(std::unique_lock<std::mutex> &lock)
+  {
+    ++_spinning;
+    lock.unlock();
+    const auto until = std::chrono::steady_clock::now() + worker_spin;
+    for (unsigned i = 1; _queued_count.load(std::memory_order_acquire) == 0; ++i)
+    {
+      cpu_relax();
+      if ((i & 63) == 0 && std::chrono::steady_clock::now() >= until)
+        break;
+    }
+    lock.lock();
+    --_spinning;
   }
 
   unsigned _thread_count;
@@ -215,8 +273,11 @@ private:
   std::condition_variable _ready;
   std::vector<std::thread> _threads;
   job_list_t _queued;
-  job_list_t _running;
+  std::unique_ptr<std::atomic<pool_job_t *>[]> _current;
   job_list_t _orphaned;
+  std::atomic<std::size_t> _queued_count{0};
+  unsigned _idle = 0;
+  unsigned _spinning = 0;
   bool _stopped = false;
 };
 

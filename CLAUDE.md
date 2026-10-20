@@ -633,7 +633,8 @@ AFD. On Linux `VIO_BACKEND=epoll|io_uring` picks one at run time; epoll is the d
 `backend_name()` reports which ran. io_uring also runs file reads, writes and `fsync` on the ring.
 Everything else that blocks -- other file work, `getaddrinfo` -- runs on the blocking pool
 (`src/blocking_pool.cpp`), which has separate file and DNS queues (4 and 2 threads,
-`VIO_FILE_THREADS` and `VIO_DNS_THREADS` to change them).
+`VIO_FILE_THREADS` and `VIO_DNS_THREADS` to change them). A worker spins for 50 µs before it sleeps,
+because waking one costs far more than a page-cache read (D56).
 
 The system calls live in `src/sys_posix.cpp`, `src/sys_win.cpp` and `src/vio/detail/sys_file.h`.
 They return a byte count or a negative `vio::errc` code (`src/vio/errc.h`), the same numbers on
