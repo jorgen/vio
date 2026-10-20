@@ -1982,12 +1982,16 @@ struct mid_drain_fork_t
     };
   }
 
-  std::thread forker()
+  std::thread forker(std::function<void()> first = {})
   {
-    return std::thread([this] {
+    return std::thread([this, first = std::move(first)] {
       while (phase.load() != 1)
         std::this_thread::sleep_for(1ms);
-      child = run_in_child([this] { loop.reset(); });
+      child = run_in_child([this, &first] {
+        if (first)
+          first();
+        loop.reset();
+      });
       phase = 2;
     });
   }
@@ -2089,6 +2093,221 @@ TEST_CASE("destroying an inherited loop in the child is not stalled by a lock an
   CHECK(quiet == forks);
   loop->stop();
   loop->run();
+}
+
+TEST_CASE("an event pipe a child drops while the parent's drain held its node is not touched again when the child destroys the loop")
+{
+  mid_drain_fork_t fork;
+  auto &core = vio::detail::core(*fork.loop);
+  int delivered = 0;
+  auto pipe = std::make_unique<vio::event_pipe_t<int>>(*fork.loop, [&delivered](int &&value) { delivered += value; });
+  core.post(fork.holder);
+  pipe->post_event(1);
+  auto forker = fork.forker([&pipe] { pipe.reset(); });
+  fork.loop->stop();
+  fork.loop->run();
+  forker.join();
+  CHECK(exited_quietly(fork.child));
+  CHECK(fork.child.message == "");
+  CHECK(delivered == 1);
+  pipe.reset();
+  CHECK(core.in_flight() == 0);
+}
+
+TEST_CASE("a child that drops an event pipe and then destroys the loop is not stalled by a lock another thread held at the fork")
+{
+  std::optional<vio::event_loop_t> loop;
+  loop.emplace();
+  auto &core = vio::detail::core(*loop);
+  std::optional<vio::event_pipe_t<int>> pipe;
+  pipe.emplace(*loop, [](int &&) {});
+  auto drop_then_destroy = [&] {
+    pipe.reset();
+    loop.reset();
+    ::_exit(0);
+  };
+
+  SUBCASE("the pipe anchor's lock")
+  {
+    auto anchor = core.pipe_anchor();
+    std::atomic<int> phase{0};
+    std::thread holder([&] {
+      std::lock_guard lock(anchor->mutex);
+      phase = 1;
+      while (phase.load() != 2)
+        std::this_thread::sleep_for(1ms);
+    });
+    while (phase.load() != 1)
+      std::this_thread::sleep_for(1ms);
+    auto child = run_in_child(drop_then_destroy, 2s);
+    phase = 2;
+    holder.join();
+    CHECK(exited_quietly(child));
+    CHECK(child.message == "");
+  }
+  SUBCASE("the post lock")
+  {
+    std::vector<vio::detail::posted_t> nodes(3);
+    for (auto &node : nodes)
+      node.run = [](vio::detail::posted_t *) {};
+    std::atomic<bool> done{false};
+    std::thread runner([&] { loop->run(); });
+    std::vector<std::thread> posters;
+    for (auto &node : nodes)
+      posters.emplace_back([&done, &core, &node] {
+        while (!done.load(std::memory_order_relaxed))
+          core.post(node);
+      });
+    int quiet = 0;
+    constexpr int forks = 60;
+    for (int i = 0; i < forks; ++i)
+    {
+      auto child = run_in_child(drop_then_destroy, 2s);
+      if (!exited_quietly(child))
+        break;
+      ++quiet;
+    }
+    done = true;
+    for (auto &poster : posters)
+      poster.join();
+    loop->stop();
+    runner.join();
+    CHECK(quiet == forks);
+  }
+  pipe.reset();
+  loop->stop();
+  loop->run();
+  CHECK(core.in_flight() == 0);
+}
+
+namespace
+{
+struct lingering_fork_t
+{
+  std::optional<vio::event_loop_t> loop;
+  std::optional<vio::tcp_server_t> listener;
+  std::optional<vio::tcp_t> peer;
+  std::optional<vio::tcp_t> client;
+  std::size_t queued = 0;
+  std::size_t peer_got = 0;
+  bool lingering = false;
+  bool ready = false;
+  death_t child;
+};
+
+vio::task_t<void> fork_while_lingering(lingering_fork_t &s)
+{
+  auto &loop = *s.loop;
+  auto listener = vio_test::get_ephemeral_port(loop);
+  if (!listener)
+  {
+    loop.stop();
+    co_return;
+  }
+  const int port = listener->second;
+  s.listener.emplace(std::move(listener->first));
+  auto server_task = [](vio::tcp_server_t &server, std::optional<vio::tcp_t> &out) -> vio::task_t<void> {
+    auto listening = co_await vio::tcp_listen(server, 10);
+    if (!listening)
+      co_return;
+    auto accepted = vio::tcp_accept(server);
+    if (accepted)
+      out.emplace(std::move(accepted.value()));
+  }(*s.listener, s.peer);
+  s.client.emplace(std::move(vio::tcp_create(loop).value()));
+  auto target = vio::ip4_addr("127.0.0.1", port);
+  auto connected = co_await vio::tcp_connect(*s.client, reinterpret_cast<const sockaddr *>(&target.value()));
+  co_await std::move(server_task);
+  if (!connected || !s.peer)
+  {
+    s.client.reset();
+    s.peer.reset();
+    s.listener.reset();
+    loop.stop();
+    co_return;
+  }
+  {
+    auto dropped = vio::write_tcp(*s.client, std::vector<std::byte>(std::size_t{32} << 20));
+  }
+  s.queued = s.client->handle->write.count;
+  auto *state = &s.client->handle.data();
+  s.client.reset();
+  s.lingering = state->lingering;
+  s.ready = true;
+
+  s.child = run_in_child([&s] {
+    s.peer.reset();
+    s.listener.reset();
+    s.loop.reset();
+  });
+
+  {
+    auto reader = vio::tcp_create_reader(*s.peer);
+    if (reader)
+    {
+      for (;;)
+      {
+        auto got = co_await reader.value();
+        if (!got)
+          break;
+        s.peer_got += got->size();
+      }
+    }
+  }
+  s.peer.reset();
+  s.listener.reset();
+  loop.stop();
+}
+
+struct sleeping_fork_t
+{
+  std::optional<vio::event_loop_t> loop;
+  death_t child;
+  bool woke = false;
+};
+} // namespace
+
+TEST_CASE("a child destroys an inherited loop quietly while a TCP connection the parent dropped still lingers on it, and the parent still delivers every byte")
+{
+  lingering_fork_t s;
+  s.loop.emplace();
+  {
+    std::optional<vio::task_t<void>> task;
+    s.loop->run_in_loop([&] { task.emplace(fork_while_lingering(s)); });
+    s.loop->run();
+  }
+  REQUIRE(s.ready);
+  CHECK(s.queued > 0);
+  CHECK(s.lingering);
+  CHECK(exited_quietly(s.child));
+  CHECK(s.child.message == "");
+  CHECK(s.peer_got == (std::size_t{32} << 20));
+  CHECK(vio::detail::core(*s.loop).in_flight() == 0);
+}
+
+TEST_CASE("a child destroys an inherited loop quietly while a parent coroutine sleeps on it, and the sleep still ends in the parent")
+{
+  sleeping_fork_t s;
+  s.loop.emplace();
+  std::optional<vio::task_t<void>> sleeper;
+  std::optional<vio::task_t<void>> forker;
+  s.loop->run_in_loop([&] {
+    sleeper.emplace([](vio::event_loop_t &loop, bool &woke) -> vio::task_t<void> {
+      auto slept = co_await vio::sleep(loop, 300ms);
+      woke = slept.has_value();
+    }(*s.loop, s.woke));
+    forker.emplace([](sleeping_fork_t &s) -> vio::task_t<void> {
+      auto slept = co_await vio::sleep(*s.loop, 20ms);
+      if (slept)
+        s.child = run_in_child([&s] { s.loop.reset(); });
+      s.loop->stop();
+    }(s));
+  });
+  s.loop->run();
+  CHECK(exited_quietly(s.child));
+  CHECK(s.child.message == "");
+  CHECK(s.woke);
+  CHECK(vio::detail::core(*s.loop).in_flight() == 0);
 }
 
 TEST_CASE("destroying an inherited io_uring loop in the child leaves the parent's ring file operations alone")

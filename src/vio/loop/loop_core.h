@@ -101,15 +101,17 @@ struct pipe_anchor_t
 {
   std::mutex mutex;
   loop_core_t *core = nullptr;
+  unsigned epoch = 0;
 };
 
 class pipe_anchor_owner_t
 {
 public:
-  explicit pipe_anchor_owner_t(loop_core_t *core)
+  pipe_anchor_owner_t(loop_core_t *core, unsigned epoch)
     : _anchor(std::make_shared<pipe_anchor_t>())
   {
     _anchor->core = core;
+    _anchor->epoch = epoch;
   }
   pipe_anchor_owner_t(const pipe_anchor_owner_t &) = delete;
   pipe_anchor_owner_t &operator=(const pipe_anchor_owner_t &) = delete;
@@ -141,6 +143,7 @@ public:
 
   void post(posted_t &node);
   bool unpost(posted_t &node) noexcept;
+  void unpost_inherited(posted_t &node) noexcept;
   void defer(posted_t &node) noexcept;
 
   void add_timer(timer_node_t &node, std::int64_t deadline);
@@ -207,9 +210,10 @@ private:
   static void on_stop(posted_t *node);
   static void note_fork_in_child() noexcept;
 
+  void reclaim_after_fork() noexcept;
   void abandon_after_fork() noexcept;
   void discard_draining() noexcept;
-  void abandon_closes() noexcept;
+  void abandon_resources() noexcept;
   void discard_queued() noexcept;
   void run_timers();
   void drain_posted();
@@ -242,11 +246,17 @@ private:
   unsigned _fork_epoch = 0;
   bool _stopping = false;
   bool _running = false;
-  pipe_anchor_owner_t _pipe_anchor{this};
+  pipe_anchor_owner_t _pipe_anchor{this, _fork_epoch};
 };
 
 inline void unpost_anchored(pipe_anchor_t &anchor, posted_t &node) noexcept
 {
+  if (anchor.epoch != fork_epoch.load(std::memory_order_relaxed)) [[unlikely]]
+  {
+    if (anchor.core)
+      anchor.core->unpost_inherited(node);
+    return;
+  }
   std::lock_guard lock(anchor.mutex);
   if (anchor.core)
     anchor.core->unpost(node);

@@ -344,16 +344,21 @@ void loop_core_t::abort_inherited(const char *action) const noexcept
   std::abort();
 }
 
-void loop_core_t::abandon_after_fork() noexcept
+void loop_core_t::reclaim_after_fork() noexcept
 {
   new (&_post_mutex) std::mutex();
   new (&_pipe_anchor.anchor()->mutex) std::mutex();
   set_thread(std::this_thread::get_id());
+}
+
+void loop_core_t::abandon_after_fork() noexcept
+{
+  reclaim_after_fork();
   pool_abandon_after_fork(*this);
   discard_draining();
   discard_queued();
-  abandon_closes();
   _backend->abandon_after_fork();
+  abandon_resources();
 }
 
 void loop_core_t::discard_draining() noexcept
@@ -375,18 +380,11 @@ void loop_core_t::discard_draining() noexcept
   }
 }
 
-void loop_core_t::abandon_closes() noexcept
+void loop_core_t::abandon_resources() noexcept
 {
-  for (auto *it = _resources; it;)
-  {
-    auto *next = it->_next;
-    if (it->_closing)
-    {
-      untrack(*it);
-      release();
-    }
-    it = next;
-  }
+  while (auto *it = _resources)
+    untrack(*it);
+  _alive = 0;
 }
 
 std::int64_t loop_core_t::now() noexcept
@@ -493,6 +491,12 @@ bool loop_core_t::unpost(posted_t &node) noexcept
     return removed;
   node.queued = false;
   return _posted.remove(node) || removed;
+}
+
+void loop_core_t::unpost_inherited(posted_t &node) noexcept
+{
+  reclaim_after_fork();
+  unpost(node);
 }
 
 void loop_core_t::defer(posted_t &node) noexcept
