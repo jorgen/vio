@@ -1070,6 +1070,16 @@ bool aborted_by_fork_rule(const death_t &death, const char *action)
          death.message.find("a child may only destroy a loop it inherited and must create its own") != std::string::npos;
 }
 
+std::string describe(const death_t &death)
+{
+  std::string text = "status " + std::to_string(death.status);
+  if (death.status != -1 && WIFSIGNALED(death.status))
+    text += ", signal " + std::to_string(WTERMSIG(death.status));
+  if (death.status != -1 && WIFEXITED(death.status))
+    text += ", exit " + std::to_string(WEXITSTATUS(death.status));
+  return text + ", output: " + death.message.substr(0, 400);
+}
+
 bool exited_quietly(const death_t &death)
 {
   return death.status != -1 && WIFEXITED(death.status) && WEXITSTATUS(death.status) == 0 && death.message.empty();
@@ -2471,7 +2481,10 @@ TEST_CASE("a child destroys an inherited thread_with_event_loop_t without stoppi
         },
         2s);
       if (!exited_quietly(child))
+      {
+        MESSAGE("child " << i << ": " << describe(child));
         break;
+      }
       ++quiet;
     }
     done = true;
@@ -2523,7 +2536,10 @@ TEST_CASE("a child that stops an inherited loop and runs it is refused by the fo
       },
       2s);
     if (!aborted_by_fork_rule(child, "run"))
+    {
+      MESSAGE("child " << i << ": " << describe(child));
       break;
+    }
     ++refused;
   }
   done = true;
