@@ -60,6 +60,20 @@ window stays open until the program closes it.
 Each await yields `std::expected<T, error_t>`. Once the window is closed, every waiter and every
 later await gets `errc::canceled`.
 
+## Examples
+
+`gui/examples/`, each built as `vio_gui_<name>`. Each takes an optional limit (frames or
+milliseconds) and quits after it, which is how CI runs them.
+
+| example | shows |
+|---------|-------|
+| `hello_window` | a GL context, input, resize and close in four coroutines |
+| `input_echo` | every input event, cursor shapes, clipboard copy and awaited paste |
+| `windows_and_network` | two windows and a TCP server on one loop; text that arrives over TCP becomes the window titles |
+| `vulkan_clear` | an instance from `required_instance_extensions`, a surface, a swapchain rebuilt on resize, and the device UUID CUDA matches |
+| `metal_clear` | a `CAMetalLayer` from `metal::create_layer`, cleared every frame (macOS) |
+| `d3d12_clear` | a swap chain from `d3d12::create_swap_chain`, resized with the window, and the adapter LUID CUDA matches (Windows) |
+
 ## The loop
 
 The window system joins the loop in one of two ways.
