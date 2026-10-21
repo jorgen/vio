@@ -372,16 +372,16 @@ void display_impl_t::pump()
       if (window->dirty)
         window->deliver();
     }
-    if (_ready.empty())
+    if (!_ready.empty())
     {
-      if (backend->dispatch_queued())
-        continue;
-      break;
+      while (auto *waiter = _ready.pop_front())
+        waiter->handle.resume();
+      continue;
     }
-    while (auto *waiter = _ready.pop_front())
-      waiter->handle.resume();
+    backend->flush();
+    if (!backend->dispatch_queued())
+      break;
   }
-  backend->flush();
 }
 
 namespace

@@ -309,7 +309,7 @@ public:
 
   bool dispatch_queued() override
   {
-    if (XEventsQueued(display, QueuedAlready) == 0)
+    if (XEventsQueued(display, QueuedAfterReading) == 0)
       return false;
     while (XEventsQueued(display, QueuedAlready) > 0)
       next_event();

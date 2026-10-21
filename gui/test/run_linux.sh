@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 binary=$1
+export LSAN_OPTIONS="suppressions=$(cd "$(dirname "$0")" && pwd)/lsan.supp${LSAN_OPTIONS:+:$LSAN_OPTIONS}"
 export XDG_RUNTIME_DIR=$(mktemp -d)
 chmod 700 "$XDG_RUNTIME_DIR"
 Xvfb :99 -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 &
