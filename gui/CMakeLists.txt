@@ -71,3 +71,8 @@ if(VIO_BUILD_TESTS)
     endif()
     add_test(NAME vio_gui_tests COMMAND vio_gui_tests)
 endif()
+
+if(VIO_BUILD_EXAMPLES)
+    add_executable(vio_gui_hello examples/hello_window.cpp)
+    target_link_libraries(vio_gui_hello PRIVATE vio_gui)
+endif()

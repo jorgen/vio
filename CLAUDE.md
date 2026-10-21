@@ -579,6 +579,15 @@ to a vio client is untested. vio sending one is covered, which is the direction
 that exercises vio's own `retry_token.h`.
 
 - `test/` - Tests using doctest
+- `gui/` - vio gui, a window library on the same loop (`gui/PLAN.md`, `gui/DECISIONS.md`). Windows
+  on X11, Wayland, Win32 and Cocoa; `frame()`, `input()`, `resized()` and `close_requested()` are
+  awaited. Window-system callbacks only record; a before-block hook resumes the waiters. On macOS
+  and Windows the loop blocks in a *host wait* (`loop_core_t::set_host_wait`) and runs
+  `run_nested()` turns inside modal resize loops. GL contexts (EGL, WGL, NSOpenGL), Vulkan surfaces,
+  a `CAMetalLayer`, a Direct3D 12 swap chain, and the OpenCL and CUDA matching handles are in
+  `vio/gui/context.h`; no graphics library is linked. Tests: `gui/test/run_linux.sh
+  build/gui/vio_gui_tests` starts Xvfb and headless weston and runs both Linux backends. On
+  Wayland a frame is only delivered after the previous one was committed (G13).
 - `3rdparty/` - boringssl, ada, structify, doctest, cmakerc (fetched via cmake-dep)
 
 ## Dependencies (toggles & install)
