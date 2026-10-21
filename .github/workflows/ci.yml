@@ -82,6 +82,7 @@ jobs:
             linker_flags: ""
             options: -DVIO_BUILD_SHARED=ON
             tests: build/bin/vio_tests
+            gui_tests: build/bin/vio_gui_tests
           - name: asan
             cc: gcc-14
             cxx: g++-14
@@ -163,6 +164,12 @@ jobs:
         run: |
           set -o pipefail
           ./${{ matrix.tests || 'build/test/vio_tests' }} 2>&1 | tee test-io_uring.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-io_uring.log | head -400; exit 1; }
+
+      - name: Test the gui library on X11 and Wayland
+        shell: bash
+        run: |
+          set -o pipefail
+          gui/test/run_linux.sh ./${{ matrix.gui_tests || 'build/gui/vio_gui_tests' }} 2>&1 | tee test-gui.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|ThreadSanitizer|AddressSanitizer" test-gui.log | head -400; exit 1; }
 
   install:
     needs: docker
@@ -319,6 +326,12 @@ jobs:
         run: |
           set -o pipefail
           ./build/test/vio_tests 2>&1 | tee test.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|AddressSanitizer" test.log | head -400; exit 1; }
+
+      - name: Test the gui library
+        shell: bash
+        run: |
+          set -o pipefail
+          ./build/gui/vio_gui_tests 2>&1 | tee test-gui.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|AddressSanitizer" test-gui.log | head -400; exit 1; }
 
   windows-msvc:
     runs-on: windows-2025

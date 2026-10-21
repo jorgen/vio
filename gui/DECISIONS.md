@@ -30,7 +30,7 @@ procedure is still running on it.
 ## G5. Frames are requested, not pushed
 
 Each await of `frame()` asks for one frame. A program that is idle draws nothing and the loop
-sleeps. This matches `wl_surface.frame`, `requestAnimationFrame` and `CVDisplayLink`.
+sleeps. This matches `wl_surface.frame` and `requestAnimationFrame`.
 
 ## G6. Graphics APIs are loaded at run time
 
@@ -79,3 +79,26 @@ the interval follows `gl_config_t::vsync`, since nothing else there knows where 
 was handed out. The compositor answers only once that frame is committed, so a program that awaits
 frames must present each one (`swap_buffers`, a Vulkan present, or its own commit). A window the
 compositor hides gets no callbacks and so no frames, which is the point.
+
+## G14. A loop timer paces frames on X11, Windows and macOS
+
+Only Wayland tells a client when to draw. Elsewhere a timer on the loop fires at the display's
+refresh rate, aligned to the clock, so windows that share a rate tick together. A display link
+thread (`CVDisplayLink`, `DwmFlush`, the X Present extension) would be closer to vertical blank but
+would add a thread per display and a post per frame. The swap interval still holds the picture to
+vertical blank where the driver supports it.
+
+## G15. One host wait per thread
+
+Windows and macOS deliver window messages per thread, not per window, so one host wait serves
+every display on a loop. A second display shares it, and a display on another loop on the same
+thread is refused with `errc::busy`.
+
+## G16. Windows: a forwarder thread puts completions back
+
+An I/O completion port cannot be waited on together with the message queue. The forwarder thread
+takes one batch of completions when the loop is about to wait, posts each straight back to the
+port, and posts a message to a hidden window, which ends `MsgWaitForMultipleObjectsEx`. It takes
+only one batch per wait, so it never spins while the loop is busy. Electron drives libuv the same
+way. The cost is one thread and the reordering of completions within a batch, which nothing in
+vio depends on.

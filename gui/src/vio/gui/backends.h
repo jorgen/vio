@@ -31,4 +31,5 @@ std::expected<std::unique_ptr<display_backend_t>, int> make_x11_backend(display_
 std::expected<std::unique_ptr<display_backend_t>, int> make_wayland_backend(display_impl_t &display);
 std::expected<std::unique_ptr<display_backend_t>, int> make_win32_backend(display_impl_t &display);
 std::expected<std::unique_ptr<display_backend_t>, int> make_cocoa_backend(display_impl_t &display);
+void *cocoa_metal_layer(window_impl_t &window);
 } // namespace vio::gui::detail

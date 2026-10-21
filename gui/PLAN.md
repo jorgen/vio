@@ -101,7 +101,7 @@ coroutine layer works the same way.
 | platform | source of frames |
 |----------|------------------|
 | Wayland  | `wl_surface.frame` callbacks |
-| macOS    | `CVDisplayLink`, posted to the loop |
+| macOS    | a loop timer at the screen's refresh rate (`NSScreen.maximumFramesPerSecond`) |
 | X11      | a loop timer at the monitor's refresh rate (XRandR) |
 | Windows  | a loop timer at the monitor's refresh rate (DWM) |
 
