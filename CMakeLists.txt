@@ -11,6 +11,7 @@ include(GNUInstallDirs)
 option(VIO_BUILD_SHARED "Build vio as a shared library" OFF)
 option(VIO_BUILD_TESTS "Build vio tests" ON)
 option(VIO_BUILD_EXAMPLES "Build vio examples" ON)
+option(VIO_BUILD_GUI "Build the vio gui window library" ON)
 option(VIO_INSTALL "Generate install and package-config rules for vio" ON)
 
 # SSL backend selection. vio speaks the OpenSSL SSL_*/BIO API through a compile-time
@@ -50,6 +51,10 @@ add_subdirectory(src)
 if (VIO_BUILD_TESTS AND NOT EMSCRIPTEN)
     enable_testing()
     add_subdirectory(test)
+endif ()
+
+if (VIO_BUILD_GUI AND NOT EMSCRIPTEN)
+    add_subdirectory(gui)
 endif ()
 
 if (VIO_BUILD_TESTS AND EMSCRIPTEN)
