@@ -23,6 +23,8 @@ Copyright (c) 2026 Jørgen Lind
 #include <doctest/doctest.h>
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <string>
 #include <variant>
@@ -164,9 +166,13 @@ TEST_CASE("cocoa: the loop keeps turning while the run loop tracks")
         }
       }(loop, ticks, stop_ticking);
       const int before = ticks;
+      setenv("VIO_GUI_TRACE", "1", 1);
+      std::fprintf(stderr, "tracking starts\n");
       NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.2];
       while ([until timeIntervalSinceNow] > 0)
         [[NSRunLoop currentRunLoop] runMode:NSEventTrackingRunLoopMode beforeDate:until];
+      std::fprintf(stderr, "tracking ends\n");
+      unsetenv("VIO_GUI_TRACE");
       ticks_inside = ticks - before;
       stop_ticking = true;
       co_await std::move(ticker);
