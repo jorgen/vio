@@ -302,6 +302,8 @@ public:
     const auto handle = core.backend().native_handle();
     if (handle < 0)
       return errc::not_supported;
+    CFRunLoopAddCommonMode(CFRunLoopGetMain(), (__bridge CFStringRef)NSEventTrackingRunLoopMode);
+    CFRunLoopAddCommonMode(CFRunLoopGetMain(), (__bridge CFStringRef)NSModalPanelRunLoopMode);
     CFFileDescriptorContext context{0, this, nullptr, nullptr, nullptr};
     _descriptor = CFFileDescriptorCreate(kCFAllocatorDefault, static_cast<int>(handle), false, &cocoa_thread_t::on_descriptor, &context);
     if (!_descriptor)
