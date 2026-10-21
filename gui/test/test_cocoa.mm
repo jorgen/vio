@@ -164,22 +164,10 @@ TEST_CASE("cocoa: the loop keeps turning while the run loop tracks")
         }
       }(loop, ticks, stop_ticking);
       const int before = ticks;
-      __block int probe_fires = 0;
-      CFRunLoopTimerRef probe = CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.005, 0.005, 0, 0, ^(CFRunLoopTimerRef) { ++probe_fires; });
-      CFRunLoopAddTimer(CFRunLoopGetMain(), probe, kCFRunLoopCommonModes);
-      int returns = 0;
-      int handled = 0;
       NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.2];
       while ([until timeIntervalSinceNow] > 0)
-      {
-        ++returns;
-        if ([[NSRunLoop currentRunLoop] runMode:NSEventTrackingRunLoopMode beforeDate:until])
-          ++handled;
-      }
-      CFRunLoopTimerInvalidate(probe);
-      CFRelease(probe);
+        [[NSRunLoop currentRunLoop] runMode:NSEventTrackingRunLoopMode beforeDate:until];
       ticks_inside = ticks - before;
-      MESSAGE("probe fires " << probe_fires << ", runMode returns " << returns << ", handled " << handled << ", ticks " << ticks_inside << ", main " << (CFRunLoopGetCurrent() == CFRunLoopGetMain()));
       stop_ticking = true;
       co_await std::move(ticker);
     }

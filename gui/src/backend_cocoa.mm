@@ -28,6 +28,7 @@ Copyright (c) 2026 Jørgen Lind
 #include <vector>
 
 #include <dlfcn.h>
+#include <poll.h>
 
 #include "vio/gui/backends.h"
 #include "vio/gui/context.h"
@@ -311,9 +312,7 @@ public:
     CFFileDescriptorEnableCallBacks(_descriptor, kCFFileDescriptorReadCallBack);
     _source = CFFileDescriptorCreateRunLoopSource(kCFAllocatorDefault, _descriptor, 0);
     CFRunLoopAddSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
-    CFRunLoopTimerContext timer_context{0, this, nullptr, nullptr, nullptr};
-    _timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0, &cocoa_thread_t::on_timer, &timer_context);
-    CFRunLoopAddTimer(CFRunLoopGetMain(), _timer, kCFRunLoopCommonModes);
+    _timer = make_timer(1e9);
     CFRunLoopObserverContext observer_context{0, this, nullptr, nullptr, nullptr};
     _observer = CFRunLoopObserverCreate(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0, &cocoa_thread_t::on_before_waiting, &observer_context);
     CFRunLoopAddObserver(CFRunLoopGetMain(), _observer, kCFRunLoopCommonModes);
@@ -379,10 +378,27 @@ private:
     [NSApp postEvent:event atStart:NO];
   }
 
-  void arm_timer()
+  CFRunLoopTimerRef make_timer(double delay)
+  {
+    CFRunLoopTimerContext context{0, this, nullptr, nullptr, nullptr};
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + delay, 1e9, 0, 0, &cocoa_thread_t::on_timer, &context);
+    CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+    return timer;
+  }
+
+  void arm_timer(bool now = false)
   {
     const std::int64_t next = core.next_timeout();
-    const double delay = next < 0 ? 1e9 : static_cast<double>(std::max<std::int64_t>(next, 1'000'000)) / 1e9;
+    double delay = next < 0 ? 1e9 : static_cast<double>(std::max<std::int64_t>(next, 1'000'000)) / 1e9;
+    if (now)
+      delay = 0;
+    if (_timer == _firing)
+    {
+      CFRunLoopTimerInvalidate(_timer);
+      CFRelease(_timer);
+      _timer = make_timer(delay);
+      return;
+    }
     CFRunLoopTimerSetNextFireDate(_timer, CFAbsoluteTimeGetCurrent() + delay);
   }
 
@@ -391,27 +407,43 @@ private:
     auto *self = static_cast<cocoa_thread_t *>(info);
     CFFileDescriptorEnableCallBacks(descriptor, kCFFileDescriptorReadCallBack);
     if (self->_state == wait_state_t::waiting)
+    {
       self->post_wake();
-    else
-      self->nested_turn();
+      return;
+    }
+    ++self->_in_descriptor;
+    self->nested_turn();
+    --self->_in_descriptor;
   }
 
   static void on_before_waiting(CFRunLoopObserverRef, CFRunLoopActivity, void *info)
   {
-    static_cast<cocoa_thread_t *>(info)->arm_timer();
+    auto *self = static_cast<cocoa_thread_t *>(info);
+    pollfd descriptor{static_cast<int>(self->core.backend().native_handle()), POLLIN, 0};
+    self->arm_timer(self->_in_descriptor > 0 && ::poll(&descriptor, 1, 0) > 0);
   }
 
-  static void on_timer(CFRunLoopTimerRef, void *info)
+  static void on_timer(CFRunLoopTimerRef timer, void *info)
   {
     auto *self = static_cast<cocoa_thread_t *>(info);
-    if (self->_state == wait_state_t::idle)
-      self->nested_turn();
+    if (self->_state == wait_state_t::waiting)
+    {
+      self->post_wake();
+      return;
+    }
+    if (self->_state != wait_state_t::idle)
+      return;
+    auto *outer = std::exchange(self->_firing, timer);
+    self->nested_turn();
+    self->_firing = outer;
   }
 
   CFFileDescriptorRef _descriptor = nullptr;
   CFRunLoopSourceRef _source = nullptr;
   CFRunLoopTimerRef _timer = nullptr;
   CFRunLoopObserverRef _observer = nullptr;
+  CFRunLoopTimerRef _firing = nullptr;
+  int _in_descriptor = 0;
   std::vector<NSEvent *> _pending;
   wait_state_t _state = wait_state_t::idle;
 };
