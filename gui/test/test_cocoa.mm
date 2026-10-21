@@ -201,7 +201,8 @@ TEST_CASE("cocoa: a Metal layer backs the view and follows its size")
       auto layer = gui::metal::create_layer(*window);
       REQUIRE(layer.has_value());
       auto *metal = (__bridge CAMetalLayer *)*layer;
-      CHECK([ns_view_of(*window) layer] == metal);
+      const bool backed = [ns_view_of(*window) layer] == metal;
+      CHECK(backed);
       auto frame = co_await window->frame();
       CHECK(metal.drawableSize.width == frame->framebuffer.width);
       REQUIRE(window->set_size({400, 250}).has_value());

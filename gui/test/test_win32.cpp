@@ -176,14 +176,12 @@ TEST_CASE("win32: the loop keeps turning inside a modal size loop")
       while (std::chrono::steady_clock::now() < until)
       {
         MSG message;
-        if (MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT) == WAIT_OBJECT_0)
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
         {
-          while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
-          {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-          }
+          TranslateMessage(&message);
+          DispatchMessageW(&message);
         }
+        MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
       }
       ticks_inside = ticks - before;
       SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);

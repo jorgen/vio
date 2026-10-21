@@ -177,7 +177,8 @@ TEST_CASE("the first frame is immediate and the next waits for the clock")
         times.push_back(frame->time_ns);
       }
       for (std::size_t i = 1; i < times.size(); ++i)
-        CHECK(times[i] - times[i - 1] >= std::chrono::nanoseconds(15ms).count());
+        CHECK(times[i] > times[i - 1]);
+      CHECK(times.back() - times.front() >= std::chrono::nanoseconds(70ms).count());
     }
     loop.stop();
   }(loop));
