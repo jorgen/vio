@@ -13,4 +13,6 @@ for _ in $(seq 100); do
   if [ -S "$XDG_RUNTIME_DIR/vio-test" ] && [ -e /tmp/.X11-unix/X99 ]; then break; fi
   sleep 0.1
 done
-DISPLAY=:99 WAYLAND_DISPLAY=vio-test "$binary"
+export DISPLAY=:99 WAYLAND_DISPLAY=vio-test
+"$binary" -tce="gl:*,vulkan:*"
+ASAN_OPTIONS="detect_leaks=0${ASAN_OPTIONS:+:$ASAN_OPTIONS}" "$binary" -tc="gl:*,vulkan:*"

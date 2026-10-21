@@ -313,6 +313,7 @@ public:
 
   void wait(std::int64_t timeout_ns) override
   {
+    arm_timer();
     if (timeout_ns == 0)
       return;
     NSDate *until = timeout_ns < 0 ? [NSDate distantFuture] : [NSDate dateWithTimeIntervalSinceNow:static_cast<double>(timeout_ns) / 1e9];
@@ -812,7 +813,7 @@ public:
     if (config.es)
       return errc::not_supported;
     auto *backend = static_cast<cocoa_window_t *>(window.backend.get());
-    std::vector<NSOpenGLPixelFormatAttribute> attributes = {NSOpenGLPFAAccelerated, NSOpenGLPFADoubleBuffer, NSOpenGLPFAOpenGLProfile};
+    std::vector<NSOpenGLPixelFormatAttribute> attributes = {NSOpenGLPFADoubleBuffer, NSOpenGLPFAOpenGLProfile};
     if (config.major >= 4 && config.core_profile)
       attributes.push_back(NSOpenGLProfileVersion4_1Core);
     else if (config.major >= 3 && config.core_profile)

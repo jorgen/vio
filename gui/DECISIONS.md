@@ -102,3 +102,18 @@ port, and posts a message to a hidden window, which ends `MsgWaitForMultipleObje
 only one batch per wait, so it never spins while the loop is busy. Electron drives libuv the same
 way. The cost is one thread and the reordering of completions within a batch, which nothing in
 vio depends on.
+
+## G17. Inside a modal loop, deadlines keep the window system's timer resolution
+
+During a Win32 size or move loop, vio's own deadlines arrive through `WM_TIMER`, which the system
+delivers at roughly 16 ms; I/O still wakes a turn at once through the forwarder. A 5 ms sleep
+therefore runs at about 60 Hz while the user drags a border, and at full speed again afterwards.
+On macOS the deadline timer is a `CFRunLoopTimer` in the common modes, re-armed before every wait,
+since vio's timers are not kqueue events and would not otherwise end a tracking loop's sleep.
+
+## G18. GL and Vulkan tests run without leak detection
+
+Mesa loads and unloads driver modules while it probes for a device. LeakSanitizer then reports
+driver allocations whose frames it can no longer name, and the report changes from run to run. The
+Linux script runs every other test with leak detection on, and the GL and Vulkan cases in a second
+pass with it off.
