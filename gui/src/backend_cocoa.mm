@@ -23,6 +23,7 @@ Copyright (c) 2026 Jørgen Lind
 #define GL_SILENCE_DEPRECATION
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -278,11 +279,7 @@ public:
       CFRunLoopObserverInvalidate(_observer);
       CFRelease(_observer);
     }
-    if (_timer)
-    {
-      CFRunLoopTimerInvalidate(_timer);
-      CFRelease(_timer);
-    }
+    drop_timer();
     if (_source)
     {
       CFRunLoopRemoveSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
@@ -315,7 +312,6 @@ public:
     CFFileDescriptorEnableCallBacks(_descriptor, kCFFileDescriptorReadCallBack);
     _source = CFFileDescriptorCreateRunLoopSource(kCFAllocatorDefault, _descriptor, 0);
     CFRunLoopAddSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
-    _timer = make_timer(1e9);
     CFRunLoopObserverContext observer_context{0, this, nullptr, nullptr, nullptr};
     _observer = CFRunLoopObserverCreate(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0, &cocoa_thread_t::on_before_waiting, &observer_context);
     CFRunLoopAddObserver(CFRunLoopGetMain(), _observer, kCFRunLoopCommonModes);
@@ -385,7 +381,7 @@ private:
   CFRunLoopTimerRef make_timer(double delay)
   {
     CFRunLoopTimerContext context{0, this, nullptr, nullptr, nullptr};
-    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + delay, 1e9, 0, 0, &cocoa_thread_t::on_timer, &context);
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + delay, 0, 0, 0, &cocoa_thread_t::on_timer, &context);
     CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
     return timer;
   }
@@ -393,18 +389,27 @@ private:
   void arm_timer(bool now = false)
   {
     const std::int64_t next = core.next_timeout();
-    double delay = next < 0 ? 1e9 : static_cast<double>(std::max<std::int64_t>(next, 1'000'000)) / 1e9;
-    if (now)
-      delay = 0;
-    VIO_TRACE("arm next=%lld delay=%f firing=%d\n", static_cast<long long>(next), delay, _timer == _firing);
-    if (_timer == _firing)
+    if (next < 0 && !now)
     {
-      CFRunLoopTimerInvalidate(_timer);
-      CFRelease(_timer);
-      _timer = make_timer(delay);
+      drop_timer();
       return;
     }
-    CFRunLoopTimerSetNextFireDate(_timer, CFAbsoluteTimeGetCurrent() + delay);
+    const double delay = now ? 0 : static_cast<double>(std::max<std::int64_t>(next, 1'000'000)) / 1e9;
+    const double when = CFAbsoluteTimeGetCurrent() + delay;
+    VIO_TRACE("arm next=%lld delay=%f\n", static_cast<long long>(next), delay);
+    if (_timer && _timer != _firing && CFRunLoopTimerIsValid(_timer) && std::abs(CFRunLoopTimerGetNextFireDate(_timer) - when) < 0.0005)
+      return;
+    drop_timer();
+    _timer = make_timer(delay);
+  }
+
+  void drop_timer()
+  {
+    if (!_timer)
+      return;
+    CFRunLoopTimerInvalidate(_timer);
+    CFRelease(_timer);
+    _timer = nullptr;
   }
 
   static void on_descriptor(CFFileDescriptorRef descriptor, CFOptionFlags, void *info)
