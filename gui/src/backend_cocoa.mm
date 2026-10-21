@@ -269,6 +269,11 @@ public:
   ~cocoa_thread_t() override
   {
     core.set_host_wait(nullptr);
+    if (_observer)
+    {
+      CFRunLoopObserverInvalidate(_observer);
+      CFRelease(_observer);
+    }
     if (_timer)
     {
       CFRunLoopTimerInvalidate(_timer);
@@ -307,6 +312,9 @@ public:
     CFRunLoopTimerContext timer_context{0, this, nullptr, nullptr, nullptr};
     _timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0, &cocoa_thread_t::on_timer, &timer_context);
     CFRunLoopAddTimer(CFRunLoopGetMain(), _timer, kCFRunLoopCommonModes);
+    CFRunLoopObserverContext observer_context{0, this, nullptr, nullptr, nullptr};
+    _observer = CFRunLoopObserverCreate(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0, &cocoa_thread_t::on_before_waiting, &observer_context);
+    CFRunLoopAddObserver(CFRunLoopGetMain(), _observer, kCFRunLoopCommonModes);
     core.set_host_wait(this);
     return 0;
   }
@@ -386,6 +394,11 @@ private:
       self->nested_turn();
   }
 
+  static void on_before_waiting(CFRunLoopObserverRef, CFRunLoopActivity, void *info)
+  {
+    static_cast<cocoa_thread_t *>(info)->arm_timer();
+  }
+
   static void on_timer(CFRunLoopTimerRef, void *info)
   {
     auto *self = static_cast<cocoa_thread_t *>(info);
@@ -396,6 +409,7 @@ private:
   CFFileDescriptorRef _descriptor = nullptr;
   CFRunLoopSourceRef _source = nullptr;
   CFRunLoopTimerRef _timer = nullptr;
+  CFRunLoopObserverRef _observer = nullptr;
   std::vector<NSEvent *> _pending;
   wait_state_t _state = wait_state_t::idle;
 };
@@ -443,6 +457,7 @@ public:
   CAMetalLayer *metal_layer = nil;
   cocoa_display_t &display;
   modifier_t modifiers = modifier_t::none;
+  bool occluded = false;
 
 private:
   static void tick(void *context);
@@ -623,7 +638,7 @@ void cocoa_window_t::report_size()
 
 void cocoa_window_t::update_visibility()
 {
-  const bool visible = [ns_window isVisible] && ![ns_window isMiniaturized] && ([ns_window occlusionState] & NSWindowOcclusionStateVisible);
+  const bool visible = [ns_window isVisible] && ![ns_window isMiniaturized] && !occluded;
   window.on_visible(visible);
 }
 
@@ -1202,8 +1217,10 @@ using vio::gui::text_event_t;
 
 - (void)windowDidChangeOcclusionState:(NSNotification *)notification
 {
-  if (owner)
-    owner->update_visibility();
+  if (!owner)
+    return;
+  owner->occluded = !([owner->ns_window occlusionState] & NSWindowOcclusionStateVisible);
+  owner->update_visibility();
 }
 
 - (void)windowDidBecomeKey:(NSNotification *)notification
