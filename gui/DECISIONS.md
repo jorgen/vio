@@ -112,10 +112,10 @@ On macOS the deadline timer is a `CFRunLoopTimer` in the common modes, re-armed 
 since vio's timers are not kqueue events and would not otherwise end a tracking loop's sleep.
 Core Foundation never fires a timer or source again while its own callout is running, and a
 nested turn can itself run inside one, because AppKit spins the run loop during ordinary calls.
-So the deadline timer is replaced by a fresh one whenever it must be re-armed from inside its own
-callout, and the before-waiting observer fires it at once when the kqueue has events while the
-descriptor source is the callout on the stack. CI showed the need: a common-mode timer of the
-test's own fired 37 times in 200 ms of tracking while vio's fired none.
+The deadline is therefore a fresh one-shot timer each time it changes, never one re-armed in place:
+a long-interval timer moved with `CFRunLoopTimerSetNextFireDate` from the before-waiting observer
+never fired during tracking on CI, while a new timer does. The observer also fires it at once when
+the kqueue has events while the descriptor source is the callout on the stack.
 
 ## G18. GL and Vulkan tests run without leak detection
 

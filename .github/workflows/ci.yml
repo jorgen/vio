@@ -331,7 +331,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./build/gui/vio_gui_tests -tc="cocoa: the loop keeps*" 2>&1 | head -80; ./build/gui/vio_gui_tests 2>&1 | tee test-gui.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|AddressSanitizer" test-gui.log | head -400; exit 1; }
+          ./build/gui/vio_gui_tests 2>&1 | tee test-gui.log || { grep -n -B6 -A12 -E "ERROR|FATAL|CRASHED|AddressSanitizer" test-gui.log | head -400; exit 1; }
 
   windows-msvc:
     runs-on: windows-2025

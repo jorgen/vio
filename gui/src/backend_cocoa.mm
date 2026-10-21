@@ -30,9 +30,6 @@ Copyright (c) 2026 Jørgen Lind
 
 #include <dlfcn.h>
 #include <poll.h>
-#include <cstdio>
-#include <cstdlib>
-#define VIO_TRACE(...) do { if (std::getenv("VIO_GUI_TRACE")) std::fprintf(stderr, __VA_ARGS__); } while (0)
 
 #include "vio/gui/backends.h"
 #include "vio/gui/context.h"
@@ -356,7 +353,6 @@ public:
 
   void nested_turn()
   {
-    VIO_TRACE("nested_turn state=%d\n", static_cast<int>(_state));
     if (_state != wait_state_t::idle)
       return;
     core.run_nested();
@@ -396,7 +392,6 @@ private:
     }
     const double delay = now ? 0 : static_cast<double>(std::max<std::int64_t>(next, 1'000'000)) / 1e9;
     const double when = CFAbsoluteTimeGetCurrent() + delay;
-    VIO_TRACE("arm next=%lld delay=%f\n", static_cast<long long>(next), delay);
     if (_timer && _timer != _firing && CFRunLoopTimerIsValid(_timer) && std::abs(CFRunLoopTimerGetNextFireDate(_timer) - when) < 0.0005)
       return;
     drop_timer();
@@ -415,7 +410,6 @@ private:
   static void on_descriptor(CFFileDescriptorRef descriptor, CFOptionFlags, void *info)
   {
     auto *self = static_cast<cocoa_thread_t *>(info);
-    VIO_TRACE("on_descriptor state=%d\n", static_cast<int>(self->_state));
     CFFileDescriptorEnableCallBacks(descriptor, kCFFileDescriptorReadCallBack);
     if (self->_state == wait_state_t::waiting)
     {
@@ -437,7 +431,6 @@ private:
   static void on_timer(CFRunLoopTimerRef timer, void *info)
   {
     auto *self = static_cast<cocoa_thread_t *>(info);
-    VIO_TRACE("on_timer state=%d\n", static_cast<int>(self->_state));
     if (self->_state == wait_state_t::waiting)
     {
       self->post_wake();
