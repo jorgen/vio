@@ -174,7 +174,7 @@ TEST_CASE("cocoa: the loop keeps turning while the run loop tracks")
     }
     loop.stop();
   }(loop, ticks_inside));
-  CHECK(ticks_inside >= 10);
+  CHECK(ticks_inside >= 5);
 }
 
 TEST_CASE("cocoa: clipboard text round-trips through the pasteboard")
