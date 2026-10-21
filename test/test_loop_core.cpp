@@ -2629,3 +2629,127 @@ TEST_CASE("a child that stops an inherited loop and runs it is refused by the fo
 }
 
 #endif
+
+TEST_CASE("a host wait replaces the blocking step and the backend is still polled")
+{
+  struct sleeping_host_t final : vio::detail::host_wait_t
+  {
+    std::vector<std::int64_t> timeouts;
+    void wait(std::int64_t timeout_ns) override
+    {
+      timeouts.push_back(timeout_ns);
+      auto cap = std::chrono::nanoseconds(5ms).count();
+      std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns < 0 ? cap : std::min(timeout_ns, cap)));
+    }
+  } host;
+
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  core.set_host_wait(&host);
+  bool fired = false;
+  std::optional<vio::timer_t> timer;
+  timer.emplace(make_timer(loop));
+  vio::timer_on_fire(*timer, [&] {
+    fired = true;
+    timer.reset();
+    loop.stop();
+  });
+  REQUIRE(vio::timer_rearm(*timer, 20ms).has_value());
+  loop.run();
+  core.set_host_wait(nullptr);
+
+  CHECK(fired);
+  REQUIRE(!host.timeouts.empty());
+  for (auto timeout : host.timeouts)
+    CHECK(timeout <= std::chrono::nanoseconds(20ms).count());
+}
+
+TEST_CASE("a nested turn from a hook runs timers and posted work but not the hook itself")
+{
+  struct nesting_hook_t
+  {
+    vio::detail::hook_t hook;
+    vio::detail::loop_core_t *core = nullptr;
+    int entered = 0;
+    int depth = 0;
+    int max_depth = 0;
+    std::function<void()> inside;
+  } nesting;
+  nesting.hook.owner = &nesting;
+  nesting.hook.run = [](vio::detail::hook_t *raw) {
+    auto &self = *static_cast<nesting_hook_t *>(raw->owner);
+    ++self.entered;
+    self.max_depth = std::max(self.max_depth, ++self.depth);
+    if (self.inside)
+      std::exchange(self.inside, nullptr)();
+    --self.depth;
+  };
+
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  nesting.core = &core;
+  turn_counter_t counter;
+  core.add_hook(nesting.hook);
+  core.add_hook(counter.hook);
+
+  bool posted_ran = false;
+  bool timer_fired = false;
+  std::optional<vio::timer_t> timer;
+  timer.emplace(make_timer(loop));
+  vio::timer_on_fire(*timer, [&] { timer_fired = true; });
+
+  nesting.inside = [&] {
+    REQUIRE(vio::timer_rearm(*timer, 0ms).has_value());
+    loop.run_in_loop([&] { posted_ran = true; });
+    auto turns_before = counter.turns;
+    while (!(posted_ran && timer_fired))
+      core.run_nested();
+    CHECK(counter.turns > turns_before);
+    timer.reset();
+    loop.stop();
+  };
+  loop.run();
+  core.remove_hook(counter.hook);
+  core.remove_hook(nesting.hook);
+
+  CHECK(posted_ran);
+  CHECK(timer_fired);
+  CHECK(nesting.max_depth == 1);
+}
+
+TEST_CASE("a nested turn from posted work leaves the batch being drained alone")
+{
+  vio::event_loop_t loop;
+  auto &core = vio::detail::core(loop);
+  std::vector<int> order;
+  loop.run_in_loop([&] {
+    order.push_back(1);
+    loop.run_in_loop([&] { order.push_back(3); });
+    core.run_nested();
+    order.push_back(2);
+  });
+  loop.run_in_loop([&] {
+    order.push_back(4);
+    loop.stop();
+  });
+  loop.run();
+  CHECK(order == std::vector<int>{1, 2, 4, 3});
+}
+
+TEST_CASE("a nested turn outside run() does nothing")
+{
+  vio::event_loop_t loop;
+  bool ran = false;
+  loop.run_in_loop([&] { ran = true; });
+  vio::detail::core(loop).run_nested();
+  CHECK(!ran);
+  loop.stop();
+  loop.run();
+  CHECK(ran);
+}
+
+TEST_CASE("the backend names a native handle a host can watch")
+{
+  vio::event_loop_t loop;
+  CHECK(vio::detail::core(loop).backend().native_handle() != -1);
+}

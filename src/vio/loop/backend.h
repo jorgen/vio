@@ -105,6 +105,10 @@ public:
   virtual ~backend_t() = default;
 
   [[nodiscard]] virtual const char *name() const noexcept = 0;
+  [[nodiscard]] virtual std::intptr_t native_handle() const noexcept
+  {
+    return -1;
+  }
   [[nodiscard]] virtual int add_watch(io_watch_t &watch) = 0;
   virtual void remove_watch(io_watch_t &watch, posted_t &done) = 0;
   virtual void wake() noexcept = 0;

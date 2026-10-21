@@ -175,6 +175,10 @@ public:
   {
     return "io_uring";
   }
+  [[nodiscard]] std::intptr_t native_handle() const noexcept override
+  {
+    return _ring.fd();
+  }
 
   [[nodiscard]] int add_watch(io_watch_t &watch) override
   {

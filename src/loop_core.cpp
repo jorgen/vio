@@ -421,10 +421,67 @@ int loop_core_t::run()
     if (_stopping && !alive())
       break;
     run_before_block();
-    _backend->poll(wait_timeout());
+    if (_host_wait)
+    {
+      _host_wait->wait(wait_timeout());
+      refuse_if_inherited();
+      poll_backend(0);
+    }
+    else
+    {
+      poll_backend(wait_timeout());
+    }
   }
   _running = false;
   return 0;
+}
+
+namespace
+{
+constexpr std::uint8_t stage_posted = 1;
+constexpr std::uint8_t stage_deferred = 2;
+constexpr std::uint8_t stage_listeners = 4;
+constexpr std::uint8_t stage_poll = 8;
+
+struct stage_t
+{
+  std::uint8_t &active;
+  std::uint8_t bit;
+  bool entered;
+  stage_t(std::uint8_t &active, std::uint8_t bit) noexcept
+    : active(active)
+    , bit(bit)
+    , entered((active & bit) == 0)
+  {
+    active |= bit;
+  }
+  stage_t(const stage_t &) = delete;
+  stage_t &operator=(const stage_t &) = delete;
+  ~stage_t()
+  {
+    if (entered)
+      active &= static_cast<std::uint8_t>(~bit);
+  }
+};
+} // namespace
+
+void loop_core_t::poll_backend(std::int64_t timeout_ns)
+{
+  stage_t stage(_active, stage_poll);
+  if (stage.entered)
+    _backend->poll(timeout_ns);
+}
+
+void loop_core_t::run_nested()
+{
+  if (!_running || !in_loop_thread())
+    return;
+  refuse_if_inherited();
+  run_timers();
+  drain_posted();
+  drain_deferred();
+  run_before_block();
+  poll_backend(0);
 }
 
 void loop_core_t::stop()
@@ -502,6 +559,9 @@ void loop_core_t::defer(posted_t &node) noexcept
 
 void loop_core_t::drain_posted()
 {
+  stage_t stage(_active, stage_posted);
+  if (!stage.entered)
+    return;
   _wake_pending.store(false, std::memory_order_release);
   _draining.clear();
   {
@@ -558,6 +618,9 @@ void loop_core_t::requeue_draining(std::size_t from) noexcept
 
 void loop_core_t::drain_deferred()
 {
+  stage_t stage(_active, stage_deferred);
+  if (!stage.entered)
+    return;
   struct interrupted_t
   {
     loop_core_t &core;
@@ -616,7 +679,8 @@ void loop_core_t::run_timers()
 
 void loop_core_t::run_before_block()
 {
-  if (!_stopping)
+  stage_t stage(_active, stage_listeners);
+  if (!_stopping && stage.entered)
   {
     for (std::size_t i = 0; i < _listeners.size(); ++i)
     {
@@ -626,7 +690,19 @@ void loop_core_t::run_before_block()
   }
   for (std::size_t i = 0; i < _hooks.size(); ++i)
   {
-    _hooks[i]->run(_hooks[i]);
+    auto *hook = _hooks[i];
+    if (std::find(_running_hooks.begin(), _running_hooks.end(), hook) != _running_hooks.end())
+      continue;
+    _running_hooks.push_back(hook);
+    struct finish_t
+    {
+      std::vector<hook_t *> &running;
+      ~finish_t()
+      {
+        running.pop_back();
+      }
+    } finish{_running_hooks};
+    hook->run(hook);
     refuse_if_inherited();
   }
 }

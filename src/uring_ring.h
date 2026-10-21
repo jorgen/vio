@@ -89,6 +89,11 @@ public:
   uring_ring_t(const uring_ring_t &) = delete;
   uring_ring_t &operator=(const uring_ring_t &) = delete;
 
+  [[nodiscard]] int fd() const noexcept
+  {
+    return _fd;
+  }
+
   ~uring_ring_t()
   {
     if (_sqes)

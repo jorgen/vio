@@ -136,6 +136,10 @@ public:
   {
     return "kqueue";
   }
+  [[nodiscard]] std::intptr_t native_handle() const noexcept override
+  {
+    return _kqueue_fd;
+  }
 
   [[nodiscard]] int add_watch(io_watch_t &watch) override
   {

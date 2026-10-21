@@ -396,6 +396,10 @@ public:
   {
     return "iocp";
   }
+  [[nodiscard]] std::intptr_t native_handle() const noexcept override
+  {
+    return reinterpret_cast<std::intptr_t>(_port);
+  }
 
   [[nodiscard]] int add_watch(io_watch_t &watch) override
   {

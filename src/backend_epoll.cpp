@@ -72,6 +72,10 @@ public:
   {
     return "epoll";
   }
+  [[nodiscard]] std::intptr_t native_handle() const noexcept override
+  {
+    return _epoll_fd;
+  }
 
   [[nodiscard]] int add_watch(io_watch_t &watch) override
   {

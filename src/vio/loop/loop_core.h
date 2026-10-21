@@ -53,6 +53,13 @@ struct hook_t
   void *owner = nullptr;
 };
 
+class host_wait_t
+{
+public:
+  virtual ~host_wait_t() = default;
+  virtual void wait(std::int64_t timeout_ns) = 0;
+};
+
 class VIO_EXPORT resource_t
 {
 public:
@@ -157,6 +164,16 @@ public:
   void add_hook(hook_t &hook);
   void remove_hook(hook_t &hook) noexcept;
 
+  void set_host_wait(host_wait_t *host) noexcept
+  {
+    _host_wait = host;
+  }
+  void run_nested();
+  [[nodiscard]] std::int64_t next_timeout() noexcept
+  {
+    return wait_timeout();
+  }
+
   void track(resource_t &resource) noexcept;
   void untrack(resource_t &resource) noexcept;
 
@@ -223,6 +240,7 @@ private:
   void requeue_draining(std::size_t from) noexcept;
   void drain_deferred();
   void run_before_block();
+  void poll_backend(std::int64_t timeout_ns);
   [[nodiscard]] std::int64_t wait_timeout() noexcept;
   [[nodiscard]] bool alive() noexcept;
 
@@ -240,6 +258,9 @@ private:
   std::vector<about_to_block_t *> _listeners;
   std::vector<hook_t *> _hooks;
   std::size_t _alive = 0;
+  host_wait_t *_host_wait = nullptr;
+  std::uint8_t _active = 0;
+  std::vector<hook_t *> _running_hooks;
 
   resource_t *_resources = nullptr;
   std::size_t _resource_count = 0;
