@@ -1,4 +1,4 @@
-set(VIO_GUI_SOURCES src/display.cpp)
+set(VIO_GUI_SOURCES src/display.cpp src/context.cpp)
 set(VIO_GUI_LIBRARIES vio)
 set(VIO_GUI_DEFINITIONS)
 
@@ -40,6 +40,7 @@ else()
         list(APPEND VIO_GUI_LIBRARIES PkgConfig::VIO_WAYLAND)
         list(APPEND VIO_GUI_DEFINITIONS VIO_GUI_HAVE_WAYLAND)
     endif()
+    list(APPEND VIO_GUI_SOURCES src/context_egl.cpp)
     list(APPEND VIO_GUI_LIBRARIES ${CMAKE_DL_LIBS})
 endif()
 
@@ -50,7 +51,7 @@ target_link_libraries(vio_gui PUBLIC ${VIO_GUI_LIBRARIES})
 target_compile_definitions(vio_gui PRIVATE ${VIO_GUI_DEFINITIONS})
 
 if(VIO_BUILD_TESTS)
-    add_executable(vio_gui_tests test/test_main.cpp test/test_gui.cpp test/test_x11.cpp test/test_wayland.cpp)
+    add_executable(vio_gui_tests test/test_main.cpp test/test_gui.cpp test/test_x11.cpp test/test_wayland.cpp test/test_context.cpp)
     target_compile_definitions(vio_gui_tests PRIVATE ${VIO_GUI_DEFINITIONS})
     target_link_libraries(vio_gui_tests PRIVATE vio_gui)
     if(VIO_USE_SYSTEM_DOCTEST)

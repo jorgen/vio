@@ -95,11 +95,34 @@ window_impl_t::~window_impl_t()
   --display.windows;
 }
 
+window_attachment_t::~window_attachment_t()
+{
+  if (window)
+    window->detach(*this);
+}
+
+void window_impl_t::attach(window_attachment_t &attachment)
+{
+  attachment.window = this;
+  attachments.push_back(&attachment);
+}
+
+void window_impl_t::detach(window_attachment_t &attachment) noexcept
+{
+  attachment.window = nullptr;
+  std::erase(attachments, &attachment);
+}
+
 void window_impl_t::close() noexcept
 {
   if (!backend)
     return;
   closing = true;
+  for (auto *attachment : std::exchange(attachments, {}))
+  {
+    attachment->window = nullptr;
+    attachment->window_closing();
+  }
   backend.reset();
   cancel_all(input_waiters, display);
   cancel_all(resize_waiters, display);

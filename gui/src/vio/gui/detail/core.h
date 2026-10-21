@@ -59,6 +59,7 @@ struct native_window_t
   void *handle = nullptr;
   std::uintptr_t id = 0;
   void *view = nullptr;
+  std::uint32_t visual = 0;
 };
 
 struct window_config_t
@@ -165,6 +166,19 @@ struct value_waiter_t : waiter_t
 class display_impl_t;
 class window_impl_t;
 
+class window_attachment_t
+{
+public:
+  window_attachment_t() = default;
+  window_attachment_t(const window_attachment_t &) = delete;
+  window_attachment_t &operator=(const window_attachment_t &) = delete;
+  virtual ~window_attachment_t();
+
+  virtual void window_closing() noexcept = 0;
+
+  window_impl_t *window = nullptr;
+};
+
 class window_backend_t
 {
 public:
@@ -264,6 +278,8 @@ public:
 
   void mark_dirty() noexcept;
   void deliver() noexcept;
+  void attach(window_attachment_t &attachment);
+  void detach(window_attachment_t &attachment) noexcept;
 
   display_impl_t &display;
   std::unique_ptr<window_backend_t> backend;
@@ -287,6 +303,7 @@ public:
   waiter_list_t resize_waiters;
   waiter_list_t close_waiters;
   waiter_list_t frame_waiters;
+  std::vector<window_attachment_t *> attachments;
 };
 
 class display_impl_t
@@ -313,6 +330,7 @@ public:
   loop_core_t &core;
   display_config_t config;
   std::unique_ptr<display_backend_t> backend;
+  std::shared_ptr<void> gl_state;
   std::size_t windows = 0;
 
 private:

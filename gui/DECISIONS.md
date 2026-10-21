@@ -47,3 +47,35 @@ and `VIO_GUI_BACKEND=x11|wayland` overrides.
 ## G8. EGL for OpenGL on Linux
 
 EGL works on X11 and Wayland alike, so one code path covers both. GLX would serve only X11.
+
+## G9. Sizes are in the window system's own units
+
+`size` is pixels on X11 and Windows, and logical units on Wayland and macOS. `framebuffer` is
+always pixels, and `scale` is the factor between them, or the user's UI scale where the two are the
+same (X11's `Xft.dpi`). Render at `frame.framebuffer`; lay out at `frame.size`. GLFW draws the
+same line, and anything else would mean inventing a unit one of the four systems does not have.
+
+## G10. A context is released when its window closes
+
+A GL context and its surface hold the native window. When the window closes, every attachment is
+told first and drops its native objects; later calls answer `errc::canceled`. Otherwise closing a
+window before its context would leave EGL holding a destroyed `wl_surface` or X window.
+
+## G11. EGL is loaded once and never unloaded
+
+Mesa's drivers keep thread-locals and register exit handlers. Unloading them while those are live
+crashes at exit on some versions. Keeping the library also lets LeakSanitizer attribute what the
+driver allocates, and with it loaded the suite reports no leaks.
+
+## G12. Wayland swaps with interval zero
+
+The frame callback already paces a Wayland window. An EGL swap interval of one would make
+`eglSwapBuffers` wait for a second callback of its own and block the loop thread meanwhile. On X11
+the interval follows `gl_config_t::vsync`, since nothing else there knows where vertical blank is.
+
+## G13. Wayland frames need a commit
+
+`frame()` on Wayland resolves from a `wl_surface.frame` callback asked for when the previous frame
+was handed out. The compositor answers only once that frame is committed, so a program that awaits
+frames must present each one (`swap_buffers`, a Vulkan present, or its own commit). A window the
+compositor hides gets no callbacks and so no frames, which is the point.

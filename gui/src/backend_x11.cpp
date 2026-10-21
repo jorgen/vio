@@ -199,6 +199,7 @@ private:
   x11_display_t &_display;
   window_impl_t &_window;
   Window _handle = 0;
+  VisualID _visual = 0;
   XIC _ic = nullptr;
   frame_clock_t _clock;
   extent_t _min_size;
@@ -573,6 +574,7 @@ int x11_window_t::create(const window_config_t &config)
   }
   attributes.event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | EnterWindowMask | LeaveWindowMask | StructureNotifyMask | ExposureMask | FocusChangeMask | VisibilityChangeMask | PropertyChangeMask;
   _size = config.size;
+  _visual = XVisualIDFromVisual(visual);
   _handle = XCreateWindow(dpy, _display.root, 0, 0, static_cast<unsigned>(std::max(1, config.size.width)), static_cast<unsigned>(std::max(1, config.size.height)), 0, depth, InputOutput, visual, mask, &attributes);
   if (!_handle)
     return errc::out_of_memory;
@@ -902,7 +904,7 @@ void x11_window_t::tick(void *context)
 
 native_window_t x11_window_t::native() const
 {
-  return {platform_t::x11, _display.display, nullptr, static_cast<std::uintptr_t>(_handle), nullptr};
+  return {platform_t::x11, _display.display, nullptr, static_cast<std::uintptr_t>(_handle), nullptr, static_cast<std::uint32_t>(_visual)};
 }
 } // namespace
 
