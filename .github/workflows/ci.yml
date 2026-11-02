@@ -9,6 +9,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: jorgen/vio-ci
+  # cmake-dep keeps fetched sources in <CMDEP_DIR>/<name>-<version>-<hash12>; a relative
+  # path resolves against the project root, so the cache below can restore it.
+  CMDEP_DIR: 3rdparty
 
 jobs:
   docker:
@@ -110,7 +113,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: 3rdparty
-          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMake/cmdep.lock', 'CMakeLists.txt') }}
           restore-keys: 3rdparty-${{ runner.os }}-
 
       - name: Cache ccache
@@ -186,7 +189,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: 3rdparty
-          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMake/cmdep.lock', 'CMakeLists.txt') }}
           restore-keys: 3rdparty-${{ runner.os }}-
 
       - name: Fetch the pinned dependency sources
@@ -200,8 +203,8 @@ jobs:
         run: |
           set -e
           pinned() { sed -n "s/^CmDepFetchPackage($1 \([^ ]*\).*/\1/p" CMake/3rdPartyPackages.cmake; }
-          boringssl=3rdparty/boringssl-$(pinned boringssl)
-          ada=3rdparty/ada-$(pinned ada)
+          boringssl=$(echo 3rdparty/boringssl-$(pinned boringssl)-*)
+          ada=$(echo 3rdparty/ada-$(pinned ada)-*)
           test -d "$boringssl" && test -d "$ada"
           cmake -G Ninja -S "$boringssl" -B deps/boringssl -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
@@ -289,7 +292,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: 3rdparty
-          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMake/cmdep.lock', 'CMakeLists.txt') }}
           restore-keys: 3rdparty-${{ runner.os }}-
 
       - name: Cache ccache
@@ -352,7 +355,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: 3rdparty
-          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMakeLists.txt') }}
+          key: 3rdparty-${{ runner.os }}-${{ hashFiles('CMake/3rdPartyPackages.cmake', 'CMake/cmdep.lock', 'CMakeLists.txt') }}
           restore-keys: 3rdparty-${{ runner.os }}-
 
       # BoringSSL assembles its x86-64 crypto with NASM, and stops rather than
