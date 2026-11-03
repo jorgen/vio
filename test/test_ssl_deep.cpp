@@ -2063,5 +2063,91 @@ TEST_CASE("upgrading a socket that is not connected fails")
     });
   REQUIRE(code == vio::errc::not_connected);
 }
+
+// A peer that connects and never sends a ClientHello. Before the handshake could
+// be cancelled the server-side awaiter never resumed and the descriptor leaked.
+void silent_handshake_case(bool cancel_before_await)
+{
+  auto config = make_pair_config();
+  bool cancelled = false;
+  bool peer_closed = false;
+
+  run_loop(
+    [&](vio::event_loop_t &el) -> vio::task_t<void>
+    {
+      auto pair = get_ephemeral_port(el);
+      REQUIRE_EXPECTED(pair);
+      int port = pair->second;
+      auto server_task = [](vio::event_loop_t &el, vio::tcp_server_t s, vio::ssl_config_t sc, int p, bool pre, bool &cancelled) -> vio::task_t<void>
+      {
+        auto server = vio::ssl_server_create(el, std::move(s), "localhost", sc);
+        REQUIRE_EXPECTED(server);
+        auto srv = std::move(server.value());
+        auto listened = co_await vio::ssl_server_listen(srv, p);
+        REQUIRE_EXPECTED(listened);
+        auto accepted = vio::ssl_server_accept(srv);
+        REQUIRE_EXPECTED(accepted);
+        auto client = std::move(accepted.value());
+        vio::cancellation_t cancel;
+        vio::cancellation_t stop;
+        if (pre)
+          cancel.cancel();
+        auto timer = [](vio::event_loop_t &el, vio::cancellation_t &target, vio::cancellation_t &stop) -> vio::task_t<void>
+        {
+          auto slept = co_await vio::sleep(el, std::chrono::milliseconds(50), &stop);
+          if (slept.has_value())
+            target.cancel();
+        }(el, cancel, stop);
+        auto hs = co_await vio::ssl_server_client_handshake(client, &cancel);
+        stop.cancel();
+        co_await std::move(timer);
+        cancelled = !hs.has_value() && vio::is_cancelled(hs.error());
+      }(el, std::move(pair->first), config.server, port, cancel_before_await, cancelled);
+
+      auto tcp = vio::tcp_create(el);
+      REQUIRE_EXPECTED(tcp);
+      auto target = vio::ip4_addr("127.0.0.1", port);
+      REQUIRE_EXPECTED(target);
+      auto connected = co_await vio::tcp_connect(tcp.value(), reinterpret_cast<const sockaddr *>(&target.value()));
+      REQUIRE_EXPECTED(connected);
+      co_await std::move(server_task);
+      { auto destroy = std::move(server_task); }
+
+      // The server dropped the connection; the silent peer now sees it end.
+      auto reader = vio::tcp_create_reader(tcp.value());
+      REQUIRE_EXPECTED(reader);
+      vio::cancellation_t stop;
+      auto guard = [](vio::event_loop_t &el, vio::tcp_reader_t &rd, vio::cancellation_t &stop) -> vio::task_t<void>
+      {
+        auto slept = co_await vio::sleep(el, std::chrono::seconds(3), &stop);
+        if (slept.has_value())
+          rd.cancel();
+      }(el, reader.value(), stop);
+      for (;;)
+      {
+        auto chunk = co_await reader.value();
+        if (!chunk.has_value())
+        {
+          peer_closed = !vio::is_cancelled(chunk.error());
+          break;
+        }
+      }
+      stop.cancel();
+      co_await std::move(guard);
+      el.stop();
+    });
+  CHECK(cancelled);
+  CHECK(peer_closed);
+}
+
+TEST_CASE("cancelling a server handshake the peer never starts resumes the awaiter and closes the connection")
+{
+  silent_handshake_case(false);
+}
+
+TEST_CASE("a server handshake awaited with a cancelled token resolves with vio_cancelled")
+{
+  silent_handshake_case(true);
+}
 } // TEST_SUITE
 } // namespace

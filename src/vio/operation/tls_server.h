@@ -26,6 +26,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "tcp_server.h"
 #include "tls_client.h"
 #include "tls_common.h"
+#include "vio/cancellation.h"
 #include "vio/errc.h"
 #include "vio/error.h"
 #include "vio/event_loop.h"
@@ -40,6 +41,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace vio
 {
@@ -74,6 +76,30 @@ struct ssl_server_client_state_t
   bool handshake_done = false;
   std::coroutine_handle<> handshake_continuation;
   std::expected<void, error_t> handshake_result;
+  registration_t handshake_cancel;
+
+  void finish_handshake(std::expected<void, error_t> result)
+  {
+    handshake_cancel.reset();
+    handshake_done = true;
+    handshake_result = std::move(result);
+    if (auto continuation = std::exchange(handshake_continuation, {}))
+    {
+      continuation.resume();
+    }
+  }
+
+  // Gives up on a handshake that has not finished: the stream fails every
+  // pending and later read and write, and the awaiter resumes with vio_cancelled.
+  void cancel_handshake()
+  {
+    if (handshake_done)
+    {
+      return;
+    }
+    socket_stream.abandon_handshake();
+    finish_handshake(std::unexpected(error_t{.code = vio_cancelled, .msg = "cancelled"}));
+  }
 };
 
 struct ssl_server_t
@@ -134,12 +160,7 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
 
   auto *state_raw = &state.data();
   state->socket_stream.on_handshake_complete = [state_raw](std::optional<error_t> err) {
-    state_raw->handshake_done = true;
-    state_raw->handshake_result = err ? std::expected<void, error_t>{std::unexpect, std::move(*err)} : std::expected<void, error_t>{};
-    if (auto continuation = std::exchange(state_raw->handshake_continuation, {}))
-    {
-      continuation.resume();
-    }
+    state_raw->finish_handshake(err ? std::expected<void, error_t>{std::unexpect, std::move(*err)} : std::expected<void, error_t>{});
   };
   state.on_destroy([state_raw]() { state_raw->socket_stream.begin_teardown(); });
   state->socket_stream.begin_handshake();
@@ -149,6 +170,11 @@ inline std::expected<ssl_server_client_t, error_t> ssl_server_accept(ssl_server_
 // Finish the TLS handshake (SSL_accept) before reading, so the negotiated ALPN
 // protocol and client-certificate verification are known up front. Optional --
 // a reader created before completion drives the handshake lazily.
+//
+// A peer that connects and never finishes the handshake would otherwise hold the
+// connection forever; cancelling `cancel` (e.g. from a timer) abandons the
+// handshake and resumes the awaiter with vio_cancelled. The stream is unusable
+// afterwards and the client should be dropped.
 struct tls_server_client_handshake_future_t
 {
   ref_ptr_t<ssl_server_client_state_t> handle;
@@ -171,8 +197,20 @@ struct tls_server_client_handshake_future_t
   }
 };
 
-inline tls_server_client_handshake_future_t ssl_server_client_handshake(ssl_server_client_t &client)
+inline tls_server_client_handshake_future_t ssl_server_client_handshake(ssl_server_client_t &client, cancellation_t *cancel = nullptr)
 {
+  if (client.handle && cancel != nullptr && !client.handle->handshake_done)
+  {
+    auto *state_raw = &client.handle.data();
+    if (cancel->is_cancelled())
+    {
+      state_raw->cancel_handshake();
+    }
+    else
+    {
+      state_raw->handshake_cancel = cancel->register_callback([state_raw]() { state_raw->cancel_handshake(); });
+    }
+  }
   return {client.handle};
 }
 
