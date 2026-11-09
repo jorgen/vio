@@ -277,7 +277,8 @@ int main(int argc, char **argv)
         co_return 1;
       bool close = false;
       auto closing = [](gui::window_t &window, bool &close) -> vio::task_t<void> {
-        if (co_await window.close_requested())
+        auto requests = window.subscribe<gui::close_request_t>();
+        if (co_await requests)
           close = true;
       }(*window, close);
       {
@@ -288,21 +289,23 @@ int main(int argc, char **argv)
           status = 1;
         }
         gui::extent_t built = window->framebuffer_size();
-        while (status == 0 && !close)
+        if (status == 0)
         {
-          auto frame = co_await window->frame();
-          if (!frame)
-            break;
-          if (frame->framebuffer != built)
+          while (auto frame = co_await window->frame())
           {
-            built = frame->framebuffer;
-            vulkan.build_swapchain(built);
+            if (close)
+              break;
+            if (frame->framebuffer != built)
+            {
+              built = frame->framebuffer;
+              vulkan.build_swapchain(built);
+            }
+            const VkResult result = vulkan.clear(static_cast<float>(frame->time_ns) / 1e9f);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+              vulkan.build_swapchain(built);
+            if (frame_limit > 0 && frame->number >= frame_limit)
+              break;
           }
-          const VkResult result = vulkan.clear(static_cast<float>(frame->time_ns) / 1e9f);
-          if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
-            vulkan.build_swapchain(built);
-          if (frame_limit > 0 && frame->number >= frame_limit)
-            break;
         }
       }
       window->close();

@@ -142,14 +142,21 @@ struct focus_event_t
   bool focused = false;
 };
 
-using input_event_t = std::variant<key_event_t, text_event_t, pointer_move_event_t, pointer_button_event_t, scroll_event_t, pointer_enter_event_t, focus_event_t>;
-
 struct resize_event_t
 {
   extent_t size;
   extent_t framebuffer;
   float scale = 1.0f;
 };
+
+// The user asked to close the window, by its close button, Alt+F4 or the like. The window stays
+// open until the program closes it.
+struct close_request_t
+{
+};
+
+// Everything a window reports, and what window_t::subscribe<Ts...>() selects from.
+using window_event_t = std::variant<key_event_t, text_event_t, pointer_move_event_t, pointer_button_event_t, scroll_event_t, pointer_enter_event_t, focus_event_t, resize_event_t, close_request_t>;
 
 struct frame_t
 {

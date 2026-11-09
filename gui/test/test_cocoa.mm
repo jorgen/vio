@@ -89,10 +89,11 @@ TEST_CASE("cocoa: a size change comes back as a resize")
     {
       auto window = gui::window_t::create(display, {.size = {200, 200}});
       co_await window->frame();
+      auto sizes = window->subscribe<gui::resize_event_t>();
       REQUIRE(window->set_size({410, 270}).has_value());
       for (;;)
       {
-        auto resized = co_await window->resized();
+        auto resized = co_await sizes;
         REQUIRE(resized.has_value());
         if (resized->size == gui::extent_t{410, 270})
           break;
@@ -110,8 +111,9 @@ TEST_CASE("cocoa: the close button is a close request and the window stays open"
     {
       auto window = gui::window_t::create(display);
       co_await window->frame();
+      auto requests = window->subscribe<gui::close_request_t>();
       [ns_window_of(*window) performClose:nil];
-      auto request = co_await window->close_requested();
+      auto request = co_await requests;
       CHECK(request.has_value());
       CHECK([ns_window_of(*window) isVisible]);
     }
@@ -122,20 +124,20 @@ TEST_CASE("cocoa: the close button is a close request and the window stays open"
 TEST_CASE("cocoa: a key down becomes a key event and its text")
 {
   vio::event_loop_t loop;
-  std::vector<gui::input_event_t> events;
-  run_gui_test(loop, [](vio::event_loop_t &loop, std::vector<gui::input_event_t> &events) -> vio::task_t<void> {
+  std::vector<gui::window_event_t> events;
+  run_gui_test(loop, [](vio::event_loop_t &loop, std::vector<gui::window_event_t> &events) -> vio::task_t<void> {
     auto display = open_cocoa(loop);
     {
       auto window = gui::window_t::create(display);
       co_await window->frame();
+      auto keys = window->subscribe<gui::key_event_t, gui::text_event_t>();
       NSEvent *down = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:[ns_window_of(*window) windowNumber] context:nil characters:@"q" charactersIgnoringModifiers:@"q" isARepeat:NO keyCode:0x0C];
       [ns_view_of(*window) keyDown:down];
       while (events.size() < 2)
       {
-        auto event = co_await window->input();
+        auto event = co_await keys;
         REQUIRE(event.has_value());
-        if (std::holds_alternative<gui::key_event_t>(*event) || std::holds_alternative<gui::text_event_t>(*event))
-          events.push_back(*event);
+        std::visit([&](auto &typed) { events.push_back(typed); }, *event);
       }
     }
     loop.stop();
@@ -206,10 +208,11 @@ TEST_CASE("cocoa: a Metal layer backs the view and follows its size")
       CHECK(backed);
       auto frame = co_await window->frame();
       CHECK(metal.drawableSize.width == frame->framebuffer.width);
+      auto sizes = window->subscribe<gui::resize_event_t>();
       REQUIRE(window->set_size({400, 250}).has_value());
       for (;;)
       {
-        auto resized = co_await window->resized();
+        auto resized = co_await sizes;
         if (resized->size == gui::extent_t{400, 250})
         {
           CHECK(metal.drawableSize.width == resized->framebuffer.width);

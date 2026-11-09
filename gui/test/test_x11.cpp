@@ -130,10 +130,11 @@ TEST_CASE("x11: a size change comes back as a resize")
     {
       auto window = gui::window_t::create(display, {.size = {200, 200}});
       co_await window->frame();
+      auto sizes = window->subscribe<gui::resize_event_t>();
       REQUIRE(window->set_size({410, 270}).has_value());
       for (;;)
       {
-        auto resized = co_await window->resized();
+        auto resized = co_await sizes;
         REQUIRE(resized.has_value());
         if (resized->size == gui::extent_t{410, 270})
           break;
@@ -157,8 +158,9 @@ TEST_CASE("x11: WM_DELETE_WINDOW from another client is a close request")
       auto window = gui::window_t::create(display);
       co_await window->frame();
       other_client_t other;
+      auto requests = window->subscribe<gui::close_request_t>();
       other.send_close(static_cast<Window>(window->native().id));
-      auto request = co_await window->close_requested();
+      auto request = co_await requests;
       CHECK(request.has_value());
     }
     loop.stop();
@@ -170,22 +172,22 @@ TEST_CASE("x11: a key press yields a key event and its text")
   if (!x11_available())
     return;
   vio::event_loop_t loop;
-  std::vector<gui::input_event_t> events;
-  run_gui_test(loop, [](vio::event_loop_t &loop, std::vector<gui::input_event_t> &events) -> vio::task_t<void> {
+  std::vector<gui::window_event_t> events;
+  run_gui_test(loop, [](vio::event_loop_t &loop, std::vector<gui::window_event_t> &events) -> vio::task_t<void> {
     auto display = open_x11(loop);
     {
       auto window = gui::window_t::create(display);
       co_await window->frame();
+      auto keys = window->subscribe<gui::key_event_t, gui::text_event_t>();
       other_client_t other;
       const auto handle = static_cast<Window>(window->native().id);
       other.send_key(handle, XK_q, true);
       other.send_key(handle, XK_q, false);
       while (events.size() < 3)
       {
-        auto event = co_await window->input();
+        auto event = co_await keys;
         REQUIRE(event.has_value());
-        if (std::holds_alternative<gui::key_event_t>(*event) || std::holds_alternative<gui::text_event_t>(*event))
-          events.push_back(*event);
+        std::visit([&](auto &typed) { events.push_back(typed); }, *event);
       }
     }
     loop.stop();

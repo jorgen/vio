@@ -33,6 +33,7 @@ Copyright (c) 2026 Jørgen Lind
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <vio/error.h>
@@ -153,10 +154,6 @@ private:
   waiter_t *_tail = nullptr;
 };
 
-struct closed_t
-{
-};
-
 template <typename T>
 struct value_waiter_t : waiter_t
 {
@@ -165,6 +162,59 @@ struct value_waiter_t : waiter_t
 
 class display_impl_t;
 class window_impl_t;
+
+template <typename T, typename... Ts>
+constexpr std::size_t event_index(std::variant<Ts...> *) noexcept
+{
+  constexpr bool matches[] = {std::is_same_v<T, Ts>...};
+  for (std::size_t i = 0; i < sizeof...(Ts); ++i)
+  {
+    if (matches[i])
+      return i;
+  }
+  return sizeof...(Ts);
+}
+
+template <typename T>
+inline constexpr std::size_t event_index_v = event_index<T>(static_cast<window_event_t *>(nullptr));
+
+template <typename... Ts>
+constexpr std::uint32_t event_mask() noexcept
+{
+  static_assert(std::variant_size_v<window_event_t> <= 32);
+  if constexpr (sizeof...(Ts) == 0)
+    return (std::uint32_t(1) << std::variant_size_v<window_event_t>) - 1;
+  else
+  {
+    static_assert(((event_index_v<Ts> < std::variant_size_v<window_event_t>) && ...), "subscribe<> takes window event types only");
+    return ((std::uint32_t(1) << event_index_v<Ts>) | ...);
+  }
+}
+
+// One subscriber's view of a window's events, and the only place they are queued. The window copies
+// each event into every subscription whose mask names its type, so subscriptions never take events
+// from one another, and an event nobody subscribed to is never stored at all.
+class subscription_impl_t
+{
+public:
+  subscription_impl_t(window_impl_t *window, std::uint32_t mask);
+  subscription_impl_t(const subscription_impl_t &) = delete;
+  subscription_impl_t &operator=(const subscription_impl_t &) = delete;
+  ~subscription_impl_t();
+
+  [[nodiscard]] bool wants(const window_event_t &event) const noexcept
+  {
+    return (mask & (std::uint32_t(1) << event.index())) != 0;
+  }
+  void push(const window_event_t &event, std::size_t limit);
+  void end() noexcept;
+
+  window_impl_t *window = nullptr;
+  std::uint32_t mask = 0;
+  std::size_t dropped = 0;
+  std::deque<window_event_t> queue;
+  waiter_list_t waiters;
+};
 
 class window_attachment_t
 {
@@ -266,8 +316,8 @@ public:
   }
 
   void on_resize(extent_t size, extent_t framebuffer, float scale);
-  void on_input(input_event_t event);
-  void on_close_request() noexcept;
+  void on_input(const window_event_t &event);
+  void on_close_request();
   void on_damage() noexcept;
   void on_frame(std::int64_t time_ns) noexcept;
   void on_visible(bool visible) noexcept;
@@ -293,17 +343,10 @@ public:
   bool closing = false;
   std::uint64_t frames = 0;
   std::int64_t frame_time = 0;
-  std::size_t input_dropped = 0;
 
-  std::deque<input_event_t> input;
-  std::optional<resize_event_t> resized;
-  std::size_t close_requests = 0;
-
-  waiter_list_t input_waiters;
-  waiter_list_t resize_waiters;
-  waiter_list_t close_waiters;
   waiter_list_t frame_waiters;
   std::vector<window_attachment_t *> attachments;
+  std::vector<subscription_impl_t *> subscriptions;
 };
 
 class display_impl_t
@@ -352,90 +395,126 @@ private:
   bool _started = false;
 };
 
-template <typename T, waiter_list_t window_impl_t::*List>
-class channel_awaitable_t : value_waiter_t<T>
+// Awaiting a frame is what asks for one, which is why frames are not a subscription: a subscription
+// would want frames for as long as it lived, and a queued frame is a stale one. Every coroutine
+// waiting in the same turn gets the same frame. Yields std::nullopt once the window has closed.
+class frame_awaitable_t : value_waiter_t<frame_t>
 {
 public:
-  explicit channel_awaitable_t(window_impl_t *window) noexcept
+  explicit frame_awaitable_t(window_impl_t *window) noexcept
     : _window(window)
   {
   }
-  channel_awaitable_t(const channel_awaitable_t &) = delete;
-  channel_awaitable_t &operator=(const channel_awaitable_t &) = delete;
-  ~channel_awaitable_t()
+  frame_awaitable_t(const frame_awaitable_t &) = delete;
+  frame_awaitable_t &operator=(const frame_awaitable_t &) = delete;
+  ~frame_awaitable_t()
   {
-    if (this->list)
-      this->list->remove(*this);
+    if (list)
+      list->remove(*this);
   }
 
   [[nodiscard]] bool await_ready() noexcept
   {
     if (!_window || !_window->open())
+      return true;
+    if (_window->frame_waiters.empty() && _window->frame_ready_now())
     {
-      this->error = errc::canceled;
+      value.emplace(_window->take_frame());
       return true;
     }
-    if ((_window->*List).empty() && take())
-      return true;
     return false;
   }
 
-  void await_suspend(std::coroutine_handle<> handle)
+  void await_suspend(std::coroutine_handle<> continuation)
   {
-    this->handle = handle;
-    if constexpr (std::is_same_v<T, frame_t>)
-      _window->add_frame_waiter(*this);
-    else
-      (_window->*List).push_back(*this);
+    handle = continuation;
+    _window->add_frame_waiter(*this);
   }
 
-  auto await_resume()
+  std::optional<frame_t> await_resume() noexcept
   {
-    using result_t = std::conditional_t<std::is_same_v<T, closed_t>, std::expected<void, error_t>, std::expected<T, error_t>>;
-    if (this->error)
-      return result_t(std::unexpected(make_error(this->error)));
-    if constexpr (std::is_same_v<T, closed_t>)
-      return result_t();
-    else
-      return result_t(std::move(*this->value));
+    return std::move(value);
   }
 
 private:
-  bool take()
+  window_impl_t *_window;
+};
+
+// What one await on a subscription yields: every window event for subscribe<>(), the event itself
+// for one type, a variant of exactly the subscribed types for several.
+template <typename... Ts>
+struct subscribed_event
+{
+  using type = std::variant<Ts...>;
+};
+template <>
+struct subscribed_event<>
+{
+  using type = window_event_t;
+};
+template <typename T>
+struct subscribed_event<T>
+{
+  using type = T;
+};
+
+template <typename... Ts>
+class subscription_awaitable_t : value_waiter_t<window_event_t>
+{
+public:
+  using event_t = typename subscribed_event<Ts...>::type;
+
+  explicit subscription_awaitable_t(subscription_impl_t *subscription) noexcept
+    : _subscription(subscription)
   {
-    if constexpr (std::is_same_v<T, input_event_t>)
-    {
-      if (_window->input.empty())
-        return false;
-      this->value.emplace(std::move(_window->input.front()));
-      _window->input.pop_front();
-      return true;
-    }
-    else if constexpr (std::is_same_v<T, resize_event_t>)
-    {
-      if (!_window->resized)
-        return false;
-      this->value = std::exchange(_window->resized, std::nullopt);
-      return true;
-    }
-    else if constexpr (std::is_same_v<T, frame_t>)
-    {
-      if (!_window->frame_ready_now())
-        return false;
-      this->value.emplace(_window->take_frame());
-      return true;
-    }
-    else
-    {
-      if (_window->close_requests == 0)
-        return false;
-      --_window->close_requests;
-      this->value.emplace();
-      return true;
-    }
+  }
+  subscription_awaitable_t(const subscription_awaitable_t &) = delete;
+  subscription_awaitable_t &operator=(const subscription_awaitable_t &) = delete;
+  ~subscription_awaitable_t()
+  {
+    if (list)
+      list->remove(*this);
   }
 
-  window_impl_t *_window;
+  [[nodiscard]] bool await_ready() noexcept
+  {
+    if (!_subscription || !_subscription->window)
+      return true;
+    if (_subscription->waiters.empty() && !_subscription->queue.empty())
+    {
+      value.emplace(std::move(_subscription->queue.front()));
+      _subscription->queue.pop_front();
+      return true;
+    }
+    return false;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    handle = continuation;
+    _subscription->waiters.push_back(*this);
+  }
+
+  std::optional<event_t> await_resume()
+  {
+    if (!value)
+      return std::nullopt;
+    if constexpr (sizeof...(Ts) == 0)
+      return std::move(*value);
+    else
+      return std::visit(
+        [](auto &&event) -> std::optional<event_t> {
+          using type_t = std::remove_cvref_t<decltype(event)>;
+          if constexpr ((std::is_same_v<type_t, Ts> || ...))
+            return event_t(std::move(event));
+          else
+            return std::nullopt;
+        },
+        std::move(*value));
+  }
+
+private:
+  subscription_impl_t *_subscription;
 };
 
 } // namespace detail

@@ -113,6 +113,51 @@ void window_impl_t::detach(window_attachment_t &attachment) noexcept
   std::erase(attachments, &attachment);
 }
 
+subscription_impl_t::subscription_impl_t(window_impl_t *window, std::uint32_t mask)
+  : mask(mask)
+{
+  if (!window || !window->open())
+    return;
+  this->window = window;
+  window->subscriptions.push_back(this);
+}
+
+subscription_impl_t::~subscription_impl_t()
+{
+  if (!window)
+    return;
+  std::erase(window->subscriptions, this);
+  end();
+}
+
+void subscription_impl_t::push(const window_event_t &event, std::size_t limit)
+{
+  // Only the latest pointer position, size or close request is worth anything, so one that arrives
+  // straight after another of its kind replaces it rather than queueing behind it.
+  const bool merges = std::holds_alternative<pointer_move_event_t>(event) || std::holds_alternative<resize_event_t>(event) || std::holds_alternative<close_request_t>(event);
+  if (merges && !queue.empty() && queue.back().index() == event.index())
+  {
+    queue.back() = event;
+    return;
+  }
+  if (queue.size() >= limit)
+  {
+    queue.pop_front();
+    ++dropped;
+  }
+  queue.push_back(event);
+}
+
+void subscription_impl_t::end() noexcept
+{
+  if (!window)
+    return;
+  auto &display = window->display;
+  window = nullptr;
+  queue.clear();
+  cancel_all(waiters, display);
+}
+
 void window_impl_t::close() noexcept
 {
   if (!backend)
@@ -123,13 +168,11 @@ void window_impl_t::close() noexcept
     attachment->window = nullptr;
     attachment->window_closing();
   }
+  for (auto *subscription : std::exchange(subscriptions, {}))
+    subscription->end();
   backend.reset();
-  cancel_all(input_waiters, display);
-  cancel_all(resize_waiters, display);
-  cancel_all(close_waiters, display);
   cancel_all(frame_waiters, display);
   display.forget(*this);
-  input.clear();
   visible = false;
 }
 
@@ -140,32 +183,28 @@ void window_impl_t::on_resize(extent_t new_size, extent_t new_framebuffer, float
   size = new_size;
   framebuffer = new_framebuffer;
   scale = new_scale;
-  resized = resize_event_t{size, framebuffer, scale};
+  on_input(resize_event_t{size, framebuffer, scale});
   damaged = true;
   mark_dirty();
 }
 
-void window_impl_t::on_input(input_event_t event)
+void window_impl_t::on_input(const window_event_t &event)
 {
-  if (std::holds_alternative<pointer_move_event_t>(event) && !input.empty() && std::holds_alternative<pointer_move_event_t>(input.back()))
+  bool taken = false;
+  for (auto *subscription : subscriptions)
   {
-    input.back() = std::move(event);
+    if (!subscription->wants(event))
+      continue;
+    subscription->push(event, display.config.input_queue_limit);
+    taken = true;
+  }
+  if (taken)
     mark_dirty();
-    return;
-  }
-  if (input.size() >= display.config.input_queue_limit)
-  {
-    input.pop_front();
-    ++input_dropped;
-  }
-  input.push_back(std::move(event));
-  mark_dirty();
 }
 
-void window_impl_t::on_close_request() noexcept
+void window_impl_t::on_close_request()
 {
-  ++close_requests;
-  mark_dirty();
+  on_input(close_request_t{});
 }
 
 void window_impl_t::on_damage() noexcept
@@ -225,25 +264,15 @@ void window_impl_t::deliver() noexcept
   dirty = false;
   if (!backend)
     return;
-  while (!input_waiters.empty() && !input.empty())
+  for (auto *subscription : subscriptions)
   {
-    auto &waiter = as<input_event_t>(*input_waiters.pop_front());
-    waiter.value.emplace(std::move(input.front()));
-    input.pop_front();
-    display.ready(waiter);
-  }
-  if (!resize_waiters.empty() && resized)
-  {
-    auto &waiter = as<resize_event_t>(*resize_waiters.pop_front());
-    waiter.value = std::exchange(resized, std::nullopt);
-    display.ready(waiter);
-  }
-  while (!close_waiters.empty() && close_requests > 0)
-  {
-    --close_requests;
-    auto &waiter = as<closed_t>(*close_waiters.pop_front());
-    waiter.value.emplace();
-    display.ready(waiter);
+    while (!subscription->waiters.empty() && !subscription->queue.empty())
+    {
+      auto &waiter = as<window_event_t>(*subscription->waiters.pop_front());
+      waiter.value.emplace(std::move(subscription->queue.front()));
+      subscription->queue.pop_front();
+      display.ready(waiter);
+    }
   }
   if (!frame_waiters.empty() && frame_ready_now())
   {

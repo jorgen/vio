@@ -210,7 +210,8 @@ int main(int argc, char **argv)
         co_return 1;
       bool close = false;
       auto closing = [](gui::window_t &window, bool &close) -> vio::task_t<void> {
-        if (co_await window.close_requested())
+        auto requests = window.subscribe<gui::close_request_t>();
+        if (co_await requests)
           close = true;
       }(*window, close);
       {
@@ -221,19 +222,21 @@ int main(int argc, char **argv)
           status = 1;
         }
         gui::extent_t built = window->framebuffer_size();
-        while (status == 0 && !close)
+        if (status == 0)
         {
-          auto frame = co_await window->frame();
-          if (!frame)
-            break;
-          if (frame->framebuffer != built && frame->framebuffer.width > 0 && frame->framebuffer.height > 0)
+          while (auto frame = co_await window->frame())
           {
-            built = frame->framebuffer;
-            renderer.resize(built);
+            if (close)
+              break;
+            if (frame->framebuffer != built && frame->framebuffer.width > 0 && frame->framebuffer.height > 0)
+            {
+              built = frame->framebuffer;
+              renderer.resize(built);
+            }
+            renderer.clear(static_cast<double>(frame->time_ns) / 1e9);
+            if (frame_limit > 0 && frame->number >= frame_limit)
+              break;
           }
-          renderer.clear(static_cast<double>(frame->time_ns) / 1e9);
-          if (frame_limit > 0 && frame->number >= frame_limit)
-            break;
         }
       }
       window->close();

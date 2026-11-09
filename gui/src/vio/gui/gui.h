@@ -123,13 +123,68 @@ private:
   std::unique_ptr<detail::display_impl_t, release_t> _impl;
 };
 
+// A window's events -- input, resizes and close requests -- filtered to Ts... and buffered for this
+// subscriber alone. This is the only way to read them: every subscription sees every matching event
+// that arrives after it was made, independently of the others, and an event of a type nobody
+// subscribed to is not kept. An await yields std::nullopt once the window has closed or the
+// subscription was dropped, so `while (auto event = co_await keys)` ends exactly when the stream
+// does.
+//
+//   subscribe<key_event_t>()                 -> std::optional<key_event_t>
+//   subscribe<key_event_t, text_event_t>()   -> std::optional<std::variant<key_event_t, text_event_t>>
+//   subscribe<>()                            -> std::optional<window_event_t>
+//
+// Order is kept within a subscription and not across two: subscribe to keys and text together
+// when their interleaving matters, or to keys and close_request_t when a dialog must see both in
+// the order they happened. A pointer move, resize or close request that arrives straight after
+// another of its kind replaces it, since only the latest is worth anything. A subscription made
+// after the window's first size does not see it; size() answers that. One coroutine at a time
+// should await a given subscription; several are served in the order they started waiting.
+template <typename... Ts>
+class subscription_t
+{
+public:
+  using event_t = typename detail::subscribed_event<Ts...>::type;
+  using awaitable_t = detail::subscription_awaitable_t<Ts...>;
+
+  subscription_t() = default;
+  explicit subscription_t(std::unique_ptr<detail::subscription_impl_t> impl) noexcept
+    : _impl(std::move(impl))
+  {
+  }
+  subscription_t(subscription_t &&) noexcept = default;
+  subscription_t &operator=(subscription_t &&) noexcept = default;
+  ~subscription_t() = default;
+
+  [[nodiscard]] awaitable_t next() noexcept
+  {
+    return awaitable_t(_impl.get());
+  }
+  [[nodiscard]] awaitable_t operator co_await() noexcept
+  {
+    return next();
+  }
+
+  // False once the window has closed: every later await yields std::nullopt at once.
+  [[nodiscard]] explicit operator bool() const noexcept
+  {
+    return _impl && _impl->window;
+  }
+  // Events this subscription lost because nobody took them before its queue reached
+  // display_config_t::input_queue_limit. Merged events are not counted.
+  [[nodiscard]] std::size_t dropped() const noexcept
+  {
+    return _impl ? _impl->dropped : 0;
+  }
+
+private:
+  std::unique_ptr<detail::subscription_impl_t> _impl;
+};
+
 class window_t
 {
 public:
-  using input_awaitable_t = detail::channel_awaitable_t<input_event_t, &detail::window_impl_t::input_waiters>;
-  using resize_awaitable_t = detail::channel_awaitable_t<resize_event_t, &detail::window_impl_t::resize_waiters>;
-  using close_awaitable_t = detail::channel_awaitable_t<detail::closed_t, &detail::window_impl_t::close_waiters>;
-  using frame_awaitable_t = detail::channel_awaitable_t<frame_t, &detail::window_impl_t::frame_waiters>;
+  using frame_awaitable_t = detail::frame_awaitable_t;
 
   window_t() = default;
   window_t(window_t &&) noexcept = default;
@@ -143,21 +198,15 @@ public:
     return _impl && _impl->open();
   }
 
+  // std::optional<frame_t>; std::nullopt once the window has closed.
   [[nodiscard]] frame_awaitable_t frame() noexcept
   {
     return frame_awaitable_t(_impl.get());
   }
-  [[nodiscard]] input_awaitable_t input() noexcept
+  template <typename... Ts>
+  [[nodiscard]] subscription_t<Ts...> subscribe()
   {
-    return input_awaitable_t(_impl.get());
-  }
-  [[nodiscard]] resize_awaitable_t resized() noexcept
-  {
-    return resize_awaitable_t(_impl.get());
-  }
-  [[nodiscard]] close_awaitable_t close_requested() noexcept
-  {
-    return close_awaitable_t(_impl.get());
+    return subscription_t<Ts...>(std::make_unique<detail::subscription_impl_t>(_impl.get(), detail::event_mask<Ts...>()));
   }
 
   void close() noexcept
@@ -195,10 +244,6 @@ public:
   [[nodiscard]] bool visible() const noexcept
   {
     return _impl && _impl->visible;
-  }
-  [[nodiscard]] std::size_t input_dropped() const noexcept
-  {
-    return _impl ? _impl->input_dropped : 0;
   }
   [[nodiscard]] native_window_t native() const
   {

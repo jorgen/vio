@@ -157,10 +157,11 @@ TEST_CASE("wayland: a size the client chooses comes back as a resize")
     {
       auto window = gui::window_t::create(display, {.size = {200, 120}});
       co_await window->frame();
+      auto sizes = window->subscribe<gui::resize_event_t>();
       REQUIRE(window->set_size({330, 210}).has_value());
       for (;;)
       {
-        auto resized = co_await window->resized();
+        auto resized = co_await sizes;
         REQUIRE(resized.has_value());
         if (resized->size == gui::extent_t{330, 210})
           break;

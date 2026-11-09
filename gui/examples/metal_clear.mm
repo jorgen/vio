@@ -51,7 +51,8 @@ int main(int argc, char **argv)
         co_return 1;
       bool close = false;
       auto closing = [](gui::window_t &window, bool &close) -> vio::task_t<void> {
-        if (co_await window.close_requested())
+        auto requests = window.subscribe<gui::close_request_t>();
+        if (co_await requests)
           close = true;
       }(*window, close);
 
@@ -68,10 +69,9 @@ int main(int argc, char **argv)
         layer.device = device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         id<MTLCommandQueue> queue = [device newCommandQueue];
-        while (!close)
+        while (auto frame = co_await window->frame())
         {
-          auto frame = co_await window->frame();
-          if (!frame)
+          if (close)
             break;
           @autoreleasepool
           {

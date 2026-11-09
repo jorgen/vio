@@ -34,13 +34,15 @@ auto draw = [](vio::gui::window_t &window) -> vio::task_t<void> {
   }
 }(*window);
 
-auto read_input = [](vio::gui::window_t &window) -> vio::task_t<void> {
-  while (auto event = co_await window.input())
+auto read_keys = [](vio::gui::window_t &window) -> vio::task_t<void> {
+  auto keys = window.subscribe<vio::gui::key_event_t, vio::gui::text_event_t>();
+  while (auto event = co_await keys)
     handle(*event);
 }(*window);
 
 auto wait_close = [](vio::event_loop_t &loop, vio::gui::window_t &window) -> vio::task_t<void> {
-  co_await window.close_requested();
+  auto requests = window.subscribe<vio::gui::close_request_t>();
+  co_await requests;
   window.close();
   loop.stop();
 }(loop, *window);
@@ -53,12 +55,18 @@ the next point the display can show one. Awaiting it in a loop renders continuou
 only after a change renders on demand. A window that was exposed or resized resolves the next
 await at once.
 
-`input()` yields events in order. `resized()` yields the latest size; sizes that arrive while
-nobody waits are merged into one. `close_requested()` resolves when the user asks to close; the
-window stays open until the program closes it.
+Everything else a window reports is read through subscriptions: input, `resize_event_t` and
+`close_request_t`, the alternatives of `window_event_t`. `subscribe<Ts...>()` names the types it
+wants and yields `std::optional<T>` for one type, `std::optional<std::variant<Ts...>>` for several,
+and every window event for `subscribe<>()`. Each subscription has its own queue: every one sees
+every matching event that arrives after it was made, independently of the others, in order. An
+event of a type nobody subscribed to is not kept. A pointer move, resize or close request that
+arrives straight after another of its kind replaces it, so a burst of sizes reaches a reader as
+the latest one. A close request leaves the window open until the program closes it.
 
-Each await yields `std::expected<T, error_t>`. Once the window is closed, every waiter and every
-later await gets `errc::canceled`.
+Every await, a frame or a subscription, yields `std::nullopt` once the window has closed, so
+`while (auto event = co_await keys)` and `while (auto frame = co_await window.frame())` end
+exactly then.
 
 ## Examples
 
@@ -67,8 +75,8 @@ milliseconds) and quits after it, which is how CI runs them.
 
 | example | shows |
 |---------|-------|
-| `hello_window` | a GL context, input, resize and close in four coroutines |
-| `input_echo` | every input event, cursor shapes, clipboard copy and awaited paste |
+| `hello_window` | a GL context, keys, clicks, resize and close in five coroutines |
+| `input_echo` | every input event through three typed subscriptions, cursor shapes, clipboard copy and awaited paste |
 | `windows_and_network` | two windows and a TCP server on one loop; text that arrives over TCP becomes the window titles |
 | `vulkan_clear` | an instance from `required_instance_extensions`, a surface, a swapchain rebuilt on resize, and the device UUID CUDA matches |
 | `metal_clear` | a `CAMetalLayer` from `metal::create_layer`, cleared every frame (macOS) |

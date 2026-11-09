@@ -77,7 +77,8 @@ vio::task_t<void> draw(gui::window_t &window, state_t &state, float hue)
 
 vio::task_t<void> close_on_request(std::optional<gui::window_t> &window)
 {
-  if (co_await window->close_requested())
+  auto requests = window->subscribe<gui::close_request_t>();
+  if (co_await requests)
     window.reset();
 }
 

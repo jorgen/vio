@@ -94,8 +94,9 @@ TEST_CASE("win32: a size change comes back as a resize")
       auto window = gui::window_t::create(display, {.size = {200, 200}});
       co_await window->frame();
       const auto scale = window->scale();
+      auto sizes = window->subscribe<gui::resize_event_t>();
       REQUIRE(window->set_size({410, 270}).has_value());
-      auto resized = co_await window->resized();
+      auto resized = co_await sizes;
       REQUIRE(resized.has_value());
       CHECK(resized->size == gui::extent_t{410, 270});
       CHECK(resized->scale == scale);
@@ -112,8 +113,9 @@ TEST_CASE("win32: WM_CLOSE is a close request and the window stays open")
     {
       auto window = gui::window_t::create(display);
       co_await window->frame();
+      auto requests = window->subscribe<gui::close_request_t>();
       PostMessageW(hwnd_of(*window), WM_CLOSE, 0, 0);
-      auto request = co_await window->close_requested();
+      auto request = co_await requests;
       CHECK(request.has_value());
       CHECK(IsWindow(hwnd_of(*window)));
     }
@@ -124,12 +126,13 @@ TEST_CASE("win32: WM_CLOSE is a close request and the window stays open")
 TEST_CASE("win32: key and character messages become key and text events")
 {
   vio::event_loop_t loop;
-  std::vector<gui::input_event_t> events;
-  run_gui_test(loop, [](vio::event_loop_t &loop, std::vector<gui::input_event_t> &events) -> vio::task_t<void> {
+  std::vector<gui::window_event_t> events;
+  run_gui_test(loop, [](vio::event_loop_t &loop, std::vector<gui::window_event_t> &events) -> vio::task_t<void> {
     auto display = open_win32(loop);
     {
       auto window = gui::window_t::create(display);
       co_await window->frame();
+      auto keys = window->subscribe<gui::key_event_t, gui::text_event_t>();
       const HWND hwnd = hwnd_of(*window);
       PostMessageW(hwnd, WM_KEYDOWN, 'Q', 0x00100001);
       PostMessageW(hwnd, WM_CHAR, 0xd83d, 0);
@@ -137,10 +140,9 @@ TEST_CASE("win32: key and character messages become key and text events")
       PostMessageW(hwnd, WM_KEYUP, 'Q', static_cast<LPARAM>(0xc0100001u));
       while (events.size() < 3)
       {
-        auto event = co_await window->input();
+        auto event = co_await keys;
         REQUIRE(event.has_value());
-        if (std::holds_alternative<gui::key_event_t>(*event) || std::holds_alternative<gui::text_event_t>(*event))
-          events.push_back(*event);
+        std::visit([&](auto &typed) { events.push_back(typed); }, *event);
       }
     }
     loop.stop();
@@ -149,6 +151,47 @@ TEST_CASE("win32: key and character messages become key and text events")
   CHECK(std::get<gui::key_event_t>(events[0]).key == gui::key_t::q);
   CHECK(std::get<gui::text_event_t>(events[1]).text == "\xf0\x9f\x98\x80");
   CHECK(!std::get<gui::key_event_t>(events[2]).pressed);
+}
+
+TEST_CASE("win32: key and text subscriptions each receive their own events from real messages")
+{
+  vio::event_loop_t loop;
+  std::vector<gui::key_event_t> keys;
+  std::vector<std::string> texts;
+  run_gui_test(loop, [](vio::event_loop_t &loop, std::vector<gui::key_event_t> &keys, std::vector<std::string> &texts) -> vio::task_t<void> {
+    auto display = open_win32(loop);
+    {
+      auto window = gui::window_t::create(display);
+      co_await window->frame();
+      auto key_events = window->subscribe<gui::key_event_t>();
+      auto text_events = window->subscribe<gui::text_event_t>();
+      auto key_reader = [](gui::subscription_t<gui::key_event_t> &events, std::vector<gui::key_event_t> &keys) -> vio::task_t<void> {
+        while (auto key = co_await events)
+        {
+          keys.push_back(*key);
+          if (!key->pressed)
+            co_return;
+        }
+      }(key_events, keys);
+      auto text_reader = [](gui::subscription_t<gui::text_event_t> &events, std::vector<std::string> &texts) -> vio::task_t<void> {
+        while (auto text = co_await events)
+          texts.push_back(text->text);
+      }(text_events, texts);
+      const HWND hwnd = hwnd_of(*window);
+      PostMessageW(hwnd, WM_KEYDOWN, 'Q', 0x00100001);
+      PostMessageW(hwnd, WM_CHAR, L'q', 0);
+      PostMessageW(hwnd, WM_KEYUP, 'Q', static_cast<LPARAM>(0xc0100001u));
+      co_await std::move(key_reader);
+      window->close();
+      co_await std::move(text_reader);
+    }
+    loop.stop();
+  }(loop, keys, texts));
+  REQUIRE(keys.size() == 2);
+  CHECK(keys[0].key == gui::key_t::q);
+  CHECK(keys[0].pressed);
+  CHECK(!keys[1].pressed);
+  CHECK(texts == std::vector<std::string>{"q"});
 }
 
 TEST_CASE("win32: the loop keeps turning inside a modal size loop")
@@ -253,8 +296,9 @@ TEST_CASE("win32: a WARP device presents through a swap chain made for the windo
         CHECK(SUCCEEDED(swap_chain->Present(1, 0)));
         co_await window->frame();
       }
+      auto sizes = window->subscribe<gui::resize_event_t>();
       REQUIRE(window->set_size({200, 150}).has_value());
-      auto resized = co_await window->resized();
+      auto resized = co_await sizes;
       CHECK(gui::d3d12::resize_swap_chain(swap_chain, resized->framebuffer).has_value());
       CHECK(SUCCEEDED(swap_chain->Present(1, 0)));
       swap_chain->Release();

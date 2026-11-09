@@ -123,3 +123,35 @@ Mesa loads and unloads driver modules while it probes for a device. LeakSanitize
 driver allocations whose frames it can no longer name, and the report changes from run to run. The
 Linux script runs every other test with leak detection on, and the GL and Vulkan cases in a second
 pass with it off.
+
+## G19. Window events are subscriptions, and subscriptions broadcast
+
+`window_t::subscribe<Ts...>()` yields only the listed event types: `optional<T>` for one,
+`optional<variant<Ts...>>` for several, everything for none. A typed await on one shared queue
+would have to either discard what it skips, which steals it from other readers, or leave it there
+to fill the queue. So each subscription has its own queue, registered before the first await, and
+the window copies every event into each subscription that names its type. Nothing is consumed
+from anyone else. Subscriptions are the only way to read input: the shared queue behind the old
+`input()` was removed rather than kept beside them, because it duplicated the queueing and
+delivery code and stored every event for a reader that might never come. An event of a type no
+subscription names is therefore not stored at all. Order holds within a
+subscription and not across two, which is why one subscription can name several types. The end of
+the window is the end of the stream, not an error: an await yields `nullopt`, so
+`while (auto e = co_await sub)` stops exactly then. Each subscription bounds its queue at
+`input_queue_limit`, merges pointer moves and counts its own drops.
+
+Resizes and close requests went the same way, as `resize_event_t` and `close_request_t` in
+`window_event_t`. `resized()` and `close_requested()` had the defect `input()` had: one waiter took
+each resize or request, so a renderer and a layout coroutine awaiting the same window each missed
+what the other got. Neither needs a backlog -- only the latest size and the fact of a request
+matter -- so a resize or close request that arrives straight after another of its kind replaces it,
+the rule pointer moves already had. Being in the same variant also orders them against input, which
+is what a dialog waiting for Escape or the close button wants. A subscription made after the
+window's first size does not see it; `size()` answers that without a stream.
+
+`frame()` stays an await, because awaiting a frame is what asks for one (`frame_wanted`): a
+subscription would want frames for as long as it lived, which makes on-demand rendering
+continuous, and a queued frame is a stale one. It already hands the same frame to every waiter of a
+turn, so it never had the splitting defect. It now yields `std::optional<frame_t>`: its only error
+was `canceled` on close, which is what `nullopt` means everywhere else, so every await in the
+library ends the same way.

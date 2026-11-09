@@ -54,11 +54,8 @@ vio::task_t<void> draw(gui::window_t &window, state_t &state, int frame_limit)
   auto viewport = context->proc<void (*)(int, int, int, int)>("glViewport");
   auto clear_color = context->proc<void (*)(float, float, float, float)>("glClearColor");
   auto clear = context->proc<void (*)(unsigned)>("glClear");
-  while (!state.done)
+  while (auto frame = co_await window.frame())
   {
-    auto frame = co_await window.frame();
-    if (!frame)
-      break;
     context->make_current();
     viewport(0, 0, frame->framebuffer.width, frame->framebuffer.height);
     const float t = static_cast<float>(frame->time_ns % 6'000'000'000) / 6e9f;
@@ -66,35 +63,41 @@ vio::task_t<void> draw(gui::window_t &window, state_t &state, int frame_limit)
     clear(0x4000);
     context->swap_buffers();
     if (frame_limit > 0 && frame->number >= static_cast<std::uint64_t>(frame_limit))
+    {
       state.done = true;
+      break;
+    }
   }
 }
 
-vio::task_t<void> read_input(gui::window_t &window, state_t &state)
+// Each subscription ends when the window closes, so these loops need no flag of their own.
+vio::task_t<void> read_keys(gui::window_t &window, state_t &state)
 {
-  while (!state.done)
+  auto keys = window.subscribe<gui::key_event_t, gui::text_event_t>();
+  while (auto event = co_await keys)
   {
-    auto event = co_await window.input();
-    if (!event)
-      break;
     if (auto *key = std::get_if<gui::key_event_t>(&*event); key && key->pressed && key->key == gui::key_t::escape)
       state.done = true;
-    if (auto *text = std::get_if<gui::text_event_t>(&*event))
+    else if (auto *text = std::get_if<gui::text_event_t>(&*event))
       std::printf("typed %s\n", text->text.c_str());
-    if (auto *button = std::get_if<gui::pointer_button_event_t>(&*event); button && button->pressed)
+  }
+}
+
+vio::task_t<void> read_clicks(gui::window_t &window, state_t &state)
+{
+  auto buttons = window.subscribe<gui::pointer_button_event_t>();
+  while (auto button = co_await buttons)
+  {
+    if (button->pressed)
       state.hue += 0.25f;
   }
 }
 
-vio::task_t<void> follow_size(gui::window_t &window, state_t &state)
+vio::task_t<void> follow_size(gui::window_t &window)
 {
-  while (!state.done)
-  {
-    auto resized = co_await window.resized();
-    if (!resized)
-      break;
+  auto sizes = window.subscribe<gui::resize_event_t>();
+  while (auto resized = co_await sizes)
     std::printf("size %dx%d, %dx%d pixels\n", resized->size.width, resized->size.height, resized->framebuffer.width, resized->framebuffer.height);
-  }
 }
 
 vio::task_t<void> run(vio::event_loop_t &loop, int frame_limit)
@@ -116,17 +119,20 @@ vio::task_t<void> run(vio::event_loop_t &loop, int frame_limit)
     }
     state_t state;
     auto drawing = draw(*window, state, frame_limit);
-    auto input = read_input(*window, state);
-    auto sizes = follow_size(*window, state);
+    auto keys = read_keys(*window, state);
+    auto clicks = read_clicks(*window, state);
+    auto sizes = follow_size(*window);
     auto closing = [](gui::window_t &window, state_t &state) -> vio::task_t<void> {
-      if (co_await window.close_requested())
+      auto requests = window.subscribe<gui::close_request_t>();
+      if (co_await requests)
         state.done = true;
     }(*window, state);
     while (!state.done)
       co_await vio::sleep(loop, 50ms);
     window->close();
     co_await std::move(drawing);
-    co_await std::move(input);
+    co_await std::move(keys);
+    co_await std::move(clicks);
     co_await std::move(sizes);
     co_await std::move(closing);
   }
