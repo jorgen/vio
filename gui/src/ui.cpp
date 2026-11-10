@@ -896,6 +896,14 @@ std::unique_ptr<renderer_t> choose_renderer(window_t &window, const run_config_t
     report("none: drawing is off");
     return nullptr;
   }
+  // A window with nothing native under it (the null backend) can have no surface. Asking anyway
+  // would load the Vulkan driver only to fail, which is slow and, under LeakSanitizer, noisy (G18).
+  const auto native = window.native();
+  if (!native.handle && !native.id)
+  {
+    report("none: the window has no native surface");
+    return nullptr;
+  }
   std::string tried;
   if (config.api == render_api_t::automatic || config.api == render_api_t::vulkan)
   {

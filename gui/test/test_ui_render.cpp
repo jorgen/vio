@@ -172,20 +172,26 @@ TEST_CASE("ui render: boxes become prims in painter's order, with a box's shadow
   };
   vio::event_loop_t loop;
   snapshot_t seen;
+  std::string renderer;
   run_gui_test(loop,
-               [](vio::event_loop_t &loop, snapshot_t &seen) -> vio::task_t<void>
+               [](vio::event_loop_t &loop, snapshot_t &seen, std::string &renderer) -> vio::task_t<void>
                {
                  auto display = open_null(loop);
                  {
                    auto window = gui::window_t::create(display, {.size = {200, 100}});
                    shadowed_t root;
-                   auto running = ui::run(*window, root, {.on_display_list = [&seen](const ui::display_list_t &list) { seen.take(list); }});
+                   ui::run_config_t config;
+                   config.on_display_list = [&seen](const ui::display_list_t &list) { seen.take(list); };
+                   config.on_renderer = [&renderer](std::string_view what) { renderer = what; };
+                   auto running = ui::run(*window, root, std::move(config));
                    co_await settle(loop);
                    window->close();
                    co_await std::move(running);
                  }
                  loop.stop();
-               }(loop, seen));
+               }(loop, seen, renderer));
+  // The null backend has no surface, so nothing tries to load a driver for it.
+  CHECK(renderer == "none: the window has no native surface");
   REQUIRE(seen.runs.size() == 1);
   auto prims = seen.placed(0);
   REQUIRE(prims.size() == 3);
@@ -389,7 +395,8 @@ bool matches(std::array<int, 4> a, std::array<int, 4> b, int tolerance = 2)
 }
 } // namespace
 
-TEST_CASE("ui render: the Vulkan pipeline draws rounded corners, borders and shadows")
+// Named vulkan: so the Linux script runs it in the pass without leak detection (G18).
+TEST_CASE("vulkan: the UI pipeline draws rounded corners, borders and shadows")
 {
   // A 100x100 target at scale 2: 50x50 logical units.
   std::vector<ui::prim_t> prims(3);
