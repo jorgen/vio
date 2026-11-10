@@ -155,3 +155,50 @@ continuous, and a queued frame is a stale one. It already hands the same frame t
 turn, so it never had the splitting defect. It now yields `std::optional<frame_t>`: its only error
 was `canceled` on close, which is what `nullopt` means everywhere else, so every await in the
 library ends the same way.
+
+## G20. The UI beat is the loop's deferred queue
+
+Everything the toolkit resumes -- a behaviour woken by a press, the frame loop woken by a change --
+waits on the runtime's ready list and is resumed from one posted node on the loop's deferred queue,
+so nothing runs on the stack of whatever recorded the event. The deferred queue rather than a
+before-block hook, because a hook that runs before the display's pump can miss work the pump makes
+ready and the loop then blocks with it pending; deferring a node instead makes the next wait return
+at once. Frames are destroyed there too, never inside their own `final_suspend` or inside
+`cancel()`. The one resumption that destroys the runtime -- the end of `ui::run`, once every scope
+has drained -- goes through a second node of its own, so the beat that triggered it has returned
+before the runtime goes.
+
+## G21. Slots are keyed by address and type
+
+A component's identity is its address, but a component and its first member share one, so the slot
+map is keyed by the address and the view thunk together. No component can contain a component of
+its own type at offset zero, so the pair is unique. Unmounting and mounting the same member again
+makes a fresh slot: its behaviours start over, its state stays.
+
+## G22. Cancellation is passed, not attached
+
+`await_transform` cannot give an operation a `cancellation_t`: vio's one-shot operations take
+the token as an argument when they are created, before the wrapper sees them, and readers have a
+`cancel()` method instead. So a behaviour passes `scope.token()`, binds a reader with
+`scope.bind()`, and the wrapper's suspension-point check is the backstop that makes
+`while (true) co_await sleep(...)` end without either. The toolkit's own subscriptions are the
+exception: the wrapper registers a callback that wakes them with `nullopt`.
+
+Some operations resume their coroutine from inside `cancel()` (sleep does; the QUIC operations
+latch and resume in their own beat), so a cancelled behaviour can run on the canceller's stack. It
+only ever runs to its next `co_await`, where it is refused and buried, so nothing is freed under
+whoever called `cancel()`. A frame parked inside an operation that took no token is never destroyed
+-- the operation holds its handle -- and delays its component's release until the operation
+completes.
+
+## G23. The first renderer clears scissor rectangles
+
+Every box is a `glScissor` and a `glClear`: no shaders, no buffers, nothing linked, only the
+`proc<>` lookups. It draws coloured rectangles and nothing else, which is all phase 6 has. Layout
+produces a flat list of `draw_item_t`, which is also what `run_config_t::on_layout` hands tests,
+so a real renderer replaces this one behind the same list. Without a GL context (the null backend)
+nothing is drawn and everything else runs.
+
+Known gaps: redraws are driven by invalidation and resizes, so a damage-only expose with no resize
+(possible on X11) is not repainted until something changes; and a behaviour that throws terminates,
+as `task_t` does, rather than rethrowing out of `ui::run`.

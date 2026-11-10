@@ -43,6 +43,11 @@ Copyright (c) 2026 Jørgen Lind
 
 #include "vio/gui/events.h"
 
+namespace vio
+{
+class event_loop_t;
+}
+
 namespace vio::gui
 {
 enum class platform_t : std::uint8_t
@@ -371,6 +376,7 @@ public:
   void add_clipboard_waiter(value_waiter_t<std::string> &waiter);
 
   loop_core_t &core;
+  event_loop_t *loop = nullptr;
   display_config_t config;
   std::unique_ptr<display_backend_t> backend;
   std::shared_ptr<void> gl_state;

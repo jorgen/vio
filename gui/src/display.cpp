@@ -603,12 +603,14 @@ std::expected<display_t, error_t> display_t::open(event_loop_t &loop, const disp
   auto &core = vio::detail::core(loop);
   display_t display;
   display._impl.reset(new detail::display_impl_t(core, config));
+  display._impl->loop = &loop;
   if (int result = display._impl->start(factory); result < 0)
   {
 #if defined(VIO_GUI_HAVE_WAYLAND) && defined(VIO_GUI_HAVE_X11)
     if (factory == &detail::make_wayland_backend && config.backend.empty() && !std::getenv("VIO_GUI_BACKEND"))
     {
       display._impl.reset(new detail::display_impl_t(core, config));
+      display._impl->loop = &loop;
       if (display._impl->start(&detail::make_x11_backend) == 0)
         return display;
     }

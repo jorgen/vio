@@ -153,6 +153,181 @@ Sharing is set up on the window-system side only:
 
 Neither OpenCL nor CUDA is linked or loaded by the library.
 
+## UI toolkit
+
+A declarative toolkit on top of the window layer, in `vio/gui/ui/ui.h` and `src/ui.cpp` as its own
+target, `vio_gui_ui`, so the window layer stays free of any toolkit. Phase 6 is in;
+`examples/ui_counter.cpp` and `test/test_ui.cpp` show it. It is not immediate mode. A UI is described with
+struct literals, and its behaviour is coroutines awaiting events.
+
+### Components
+
+A component is one struct that holds its state, a `view()` that describes it, and an optional
+`behave()` that reacts to events. There is no separate model or controller.
+
+```cpp
+struct counter_t
+{
+  int count = 0;
+  ui::pressable_t inc, dec;
+
+  ui::node_t view() const
+  {
+    return ui::row_t{.gap = 8, .children = {
+      ui::box_t{.size = {60, 60}, .color = dec.held() ? dark_red : red, .events = dec},
+      ui::box_t{.size = {60, 60}, .color = green, .events = inc},
+      ui::box_t{.size = {20.f * count, 60}, .color = grey},
+    }};
+  }
+
+  ui::behaviour_t behave(ui::scope_t &scope)
+  {
+    auto presses = ui::subscribe<ui::press_event_t>(inc, dec);
+    while (auto press = co_await presses)
+      count += press->source == &inc ? 1 : -1;
+  }
+};
+
+co_await ui::run(*window, counter_t{});
+```
+
+`view()` is `const`: it describes and never mutates. `behave()` runs once, for the life of the
+component, and keeps its state in ordinary members. React's hooks, stale closures and effect
+dependencies all exist because a function component re-runs. Here only the stateless half
+re-runs. A one-line handler can sit in the literal as a plain callback in `on_press`. Since the
+view is const, its `this` is too, so for now such a handler has to `const_cast` to mutate its
+component; a better spelling is open. Logic that spans several events, such as a drag, a
+press-and-hold, or a press that waits for a reply, belongs in `behave()`.
+
+The node types are plain aggregates, so a tree is written with designated initializers. The
+recursion is legal because `std::vector` accepts an incomplete type:
+
+```cpp
+struct node_t;
+struct box_t    { extent_t size; color_t color; event_ref_t events; };
+struct row_t    { float gap = 0; std::vector<node_t> children; };
+struct column_t { float gap = 0; std::vector<node_t> children; };
+struct node_t : std::variant<box_t, row_t, column_t> { using variant::variant; };
+```
+
+Field order is API, since designated initializers must follow it.
+
+### Two trees
+
+- The **component tree** is retained. `ui::run` owns the root, children are members of their
+  parent, and `ui::list_t<T>` holds dynamic children at stable addresses. Identity is that stable
+  ownership, so there are no reconciliation keys and no diffing. Interaction state (hovered, held,
+  focused) lives in the event source, for example `pressable_t`, which a view may read.
+- The **node tree** is disposable. Each component caches its last `view()` output. A
+  `ui::mount(child)` in that output is a reference to the child component, not the child's nodes.
+
+At a frame, only dirty components re-run `view()`. A parent that re-runs mounts the same child
+again and does not rebuild it. Layout and drawing walk the stitched result and are whole-window
+to begin with.
+
+**A `view()` reads only its own component's state.** A parent that reads `left.count` is not
+rebuilt when `left` changes, and nothing reports the stale frame. Data flows down as props,
+`ui::mount(left, {.highlight = selected == 0})`: those props are part of the parent's output, and
+the child is rebuilt when they compare unequal. Data flows up as events: the child exposes a
+source and the parent's behaviour subscribes to it.
+
+### Invalidation
+
+`behave()` returns `ui::behaviour_t`, whose promise has an `await_transform`. Every `co_await`
+in a behaviour, whether a UI event, `vio::sleep`, a socket read or a QUIC stream, is wrapped, and
+the wrapper marks the component dirty when the coroutine resumes. The rule is: **a behaviour that
+woke up rebuilds its view.** Being dirty only calls `request_frame()`, so ten wake-ups in one
+turn cost one rebuild, done at the frame.
+
+The gap: a nested `vio::task_t` that mutates the component mid-way is not seen until it returns
+to the behaviour. `scope.invalidate()` covers that, and changes made from outside a behaviour.
+
+### Behaviours and scopes
+
+A scope is the lifetime of a component. `behave()` is the first behaviour started in it, and
+`scope.spawn(b)` starts more. All of them run on the loop thread, so they share the component's
+members without locks.
+
+- The promise constructor takes the coroutine's arguments, so it finds `*this` and the
+  `scope_t &` there before the body runs. A behaviour without a scope parameter does not compile.
+- `behaviour_t` is lazy, unlike `task_t`. `spawn` takes the handle, records it and resumes it at
+  once. The child runs to its first suspension before `spawn` returns.
+- The scope owns the frames. A finished behaviour moves itself to the scope's finished list at
+  `final_suspend`, and the scope destroys it in the beat, never from inside its own stack.
+- A spawned behaviour belongs to the scope, not to its spawner, so it outlives a `behave()` that
+  returns. A `scope_t` constructed from a parent is a child scope for shorter lifetimes, with
+  `cancel()` and `co_await join()`, and the parent's cancellation reaches it.
+- `spawn` returns `spawned_t<T>`, which can be awaited for the result. Dropping it does not
+  detach the behaviour.
+- An exception in a behaviour terminates, as it does in `task_t`. Keeping it in the promise and
+  rethrowing it out of `ui::run`, the way a throwing callback leaves `run()` (D52), is still to do.
+
+### Unmount and cancellation
+
+`vio::cancellation_t` (`src/vio/cancellation.h`) shapes this part, in four ways:
+
+- **A token reaches an operation only when the operation is created.** Sleep, DNS, file work,
+  TCP connect/write/listen, TLS connect/handshake/write, UDP send, the QUIC operations and
+  `http_client` fetch all take a `cancellation_t *` argument. Readers (`tcp_reader_t`,
+  `stream_reader_t`, the UDP and QUIC stream readers) take none and have a `cancel()` method
+  instead. The window's `frame()` and subscriptions take neither; they end when the window
+  closes. So `await_transform` cannot attach cancellation to an operation that already exists.
+  A behaviour passes `scope.token()` to what it starts, and binds a reader with
+  `scope.bind(reader)`, which registers a callback calling `reader.cancel()`. The
+  `registration_t` is RAII and deregisters when the frame is destroyed.
+- **Some operations resume inside `cancel()`.** Sleep's callback calls `continuation.resume()`
+  directly, while the QUIC operations latch and resume in the beat. So `scope.cancel()` can run
+  behaviours on its own stack. It is called only from the beat, never while the framework walks
+  the component tree or a scope's lists, and no frame is destroyed until it has returned.
+- **A frame parked inside an operation is never destroyed,** because the operation holds its
+  handle. Only a frame stopped at the wrapper's refusal (below) is destroyed. A parked operation
+  that took no token therefore delays the unmount until it completes. That is correct, only late,
+  like the TCP linger (D49).
+- `cancellation_t` cannot be moved, so `scope_t` cannot either. It lives in the slot the
+  framework holds for the component. A child scope registers a callback on its parent's token.
+
+The unmount itself:
+
+1. The component leaves the tree, because a parent stopped mounting it or a `list_t` erased it.
+   It moves to a dying list and is not freed.
+2. In the beat, the scope's token is cancelled. Operations holding it resolve as cancelled, bound
+   readers are cancelled, and subscriptions on the component's sources yield `std::nullopt`.
+3. Each behaviour resumes and runs to its next `co_await`. There, the wrapper's `await_suspend`
+   sees the cancelled scope and does not arm the operation. The coroutine stays suspended with no
+   one else holding its handle, and the scope destroys the frame after `cancel()` returns. Locals
+   are destroyed with the frame, so a socket held in one closes. A `while (true)` loop around a
+   sleep therefore ends without checking anything.
+4. The component's storage is freed once its scope has no running behaviours, because every
+   behaviour holds `this`.
+
+Open question for vio: giving readers a `cancellation_t *` as well would make the token the only
+mechanism and retire `scope.bind`.
+
+### Several events at once
+
+- **Several sources of one kind:** `ui::subscribe<press_event_t>(inc, dec)` reports which one
+  fired, as `window.subscribe<A, B>()` reports which type arrived.
+- **Independent concerns:** `scope.spawn` one straight-line loop per concern. This should be the
+  common case.
+- **First of several:** `ui::merge(a, b, c)` yields a variant from whichever source has
+  something. It is over *sources*, things that queue the way subscriptions do, never over one-shot
+  operations: a one-shot operation that loses the race must either be cancelled, which can drop
+  what it already read, or carried into the next iteration and armed twice. Timers and sockets
+  join through adapters (`ui::every`, `ui::lines`) that keep one operation armed and hold its
+  result until it is taken.
+
+### Input and drawing
+
+Layout produces a flat list of `{rect, color, source}`. Hit testing walks that list backwards on
+the window's pointer events. A press is a down and an up on the same source, with the pointer
+captured between them. Hit testing also sets hovered and held. The first renderer draws each box
+with `glScissor` and `glClear`, which needs no shaders, no buffers and no linked graphics API,
+only the `proc<>` lookups. A real renderer replaces it later, behind the same flat list.
+
+Redraws follow invalidation and resizes only, so a damage-only expose is not repainted until
+something changes (G23). Layout is fixed sizes and row/column stacking. Flex-style grow and shrink comes next. Text needs a
+real renderer and a font dependency, and stays out until then.
+
 ## Phases
 
 | phase | work | verified by |
@@ -162,3 +337,6 @@ Neither OpenCL nor CUDA is linked or loaded by the library.
 | 3 | EGL, GL and Vulkan surfaces on Linux; interop properties | tests under Xvfb and weston, llvmpipe and lavapipe |
 | 4 | Win32 backend, WGL and Direct3D 12 | Windows CI |
 | 5 | Cocoa backend, NSOpenGL and Metal | macOS CI |
+| 6 | UI: components, `behaviour_t` with dirty marking, scopes with `spawn` and unmount cancellation, `box`/`row`/`column`, mount, hit testing, scissor-clear drawing | a counter and a sleep-driven clock example; unit tests for scope teardown |
+| 7 | UI: `list_t`, props, child scopes, `spawned_t<T>` | a dynamic list example; unmount tests |
+| 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
