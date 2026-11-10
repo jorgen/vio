@@ -199,9 +199,9 @@ produces a flat list of `draw_item_t`, which is also what `run_config_t::on_layo
 so a real renderer replaces this one behind the same list. Without a GL context (the null backend)
 nothing is drawn and everything else runs.
 
-Known gaps: redraws are driven by invalidation and resizes, so a damage-only expose with no resize
-(possible on X11) is not repainted until something changes; and a behaviour that throws terminates,
-as `task_t` does, rather than rethrowing out of `ui::run`.
+Known gap: a behaviour that throws terminates, as `task_t` does, rather than rethrowing out of
+`ui::run`. (The other gap recorded here, an expose with no change going unpainted, is closed by
+G36. This renderer is now the GL fallback of G32 and reads the display list of G24.)
 
 ## G24. The renderer reads a display list, not the hit-test list
 
@@ -264,12 +264,20 @@ primitives each, and assembling a frame from thousands of tiny copies would pay 
 on all of them. So a subtree below a threshold flattens into its ancestor's chunk, with hysteresis
 so one near the limit does not switch every frame. Flattened copies at *every* level were rejected:
 memory grows with depth, a leaf change re-flattens every ancestor, and the root's copy is the whole
-window anyway. With chunks every command lives in exactly one, and a rebuild is bounded by the
-threshold.
+window anyway. With chunks every command lives in exactly one.
+
+What the threshold does *not* bound, as built: a holder's chunk holds its own commands and those
+of every descendant too small to hold one, so a parent of a thousand 100-primitive children holds
+one chunk of 100,000 and flattens all of it when any child changes. And a holder that is marked
+only because a nested holder below it changed flattens again although none of its own content did.
+Both are bounded by what the window shows, both are cheap next to running views, and neither is
+fixed: the first wants a holder that grows past a multiple of the threshold to promote its largest
+inlined children; the second wants a third flag, set only by changes that land in the holder's own
+chunk.
 
 The instance buffer is concatenated afresh every frame rather than patched in place. Patching
 would need an allocator over the buffer and a plan for chunks that change length, to save a copy
-of tens of microseconds. Offsets are applied in the shader from a buffer of chunk origins, so that
+of tens of microseconds. Offsets are applied in the shader from each run's origin (G34), so that
 copy is a plain `memcpy` and moving costs one origin. Boundaries, which hold their own GPU buffers,
 are for the subtrees large enough that even the copy matters. Data that is large in itself -- the
 atlas, plot series, heatmaps -- lives in its own GPU resources and is never part of any copy.
@@ -281,3 +289,82 @@ CI under Xvfb and weston, as phase 3 already does for surfaces, and the same cod
 D3D12 would be testable only on Windows and Metal only on macOS. It also sidesteps WGL, whose
 context creation fails on the Windows machine the toolkit was first run on. D3D12 and Metal follow
 once the display list, shaders and text are settled on Vulkan.
+
+## G31. The renderer owns its Vulkan device unless the program lends one
+
+The window layer never creates a device; a toolkit that draws has to. So by default the renderer
+creates its own instance and device, picking a discrete GPU over an integrated one over anything
+else (lavapipe last), and a queue family that can present to the window. A program that already
+renders passes `run_config_t::vulkan_device` -- instance, physical device, device, queue, family
+and its `vkGetInstanceProcAddr` -- and the renderer makes only its surface, swapchain, pipeline and
+buffers on it, destroying those and nothing else. The program must have enabled the instance's
+surface extensions (`vulkan::required_instance_extensions`) and the device's `VK_KHR_swapchain`,
+and must not use the queue from another thread while the loop draws: Vulkan queues are externally
+synchronised and the renderer submits from the loop thread. Handles cross the public header as
+`void *`, so `ui.h` needs no `vulkan.h`.
+
+## G32. The GL stopgap stays as the fallback
+
+`render_api_t::automatic` tries Vulkan, then GL. GL is still G23's scissor-clear renderer, now
+reading the display list: square corners, no borders, no shadows. It stays until Vulkan has run on
+every platform CI covers, because until then it is the only thing that draws on a machine whose
+Vulkan loader or driver is missing. `run_config_t::on_renderer` says which was chosen and why
+Vulkan was not, since a silent fallback looks like a styling bug. Removing it is phase 12's call.
+
+## G33. The committed SPIR-V is a stopgap from a GLSL transcription
+
+`ui.slang` is the source of truth (G25), but the first `ui_spirv.h` was not compiled from it.
+Downloading slangc was refused in the session that wrote the renderer, and nothing installed on the
+machine compiled Slang. RenderDoc's `glslangValidator` 16.2.0 was installed, so the two entry
+points were transcribed to GLSL by hand -- same attribute locations, same push-constant block, same
+arithmetic -- and compiled with that; the transcription is not in the tree. The header says so in
+its first lines. Regenerate it with `cmake --build <dir> --target vio_gui_shaders` once slangc is
+on `PATH`, then run `test_ui_render.cpp`: the offscreen test reads back pixels and is what proves
+the Slang output matches. The renderer reads each module's entry point name out of its
+`OpEntryPoint`, so slangc keeping `vertexMain` where glslang writes `main` needs no change. The
+target builds for `spirv_1_0` because the renderer asks for Vulkan 1.0.
+
+## G34. A run's origin is a push constant, not an index into a buffer
+
+G29 planned a buffer of chunk origins indexed per instance. One `vkCmdDraw` per run with the origin
+pushed does the same job without a descriptor set, a second buffer or a field in every primitive,
+and the number of runs is the number of chunks, roughly primitives / threshold -- dozens, not
+thousands. The cost is a draw call per run. When the glyph atlas brings descriptor sets in phase 10,
+or a profile shows draw calls, the buffer is the change to make; the display list already carries
+everything it needs.
+
+## G35. Layout is in logical units, on every platform
+
+`frame.framebuffer / frame.scale` is the window's size on Wayland and macOS and its size divided by
+the UI scale on Windows and X11 (G9), so one expression gives the same unit everywhere. Before
+this, layout used `frame.size`, which is pixels on Windows and X11 -- a 60-unit box
+was 60 pixels at any DPI. Pointer positions arrive in the window system's units and are scaled by
+logical / size before hit testing. Sizes stay integers; the renderer scales by framebuffer /
+logical, per axis, in floating point. Only the null backend (scale 1) is under test, so the
+conversion itself has been seen working only in the counter example at 144 DPI.
+
+## G36. An expose is an event in the window layer
+
+The frame loop sleeps in `changed()` and a window's `damaged` flag reached nobody until something
+else asked for a frame -- the G23 gap. `expose_event_t` joins `window_event_t`, emitted when the
+window system reports damage and when a hidden window is shown again, so a subscriber learns that
+its contents were lost. It is an event rather than a flag on `frame()` because frames are only
+delivered when asked for (G5): a program waiting for a reason to draw needs to be told. The UI
+subscribes to it beside `resize_event_t`; the frame that follows runs no view and reuses every
+chunk, which `test_ui_render.cpp` checks.
+
+## G37. A shadow is the Gaussian of the distance, not the exact convolution
+
+The shadow's coverage is `0.5 - 0.5 erf(d / (sqrt(2) sigma))` of the same rounded-box distance the
+box itself uses. It is exact along straight edges and an approximation at corners, where the true
+convolution of a rounded rectangle is slightly darker. Evan Wallace's closed form integrates the
+corners properly but is several times the code; at UI shadow sizes the difference is not visible.
+The quad grows by three sigmas so the tail is not clipped.
+
+## G38. Colours are sRGB as authored, blended in linear space
+
+`color_t` values are what a designer types -- sRGB, straight alpha. The vertex shader converts to
+linear and premultiplies; blending is `ONE, ONE_MINUS_SRC_ALPHA`; the swapchain is an `_SRGB` format
+so the hardware encodes on write. Where a surface offers no sRGB format the shader encodes itself
+(`encode_srgb` in the push constants). The clear colour is converted on the CPU to match. This is
+what G27 asks of text, set up before text arrives.

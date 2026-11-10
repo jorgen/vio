@@ -318,78 +318,59 @@ mechanism and retire `scope.bind`.
 
 ### Input and drawing
 
-Layout produces a flat list of `{rect, color, source}`. Hit testing walks that list backwards on
-the window's pointer events. A press is a down and an up on the same source, with the pointer
-captured between them. Hit testing also sets hovered and held. The first renderer draws each box
-with `glScissor` and `glClear`, which needs no shaders, no buffers and no linked graphics API,
-only the `proc<>` lookups. A real renderer replaces it later, behind the same flat list.
+Layout produces a flat list of `draw_item_t`, one per box. Hit testing walks that list backwards on
+the window's pointer events, which arrive in the window system's units and are converted to layout
+units first. A press is a down and an up on the same source, with the pointer captured between
+them. Hit testing also sets hovered and held. Drawing reads a separate display list, below.
 
-Redraws follow invalidation and resizes only, so a damage-only expose is not repainted until
-something changes (G23). Layout is fixed sizes and row/column stacking. Flex-style grow and shrink comes next. Text needs a
-real renderer and a font dependency, and stays out until then.
+Layout is fixed sizes and row/column stacking. Flex-style grow and shrink comes next. Text is phase
+10.
 
 ### Rendering
 
-The renderer replaces the scissor-clear stopgap at the layout output and never reaches into the
-component layer. The design below is agreed in outline; G24-G28 hold the reasons.
+The renderer reads the display list and never reaches into the component layer. Phase 9 built what
+this section describes except where it says otherwise; G24-G38 hold the reasons.
 
 **Two lists, not one.** `draw_item_t` stays what it is: one entry per hit-testable box, walked
-backwards for input. Layout also emits a *display list* in painter's order, which is what the
-renderer consumes. They differ because one text item is many glyphs and one plot is thousands of
-segments, none of which hit testing should walk (G24). Each display-list command carries a clip
-rect, so scrolling regions and plot areas clip by scissor.
+backwards for input. Layout also emits a `display_list_t` in painter's order, which is what the
+renderer consumes. They differ because one text item will be many glyphs and one plot thousands of
+segments, none of which hit testing should walk (G24). Not yet: a clip rect per command, which
+scrolling regions and plot areas will need.
 
-**Incremental updates** (G29). `view()` is already incremental; layout and the display list
-become so with the renderer:
+**What a frame does** (G29), in `runtime_t::step`:
 
-- Each slot keeps the commands from its own output, in coordinates relative to its origin, and
-  two flags. `view_dirty` re-runs its `view()`. `subtree_dirty` says something below changed. It
-  is set on every ancestor up to the first that already has it, and never re-runs an ancestor's
-  view. Assembly skips every subtree whose `subtree_dirty` is clear.
-- Commands are grouped in *chunks*, so assembly is a few large copies rather than one tiny copy per
-  component. A subtree with fewer than a threshold of commands (128 to start, to be tuned) is
-  flattened into the chunk of its nearest ancestor that holds one. A chunk-holding subtree that
-  falls below half the threshold folds back into its parent; the gap keeps a subtree near the
-  limit from switching every frame. A change rebuilds only the chunk it lands in, from the
-  retained per-slot commands, without running any clean view. Every command lives in exactly one
-  chunk, so memory is at most twice the commands, never one copy per level of depth.
-- A *boundary* is the other end of the same scale: a subtree large enough, or marked with
-  `ui::boundary`, to own a persistent GPU instance buffer and its own draw call. A clean boundary
-  costs no walk, no copy and no upload. Plots and long lists are the intended cases. Boundaries
-  come when profiling asks for them; chunks and the dirty flags come with the renderer.
-- Offsets are applied in the shader: each instance carries an index into a buffer of chunk
-  origins, so copying a chunk is a plain `memcpy` and a chunk or boundary that only moved changes
-  one origin and nothing else.
-- Each slot caches its measured size and the constraints it was measured under. A clean slot under
-  unchanged constraints answers from the cache without walking its subtree, and a dirty one whose
-  size did not change stops the relayout there. This also ends today's repeated measuring, where
-  `place` calls a recursive `measure` for every child.
-- The whole window is rendered every frame: a GPU frame is not drawn in parts. Outside
-  boundaries, the instance buffer is assembled from the chunks every frame. That is a copy of tens of
-  microseconds for ten thousand primitives; the cost worth caching is `view()`, layout and shaping.
-  The glyph atlas, plot point buffers and heatmap textures are persistent resources that commands
-  refer to by handle, updated only when their data changes.
-- Hit testing keeps `draw_item_t`, rebuilt from cached positions without running any view.
-- Telling the compositor which region changed (`Present1` dirty rects,
-  `VK_KHR_incremental_present`, Wayland damage) saves power, not frame time, and flip-model swap
-  chains do not keep the previous frame. It is deferred.
+1. `build` re-runs the dirty views and marks `subtree_dirty` on the way back up through its return
+   values, so an ancestor is marked without its view running. It still walks every slot to find
+   which ones left the tree; that walk is pointer chasing, not views.
+2. `lay_out` revisits only marked slots. Each lays out its marked children, then places its own
+   output around them in one pass, producing its *entries*: primitives in its own coordinates and
+   children at offsets. A clean slot keeps its size and entries. There are no constraints yet --
+   sizes are fixed -- so a slot's size depends on its output and its children only; flex will add
+   the constraints to what the cache depends on.
+3. Chunks. The root always holds one; any other subtree holds one from `chunk_threshold` primitives
+   (128 by default) and gives it back below half of that. A holder flattens its own entries and
+   those of every non-holding descendant into one array, cut into segments wherever a holding
+   descendant sits in painter's order. Only marked holders flatten again; a clean one is reused.
+   Every primitive lives in one chunk, so memory is at most twice the primitives.
+4. Assembly copies the chunks into one array and records a `run_t` per segment: a range and the
+   origin it is drawn at. Moving a chunk changes its origin and nothing in it.
+5. The hit-test list is rebuilt from the entries, with no view run.
 
-**Units.** Layout is in logical units and the renderer works in framebuffer pixels as floats,
-snapping rect edges to whole pixels itself. Today `step(frame->size)` lays out in the window
-system's units (G9), which are pixels on Windows and X11, so the UI is not DPI-scaled there. The
-renderer's arrival is when layout moves to `frame.size / frame.scale` on every platform.
+So per frame the work that scales with the whole window is a pointer walk, one copy of every
+primitive, and one walk of the boxes for hit testing; `view()`, layout and flattening scale with
+what changed. Not yet: boundaries, subtrees that keep their own GPU buffer so that even the copy is
+skipped (G29). They wait for a profile that asks for them -- plots are the likely first.
 
-**Two pipelines** (G26):
+**Units** (G35). Layout is in logical units: `frame.framebuffer / frame.scale`, which is the
+window's size on Wayland and macOS and its size divided by the UI scale on Windows and X11. The
+renderer scales by framebuffer / logical. On a 144 DPI Windows display a 60-unit box is 90 pixels.
 
-1. *Instanced primitives*: one quad per primitive, the shape evaluated analytically in the fragment
-   shader -- rect, rounded rect with per-corner radii and border, analytic Gaussian shadow, circle,
-   arc, capsule, plot marker, polyline segment, and atlas glyph. Antialiasing is
-   `clamp(0.5 - d / fwidth(d), 0, 1)`; no MSAA.
-2. *Triangle meshes*: fills that are not one of the primitives, such as the area under a plot
-   curve.
-
-Glyphs share the primitive pipeline, so text and shapes interleave in painter's order without a
-pipeline change, and a typical window is one or two draws.
+**One pipeline so far** (G26). One instanced quad per primitive, its shape computed per pixel: a
+rounded rectangle with per-corner radii and a border, or a blurred one, which is a shadow (G37).
+Antialiasing is half a pixel either side of the exact distance; no MSAA. Colours are authored in
+sRGB and blended in linear space (G38). Still to come in later phases: circles, arcs, capsules,
+markers, polyline segments and glyphs in the same pipeline, and the triangle-mesh pipeline for
+fills.
 
 **Text** (G27): HarfBuzz shapes, FreeType rasterizes at the exact pixel size into a coverage atlas
 keyed by font, size, glyph and one of four horizontal subpixel offsets. Blending is in linear
@@ -402,24 +383,45 @@ strips; heatmaps as an `R32F` data texture plus a colormap lookup texture; serie
 coordinates relative to a per-series origin subtracted in `double`, with pan and zoom as a uniform;
 M4 decimation (first, last, min, max per pixel column) once a series has more points than pixels.
 
-**Shaders** (G25): Slang, compiled offline to SPIR-V, MSL and DXIL. The outputs are committed and
-embedded with cmakerc, so building vio needs no `slangc`; a target regenerates them.
+**Shaders** (G25, G33): `src/shaders/ui.slang` is the source. `src/shaders/ui_spirv.h` is the
+compiled SPIR-V, committed, so building vio needs no shader compiler; `cmake --build <dir> --target
+vio_gui_shaders` regenerates it when `slangc` is on `PATH`. The header in the tree was not made by
+slangc -- see G33 before trusting it.
+
+**Vulkan** (G30, G31, G34). `src/ui_vulkan.cpp`: the loader is opened at run time, Vulkan 1.0, a
+classic render pass, an sRGB swapchain with FIFO present, two frames in flight, one host-visible
+vertex buffer per frame. One `vkCmdDraw` per run, the run's origin pushed as a constant. The
+renderer creates its own instance and device unless `run_config_t::vulkan_device` hands it the
+program's. `run_config_t::api` picks Vulkan, GL or automatic (Vulkan, then GL), and `on_renderer`
+reports which was chosen and why the others were not.
+
+**GL** stays as the fallback (G32): the scissor-clear stopgap of G23, now reading the display list.
+Corners are square and shadows are skipped.
+
+**Damage** (G36). An expose -- `expose_event_t`, new in the window layer -- wakes the frame loop,
+and the frame that follows reuses every chunk and runs no view.
 
 **Backend seam.** Per graphics API the renderer needs about five operations: upload a buffer,
 upload a texture region, set a scissor, draw instanced, present. It is not a general rendering
 hardware interface and must not grow into one. APIs are loaded at run time as G6 has it.
 
-**Vulkan first** (G30). D3D12 and Metal follow in phase 12.
-
-**Damage.** The present path closes G23's gap: a frame with `frame.damaged` set and nothing
-invalidated re-submits the last display list without running layout. The frame loop has to learn
-of damage while it waits on `changed()`, which today it does not.
+**Verified so far.** Windows, MSVC, AMD Radeon RX 5700 XT: `test/test_ui_render.cpp` (display list,
+chunks, hysteresis, expose, and an offscreen Vulkan render read back pixel by pixel), and
+`vio_gui_ui_counter` drawn through the swapchain at 144 DPI and checked by a screen capture. The
+chunk-hysteresis and expose tests were each confirmed to fail with their fix reverted. **Not run:**
+Linux (lavapipe, X11, Wayland) and macOS (MoltenVK) -- Docker was down; clang-cl `-fsyntax-only`
+over the new sources is the only check beyond MSVC.
 
 Open:
 
-- Who owns the device. The window layer never creates a device (see *Rendering contexts*); the
-  renderer has to, by default, and should accept the program's when the program renders too.
-- Whether GL stays as a backend once one of the three lands, or the stopgap is simply removed.
+- Telling the compositor which region changed (`Present1` dirty rects,
+  `VK_KHR_incremental_present`, Wayland damage) saves power, not frame time, and flip-model swap
+  chains do not keep the previous frame. Deferred.
+- A chunk is bounded per descendant, not in total: a parent of many small children holds one big
+  chunk and flattens all of it on any change, and a holder flattens again when only a nested holder
+  below it changed. G29 records both and the fix for each.
+- Device loss is handled by giving up: `render` returns false and the frame loop stops drawing. A
+  recreate would be better and is not written.
 
 ## Phases
 
@@ -433,7 +435,7 @@ Open:
 | 6 | UI: components, `behaviour_t` with dirty marking, scopes with `spawn` and unmount cancellation, `box`/`row`/`column`, mount, hit testing, scissor-clear drawing | a counter and a sleep-driven clock example; unit tests for scope teardown |
 | 7 | UI: `list_t`, props, child scopes, `spawned_t<T>` | a dynamic list example; unmount tests |
 | 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
-| 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint | rounded rects, borders and shadows on screen; an expose with no change repaints |
+| 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint. **In on Windows**; Linux and macOS not yet run | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons | labels at 1x and 2x scale; a shaping test with a non-Latin script |
 | 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation | thick translucent zigzag lines; a million-point series panned at frame rate |
 | 12 | D3D12 and Metal backends | the phase 9 to 11 examples on each |
