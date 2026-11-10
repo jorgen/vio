@@ -273,3 +273,11 @@ of tens of microseconds. Offsets are applied in the shader from a buffer of chun
 copy is a plain `memcpy` and moving costs one origin. Boundaries, which hold their own GPU buffers,
 are for the subtrees large enough that even the copy matters. Data that is large in itself -- the
 atlas, plot series, heatmaps -- lives in its own GPU resources and is never part of any copy.
+
+## G30. Vulkan is the renderer's first backend
+
+It is the one backend that can be tested everywhere the window layer is: lavapipe runs it in Linux
+CI under Xvfb and weston, as phase 3 already does for surfaces, and the same code runs on Windows.
+D3D12 would be testable only on Windows and Metal only on macOS. It also sidesteps WGL, whose
+context creation fails on the Windows machine the toolkit was first run on. D3D12 and Metal follow
+once the display list, shaders and text are settled on Vulkan.

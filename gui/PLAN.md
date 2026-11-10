@@ -409,14 +409,14 @@ embedded with cmakerc, so building vio needs no `slangc`; a target regenerates t
 upload a texture region, set a scissor, draw instanced, present. It is not a general rendering
 hardware interface and must not grow into one. APIs are loaded at run time as G6 has it.
 
+**Vulkan first** (G30). D3D12 and Metal follow in phase 12.
+
 **Damage.** The present path closes G23's gap: a frame with `frame.damaged` set and nothing
 invalidated re-submits the last display list without running layout. The frame loop has to learn
 of damage while it waits on `changed()`, which today it does not.
 
 Open:
 
-- Which backend comes first. Vulkan is testable in Linux CI on lavapipe and also runs on Windows;
-  D3D12 is native here, where WGL creation currently fails. Metal follows either way.
 - Who owns the device. The window layer never creates a device (see *Rendering contexts*); the
   renderer has to, by default, and should accept the program's when the program renders too.
 - Whether GL stays as a backend once one of the three lands, or the stopgap is simply removed.
@@ -433,7 +433,7 @@ Open:
 | 6 | UI: components, `behaviour_t` with dirty marking, scopes with `spawn` and unmount cancellation, `box`/`row`/`column`, mount, hit testing, scissor-clear drawing | a counter and a sleep-driven clock example; unit tests for scope teardown |
 | 7 | UI: `list_t`, props, child scopes, `spawned_t<T>` | a dynamic list example; unmount tests |
 | 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
-| 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on the first backend, damage repaint | rounded rects, borders and shadows on screen; an expose with no change repaints |
+| 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons | labels at 1x and 2x scale; a shaping test with a non-Latin script |
 | 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation | thick translucent zigzag lines; a million-point series panned at frame rate |
-| 12 | The remaining two of Vulkan, D3D12 and Metal | the phase 9 to 11 examples on each |
+| 12 | D3D12 and Metal backends | the phase 9 to 11 examples on each |
