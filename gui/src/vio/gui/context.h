@@ -113,6 +113,7 @@ namespace vulkan
 using get_instance_proc_addr_t = void (*(*)(void *instance, const char *name))();
 
 [[nodiscard]] std::vector<const char *> required_instance_extensions(const display_t &display);
+[[nodiscard]] std::vector<const char *> required_instance_extensions(platform_t platform);
 std::expected<std::uint64_t, error_t> create_surface(window_t &window, void *instance, get_instance_proc_addr_t get_instance_proc_addr, const void *allocator = nullptr);
 std::expected<std::array<std::uint8_t, 16>, error_t> device_uuid(void *instance, void *physical_device, get_instance_proc_addr_t get_instance_proc_addr);
 } // namespace vulkan

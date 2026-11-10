@@ -241,7 +241,12 @@ std::vector<const char *> required_instance_extensions(const display_t &display)
 {
   if (!display)
     return {};
-  switch (display.platform())
+  return required_instance_extensions(display.platform());
+}
+
+std::vector<const char *> required_instance_extensions(platform_t platform)
+{
+  switch (platform)
   {
   case platform_t::x11:
     return {"VK_KHR_surface", "VK_KHR_xlib_surface"};

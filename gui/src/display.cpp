@@ -210,6 +210,7 @@ void window_impl_t::on_close_request()
 void window_impl_t::on_damage() noexcept
 {
   damaged = true;
+  on_input(expose_event_t{});
   mark_dirty();
 }
 
@@ -226,7 +227,10 @@ void window_impl_t::on_visible(bool now_visible) noexcept
     return;
   visible = now_visible;
   if (visible)
+  {
     damaged = true;
+    on_input(expose_event_t{});
+  }
   mark_dirty();
 }
 

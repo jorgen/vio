@@ -36,3 +36,11 @@ CmDepFetchPackage(ada 3.2.4
 CmDepFetchPackage(structify b114582
     https://github.com/jorgen/structify/archive/b1145826ab4a06cbe32ae0c373a3161f74c48ac8.tar.gz
     SHA256=49f3af94194bd37aa76d99c1d3e351eb237b838ae75d21fecaf6ac4a806c7606)
+
+# Vulkan-Headers: the declarations only. The gui toolkit's renderer loads the Vulkan loader at run
+# time (gui/DECISIONS.md G6, G31), so nothing is linked and no Vulkan SDK is needed to build.
+if(VIO_BUILD_GUI)
+    CmDepFetchPackage(vulkan_headers 1.4.350.1
+        https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz
+        SHA256=6d1bb65e49520344cc0a48af3dc02e993781efff14c7ebdcb8ae9fa23ddf7e83)
+endif()

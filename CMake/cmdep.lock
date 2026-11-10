@@ -37,3 +37,10 @@ CmDepLocked(structify
     HASH SHA256=49f3af94194bd37aa76d99c1d3e351eb237b838ae75d21fecaf6ac4a806c7606
     DECLARED_BY .
     REQUESTED_BY [==[.=b114582]==])
+
+CmDepLocked(vulkan_headers
+    VERSION [==[1.4.350.1]==]
+    URL [==[https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz]==]
+    HASH SHA256=6d1bb65e49520344cc0a48af3dc02e993781efff14c7ebdcb8ae9fa23ddf7e83
+    DECLARED_BY .
+    REQUESTED_BY [==[.=1.4.350.1]==])

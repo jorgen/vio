@@ -155,8 +155,15 @@ struct close_request_t
 {
 };
 
+// The window's contents were lost -- an expose on X11, WM_PAINT, the window shown again -- and must
+// be drawn again although nothing in the program changed. The next frame() has `damaged` set; this
+// is how a program that only awaits frames when something changed learns that it should.
+struct expose_event_t
+{
+};
+
 // Everything a window reports, and what window_t::subscribe<Ts...>() selects from.
-using window_event_t = std::variant<key_event_t, text_event_t, pointer_move_event_t, pointer_button_event_t, scroll_event_t, pointer_enter_event_t, focus_event_t, resize_event_t, close_request_t>;
+using window_event_t = std::variant<key_event_t, text_event_t, pointer_move_event_t, pointer_button_event_t, scroll_event_t, pointer_enter_event_t, focus_event_t, resize_event_t, close_request_t, expose_event_t>;
 
 struct frame_t
 {

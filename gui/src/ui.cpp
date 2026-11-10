@@ -22,10 +22,13 @@ Copyright (c) 2026 Jørgen Lind
 
 #include "vio/gui/ui/ui.h"
 
+#include <cmath>
+#include <string>
 #include <unordered_map>
 
 #include <vio/event_loop.h>
 
+#include "ui_renderer.h"
 #include "vio/gui/context.h"
 
 namespace vio::gui::ui
@@ -35,6 +38,38 @@ namespace detail
 using vio::detail::loop_core_t;
 using vio::detail::posted_t;
 
+// One laid-out piece of a component's own output: a primitive in the component's coordinates, or a
+// mounted child placed at an offset. `box` is set on the primitive that draws a box, which is what
+// hit testing reports; a shadow's primitive has none.
+struct entry_t
+{
+  prim_t prim;
+  slot_t *child = nullptr;
+  const box_t *box = nullptr;
+  int x = 0;
+  int y = 0;
+  int ordinal = 0;
+};
+
+// A chunk is the flattened output of a subtree too small to keep apart (G29): its own primitives
+// and its inlined descendants', in its own coordinates, cut into segments wherever a descendant
+// large enough to hold a chunk of its own sits in painter's order.
+struct segment_t
+{
+  std::uint32_t begin = 0;
+  std::uint32_t end = 0;
+  slot_t *child = nullptr;
+  int x = 0;
+  int y = 0;
+};
+
+struct chunk_t
+{
+  std::vector<prim_t> prims;
+  std::vector<segment_t> segments;
+  bool valid = false;
+};
+
 // What the framework keeps for one mounted component.
 struct slot_t
 {
@@ -43,8 +78,20 @@ struct slot_t
   behaviour_t (*behave)(void *, scope_t &) = nullptr;
   std::unique_ptr<scope_t> scope;
   node_t output;
+  // Its view must run again.
   bool dirty = true;
+  // It or something below it changed since the last frame, so its layout, entries and chunk are
+  // stale. Set on the way back up from a view that ran; never re-runs this slot's own view.
+  bool subtree_dirty = false;
   bool reached = false;
+  // Laid out at least once; until then it counts as changed.
+  bool laid_out = false;
+
+  extent_t size;
+  std::vector<entry_t> entries;
+  std::size_t subtree_prims = 0;
+  bool holder = false;
+  chunk_t chunk;
 };
 
 // Where a press is aimed. A box with a source is that source wherever it moves; a box with only an
@@ -62,6 +109,41 @@ struct target_t
   }
   friend bool operator==(const target_t &, const target_t &) = default;
 };
+
+namespace
+{
+prim_t box_prim(const box_t &box, int x, int y)
+{
+  prim_t prim;
+  prim.x = float(x);
+  prim.y = float(y);
+  prim.width = float(box.size.width);
+  prim.height = float(box.size.height);
+  for (auto &radius : prim.radii)
+    radius = box.radius;
+  prim.fill = box.color;
+  prim.border_color = box.border_color;
+  prim.border_width = box.border_width;
+  return prim;
+}
+
+bool has_shadow(const box_t &box) noexcept
+{
+  return box.shadow.color.a > 0 && (box.shadow.blur > 0 || box.shadow.x != 0 || box.shadow.y != 0);
+}
+
+prim_t shadow_prim(const box_t &box, int x, int y)
+{
+  prim_t prim = box_prim(box, x, y);
+  prim.x += box.shadow.x;
+  prim.y += box.shadow.y;
+  prim.fill = box.shadow.color;
+  prim.border_color = {0, 0, 0, 0};
+  prim.border_width = 0;
+  prim.blur = box.shadow.blur;
+  return prim;
+}
+} // namespace
 
 class runtime_t
 {
@@ -91,6 +173,11 @@ public:
   [[nodiscard]] vio::event_loop_t &loop() const noexcept
   {
     return *_window.impl()->display.loop;
+  }
+
+  [[nodiscard]] const run_config_t &config() const noexcept
+  {
+    return _config;
   }
 
   // ---- resumption: everything the toolkit resumes, it resumes here, from the loop's deferred
@@ -136,11 +223,6 @@ public:
     slot.dirty = true;
     wake_frame();
   }
-  void relayout() noexcept
-  {
-    _layout_dirty = true;
-    wake_frame();
-  }
   void wake_frame() noexcept
   {
     _changed = true;
@@ -169,10 +251,12 @@ public:
     return {*this};
   }
 
-  // ---- the frame step
-  void step(extent_t size)
+  // ---- the frame step: views that are dirty, layout and entries of the subtrees they are in, the
+  // chunks those subtrees fall in; then the display list and the hit-test list, assembled whole.
+  void step(const frame_t &frame)
   {
     _changed = false;
+    set_units(frame);
     if (!_root)
       _root = make_slot(_root_mount);
     for (auto &[component, slot] : _slots)
@@ -194,25 +278,36 @@ public:
     for (auto *slot : leaving)
       unmount(*slot);
 
+    lay_out(*_root);
+    _prims.clear();
+    _runs.clear();
+    _root->holder = true;
+    emit(*_root, 0, 0);
+    for (auto *slot : std::exchange(_touched, {}))
+      slot->subtree_dirty = false;
+
     _items.clear();
-    _ordinals.clear();
-    place(_root->output, *_root, 0, 0);
-    _layout_dirty = false;
-    _size = size;
+    collect_items(*_root, 0, 0);
     if (_has_pointer)
       hover(_pointer);
     if (_config.on_layout)
       _config.on_layout(_items);
+    if (_config.on_display_list)
+      _config.on_display_list(display_list());
   }
 
-  void draw(gl_context_t *gl, const frame_t &frame);
+  [[nodiscard]] display_list_t display_list() const noexcept
+  {
+    return {_prims, _runs, _config.background, _logical, _framebuffer, _scale};
+  }
 
-  // ---- input
+  // ---- input. Pointer positions arrive in the window system's units (G9) and are kept in layout
+  // units.
   void pointer_moved(point_t position)
   {
-    _pointer = position;
+    _pointer = to_logical(position);
     _has_pointer = true;
-    hover(position);
+    hover(_pointer);
   }
   void pointer_left()
   {
@@ -223,12 +318,13 @@ public:
   {
     if (event.button != button_t::left)
       return;
-    _pointer = event.position;
+    const auto position = to_logical(event.position);
+    _pointer = position;
     _has_pointer = true;
-    hover(event.position);
+    hover(position);
     if (event.pressed)
     {
-      _held = target_at(event.position);
+      _held = target_at(position);
       if (_held.source)
         set_flag(_held.source, &pressable_t::_held, true);
       return;
@@ -236,11 +332,11 @@ public:
     auto held = std::exchange(_held, {});
     if (held.source)
       set_flag(held.source, &pressable_t::_held, false);
-    if (held.empty() || !(target_at(event.position) == held))
+    if (held.empty() || !(target_at(position) == held))
       return;
     const auto *item = find(held);
     if (held.source)
-      const_cast<pressable_t *>(held.source)->emit(press_event_t{held.source, event.position}, *this);
+      const_cast<pressable_t *>(held.source)->emit(press_event_t{held.source, position}, *this);
     if (item && item->box->on_press)
     {
       // The handler mutates its component, so that component is rebuilt. Copied first: the
@@ -264,6 +360,9 @@ public:
     }
     _slots.clear();
     _root = nullptr;
+    _items.clear();
+    _prims.clear();
+    _runs.clear();
     for (auto *slot : leaving)
       unmount(*slot);
     reap();
@@ -298,6 +397,22 @@ public:
   }
 
 private:
+  // Layout is in logical units: the framebuffer divided by the scale, which is the window's size on
+  // Wayland and macOS and its size divided by the UI scale on Windows and X11 (G9).
+  void set_units(const frame_t &frame)
+  {
+    _framebuffer = frame.framebuffer;
+    _scale = frame.scale > 0 ? frame.scale : 1.0f;
+    _logical = {int(std::lround(frame.framebuffer.width / _scale)), int(std::lround(frame.framebuffer.height / _scale))};
+    _input_x = frame.size.width > 0 ? double(_logical.width) / frame.size.width : 1.0;
+    _input_y = frame.size.height > 0 ? double(_logical.height) / frame.size.height : 1.0;
+  }
+
+  [[nodiscard]] point_t to_logical(point_t position) const noexcept
+  {
+    return {position.x * _input_x, position.y * _input_y};
+  }
+
   slot_t *make_slot(const mount_t &mount)
   {
     auto slot = std::make_unique<slot_t>();
@@ -324,47 +439,103 @@ private:
     return it == _slots.end() ? nullptr : it->second.get();
   }
 
-  // Re-run the views that are dirty, starting at `slot`, and mark what is still mounted.
-  void build(slot_t &slot)
+  // Re-run the views that are dirty, starting at `slot`, and mark what is still mounted. Returns
+  // whether anything at or below `slot` changed, which is what marks it subtree_dirty: the mark
+  // travels up through the return values and never re-runs a view.
+  bool build(slot_t &slot)
   {
     slot.reached = true;
+    bool changed = false;
     if (slot.dirty)
     {
       slot.dirty = false;
       slot.output = slot.view(slot.component);
+      changed = true;
     }
-    visit_mounts(slot.output);
+    if (visit_mounts(slot.output))
+      changed = true;
+    if (changed || !slot.laid_out)
+      mark(slot);
+    return slot.subtree_dirty;
   }
 
-  void visit_mounts(const node_t &node)
+  bool visit_mounts(const node_t &node)
   {
     if (const auto *mount = std::get_if<mount_t>(&node))
     {
       auto *child = slot_for(*mount);
-      if (!child->reached)
-        build(*child);
-      return;
+      return !child->reached && build(*child);
     }
     const std::vector<node_t> *children = nullptr;
     if (const auto *row = std::get_if<row_t>(&node))
       children = &row->children;
     else if (const auto *column = std::get_if<column_t>(&node))
       children = &column->children;
+    bool changed = false;
     if (children)
     {
       for (const auto &child : *children)
-        visit_mounts(child);
+      {
+        if (visit_mounts(child))
+          changed = true;
+      }
     }
+    return changed;
   }
 
-  extent_t measure(const node_t &node)
+  void mark(slot_t &slot)
+  {
+    if (slot.subtree_dirty)
+      return;
+    slot.subtree_dirty = true;
+    _touched.push_back(&slot);
+  }
+
+  // ---- layout. A subtree that did not change keeps its size and its entries; one that did lays
+  // its children out first and then places its own output around them, in one pass, since a row
+  // or column needs each child's size only once it has been placed.
+  void lay_out(slot_t &slot)
+  {
+    if (!slot.subtree_dirty)
+      return;
+    slot.entries.clear();
+    slot.subtree_prims = 0;
+    int ordinal = 0;
+    slot.size = place(slot, slot.output, 0, 0, ordinal);
+    slot.laid_out = true;
+  }
+
+  extent_t place(slot_t &slot, const node_t &node, int x, int y, int &ordinal)
   {
     if (const auto *box = std::get_if<box_t>(&node))
+    {
+      if (has_shadow(*box))
+      {
+        slot.entries.push_back(entry_t{shadow_prim(*box, x, y)});
+        ++slot.subtree_prims;
+      }
+      entry_t entry{box_prim(*box, x, y)};
+      entry.box = box;
+      entry.x = x;
+      entry.y = y;
+      entry.ordinal = ordinal++;
+      slot.entries.push_back(entry);
+      ++slot.subtree_prims;
       return box->size;
+    }
     if (const auto *mount = std::get_if<mount_t>(&node))
     {
       auto *child = existing(*mount);
-      return child ? measure(child->output) : extent_t{};
+      if (!child)
+        return {};
+      lay_out(*child);
+      entry_t entry;
+      entry.child = child;
+      entry.x = x;
+      entry.y = y;
+      slot.entries.push_back(entry);
+      slot.subtree_prims += child->subtree_prims;
+      return child->size;
     }
     const bool horizontal = std::holds_alternative<row_t>(node);
     const auto &children = horizontal ? std::get<row_t>(node).children : std::get<column_t>(node).children;
@@ -372,15 +543,16 @@ private:
     extent_t total;
     for (std::size_t i = 0; i < children.size(); ++i)
     {
-      const auto size = measure(children[i]);
       const int spacing = i > 0 ? gap : 0;
       if (horizontal)
       {
+        const auto size = place(slot, children[i], x + total.width + spacing, y, ordinal);
         total.width += size.width + spacing;
         total.height = std::max(total.height, size.height);
       }
       else
       {
+        const auto size = place(slot, children[i], x, y + total.height + spacing, ordinal);
         total.height += size.height + spacing;
         total.width = std::max(total.width, size.width);
       }
@@ -388,31 +560,89 @@ private:
     return total;
   }
 
-  void place(const node_t &node, slot_t &slot, int x, int y)
+  // ---- chunks (G29). The root always holds one. Any other subtree holds one from the threshold
+  // up and gives it back below half of it, so a subtree near the limit does not switch every frame.
+  bool decide_holder(slot_t &slot)
   {
-    if (const auto *box = std::get_if<box_t>(&node))
+    const std::size_t threshold = std::max<std::size_t>(_config.chunk_threshold, 1);
+    const bool now = slot.holder ? slot.subtree_prims >= std::max<std::size_t>(threshold / 2, 1) : slot.subtree_prims >= threshold;
+    if (now != slot.holder)
     {
-      const int ordinal = _ordinals[&slot]++;
-      _items.push_back(draw_item_t{{x, y, box->size.width, box->size.height}, box->color, box, &slot, ordinal});
-      return;
+      slot.holder = now;
+      slot.chunk = {};
     }
-    if (const auto *mount = std::get_if<mount_t>(&node))
+    return now;
+  }
+
+  void flatten(slot_t &holder)
+  {
+    auto &chunk = holder.chunk;
+    chunk.prims.clear();
+    chunk.segments.clear();
+    std::uint32_t begin = 0;
+    auto close_run = [&] {
+      const auto end = std::uint32_t(chunk.prims.size());
+      if (end > begin)
+        chunk.segments.push_back(segment_t{begin, end});
+      begin = end;
+    };
+    auto walk = [&](auto &self, const slot_t &slot, int dx, int dy) -> void {
+      for (const auto &entry : slot.entries)
+      {
+        if (!entry.child)
+        {
+          prim_t prim = entry.prim;
+          prim.x += float(dx);
+          prim.y += float(dy);
+          chunk.prims.push_back(prim);
+          continue;
+        }
+        if (decide_holder(*entry.child))
+        {
+          close_run();
+          chunk.segments.push_back(segment_t{0, 0, entry.child, dx + entry.x, dy + entry.y});
+          continue;
+        }
+        self(self, *entry.child, dx + entry.x, dy + entry.y);
+      }
+    };
+    walk(walk, holder, 0, 0);
+    close_run();
+    chunk.valid = true;
+  }
+
+  // Concatenate the chunks into this frame's prims, one run per segment. A clean chunk is a copy.
+  void emit(slot_t &holder, int x, int y)
+  {
+    if (holder.subtree_dirty || !holder.chunk.valid)
+      flatten(holder);
+    for (const auto &segment : holder.chunk.segments)
     {
-      if (auto *child = existing(*mount))
-        place(child->output, *child, x, y);
-      return;
+      if (segment.child)
+      {
+        emit(*segment.child, x + segment.x, y + segment.y);
+        continue;
+      }
+      const auto first = std::uint32_t(_prims.size());
+      _prims.insert(_prims.end(), holder.chunk.prims.begin() + segment.begin, holder.chunk.prims.begin() + segment.end);
+      _runs.push_back(run_t{first, segment.end - segment.begin, float(x), float(y)});
     }
-    const bool horizontal = std::holds_alternative<row_t>(node);
-    const auto &children = horizontal ? std::get<row_t>(node).children : std::get<column_t>(node).children;
-    const int gap = horizontal ? std::get<row_t>(node).gap : std::get<column_t>(node).gap;
-    for (const auto &child : children)
+  }
+
+  // The hit-test list, from the entries as they stand: no view runs for it.
+  void collect_items(slot_t &slot, int x, int y)
+  {
+    for (const auto &entry : slot.entries)
     {
-      place(child, slot, x, y);
-      const auto size = measure(child);
-      if (horizontal)
-        x += size.width + gap;
-      else
-        y += size.height + gap;
+      if (entry.child)
+      {
+        collect_items(*entry.child, x + entry.x, y + entry.y);
+        continue;
+      }
+      if (!entry.box)
+        continue;
+      const auto &box = *entry.box;
+      _items.push_back(draw_item_t{{x + entry.x, y + entry.y, box.size.width, box.size.height}, box.color, &box, &slot, entry.ordinal});
     }
   }
 
@@ -490,6 +720,7 @@ private:
       _hovered = nullptr;
     if (_held.slot == &slot || (_held.source && owner_of(_held.source) == &slot))
       _held = {};
+    std::erase(_touched, &slot);
     slot.scope->cancel();
   }
 
@@ -537,24 +768,20 @@ private:
   }
   std::unordered_map<key_t, std::unique_ptr<slot_t>, key_hash_t> _slots;
   std::vector<std::unique_ptr<slot_t>> _dying;
+  std::vector<slot_t *> _touched;
   std::vector<draw_item_t> _items;
-  std::unordered_map<slot_t *, int> _ordinals;
-  extent_t _size;
+  std::vector<prim_t> _prims;
+  std::vector<run_t> _runs;
+
+  extent_t _logical;
+  extent_t _framebuffer;
+  float _scale = 1;
+  double _input_x = 1;
+  double _input_y = 1;
 
   bool _changed = true;
-  bool _layout_dirty = true;
   waiter_t _change_waiter;
   std::coroutine_handle<> _drained_waiter;
-
-  struct gl_procs_t
-  {
-    void (*viewport)(int, int, int, int) = nullptr;
-    void (*scissor)(int, int, int, int) = nullptr;
-    void (*clear_color)(float, float, float, float) = nullptr;
-    void (*clear)(unsigned) = nullptr;
-    void (*enable)(unsigned) = nullptr;
-    void (*disable)(unsigned) = nullptr;
-  } _gl;
 
   point_t _pointer;
   bool _has_pointer = false;
@@ -562,57 +789,139 @@ private:
   target_t _held;
 };
 
+// ---- the GL stopgap (G23): every primitive is a scissored clear. Corners stay square, borders and
+// shadows are not drawn. It stays until Vulkan has run on every platform CI covers (G32).
 namespace
 {
 constexpr unsigned gl_color_buffer_bit = 0x4000;
 constexpr unsigned gl_scissor_test = 0x0C11;
+
+class gl_renderer_t final : public renderer_t
+{
+public:
+  explicit gl_renderer_t(gl_context_t context)
+    : _gl(std::move(context))
+  {
+  }
+
+  bool load()
+  {
+    if (!_gl.make_current())
+      return false;
+    _viewport = _gl.proc<void (*)(int, int, int, int)>("glViewport");
+    _scissor = _gl.proc<void (*)(int, int, int, int)>("glScissor");
+    _clear_color = _gl.proc<void (*)(float, float, float, float)>("glClearColor");
+    _clear = _gl.proc<void (*)(unsigned)>("glClear");
+    _enable = _gl.proc<void (*)(unsigned)>("glEnable");
+    _disable = _gl.proc<void (*)(unsigned)>("glDisable");
+    return _viewport && _scissor && _clear_color && _clear && _enable && _disable;
+  }
+
+  [[nodiscard]] std::string describe() const override
+  {
+    return "gl";
+  }
+
+  bool render(const display_list_t &list) override
+  {
+    if (!_gl.make_current())
+      return false;
+    const int width = list.framebuffer.width;
+    const int height = list.framebuffer.height;
+    const double sx = list.logical.width > 0 ? double(width) / list.logical.width : 1.0;
+    const double sy = list.logical.height > 0 ? double(height) / list.logical.height : 1.0;
+    _viewport(0, 0, width, height);
+    _disable(gl_scissor_test);
+    _clear_color(list.background.r, list.background.g, list.background.b, list.background.a);
+    _clear(gl_color_buffer_bit);
+    _enable(gl_scissor_test);
+    for (const auto &run : list.runs)
+    {
+      for (std::uint32_t i = run.first; i < run.first + run.count; ++i)
+      {
+        const auto &prim = list.prims[i];
+        if (prim.blur > 0)
+          continue;
+        const int x0 = int((run.x + prim.x) * sx + 0.5);
+        const int x1 = int((run.x + prim.x + prim.width) * sx + 0.5);
+        const int y0 = int((run.y + prim.y) * sy + 0.5);
+        const int y1 = int((run.y + prim.y + prim.height) * sy + 0.5);
+        _scissor(x0, height - y1, x1 - x0, y1 - y0);
+        _clear_color(prim.fill.r, prim.fill.g, prim.fill.b, prim.fill.a);
+        _clear(gl_color_buffer_bit);
+      }
+    }
+    _disable(gl_scissor_test);
+    return bool(_gl.swap_buffers());
+  }
+
+private:
+  gl_context_t _gl;
+  void (*_viewport)(int, int, int, int) = nullptr;
+  void (*_scissor)(int, int, int, int) = nullptr;
+  void (*_clear_color)(float, float, float, float) = nullptr;
+  void (*_clear)(unsigned) = nullptr;
+  void (*_enable)(unsigned) = nullptr;
+  void (*_disable)(unsigned) = nullptr;
+};
 } // namespace
 
-// Every box is a scissored clear: no shaders, no buffers, nothing linked.
-void runtime_t::draw(gl_context_t *gl, const frame_t &frame)
+std::unique_ptr<renderer_t> make_gl_renderer(window_t &window, std::string &why)
 {
-  if (!gl->make_current())
-    return;
-  if (!_gl.clear)
+  auto made = gl_context_t::create(window);
+  if (!made)
   {
-    _gl.viewport = gl->proc<void (*)(int, int, int, int)>("glViewport");
-    _gl.scissor = gl->proc<void (*)(int, int, int, int)>("glScissor");
-    _gl.clear_color = gl->proc<void (*)(float, float, float, float)>("glClearColor");
-    _gl.clear = gl->proc<void (*)(unsigned)>("glClear");
-    _gl.enable = gl->proc<void (*)(unsigned)>("glEnable");
-    _gl.disable = gl->proc<void (*)(unsigned)>("glDisable");
-    if (!_gl.viewport || !_gl.scissor || !_gl.clear_color || !_gl.clear || !_gl.enable || !_gl.disable)
-    {
-      _gl = {};
-      return;
-    }
+    why = made.error().msg;
+    return nullptr;
   }
-  const int width = frame.framebuffer.width;
-  const int height = frame.framebuffer.height;
-  const double sx = frame.size.width > 0 ? double(width) / frame.size.width : 1.0;
-  const double sy = frame.size.height > 0 ? double(height) / frame.size.height : 1.0;
-  _gl.viewport(0, 0, width, height);
-  _gl.disable(gl_scissor_test);
-  const auto &background = _config.background;
-  _gl.clear_color(background.r, background.g, background.b, background.a);
-  _gl.clear(gl_color_buffer_bit);
-  _gl.enable(gl_scissor_test);
-  for (const auto &item : _items)
+  auto renderer = std::make_unique<gl_renderer_t>(std::move(*made));
+  if (!renderer->load())
   {
-    const int x0 = int(item.rect.x * sx + 0.5);
-    const int x1 = int((item.rect.x + item.rect.width) * sx + 0.5);
-    const int y0 = int(item.rect.y * sy + 0.5);
-    const int y1 = int((item.rect.y + item.rect.height) * sy + 0.5);
-    _gl.scissor(x0, height - y1, x1 - x0, y1 - y0);
-    _gl.clear_color(item.color.r, item.color.g, item.color.b, item.color.a);
-    _gl.clear(gl_color_buffer_bit);
+    why = "GL entry points missing";
+    return nullptr;
   }
-  _gl.disable(gl_scissor_test);
-  (void)gl->swap_buffers();
+  return renderer;
 }
 
 namespace
 {
+std::unique_ptr<renderer_t> choose_renderer(window_t &window, const run_config_t &config)
+{
+  auto report = [&config](std::string_view what) {
+    if (config.on_renderer)
+      config.on_renderer(what);
+  };
+  if (!config.draw)
+  {
+    report("none: drawing is off");
+    return nullptr;
+  }
+  std::string tried;
+  if (config.api == render_api_t::automatic || config.api == render_api_t::vulkan)
+  {
+    std::string why;
+    if (auto renderer = make_vulkan_renderer(window, config.vulkan_device, why))
+    {
+      report(renderer->describe());
+      return renderer;
+    }
+    tried = "vulkan: " + why;
+    if (config.api == render_api_t::vulkan)
+    {
+      report("none: " + tried);
+      return nullptr;
+    }
+  }
+  std::string why;
+  if (auto renderer = make_gl_renderer(window, why))
+  {
+    report(renderer->describe() + (tried.empty() ? "" : " (" + tried + ")"));
+    return renderer;
+  }
+  report("none: " + (tried.empty() ? "" : tried + "; ") + "gl: " + why);
+  return nullptr;
+}
+
 vio::task_t<void> pointer_loop(window_t &window, runtime_t &runtime)
 {
   auto events = window.subscribe<pointer_move_event_t, pointer_button_event_t, pointer_enter_event_t>();
@@ -627,44 +936,39 @@ vio::task_t<void> pointer_loop(window_t &window, runtime_t &runtime)
   }
 }
 
-// A resize needs a new frame even when no view changed, and the end of this subscription is how the
-// frame loop learns the window closed while it was waiting for a change.
-vio::task_t<void> resize_loop(window_t &window, runtime_t &runtime)
+// A resize or an expose needs a new frame although no view changed; an expose redraws the display
+// list as it stands, since the chunks are clean. The end of this subscription is how the frame loop
+// learns the window closed while it was waiting for a change.
+vio::task_t<void> repaint_loop(window_t &window, runtime_t &runtime)
 {
-  auto resizes = window.subscribe<resize_event_t>();
-  while (co_await resizes)
-    runtime.relayout();
+  auto events = window.subscribe<resize_event_t, expose_event_t>();
+  while (co_await events)
+    runtime.wake_frame();
   runtime.wake_frame();
 }
 } // namespace
 
 vio::task_t<void> run_root(window_t &window, mount_t root, run_config_t config)
 {
-  const bool draw = config.draw;
   runtime_t runtime(window, std::move(config));
   runtime.set_root(root);
-  std::optional<gl_context_t> gl;
-  if (draw)
-  {
-    if (auto made = gl_context_t::create(window))
-      gl.emplace(std::move(*made));
-  }
+  auto renderer = choose_renderer(window, runtime.config());
   auto pointer = pointer_loop(window, runtime);
-  auto resizes = resize_loop(window, runtime);
+  auto repaints = repaint_loop(window, runtime);
   while (window)
   {
     co_await runtime.changed();
     auto frame = co_await window.frame();
     if (!frame)
       break;
-    runtime.step(frame->size);
-    if (gl)
-      runtime.draw(&*gl, *frame);
+    runtime.step(*frame);
+    if (renderer && !renderer->render(runtime.display_list()))
+      renderer.reset();
   }
-  gl.reset();
+  renderer.reset();
   runtime.shutdown();
   co_await std::move(pointer);
-  co_await std::move(resizes);
+  co_await std::move(repaints);
   co_await runtime.drained();
 }
 

@@ -52,12 +52,42 @@ target_link_libraries(vio_gui PUBLIC ${VIO_GUI_LIBRARIES})
 target_compile_definitions(vio_gui PRIVATE ${VIO_GUI_DEFINITIONS})
 
 # The declarative toolkit, on top of the window layer and kept out of it (PLAN.md, "UI toolkit").
-add_library(vio_gui_ui STATIC src/ui.cpp)
+add_library(vio_gui_ui STATIC src/ui.cpp src/ui_vulkan.cpp)
 add_library(vio::gui_ui ALIAS vio_gui_ui)
 target_link_libraries(vio_gui_ui PUBLIC vio_gui)
+# Vulkan declarations only: the loader is opened at run time (G6, G31), so nothing is linked.
+if(vulkan_headers_USE_SYSTEM)
+    find_package(VulkanHeaders CONFIG REQUIRED)
+    target_link_libraries(vio_gui_ui PRIVATE Vulkan::Headers)
+else()
+    target_include_directories(vio_gui_ui SYSTEM PRIVATE ${vulkan_headers_SOURCE_DIR}/include)
+endif()
+if(NOT WIN32)
+    target_link_libraries(vio_gui_ui PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
+# Regenerates src/shaders/ui_spirv.h from ui.slang (G25). Not part of any build: the header is
+# committed, and only someone changing a shader needs slangc.
+find_program(VIO_SLANGC slangc)
+if(VIO_SLANGC)
+    set(shader_dir ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+    add_custom_target(vio_gui_shaders
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+        COMMAND ${VIO_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/ui.slang -target spirv -profile spirv_1_0
+                -entry vertexMain -stage vertex -o ${shader_dir}/ui.vert.spv
+        COMMAND ${VIO_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/ui.slang -target spirv -profile spirv_1_0
+                -entry fragmentMain -stage fragment -o ${shader_dir}/ui.frag.spv
+        COMMAND ${CMAKE_COMMAND} -DOUTPUT=${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/ui_spirv.h
+                "-DCOMPILER=slangc from ui.slang"
+                "-DNAMES=ui_vertex\\;ui_fragment"
+                "-DFILES=${shader_dir}/ui.vert.spv\\;${shader_dir}/ui.frag.spv"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake
+        COMMENT "Compiling the UI shaders with slangc"
+        VERBATIM)
+endif()
 
 if(VIO_BUILD_TESTS)
-    set(VIO_GUI_TEST_SOURCES test/test_main.cpp test/test_gui.cpp test/test_ui.cpp)
+    set(VIO_GUI_TEST_SOURCES test/test_main.cpp test/test_gui.cpp test/test_ui.cpp test/test_ui_render.cpp)
     if(WIN32)
         list(APPEND VIO_GUI_TEST_SOURCES test/test_win32.cpp)
     elseif(APPLE)

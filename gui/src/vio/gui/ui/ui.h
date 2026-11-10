@@ -38,6 +38,7 @@ Copyright (c) 2026 Jørgen Lind
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -337,10 +338,25 @@ struct event_ref_t
 
 struct node_t;
 
+// A soft shadow under a box: the box's shape, moved by the offset and blurred. `blur` is the
+// Gaussian's standard deviation in logical units; a shadow with a transparent color is not drawn.
+struct shadow_t
+{
+  float x = 0;
+  float y = 0;
+  float blur = 0;
+  color_t color = {0, 0, 0, 0};
+};
+
 struct box_t
 {
   extent_t size;
+  // Colors are sRGB, as authored; the renderer blends in linear space (G27).
   color_t color;
+  float radius = 0;
+  float border_width = 0;
+  color_t border_color = {0, 0, 0, 0};
+  shadow_t shadow;
   event_ref_t events;
   // A one-line handler. It runs when the box is pressed, and its component is rebuilt after it.
   // For anything that spans several events, subscribe in behave() instead.
@@ -673,8 +689,8 @@ template <component C>
   return node;
 }
 
-// What layout produced: a box, where it is, and whom it reports to. Exposed for tests and for a
-// renderer other than the built-in one.
+// What layout produced: a box, where it is, and whom it reports to. This is the hit-test list,
+// one entry per box in logical units; a renderer reads display_list_t instead (G24).
 struct draw_item_t
 {
   rect_t rect;
@@ -684,14 +700,88 @@ struct draw_item_t
   int ordinal = 0;
 };
 
+// ---------------------------------------------------------------------------------------------
+// The display list (gui/PLAN.md, "Rendering")
+
+// One primitive: an instanced quad whose shape the fragment shader computes. A rounded rectangle
+// with an optional border, or with `blur` > 0 a Gaussian-blurred one, which is a shadow. The rect
+// is in logical units relative to the origin of the run it is drawn in. 80 bytes, laid out for a
+// vertex buffer read at instance rate.
+struct prim_t
+{
+  float x = 0;
+  float y = 0;
+  float width = 0;
+  float height = 0;
+  // Top-left, top-right, bottom-right, bottom-left.
+  float radii[4] = {0, 0, 0, 0};
+  color_t fill;
+  color_t border_color = {0, 0, 0, 0};
+  float border_width = 0;
+  float blur = 0;
+  float reserved[2] = {0, 0};
+};
+static_assert(sizeof(prim_t) == 80);
+
+// A range of prims drawn at one origin. Moving a chunk changes its origin and nothing else (G29).
+struct run_t
+{
+  std::uint32_t first = 0;
+  std::uint32_t count = 0;
+  float x = 0;
+  float y = 0;
+};
+
+// One frame's worth of drawing, in painter's order. `prims` is assembled afresh every frame from
+// cached chunks; only what changed was regenerated.
+struct display_list_t
+{
+  std::span<const prim_t> prims;
+  std::span<const run_t> runs;
+  color_t background;
+  // Layout units. framebuffer / logical is the scale the renderer applies.
+  extent_t logical;
+  extent_t framebuffer;
+  float scale = 1;
+};
+
+// A Vulkan device the program already has, for the renderer to share rather than create its own
+// (G31). Handles are the Vulkan ones, passed as pointers so this header needs no vulkan.h.
+struct vulkan_device_t
+{
+  void *instance = nullptr;
+  void *physical_device = nullptr;
+  void *device = nullptr;
+  void *queue = nullptr;
+  std::uint32_t queue_family = 0;
+  void (*(*get_instance_proc_addr)(void *instance, const char *name))() = nullptr;
+};
+
+enum class render_api_t : std::uint8_t
+{
+  // Vulkan when it can be loaded and a device made, else the GL stopgap, else nothing.
+  automatic,
+  vulkan,
+  gl,
+};
+
 struct run_config_t
 {
   color_t background = {0.12f, 0.12f, 0.14f, 1};
-  // Draw with OpenGL. Without a GL context (the null backend) nothing is drawn, and everything
+  // Draw at all. Without a renderer (the null backend has none) nothing is drawn, and everything
   // else -- views, layout, input, behaviours -- still runs.
   bool draw = true;
-  // Called after every layout with what it produced.
+  render_api_t api = render_api_t::automatic;
+  // Share the program's Vulkan device. Without one the renderer creates and owns its own.
+  std::optional<vulkan_device_t> vulkan_device;
+  // Commands per chunk before a subtree holds its own (G29). Tests lower it.
+  std::size_t chunk_threshold = 128;
+  // Called after every layout with the hit-test list it produced.
   std::function<void(std::span<const draw_item_t>)> on_layout;
+  // Called after every layout with the display list, whether or not anything draws it.
+  std::function<void(const display_list_t &)> on_display_list;
+  // Called once, with which renderer was chosen ("vulkan: <device>", "gl") or why none was.
+  std::function<void(std::string_view)> on_renderer;
 };
 
 namespace detail

@@ -27,6 +27,7 @@ Copyright (c) 2026 Jørgen Lind
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 
 #include <vio/event_loop.h>
 #include <vio/gui/gui.h>
@@ -49,9 +50,18 @@ constexpr ui::color_t light_red{1.0f, 0.45f, 0.45f, 1};
 constexpr ui::color_t grey{0.6f, 0.6f, 0.65f, 1};
 constexpr ui::color_t blue{0.3f, 0.5f, 0.9f, 1};
 
+constexpr ui::color_t outline{0.85f, 0.85f, 0.9f, 1};
+
 ui::color_t shade(const ui::pressable_t &p, ui::color_t normal, ui::color_t hover, ui::color_t held)
 {
   return p.held() ? held : p.hovered() ? hover : normal;
+}
+
+// A button sits on a shadow that tightens as it is pressed.
+ui::shadow_t lift(const ui::pressable_t &p)
+{
+  const float height = p.held() ? 1.0f : p.hovered() ? 5.0f : 3.0f;
+  return {.x = 0, .y = height, .blur = height * 1.5f, .color = {0, 0, 0, 0.6f}};
 }
 
 struct counter_t
@@ -64,9 +74,9 @@ struct counter_t
   {
     return ui::row_t{.gap = 8,
                      .children = {
-                       ui::box_t{.size = {60, 60}, .color = shade(dec, red, light_red, dark_red), .events = dec},
-                       ui::box_t{.size = {60, 60}, .color = shade(inc, green, light_green, dark_green), .events = inc},
-                       ui::box_t{.size = {4 + 16 * std::max(count, 0), 60}, .color = grey},
+                       ui::box_t{.size = {60, 60}, .color = shade(dec, red, light_red, dark_red), .radius = 12, .shadow = lift(dec), .events = dec},
+                       ui::box_t{.size = {60, 60}, .color = shade(inc, green, light_green, dark_green), .radius = 12, .shadow = lift(inc), .events = inc},
+                       ui::box_t{.size = {4 + 16 * std::max(count, 0), 60}, .color = grey, .radius = 6, .border_width = 2, .border_color = outline},
                      }};
   }
 
@@ -84,7 +94,7 @@ struct clock_bar_t
 
   ui::node_t view() const
   {
-    return ui::box_t{.size = {4 + 8 * (seconds % 60), 20}, .color = blue};
+    return ui::box_t{.size = {4 + 8 * (seconds % 60), 20}, .color = blue, .radius = 10};
   }
 
   ui::behaviour_t behave(ui::scope_t &scope)
@@ -135,7 +145,9 @@ int main(int argc, char **argv)
         }
         window.close();
       }(*window, limit);
-      co_await ui::run(*window, app_t{});
+      ui::run_config_t config;
+      config.on_renderer = [](std::string_view what) { std::fprintf(stderr, "renderer: %.*s\n", int(what.size()), what.data()); };
+      co_await ui::run(*window, app_t{}, std::move(config));
       co_await std::move(closing);
     }
     co_return 0;
