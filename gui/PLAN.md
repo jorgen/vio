@@ -342,15 +342,30 @@ rect, so scrolling regions and plot areas clip by scissor.
 **Incremental updates** (G29). `view()` is already incremental; layout and the display list
 become so with the renderer:
 
-- Each slot owns a *segment* of the display list: the commands from its own output, in coordinates
-  relative to its origin. A mounted child is a reference in its parent's segment, not a copy of its
-  commands, and the window's list is a walk of those references in tree order. A component whose
-  view re-ran regenerates its segment; one that only moved reuses it at a new offset.
+- Each slot keeps the commands from its own output, in coordinates relative to its origin, and
+  two flags. `view_dirty` re-runs its `view()`. `subtree_dirty` says something below changed. It
+  is set on every ancestor up to the first that already has it, and never re-runs an ancestor's
+  view. Assembly skips every subtree whose `subtree_dirty` is clear.
+- Commands are grouped in *chunks*, so assembly is a few large copies rather than one tiny copy per
+  component. A subtree with fewer than a threshold of commands (128 to start, to be tuned) is
+  flattened into the chunk of its nearest ancestor that holds one. A chunk-holding subtree that
+  falls below half the threshold folds back into its parent; the gap keeps a subtree near the
+  limit from switching every frame. A change rebuilds only the chunk it lands in, from the
+  retained per-slot commands, without running any clean view. Every command lives in exactly one
+  chunk, so memory is at most twice the commands, never one copy per level of depth.
+- A *boundary* is the other end of the same scale: a subtree large enough, or marked with
+  `ui::boundary`, to own a persistent GPU instance buffer and its own draw call. A clean boundary
+  costs no walk, no copy and no upload. Plots and long lists are the intended cases. Boundaries
+  come when profiling asks for them; chunks and the dirty flags come with the renderer.
+- Offsets are applied in the shader: each instance carries an index into a buffer of chunk
+  origins, so copying a chunk is a plain `memcpy` and a chunk or boundary that only moved changes
+  one origin and nothing else.
 - Each slot caches its measured size and the constraints it was measured under. A clean slot under
   unchanged constraints answers from the cache without walking its subtree, and a dirty one whose
   size did not change stops the relayout there. This also ends today's repeated measuring, where
   `place` calls a recursive `measure` for every child.
-- The instance buffer is rebuilt from the segments every frame. That is a copy of tens of
+- The whole window is rendered every frame: a GPU frame is not drawn in parts. Outside
+  boundaries, the instance buffer is assembled from the chunks every frame. That is a copy of tens of
   microseconds for ten thousand primitives; the cost worth caching is `view()`, layout and shaping.
   The glyph atlas, plot point buffers and heatmap textures are persistent resources that commands
   refer to by handle, updated only when their data changes.
@@ -418,7 +433,7 @@ Open:
 | 6 | UI: components, `behaviour_t` with dirty marking, scopes with `spawn` and unmount cancellation, `box`/`row`/`column`, mount, hit testing, scissor-clear drawing | a counter and a sleep-driven clock example; unit tests for scope teardown |
 | 7 | UI: `list_t`, props, child scopes, `spawned_t<T>` | a dynamic list example; unmount tests |
 | 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
-| 9 | Renderer: display list with per-slot segments, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on the first backend, damage repaint | rounded rects, borders and shadows on screen; an expose with no change repaints |
+| 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on the first backend, damage repaint | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons | labels at 1x and 2x scale; a shaping test with a non-Latin script |
 | 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation | thick translucent zigzag lines; a million-point series panned at frame rate |
 | 12 | The remaining two of Vulkan, D3D12 and Metal | the phase 9 to 11 examples on each |

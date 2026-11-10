@@ -252,11 +252,24 @@ turns a million points into a few thousand segments.
 
 ## G29. Updates are cached per component on the CPU, rebuilt whole on the GPU
 
-The expensive part of a frame is producing it -- `view()`, layout, text shaping -- not uploading
-it. So the caching is per slot: each owns a display-list segment in its own coordinates and a
-measured size with the constraints behind it, and a change regenerates only the slots it reached.
-Local coordinates are what let a component that merely moved keep its segment. The instance buffer
-itself is then concatenated afresh every frame rather than patched in place: patching would need an
-allocator over the buffer and a story for segments that change length, to save a copy that costs
-tens of microseconds. Data that is genuinely large -- the atlas, plot series, heatmaps -- lives in
-its own GPU resources and is never part of that copy.
+The whole window is rendered every frame, so the saving is not in drawing less. It is in not
+producing what has not changed, because `view()`, layout and text shaping are the expensive part
+of a frame. Each slot keeps its own commands, in its own coordinates, and a measured size with the
+constraints behind it. A change marks `subtree_dirty` upward, stopping at the first ancestor
+already marked, and only marked subtrees are revisited. It is a separate flag from `view_dirty`:
+marking a parent view-dirty would re-run user code for every change below it.
+
+Commands are grouped in chunks rather than kept one list per slot. Most components produce a few
+primitives each, and assembling a frame from thousands of tiny copies would pay per-copy overhead
+on all of them. So a subtree below a threshold flattens into its ancestor's chunk, with hysteresis
+so one near the limit does not switch every frame. Flattened copies at *every* level were rejected:
+memory grows with depth, a leaf change re-flattens every ancestor, and the root's copy is the whole
+window anyway. With chunks every command lives in exactly one, and a rebuild is bounded by the
+threshold.
+
+The instance buffer is concatenated afresh every frame rather than patched in place. Patching
+would need an allocator over the buffer and a plan for chunks that change length, to save a copy
+of tens of microseconds. Offsets are applied in the shader from a buffer of chunk origins, so that
+copy is a plain `memcpy` and moving costs one origin. Boundaries, which hold their own GPU buffers,
+are for the subtrees large enough that even the copy matters. Data that is large in itself -- the
+atlas, plot series, heatmaps -- lives in its own GPU resources and is never part of any copy.
