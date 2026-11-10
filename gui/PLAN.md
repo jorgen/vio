@@ -328,6 +328,84 @@ Redraws follow invalidation and resizes only, so a damage-only expose is not rep
 something changes (G23). Layout is fixed sizes and row/column stacking. Flex-style grow and shrink comes next. Text needs a
 real renderer and a font dependency, and stays out until then.
 
+### Rendering
+
+The renderer replaces the scissor-clear stopgap at the layout output and never reaches into the
+component layer. The design below is agreed in outline; G24-G28 hold the reasons.
+
+**Two lists, not one.** `draw_item_t` stays what it is: one entry per hit-testable box, walked
+backwards for input. Layout also emits a *display list* in painter's order, which is what the
+renderer consumes. They differ because one text item is many glyphs and one plot is thousands of
+segments, none of which hit testing should walk (G24). Each display-list command carries a clip
+rect, so scrolling regions and plot areas clip by scissor.
+
+**Incremental updates** (G29). `view()` is already incremental; layout and the display list
+become so with the renderer:
+
+- Each slot owns a *segment* of the display list: the commands from its own output, in coordinates
+  relative to its origin. A mounted child is a reference in its parent's segment, not a copy of its
+  commands, and the window's list is a walk of those references in tree order. A component whose
+  view re-ran regenerates its segment; one that only moved reuses it at a new offset.
+- Each slot caches its measured size and the constraints it was measured under. A clean slot under
+  unchanged constraints answers from the cache without walking its subtree, and a dirty one whose
+  size did not change stops the relayout there. This also ends today's repeated measuring, where
+  `place` calls a recursive `measure` for every child.
+- The instance buffer is rebuilt from the segments every frame. That is a copy of tens of
+  microseconds for ten thousand primitives; the cost worth caching is `view()`, layout and shaping.
+  The glyph atlas, plot point buffers and heatmap textures are persistent resources that commands
+  refer to by handle, updated only when their data changes.
+- Hit testing keeps `draw_item_t`, rebuilt from cached positions without running any view.
+- Telling the compositor which region changed (`Present1` dirty rects,
+  `VK_KHR_incremental_present`, Wayland damage) saves power, not frame time, and flip-model swap
+  chains do not keep the previous frame. It is deferred.
+
+**Units.** Layout is in logical units and the renderer works in framebuffer pixels as floats,
+snapping rect edges to whole pixels itself. Today `step(frame->size)` lays out in the window
+system's units (G9), which are pixels on Windows and X11, so the UI is not DPI-scaled there. The
+renderer's arrival is when layout moves to `frame.size / frame.scale` on every platform.
+
+**Two pipelines** (G26):
+
+1. *Instanced primitives*: one quad per primitive, the shape evaluated analytically in the fragment
+   shader -- rect, rounded rect with per-corner radii and border, analytic Gaussian shadow, circle,
+   arc, capsule, plot marker, polyline segment, and atlas glyph. Antialiasing is
+   `clamp(0.5 - d / fwidth(d), 0, 1)`; no MSAA.
+2. *Triangle meshes*: fills that are not one of the primitives, such as the area under a plot
+   curve.
+
+Glyphs share the primitive pipeline, so text and shapes interleave in painter's order without a
+pipeline change, and a typical window is one or two draws.
+
+**Text** (G27): HarfBuzz shapes, FreeType rasterizes at the exact pixel size into a coverage atlas
+keyed by font, size, glyph and one of four horizontal subpixel offsets. Blending is in linear
+space. Icons are FreeType outline renders of vector paths into the same atlas, so general paths are
+not needed on the GPU.
+
+**Plots** (G28): polyline segments expanded in the vertex shader from a point buffer with miter
+joins (bevel past a limit), so translucent lines do not double-blend at joints; fills as triangle
+strips; heatmaps as an `R32F` data texture plus a colormap lookup texture; series uploaded in plot
+coordinates relative to a per-series origin subtracted in `double`, with pan and zoom as a uniform;
+M4 decimation (first, last, min, max per pixel column) once a series has more points than pixels.
+
+**Shaders** (G25): Slang, compiled offline to SPIR-V, MSL and DXIL. The outputs are committed and
+embedded with cmakerc, so building vio needs no `slangc`; a target regenerates them.
+
+**Backend seam.** Per graphics API the renderer needs about five operations: upload a buffer,
+upload a texture region, set a scissor, draw instanced, present. It is not a general rendering
+hardware interface and must not grow into one. APIs are loaded at run time as G6 has it.
+
+**Damage.** The present path closes G23's gap: a frame with `frame.damaged` set and nothing
+invalidated re-submits the last display list without running layout. The frame loop has to learn
+of damage while it waits on `changed()`, which today it does not.
+
+Open:
+
+- Which backend comes first. Vulkan is testable in Linux CI on lavapipe and also runs on Windows;
+  D3D12 is native here, where WGL creation currently fails. Metal follows either way.
+- Who owns the device. The window layer never creates a device (see *Rendering contexts*); the
+  renderer has to, by default, and should accept the program's when the program renders too.
+- Whether GL stays as a backend once one of the three lands, or the stopgap is simply removed.
+
 ## Phases
 
 | phase | work | verified by |
@@ -340,3 +418,7 @@ real renderer and a font dependency, and stays out until then.
 | 6 | UI: components, `behaviour_t` with dirty marking, scopes with `spawn` and unmount cancellation, `box`/`row`/`column`, mount, hit testing, scissor-clear drawing | a counter and a sleep-driven clock example; unit tests for scope teardown |
 | 7 | UI: `list_t`, props, child scopes, `spawned_t<T>` | a dynamic list example; unmount tests |
 | 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
+| 9 | Renderer: display list with per-slot segments, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on the first backend, damage repaint | rounded rects, borders and shadows on screen; an expose with no change repaints |
+| 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons | labels at 1x and 2x scale; a shaping test with a non-Latin script |
+| 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation | thick translucent zigzag lines; a million-point series panned at frame rate |
+| 12 | The remaining two of Vulkan, D3D12 and Metal | the phase 9 to 11 examples on each |

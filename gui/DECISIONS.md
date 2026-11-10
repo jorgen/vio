@@ -202,3 +202,61 @@ nothing is drawn and everything else runs.
 Known gaps: redraws are driven by invalidation and resizes, so a damage-only expose with no resize
 (possible on X11) is not repainted until something changes; and a behaviour that throws terminates,
 as `task_t` does, rather than rethrowing out of `ui::run`.
+
+## G24. The renderer reads a display list, not the hit-test list
+
+`draw_item_t` is one entry per box because hit testing needs exactly that. A renderer needs
+something else: a label is one box and dozens of glyphs, a plot is one box and thousands of
+segments. Folding those into `draw_item_t` would make every pointer move walk them. So layout emits
+two lists, and the component layer is unchanged by either.
+
+## G25. Shaders are Slang, compiled offline and committed
+
+One source gives SPIR-V, MSL and DXIL, and GLSL or WGSL if a GL or WebGPU backend is ever wanted.
+Compiled at build time, never at run time: the Slang runtime is large and a UI has two or three
+shaders. The outputs are committed so that building vio does not need `slangc` on `PATH`, a
+requirement BoringSSL already makes of Go and NASM and which is not worth repeating for three
+shaders.
+
+## G26. Shapes are analytic distance functions, not tessellation
+
+Rounded rects, borders, shadows, circles and arcs are one instanced quad each, with the exact
+distance to the shape computed in the fragment shader and turned into coverage with `fwidth`.
+Tessellation shaders were the alternative and lose on every count: D3D12, Vulkan and Metal each
+model tessellation differently (Metal through compute), the output is triangles that still need
+MSAA to look right, and it is a whole pipeline stage for primitives a few hundred pixels across.
+These distances are exact, not sampled from a texture, so they have none of the softness of
+distance-field text.
+
+## G27. Text is FreeType and HarfBuzz into a coverage atlas
+
+Signed distance field text was considered and rejected: at UI sizes (11-16 px) it is visibly
+softer than a glyph rasterized at its size, a single-channel field rounds corners, and it has no
+hinting. Its strength, one atlas entry for every size, matters for zoomable or transformed text,
+which a UI rarely has. FreeType gives hinting and an outline rasterizer that also renders icons;
+HarfBuzz gives shaping, without which only Latin text is right. FreeType is built with
+`FT_DISABLE_HARFBUZZ=ON` so the two do not depend on each other. Both are dependencies of
+`vio_gui_ui` only, through cmake-dep with the usual `VIO_USE_SYSTEM_*` toggles; neither the vio
+core nor the window layer sees them. Blending is in linear space, because without it light text on
+dark is too thin and dark text on light too heavy.
+
+## G28. Plot lines are joined segments, and large series are decimated
+
+A polyline drawn as independent capsules looks right only when opaque: translucent lines blend twice
+where neighbours overlap and bead at every point. So each segment reads its neighbours from the
+point buffer and the vertex shader builds a miter join, bevelled past a limit, with no overlap.
+Series are uploaded relative to an origin subtracted in `double`, because `float32` cannot hold a
+timestamp axis and zooming into one jitters. Past one point per pixel column, M4 decimation keeps
+the first, last, minimum and maximum of each column, which is pixel-identical for a line plot and
+turns a million points into a few thousand segments.
+
+## G29. Updates are cached per component on the CPU, rebuilt whole on the GPU
+
+The expensive part of a frame is producing it -- `view()`, layout, text shaping -- not uploading
+it. So the caching is per slot: each owns a display-list segment in its own coordinates and a
+measured size with the constraints behind it, and a change regenerates only the slots it reached.
+Local coordinates are what let a component that merely moved keep its segment. The instance buffer
+itself is then concatenated afresh every frame rather than patched in place: patching would need an
+allocator over the buffer and a story for segments that change length, to save a copy that costs
+tens of microseconds. Data that is genuinely large -- the atlas, plot series, heatmaps -- lives in
+its own GPU resources and is never part of that copy.
