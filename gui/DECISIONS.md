@@ -465,3 +465,24 @@ pixels so they stay texel-exact; it is opt-in, because a line of text must keep 
 or neighbouring lines of different content would not match. A centred offset is also snapped to the
 nearest pixel rather than floored to a whole unit, which at 1.5x is worth up to three quarters of a
 pixel. The labels are now within half a pixel of centre.
+
+## G42. Flex is measure-then-place where space is handed out; lists own by shared pointer
+
+Flex needs a child's natural size before the child is placed, which a one-pass layout cannot give.
+Rather than a second, separate measuring function per node type -- which would have to agree with
+placing forever -- measuring is placing and taking it back: the entries are truncated and the
+counters restored, and the result is cached for the frame by the node's address, so nesting does
+not multiply it. Only a container that hands out space (a child grows or stretches, or it was given
+a size itself) measures; everything else is still placed once. A mounted component is laid out for
+the size it is given and keeps its natural size from its last unconstrained layout, so a clean
+child is measured for free. The root is given the window, which is what lets a page fill it.
+
+`list_t<T>` holds its items by `shared_ptr` and its mounts share that ownership with the slot: an
+erased item's behaviours still hold `this` until they reach their next await, so the item is freed
+when the slot is reaped, not at `erase()`. Props are carried type-erased on `mount_t`, compared each
+frame and copied into the child only when they differ, which is what rebuilds it. A child scope is
+cancelled through a callback on its parent's token, and its owner must join it; that await, and
+awaiting a spawned job, are exempt from the refusal a cancelled scope gives every other await,
+because both are bounded by the cancellation itself and refusing them would end the owner while
+what it owns still runs. `job_t<T>` keeps its result outside its frame, since the scope destroys the
+frame a beat after it ends.

@@ -135,13 +135,15 @@ struct edges_t
 
 // Where a child sits across the space it was given. `baseline` lines up the first baseline of each
 // child of a row -- text's, or the first text inside a container -- and a child with none sits on
-// it by its bottom edge. Anywhere else baseline means start.
+// it by its bottom edge. Anywhere else baseline means start. `stretch` gives each child the whole
+// breadth: a box grows to it, a row or column lays its own children out in it.
 enum class align_t : std::uint8_t
 {
   start,
   center,
   end,
   baseline,
+  stretch,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -418,6 +420,9 @@ struct box_t
   // A one-line handler. It runs when the box is pressed, and its component is rebuilt after it.
   // For anything that spans several events, subscribe in behave() instead.
   std::function<void()> on_press;
+  // In a row or column, its share of the space left along it: what remains after every child has
+  // its natural size is split between the children in proportion to `grow` (G42).
+  float grow = 0;
   // Children are drawn on the box, each placed inside the padding by the two alignments; they
   // overlap, so a box holding several usually holds one row or column. With children, `size` is a
   // minimum: the box grows to fit them and its padding.
@@ -533,6 +538,8 @@ struct row_t
   int gap = 0;
   align_t align = align_t::start;
   edges_t padding;
+  // As box_t::grow, inside a row or column of its own.
+  float grow = 0;
   std::vector<node_t> children;
 };
 
@@ -542,7 +549,16 @@ struct column_t
   int gap = 0;
   align_t align = align_t::start;
   edges_t padding;
+  float grow = 0;
   std::vector<node_t> children;
+};
+
+// Empty space that grows: `row_t{.children = {label, ui::spacer_t{}, button}}` puts the button at
+// the far end of a row that was given more room than it needs.
+struct spacer_t
+{
+  float grow = 1;
+  extent_t size;
 };
 
 // Children at an offset from where this node is placed, overlapping. The offset may be fractional:
@@ -580,9 +596,16 @@ struct mount_t
   void *component = nullptr;
   node_t (*view)(const void *component) = nullptr;
   behaviour_t (*behave)(void *component, scope_t &scope) = nullptr;
+  // Shares ownership of a list_t item, so an erased item lives until its behaviours have ended.
+  std::shared_ptr<void> keep;
+  // Props (ui::mount(child, props)): compared with the child's own each frame and, when unequal,
+  // copied into it, which rebuilds it.
+  std::shared_ptr<const void> props;
+  bool (*props_equal)(const void *component, const void *props) = nullptr;
+  void (*apply_props)(void *component, const void *props) = nullptr;
 };
 
-struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t, at_t, polyline_t>
+struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t, at_t, polyline_t, spacer_t>
 {
   using variant::variant;
 };
@@ -605,6 +628,10 @@ decltype(auto) get_awaiter(A &&awaitable)
 
 template <typename T>
 concept ui_cancellable = requires(T &awaiter, runtime_t &runtime) { awaiter.cancel_wait(runtime); };
+
+// An await a cancelled scope does not refuse: joining a child scope.
+template <typename T>
+concept ui_uninterruptible = requires { requires std::remove_cvref_t<T>::uninterruptible; };
 
 // Implemented in ui.cpp, so the templates below need only declarations.
 [[nodiscard]] bool scope_cancelled(const scope_t &scope) noexcept;
@@ -631,7 +658,7 @@ public:
 
   bool await_ready()
   {
-    if (scope_cancelled(*_scope))
+    if (!ui_uninterruptible<Awaiter> && scope_cancelled(*_scope))
       return false;
     return _inner.await_ready();
   }
@@ -639,7 +666,7 @@ public:
   template <typename Promise>
   std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> frame)
   {
-    if (scope_cancelled(*_scope))
+    if (!ui_uninterruptible<Awaiter> && scope_cancelled(*_scope))
     {
       scope_refused(*_scope, frame);
       return std::noop_coroutine();
@@ -685,68 +712,99 @@ template <typename A>
 guarded_t(A &&, scope_t &) -> guarded_t<decltype(get_awaiter(std::declval<A>()))>;
 } // namespace detail
 
+namespace detail
+{
+// What every coroutine run in a scope shares: it is lazy, finds its scope among its parameters --
+// the first, or the second after a member function's object -- so one without a scope_t &
+// parameter does not compile, goes through guarded_t at every co_await, and hands its frame back
+// to the scope when it ends.
+struct promise_base_t
+{
+  template <typename... Rest>
+  explicit promise_base_t(scope_t &scope, Rest &...) noexcept
+    : scope(&scope)
+  {
+  }
+  template <typename Self, typename... Rest>
+    requires(!std::same_as<std::remove_cvref_t<Self>, scope_t>)
+  promise_base_t(Self &, scope_t &scope, Rest &...) noexcept
+    : scope(&scope)
+  {
+  }
+
+  std::suspend_always initial_suspend() noexcept
+  {
+    return {};
+  }
+  struct final_t
+  {
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+      return false;
+    }
+    template <typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> frame) noexcept
+    {
+      scope_finished(*frame.promise().scope, frame);
+    }
+    void await_resume() const noexcept
+    {
+    }
+  };
+  final_t final_suspend() noexcept
+  {
+    return {};
+  }
+  void unhandled_exception() noexcept
+  {
+    std::terminate();
+  }
+
+  template <typename A>
+  auto await_transform(A &&awaitable)
+  {
+    return guarded_t(std::forward<A>(awaitable), *scope);
+  }
+
+  scope_t *scope;
+};
+
+// Where a job's result waits for whoever awaits it. Outside the frame, because the scope destroys
+// the frame in the beat after it ends; finished when the frame is destroyed, with a value if the
+// job returned one and without if its scope was cancelled first.
+template <typename T>
+struct job_state_t
+{
+  std::optional<T> value;
+  bool done = false;
+  runtime_t *runtime = nullptr;
+  waiter_t *waiter = nullptr;
+
+  void finish() noexcept
+  {
+    done = true;
+    if (auto *w = std::exchange(waiter, nullptr))
+      ready(*runtime, *w);
+  }
+};
+} // namespace detail
+
 // The coroutine type of behave() and of everything spawned into a scope. Unlike task_t it is lazy:
-// scope_t::spawn starts it. The promise finds its scope among the coroutine's parameters -- the
-// first, or the second after a member function's object -- so a behaviour without a scope_t &
-// parameter does not compile.
+// scope_t::spawn starts it.
 class behaviour_t
 {
 public:
-  struct promise_type
+  struct promise_type : detail::promise_base_t
   {
-    template <typename... Rest>
-    explicit promise_type(scope_t &scope, Rest &...) noexcept
-      : scope(&scope)
-    {
-    }
-    template <typename Self, typename... Rest>
-      requires(!std::same_as<std::remove_cvref_t<Self>, scope_t>)
-    promise_type(Self &, scope_t &scope, Rest &...) noexcept
-      : scope(&scope)
-    {
-    }
+    using promise_base_t::promise_base_t;
 
     behaviour_t get_return_object() noexcept
     {
       return behaviour_t(std::coroutine_handle<promise_type>::from_promise(*this));
     }
-    std::suspend_always initial_suspend() noexcept
-    {
-      return {};
-    }
-    struct final_t
-    {
-      [[nodiscard]] bool await_ready() const noexcept
-      {
-        return false;
-      }
-      void await_suspend(std::coroutine_handle<promise_type> frame) noexcept
-      {
-        detail::scope_finished(*frame.promise().scope, frame);
-      }
-      void await_resume() const noexcept
-      {
-      }
-    };
-    final_t final_suspend() noexcept
-    {
-      return {};
-    }
     void return_void() noexcept
     {
     }
-    void unhandled_exception() noexcept
-    {
-      std::terminate();
-    }
-
-    template <typename A>
-    auto await_transform(A &&awaitable)
-    {
-      return detail::guarded_t(std::forward<A>(awaitable), *scope);
-    }
-
-    scope_t *scope;
   };
 
   behaviour_t(behaviour_t &&other) noexcept
@@ -785,6 +843,121 @@ private:
   std::coroutine_handle<promise_type> _frame;
 };
 
+template <typename T>
+class spawned_t;
+
+// A behaviour with a result: `ui::job_t<int> fetch(ui::scope_t &scope)`. Spawned like any other,
+// it gives back a spawned_t<T> to await the result with.
+template <typename T>
+class job_t
+{
+public:
+  struct promise_type : detail::promise_base_t
+  {
+    using promise_base_t::promise_base_t;
+    promise_type(const promise_type &) = delete;
+    promise_type &operator=(const promise_type &) = delete;
+    ~promise_type()
+    {
+      state->finish();
+    }
+
+    job_t get_return_object()
+    {
+      state->runtime = &detail::scope_runtime(*scope);
+      return job_t(std::coroutine_handle<promise_type>::from_promise(*this));
+    }
+    template <typename V>
+    void return_value(V &&value)
+    {
+      state->value.emplace(std::forward<V>(value));
+    }
+
+    std::shared_ptr<detail::job_state_t<T>> state = std::make_shared<detail::job_state_t<T>>();
+  };
+
+  job_t(job_t &&other) noexcept
+    : _frame(std::exchange(other._frame, {}))
+  {
+  }
+  job_t(const job_t &) = delete;
+  job_t &operator=(const job_t &) = delete;
+  job_t &operator=(job_t &&) = delete;
+  ~job_t()
+  {
+    if (_frame)
+      _frame.destroy();
+  }
+
+  [[nodiscard]] std::coroutine_handle<promise_type> release() noexcept
+  {
+    return std::exchange(_frame, {});
+  }
+
+private:
+  explicit job_t(std::coroutine_handle<promise_type> frame) noexcept
+    : _frame(frame)
+  {
+  }
+  std::coroutine_handle<promise_type> _frame;
+};
+
+// A spawned job's result: `if (auto value = co_await spawned)`. std::nullopt when the job's scope
+// was cancelled before it returned. Dropping it does not stop the job, which belongs to its scope.
+template <typename T>
+class spawned_t
+{
+public:
+  explicit spawned_t(std::shared_ptr<detail::job_state_t<T>> state) noexcept
+    : _state(std::move(state))
+  {
+  }
+
+  [[nodiscard]] bool done() const noexcept
+  {
+    return _state->done;
+  }
+
+  struct awaitable_t : detail::waiter_t
+  {
+    // Not refused by a cancelled scope: the job is cancelled whenever the awaiting scope is, so
+    // the wait is bounded, and refusing it could end a child scope's owner before the job.
+    static constexpr bool uninterruptible = true;
+    std::shared_ptr<detail::job_state_t<T>> state;
+    awaitable_t(std::shared_ptr<detail::job_state_t<T>> s) noexcept
+      : state(std::move(s))
+    {
+    }
+    awaitable_t(const awaitable_t &) = delete;
+    awaitable_t &operator=(const awaitable_t &) = delete;
+    ~awaitable_t()
+    {
+      if (state->waiter == this)
+        state->waiter = nullptr;
+    }
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+      return state->done;
+    }
+    void await_suspend(std::coroutine_handle<> continuation) noexcept
+    {
+      handle = continuation;
+      state->waiter = this;
+    }
+    std::optional<T> await_resume() noexcept
+    {
+      return std::move(state->value);
+    }
+  };
+  [[nodiscard]] awaitable_t operator co_await() const noexcept
+  {
+    return awaitable_t(_state);
+  }
+
+private:
+  std::shared_ptr<detail::job_state_t<T>> _state;
+};
+
 // The lifetime of a mounted component. Every behaviour of the component runs in it: behave() first,
 // then whatever is spawned. Unmounting cancels it; the component's storage is released only once no
 // behaviour is left running, since every one of them holds `this`.
@@ -796,22 +969,72 @@ public:
     , _slot(slot)
   {
   }
+  // A child scope, for work shorter than the component's life. It is cancelled with its parent or
+  // on its own with cancel(), and `co_await join()` resolves once nothing in it runs -- which its
+  // owner must await before the scope goes out of scope, since what runs in it holds it.
+  explicit scope_t(scope_t &parent);
   scope_t(const scope_t &) = delete;
   scope_t &operator=(const scope_t &) = delete;
   ~scope_t()
   {
-    assert(_running.empty() && "a scope was destroyed with behaviours still running");
+    assert(_running.empty() && "a scope was destroyed with behaviours still running: co_await join() first");
   }
 
   // Start a behaviour in this scope. It runs to its first suspension before spawn returns, and it
   // belongs to the scope, not to whoever spawned it.
   void spawn(behaviour_t behaviour);
+  template <typename T>
+  spawned_t<T> spawn(job_t<T> job)
+  {
+    auto frame = job.release();
+    auto state = frame.promise().state;
+    start(frame);
+    return spawned_t<T>(std::move(state));
+  }
+
+  // End everything running in this scope: operations started with its token resolve as cancelled,
+  // and each behaviour stops at its next co_await.
+  void cancel();
+
+  class join_awaitable_t : detail::waiter_t
+  {
+  public:
+    // Exempt from the refusal a cancelled scope gives every other await: the owner of a child scope
+    // must outlive what runs in it, cancelled or not.
+    static constexpr bool uninterruptible = true;
+
+    explicit join_awaitable_t(scope_t &scope) noexcept
+      : _scope(&scope)
+    {
+    }
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+      return _scope->_running.empty();
+    }
+    void await_suspend(std::coroutine_handle<> continuation) noexcept
+    {
+      handle = continuation;
+      _scope->_joiner = this;
+    }
+    void await_resume() const noexcept
+    {
+    }
+
+  private:
+    scope_t *_scope;
+  };
+  [[nodiscard]] join_awaitable_t join() noexcept
+  {
+    return join_awaitable_t(*this);
+  }
 
   // Rebuild this component's view at the next frame. Resuming a behaviour already does this; call
   // it for a change made where no behaviour woke up.
   void invalidate() noexcept;
 
   [[nodiscard]] vio::event_loop_t &loop() const noexcept;
+  // The window the component is shown in, for what the toolkit does not wrap: keys, text.
+  [[nodiscard]] gui::window_t &window() const noexcept;
 
   // Pass to operations a behaviour starts, so unmounting resolves them as cancelled.
   [[nodiscard]] vio::cancellation_t *token() noexcept
@@ -850,12 +1073,14 @@ private:
   friend void detail::scope_refused(scope_t &, std::coroutine_handle<>) noexcept;
   friend void detail::scope_finished(scope_t &, std::coroutine_handle<>) noexcept;
 
-  void cancel();
+  void start(std::coroutine_handle<> frame);
   void forget(std::coroutine_handle<> frame) noexcept;
 
   detail::runtime_t *_runtime;
   detail::slot_t *_slot;
   vio::cancellation_t _token;
+  vio::registration_t _on_parent;
+  detail::waiter_t *_joiner = nullptr;
   std::vector<std::coroutine_handle<>> _running;
 };
 
@@ -886,6 +1111,185 @@ template <component C>
     node.behave = [](void *component, scope_t &scope) -> behaviour_t { return static_cast<C *>(component)->behave(scope); };
   return node;
 }
+
+// A component that takes props: a `props_t` with operator==, and a `props` member its view reads.
+template <typename C>
+concept has_props = component<C> && requires(C &c, const typename C::props_t &p) {
+  c.props = p;
+  { c.props == p } -> std::convertible_to<bool>;
+};
+
+// A child mounted with props: data flowing down from the parent's view. The child is rebuilt when
+// they differ from what it has, and not otherwise -- so a parent rebuilding with the same props
+// costs the child nothing.
+template <has_props C>
+[[nodiscard]] mount_t mount(const C &child, typename C::props_t props)
+{
+  using props_t = typename C::props_t;
+  mount_t node = mount(child);
+  node.props = std::make_shared<const props_t>(std::move(props));
+  node.props_equal = [](const void *component, const void *p) -> bool { return static_cast<const C *>(component)->props == *static_cast<const props_t *>(p); };
+  node.apply_props = [](void *component, const void *p) { static_cast<C *>(component)->props = *static_cast<const props_t *>(p); };
+  return node;
+}
+
+// Dynamic children at stable addresses. Identity is the item itself, so there are no keys: an item
+// keeps its state and its behaviours however the list around it changes. Erasing one ends its
+// behaviours and frees it once they have stopped, which is a frame or so later, not at erase().
+template <component T>
+class list_t
+{
+  using items_t = std::vector<std::shared_ptr<T>>;
+
+public:
+  list_t() = default;
+  list_t(list_t &&) noexcept = default;
+  list_t &operator=(list_t &&) noexcept = default;
+  list_t(const list_t &) = delete;
+  list_t &operator=(const list_t &) = delete;
+
+  template <typename... A>
+  T &emplace_back(A &&...args)
+  {
+    _items.push_back(std::make_shared<T>(std::forward<A>(args)...));
+    return *_items.back();
+  }
+  template <typename... A>
+  T &emplace(std::size_t index, A &&...args)
+  {
+    auto it = _items.insert(_items.begin() + std::ptrdiff_t(std::min(index, _items.size())), std::make_shared<T>(std::forward<A>(args)...));
+    return **it;
+  }
+  void erase(const T &item)
+  {
+    std::erase_if(_items, [&](const std::shared_ptr<T> &p) { return p.get() == &item; });
+  }
+  void erase_at(std::size_t index)
+  {
+    _items.erase(_items.begin() + std::ptrdiff_t(index));
+  }
+  void clear() noexcept
+  {
+    _items.clear();
+  }
+  // Move the item at `from` to `to`; nothing is rebuilt but the parent's order.
+  void move(std::size_t from, std::size_t to)
+  {
+    auto item = std::move(_items[from]);
+    _items.erase(_items.begin() + std::ptrdiff_t(from));
+    _items.insert(_items.begin() + std::ptrdiff_t(std::min(to, _items.size())), std::move(item));
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept
+  {
+    return _items.size();
+  }
+  [[nodiscard]] bool empty() const noexcept
+  {
+    return _items.empty();
+  }
+  [[nodiscard]] T &operator[](std::size_t i) noexcept
+  {
+    return *_items[i];
+  }
+  [[nodiscard]] const T &operator[](std::size_t i) const noexcept
+  {
+    return *_items[i];
+  }
+  // The index of an item, or size() if it is not here.
+  [[nodiscard]] std::size_t index_of(const T &item) const noexcept
+  {
+    for (std::size_t i = 0; i < _items.size(); ++i)
+    {
+      if (_items[i].get() == &item)
+        return i;
+    }
+    return _items.size();
+  }
+
+  template <typename Item, typename Base>
+  class iterator_t
+  {
+  public:
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    iterator_t() = default;
+    explicit iterator_t(Base it) noexcept
+      : _it(it)
+    {
+    }
+    Item &operator*() const noexcept
+    {
+      return **_it;
+    }
+    Item *operator->() const noexcept
+    {
+      return _it->get();
+    }
+    iterator_t &operator++() noexcept
+    {
+      ++_it;
+      return *this;
+    }
+    iterator_t operator++(int) noexcept
+    {
+      auto copy = *this;
+      ++_it;
+      return copy;
+    }
+    friend bool operator==(const iterator_t &, const iterator_t &) = default;
+
+  private:
+    Base _it{};
+  };
+  using iterator = iterator_t<T, typename items_t::iterator>;
+  using const_iterator = iterator_t<const T, typename items_t::const_iterator>;
+  iterator begin() noexcept
+  {
+    return iterator(_items.begin());
+  }
+  iterator end() noexcept
+  {
+    return iterator(_items.end());
+  }
+  const_iterator begin() const noexcept
+  {
+    return const_iterator(_items.begin());
+  }
+  const_iterator end() const noexcept
+  {
+    return const_iterator(_items.end());
+  }
+
+  // An item in a view. Use this rather than ui::mount(item): it shares the item's ownership, so an
+  // item erased while its behaviours still run is not freed under them.
+  [[nodiscard]] mount_t mount(std::size_t index) const
+  {
+    auto node = ui::mount(*_items[index]);
+    node.keep = _items[index];
+    return node;
+  }
+  template <typename P>
+    requires has_props<T>
+  [[nodiscard]] mount_t mount(std::size_t index, P &&props) const
+  {
+    auto node = ui::mount(*_items[index], typename T::props_t(std::forward<P>(props)));
+    node.keep = _items[index];
+    return node;
+  }
+  // Every item, in order, for a row or column's children.
+  [[nodiscard]] std::vector<node_t> mount_all() const
+  {
+    std::vector<node_t> nodes;
+    nodes.reserve(_items.size());
+    for (std::size_t i = 0; i < _items.size(); ++i)
+      nodes.push_back(mount(i));
+    return nodes;
+  }
+
+private:
+  items_t _items;
+};
 
 // What layout produced: a box, where it is, and whom it reports to. This is the hit-test list,
 // one entry per box in logical units; a renderer reads display_list_t instead (G24).

@@ -74,6 +74,8 @@ struct chunk_t
 // What the framework keeps for one mounted component.
 struct slot_t
 {
+  // A list item's ownership, released last: after the scope, whose behaviours hold the component.
+  std::shared_ptr<void> keep;
   void *component = nullptr;
   node_t (*view)(const void *) = nullptr;
   behaviour_t (*behave)(void *, scope_t &) = nullptr;
@@ -89,6 +91,11 @@ struct slot_t
   bool laid_out = false;
 
   extent_t size;
+  // What it was last laid out to fill, -1 where nothing was given; and its size with nothing given,
+  // which a flex parent measures it by (G42).
+  extent_t want{-1, -1};
+  extent_t natural;
+  bool natural_valid = false;
   std::vector<entry_t> entries;
   std::size_t subtree_prims = 0;
   bool holder = false;
@@ -225,6 +232,11 @@ public:
     return *_window.impl()->display.loop;
   }
 
+  [[nodiscard]] window_t &window() const noexcept
+  {
+    return _window;
+  }
+
   [[nodiscard]] const run_config_t &config() const noexcept
   {
     return _config;
@@ -336,14 +348,16 @@ public:
     for (auto *slot : leaving)
       unmount(*slot);
 
-    lay_out(*_root);
+    _measured.clear();
+    lay_out(*_root, _logical);
     if (_text.take_reset())
     {
       // The atlas filled and was emptied part way through: whatever was laid out before that names
       // rectangles that are gone. Once more, from an empty atlas (G39).
       for (auto &[component, slot] : _slots)
         mark(*slot);
-      lay_out(*_root);
+      _measured.clear();
+      lay_out(*_root, _logical);
     }
     _prims.clear();
     _runs.clear();
@@ -489,6 +503,9 @@ private:
     slot->view = mount.view;
     slot->behave = mount.behave;
     slot->scope = std::make_unique<scope_t>(*this, slot.get());
+    slot->keep = mount.keep;
+    if (mount.props)
+      mount.apply_props(slot->component, mount.props.get());
     auto *raw = slot.get();
     _slots.emplace(key_of(mount), std::move(slot));
     if (raw->behave)
@@ -533,6 +550,13 @@ private:
     if (const auto *mount = std::get_if<mount_t>(&node))
     {
       auto *child = slot_for(*mount);
+      if (mount->keep && child->keep != mount->keep)
+        child->keep = mount->keep;
+      if (mount->props && !mount->props_equal(child->component, mount->props.get()))
+      {
+        mount->apply_props(child->component, mount->props.get());
+        child->dirty = true;
+      }
       return !child->reached && build(*child);
     }
     const std::vector<node_t> *children = children_of(node);
@@ -559,16 +583,27 @@ private:
   // ---- layout. A subtree that did not change keeps its size and its entries; one that did lays
   // its children out first and then places its own output around them, in one pass, since a row
   // or column needs each child's size only once it has been placed.
-  void lay_out(slot_t &slot)
+  // `want` is the size the parent gives it, -1 in a dimension it leaves to the content (G42). A
+  // slot laid out for the same want and unchanged below keeps what it has.
+  void lay_out(slot_t &slot, extent_t want = unconstrained)
   {
-    if (!slot.subtree_dirty)
+    if (!slot.subtree_dirty && slot.laid_out && slot.want == want)
       return;
+    mark(slot);
     slot.entries.clear();
     slot.subtree_prims = 0;
     int ordinal = 0;
-    slot.size = place(slot, slot.output, 0, 0, ordinal).size;
+    slot.size = place(slot, slot.output, 0, 0, ordinal, want).size;
+    slot.want = want;
     slot.laid_out = true;
+    if (want == unconstrained)
+    {
+      slot.natural = slot.size;
+      slot.natural_valid = true;
+    }
   }
+
+  static constexpr extent_t unconstrained{-1, -1};
 
   // What placing a node produced: its size, and its first baseline below its top if it has one.
   struct placed_t
@@ -590,11 +625,11 @@ private:
     placed_t placed;
   };
 
-  placed_child_t place_child(slot_t &slot, const node_t &node, float x, float y, int &ordinal)
+  placed_child_t place_child(slot_t &slot, const node_t &node, float x, float y, int &ordinal, extent_t want = unconstrained)
   {
     placed_child_t child;
     child.begin = slot.entries.size();
-    child.placed = place(slot, node, x, y, ordinal);
+    child.placed = place(slot, node, x, y, ordinal, want);
     child.end = slot.entries.size();
     return child;
   }
@@ -613,12 +648,49 @@ private:
     }
   }
 
-  // Layout is one pass, children first. A container places each child at its start position, and
-  // moves it once its own size is known -- which is only once every child has been placed.
-  placed_t place(slot_t &slot, const node_t &node, float x, float y, int &ordinal)
+  // A node's size with nothing given to it: placed and then taken back. Cached for the frame by
+  // the node's address, so a flex container's children are measured once however deep it nests; a
+  // mounted child that did not change answers from its last layout.
+  placed_t measure(slot_t &slot, const node_t &node)
+  {
+    if (const auto *mount = std::get_if<mount_t>(&node))
+    {
+      if (auto *child = existing(*mount); child && child->natural_valid && !child->subtree_dirty)
+        return {child->natural};
+    }
+    if (auto it = _measured.find(&node); it != _measured.end())
+      return it->second;
+    const auto entries = slot.entries.size();
+    const auto prims = slot.subtree_prims;
+    int ordinal = 0;
+    const auto placed = place(slot, node, 0, 0, ordinal, unconstrained);
+    slot.entries.resize(entries);
+    slot.subtree_prims = prims;
+    _measured.emplace(&node, placed);
+    return placed;
+  }
+
+  static float grow_of(const node_t &node) noexcept
   {
     if (const auto *box = std::get_if<box_t>(&node))
-      return place_box(slot, *box, x, y, ordinal);
+      return box->grow;
+    if (const auto *row = std::get_if<row_t>(&node))
+      return row->grow;
+    if (const auto *column = std::get_if<column_t>(&node))
+      return column->grow;
+    if (const auto *spacer = std::get_if<spacer_t>(&node))
+      return spacer->grow;
+    return 0;
+  }
+
+  // Layout is children first. A container places each child at its start position, and moves it
+  // once its own size is known -- which is only once every child has been placed. Only a container
+  // that hands out space -- to children that grow or stretch, or because it was given a size --
+  // measures its children first (G42).
+  placed_t place(slot_t &slot, const node_t &node, float x, float y, int &ordinal, extent_t want = unconstrained)
+  {
+    if (const auto *box = std::get_if<box_t>(&node))
+      return place_box(slot, *box, x, y, ordinal, want);
     if (const auto *text = std::get_if<text_t>(&node))
     {
       const auto laid = _text.add_text(*text, default_font(), x, y, _glyphs);
@@ -633,6 +705,8 @@ private:
     }
     if (const auto *line = std::get_if<polyline_t>(&node))
       return place_polyline(slot, *line, x, y);
+    if (const auto *spacer = std::get_if<spacer_t>(&node))
+      return {{std::max(spacer->size.width, want.width), std::max(spacer->size.height, want.height)}};
     if (const auto *at = std::get_if<at_t>(&node))
     {
       extent_t size;
@@ -649,7 +723,7 @@ private:
       auto *child = existing(*mount);
       if (!child)
         return {};
-      lay_out(*child);
+      lay_out(*child, want);
       entry_t entry;
       entry.child = child;
       entry.x = x;
@@ -660,12 +734,12 @@ private:
       return {child->size};
     }
     if (const auto *row = std::get_if<row_t>(&node))
-      return place_line(slot, row->children, true, row->gap, row->align, row->padding, x, y, ordinal);
+      return place_line(slot, row->children, true, row->gap, row->align, row->padding, x, y, ordinal, want);
     const auto &column = std::get<column_t>(node);
-    return place_line(slot, column.children, false, column.gap, column.align, column.padding, x, y, ordinal);
+    return place_line(slot, column.children, false, column.gap, column.align, column.padding, x, y, ordinal, want);
   }
 
-  placed_t place_box(slot_t &slot, const box_t &box, float x, float y, int &ordinal)
+  placed_t place_box(slot_t &slot, const box_t &box, float x, float y, int &ordinal, extent_t want)
   {
     // The box is drawn before its children, so its entries go in first and are filled in once the
     // children have given it its size.
@@ -681,17 +755,34 @@ private:
     const int box_ordinal = ordinal++;
 
     const auto &pad = box.padding;
+    const bool stretch_x = box.align_x == align_t::stretch;
+    const bool stretch_y = box.align_y == align_t::stretch;
+    // A child stretched to the room needs the room first, and the room needs the children's sizes.
+    extent_t room{-1, -1};
+    if (stretch_x || stretch_y)
+    {
+      extent_t content;
+      for (const auto &node : box.children)
+      {
+        const auto natural = measure(slot, node).size;
+        content.width = std::max(content.width, natural.width);
+        content.height = std::max(content.height, natural.height);
+      }
+      room = {std::max({box.size.width, content.width + pad.left + pad.right, want.width}) - pad.left - pad.right, std::max({box.size.height, content.height + pad.top + pad.bottom, want.height}) - pad.top - pad.bottom};
+    }
+    const extent_t child_want{stretch_x ? room.width : -1, stretch_y ? room.height : -1};
+
     std::vector<placed_child_t> children;
     children.reserve(box.children.size());
     extent_t content;
     for (const auto &node : box.children)
     {
-      children.push_back(place_child(slot, node, x + float(pad.left), y + float(pad.top), ordinal));
+      children.push_back(place_child(slot, node, x + float(pad.left), y + float(pad.top), ordinal, child_want));
       content.width = std::max(content.width, children.back().placed.size.width);
       content.height = std::max(content.height, children.back().placed.size.height);
     }
-    const extent_t size{std::max(box.size.width, content.width + pad.left + pad.right), std::max(box.size.height, content.height + pad.top + pad.bottom)};
-    const extent_t room{size.width - pad.left - pad.right, size.height - pad.top - pad.bottom};
+    const extent_t size{std::max({box.size.width, content.width + pad.left + pad.right, want.width}), std::max({box.size.height, content.height + pad.top + pad.bottom, want.height})};
+    room = {size.width - pad.left - pad.right, size.height - pad.top - pad.bottom};
     float baseline = -1;
     for (const auto &child : children)
     {
@@ -713,8 +804,57 @@ private:
     return {size, baseline};
   }
 
-  placed_t place_line(slot_t &slot, const std::vector<node_t> &nodes, bool horizontal, int gap, align_t align, const edges_t &pad, float x, float y, int &ordinal)
+  placed_t place_line(slot_t &slot, const std::vector<node_t> &nodes, bool horizontal, int gap, align_t align, const edges_t &pad, float x, float y, int &ordinal, extent_t want)
   {
+    const int pad_along = horizontal ? pad.left + pad.right : pad.top + pad.bottom;
+    const int pad_across = horizontal ? pad.top + pad.bottom : pad.left + pad.right;
+    const int want_along = horizontal ? want.width : want.height;
+    const int want_across = horizontal ? want.height : want.width;
+
+    // What each child is given: its share of the space left along the line if it grows, the line's
+    // whole breadth if the line stretches. Without either, nothing is measured.
+    std::vector<extent_t> wants(nodes.size(), unconstrained);
+    int across_room = -1;
+    float total_grow = 0;
+    for (const auto &node : nodes)
+      total_grow += std::max(grow_of(node), 0.0f);
+    if (total_grow > 0 || align == align_t::stretch || want_along >= 0 || want_across >= 0)
+    {
+      std::vector<extent_t> naturals;
+      naturals.reserve(nodes.size());
+      int natural_along = 0;
+      int natural_across = 0;
+      for (std::size_t i = 0; i < nodes.size(); ++i)
+      {
+        naturals.push_back(measure(slot, nodes[i]).size);
+        natural_along += (horizontal ? naturals.back().width : naturals.back().height) + (i > 0 ? gap : 0);
+        natural_across = std::max(natural_across, horizontal ? naturals.back().height : naturals.back().width);
+      }
+      across_room = std::max(natural_across, want_across - pad_across);
+      const int extra = std::max(want_along - pad_along - natural_along, 0);
+      // Shares are whole units; what rounding leaves over goes to the last child that grows.
+      int handed = 0;
+      std::size_t last = nodes.size();
+      for (std::size_t i = 0; i < nodes.size(); ++i)
+      {
+        if (grow_of(nodes[i]) > 0)
+          last = i;
+      }
+      for (std::size_t i = 0; i < nodes.size(); ++i)
+      {
+        auto &w = wants[i];
+        const float g = std::max(grow_of(nodes[i]), 0.0f);
+        if (g > 0 && extra > 0)
+        {
+          const int share = i == last ? extra - handed : int(float(extra) * g / total_grow);
+          handed += share;
+          (horizontal ? w.width : w.height) = (horizontal ? naturals[i].width : naturals[i].height) + share;
+        }
+        if (align == align_t::stretch)
+          (horizontal ? w.height : w.width) = across_room;
+      }
+    }
+
     std::vector<placed_child_t> children;
     children.reserve(nodes.size());
     // Where each child starts along the line, from the content's edge.
@@ -728,12 +868,13 @@ private:
       starts.push_back(along);
       const float cx = x + float(pad.left + (horizontal ? along : 0));
       const float cy = y + float(pad.top + (horizontal ? 0 : along));
-      children.push_back(place_child(slot, nodes[i], cx, cy, ordinal));
+      children.push_back(place_child(slot, nodes[i], cx, cy, ordinal, wants[i]));
       const auto &size = children.back().placed.size;
       along += horizontal ? size.width : size.height;
     }
+    along = std::max(along, want_along - pad_along);
 
-    int across = 0;
+    int across = std::max(across_room, 0);
     float baseline = -1;
     if (horizontal && align == align_t::baseline)
     {
@@ -750,7 +891,7 @@ private:
       }
       for (const auto &child : children)
         shift(slot, child, 0, above - baseline_of(child.placed));
-      across = int(std::ceil(above + below - 1e-3f));
+      across = std::max(across, int(std::ceil(above + below - 1e-3f)));
       if (!children.empty())
         baseline = float(pad.top) + above;
     }
@@ -1071,6 +1212,7 @@ private:
   std::vector<run_t> _runs;
   text_engine_t _text;
   std::vector<prim_t> _glyphs;
+  std::unordered_map<const node_t *, placed_t> _measured;
   font_t _default_font;
   bool _looked_for_font = false;
 
@@ -1319,9 +1461,23 @@ void scope_finished(scope_t &scope, std::coroutine_handle<> frame) noexcept
 }
 } // namespace detail
 
+scope_t::scope_t(scope_t &parent)
+  : _runtime(parent._runtime)
+  , _slot(parent._slot)
+{
+  if (parent._token.is_cancelled())
+    _token.cancel();
+  else
+    _on_parent = parent._token.register_callback([this] { _token.cancel(); });
+}
+
 void scope_t::spawn(behaviour_t behaviour)
 {
-  auto frame = behaviour.release();
+  start(behaviour.release());
+}
+
+void scope_t::start(std::coroutine_handle<> frame)
+{
   if (!frame)
     return;
   if (_token.is_cancelled())
@@ -1345,6 +1501,11 @@ vio::event_loop_t &scope_t::loop() const noexcept
   return _runtime->loop();
 }
 
+gui::window_t &scope_t::window() const noexcept
+{
+  return _runtime->window();
+}
+
 void scope_t::cancel()
 {
   _token.cancel();
@@ -1353,5 +1514,7 @@ void scope_t::cancel()
 void scope_t::forget(std::coroutine_handle<> frame) noexcept
 {
   std::erase(_running, frame);
+  if (_running.empty() && _joiner)
+    _runtime->ready(*std::exchange(_joiner, nullptr));
 }
 } // namespace vio::gui::ui

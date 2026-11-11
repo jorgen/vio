@@ -217,8 +217,15 @@ across by `align` -- start, center, end, or for a row baseline, which lines up t
 baseline of each child to the pixel. A box with children holds them inside its padding, aligned by
 `align_x` and `align_y`, overlapping; its `size` is then a minimum, which is how a label sits centred
 on a button. `at_t` places its children at an offset that may be fractional, which is what lets a
-plot's bars scroll smoothly. Positions are `float` throughout; hit testing rounds them. Not yet:
-children that grow to fill the space left (flex), or wrap.
+plot's bars scroll smoothly. Positions are `float` throughout; hit testing rounds them.
+
+**Flex** (G42): a node may be given a size by its parent. A row or column shares what is left along
+it between children with `grow` (boxes, rows, columns, and `spacer_t`), and `align_t::stretch`
+gives each child its whole breadth; a box stretches its children with `align_x`/`align_y`. The root
+is given the window. Only a container that hands out space measures its children first -- placed
+and taken back, cached per frame -- so the rest stays one pass. A mounted child is laid out for
+what it was given, and laid out again only when that changes. Not yet: shrinking below the natural
+size, or wrapping.
 
 Field order is API, since designated initializers must follow it.
 
@@ -478,8 +485,6 @@ Open:
 - The atlas never evicts: glyphs no longer shown stay until it fills at 4096 square and is emptied
   whole, which relays out everything once. Fine for UI text; a plot labelling at many sizes may want
   per-size eviction.
-- Layout has no flex: nothing grows to fill the space left in a row or column, so a fixed-size
-  panel is a box with a size. Next with phase 7, whose lists want it.
 - A translucent polyline darkens where its segments overlap at each point (G41). Phase 11's joined
   segments (G28) fix it; until then plot lines are opaque.
 
@@ -493,7 +498,7 @@ Open:
 | 4 | Win32 backend, WGL and Direct3D 12 | Windows CI |
 | 5 | Cocoa backend, NSOpenGL and Metal | macOS CI |
 | 6 | UI: components, `behaviour_t` with dirty marking, scopes with `spawn` and unmount cancellation, `box`/`row`/`column`, mount, hit testing, scissor-clear drawing | a counter and a sleep-driven clock example; unit tests for scope teardown |
-| 7 | UI: `list_t`, props, child scopes, `spawned_t<T>` | a dynamic list example; unmount tests |
+| 7 | UI: `list_t`, props, child scopes, `spawned_t<T>`; flex. **In on Windows** (G42) | a dynamic list example; unmount tests |
 | 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
 | 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint. **In on Windows**; Linux and macOS not yet run | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons. **In on Windows**; Linux and macOS not yet run | labels at 1x and 2x scale; a shaping test with a non-Latin script |
