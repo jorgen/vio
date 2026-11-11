@@ -204,11 +204,21 @@ recursion is legal because `std::vector` accepts an incomplete type:
 
 ```cpp
 struct node_t;
-struct box_t    { extent_t size; color_t color; event_ref_t events; };
-struct row_t    { float gap = 0; std::vector<node_t> children; };
-struct column_t { float gap = 0; std::vector<node_t> children; };
-struct node_t : std::variant<box_t, row_t, column_t> { using variant::variant; };
+struct box_t    { extent_t size; color_t color; event_ref_t events; ...; edges_t padding;
+                  align_t align_x, align_y; std::vector<node_t> children; };
+struct row_t    { int gap = 0; align_t align; edges_t padding; std::vector<node_t> children; };
+struct column_t { int gap = 0; align_t align; edges_t padding; std::vector<node_t> children; };
+struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t, at_t, polyline_t> { ... };
 ```
+
+**Layout** (G41) is content-sized and one pass, children first: nothing hands a child a size to
+fill. A row or column lays its children along it with `gap`, inside `padding`, and places each
+across by `align` -- start, center, end, or for a row baseline, which lines up the first text
+baseline of each child to the pixel. A box with children holds them inside its padding, aligned by
+`align_x` and `align_y`, overlapping; its `size` is then a minimum, which is how a label sits centred
+on a button. `at_t` places its children at an offset that may be fractional, which is what lets a
+plot's bars scroll smoothly. Positions are `float` throughout; hit testing rounds them. Not yet:
+children that grow to fill the space left (flex), or wrap.
 
 Field order is API, since designated initializers must follow it.
 
@@ -328,8 +338,9 @@ Layout is fixed sizes and row/column stacking. Flex-style grow and shrink comes 
 
 ### Rendering
 
-The renderer reads the display list and never reaches into the component layer. Phases 9 and 10
-built what this section describes except where it says otherwise; G24-G40 hold the reasons.
+The renderer reads the display list and never reaches into the component layer. Phases 9 and 10,
+and the first slice of 11, built what this section describes except where it says otherwise; G24-G41
+hold the reasons.
 
 **Two lists, not one.** `draw_item_t` stays what it is: one entry per hit-testable box, walked
 backwards for input. Layout also emits a `display_list_t` in painter's order, which is what the
@@ -365,13 +376,14 @@ skipped (G29). They wait for a profile that asks for them -- plots are the likel
 window's size on Wayland and macOS and its size divided by the UI scale on Windows and X11. The
 renderer scales by framebuffer / logical. On a 144 DPI Windows display a 60-unit box is 90 pixels.
 
-**One pipeline so far** (G26). One instanced quad per primitive, of two kinds (`prim_kind_t`). A
+**One pipeline so far** (G26). One instanced quad per primitive, of four kinds (`prim_kind_t`). A
 shape is computed per pixel: a rounded rectangle with per-corner radii and a border, or a blurred
-one, which is a shadow (G37). Antialiasing is half a pixel either side of the exact distance; no
-MSAA. Coverage -- a glyph or an icon -- is a rectangle of the atlas copied texel for texel and tinted
-(G39). Colours are authored in sRGB and blended in linear space (G38). Still to come in later
-phases: circles, arcs, capsules, markers and polyline segments in the same pipeline, and the
-triangle-mesh pipeline for fills.
+one, which is a shadow (G37); a circle is a shape whose radii are half its size. Antialiasing is
+half a pixel either side of the exact distance; no MSAA. Coverage -- a glyph or an icon -- is a
+rectangle of the atlas copied texel for texel and tinted (G39). A segment is a line with round ends,
+by its distance; an area is the region under one (G41). Colours are authored in sRGB and blended in
+linear space (G38). Still to come: arcs in the same pipeline, and phase 11's point-buffer line
+pipeline with joins that do not overlap (G28).
 
 **Text** (G27, G39, G40). `text_t` is one line in one `font_t` at a size in logical units; a
 `font_t` is a file's bytes and HarfBuzz's face over them, shared freely. Layout shapes it with
@@ -384,10 +396,19 @@ origin. A new scale empties the atlas and lays everything out again; so does an 
 into the same atlas, so general paths are not needed on the GPU. Shaping runs where layout does,
 so only for changed subtrees. Text with no font named uses `run_config_t::font`, else
 `font_t::system_default()`. `src/ui_text.cpp` is all of it; nothing in `ui.h` names FreeType or
-HarfBuzz. Not yet: bidirectional text, font fallback, wrapping, baseline alignment in a row (a row
-aligns tops), colour glyphs -- G40.
+HarfBuzz. A text reports its baseline, a whole number of pixels below its anchor, which is what a
+row aligned on baselines lines up. Not yet: bidirectional text, font fallback, wrapping, colour
+glyphs -- G40.
 
-**Plots** (G28): polyline segments expanded in the vertex shader from a point buffer with miter
+**Plots, first slice** (G41): `polyline_t` is a line through points in a box of a given size, with
+round joins, an optional fill down to the box's bottom and optional round markers -- one segment
+prim per segment, one area prim per segment of fill, one shape per marker, all through the one
+pipeline. With rules, bars as boxes under `at_t`, and text for the labels, that is enough for the
+scrolling line, bar and scatter plots in `vio_gui_ui_counter`. The plot rebuilds its prims whenever
+its data changes; that is a few thousand prims and fine at UI rates, and it is what the rest below
+replaces.
+
+**Plots, the rest** (G28): polyline segments expanded in the vertex shader from a point buffer with miter
 joins (bevel past a limit), so translucent lines do not double-blend at joints; fills as triangle
 strips; heatmaps as an `R32F` data texture plus a colormap lookup texture; series uploaded in plot
 coordinates relative to a per-series origin subtracted in `double`, with pan and zoom as a uniform;
@@ -434,6 +455,14 @@ Arabic, captured at 144 DPI; that capture is what found the barrier problem in G
 reproduces. **Not run:** Linux (lavapipe, X11, Wayland) and macOS (MoltenVK) -- Docker was down;
 clang-cl `-fsyntax-only` over the phase 9 sources is the only check beyond MSVC. No validation
 layer is installed on the machine that ran this, so `VIO_VULKAN_VALIDATION=1` checked nothing.
+Layout and the first plots: `test/test_ui_layout.cpp` -- padding, alignment and growth of a box
+around its children, rows and columns aligned across, a press on a label reaching its button,
+`at_t`'s fractional offset, a polyline's prims and their order, and two offscreen renders: a line
+over its fill, and three hundred areas a pixel wide at 1.5x on a fractional origin, every pixel
+drawn once. The baseline test in `test_ui_text.cpp` runs at 1.5x and was confirmed to fail with the
+shift rounded to whole units; the seam test was confirmed to fail with the areas overlapping by
+0.6 px, and the thin-area test is what found the problem G41 describes, after the capture showed
+stripes.
 
 Open:
 
@@ -448,8 +477,10 @@ Open:
 - The atlas never evicts: glyphs no longer shown stay until it fills at 4096 square and is emptied
   whole, which relays out everything once. Fine for UI text; a plot labelling at many sizes may want
   per-size eviction.
-- Boxes have no children, so a label cannot sit on a button yet; that is padding and alignment,
-  the flex work after phase 10.
+- Layout has no flex: nothing grows to fill the space left in a row or column, so a fixed-size
+  panel is a box with a size. Next with phase 7, whose lists want it.
+- A translucent polyline darkens where its segments overlap at each point (G41). Phase 11's joined
+  segments (G28) fix it; until then plot lines are opaque.
 
 ## Phases
 
@@ -465,5 +496,5 @@ Open:
 | 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
 | 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint. **In on Windows**; Linux and macOS not yet run | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons. **In on Windows**; Linux and macOS not yet run | labels at 1x and 2x scale; a shaping test with a non-Latin script |
-| 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation | thick translucent zigzag lines; a million-point series panned at frame rate |
+| 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation. **First slice in on Windows** (G41): round-joined segments, area fills, markers | thick translucent zigzag lines; a million-point series panned at frame rate |
 | 12 | D3D12 and Metal backends | the phase 9 to 11 examples on each |

@@ -424,3 +424,36 @@ label on a UI. The default font is found by path -- Segoe UI, the macOS system f
 Liberation Sans -- rather than through fontconfig, which would be a third dependency loaded at run
 time for one lookup; `run_config_t::font` overrides it. Colour glyphs (emoji) are not drawn: the
 atlas is one channel.
+
+## G41. Layout is one pass with padding and alignment; plots start as segments and areas
+
+Layout stays content-sized and single-pass: a container places each child at its start position,
+learns its size from doing so, and only then moves it -- across for alignment, down for a baseline
+-- by shifting the entries the child produced. No constraints travel down, so nothing yet grows to
+fill a row (flex); that is a second pass and waits for a layout that needs it. Positions became
+`float`, because two things need fractions: a plot's bars move by fractions of a unit as they
+scroll, and baselines do. A text's baseline is a whole number of pixels below its anchor, which the
+shader rounds; moving the anchor by exactly the difference of two baselines in logical units --
+fractional at 1.5x -- therefore lands both on the same pixel row, where rounding the move to whole
+units missed by one. Hit testing rounds positions; drawing keeps them.
+
+A box with children holds them overlapping, each aligned inside its padding, rather than as a
+column: one child is the common case (a label on a button), and a column inside is one more node.
+`at_t` exists for what alignment cannot say -- a bar at a time-dependent x.
+
+Plots begin inside the existing pipeline, ahead of phase 11's point buffer (G28). `polyline_t`
+emits one segment prim per segment -- the distance to the segment, so ends and joins are round --
+one area prim per segment of fill, and one circle per marker. Round joins overlap, so a translucent
+line darkens at every point; G28's joined segments remove that, and until then the example's lines
+are opaque. A line is rebuilt with its component, which at a few thousand prims is cheap.
+
+Areas meet edge to edge, and that edge is not the rasterizer's to decide. The first version made
+each area's quad exactly x0 to x1 and relied on shared edges rasterizing once; the offscreen test
+of one shared edge at 2x passed, and the running example at 1.5x showed stripes where the fill was
+blended twice. SPIR-V lets the driver contract and reorder vertex arithmetic per vertex, so two
+vertices computed from the same float need not land on the same position. The quad is now a pixel
+wider on each side, and the fragment shader keeps a pixel only if its centre, mapped back to the
+run's logical x, lies in [x0, x1) -- bounds passed through from the attributes with no arithmetic,
+compared against a value computed the same way for that pixel in either prim, so exactly one of
+two neighbours keeps it. A test of three hundred thin areas at 1.5x on a fractional origin failed
+on 174 pixels of one row before that, and passes after.
