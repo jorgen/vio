@@ -12,6 +12,7 @@ option(VIO_BUILD_SHARED "Build vio as a shared library" OFF)
 option(VIO_BUILD_TESTS "Build vio tests" ON)
 option(VIO_BUILD_EXAMPLES "Build vio examples" ON)
 option(VIO_BUILD_GUI "Build the vio gui window library" ON)
+option(VIO_GUI_FETCH_SLANG "Fetch a prebuilt slangc for the vio_gui_shaders target (gui/DECISIONS.md G33)" OFF)
 option(VIO_INSTALL "Generate install and package-config rules for vio" ON)
 
 # SSL backend selection. vio speaks the OpenSSL SSL_*/BIO API through a compile-time

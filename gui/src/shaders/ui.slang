@@ -58,7 +58,10 @@ float4 premultiplied_linear(float4 c)
 }
 
 [shader("vertex")]
-Varyings vertexMain(Prim prim, uint vertex : SV_VertexID)
+// SV_VulkanVertexID, not SV_VertexID: Slang makes the latter zero-based by subtracting BaseVertex,
+// which needs DrawParameters and so SPIR-V 1.3, and the renderer asks for Vulkan 1.0. Every draw
+// starts at vertex 0, so the two are the same number.
+Varyings vertexMain(Prim prim, uint vertex : SV_VulkanVertexID)
 {
     // Two triangles: 0 1 2, 2 1 3 over the corners (0,0) (1,0) (0,1) (1,1).
     const uint corner_index = vertex < 3 ? vertex : (vertex == 3 ? 2 : (vertex == 4 ? 1 : 3));

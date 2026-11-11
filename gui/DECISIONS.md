@@ -324,6 +324,16 @@ the Slang output matches. The renderer reads each module's entry point name out 
 `OpEntryPoint`, so slangc keeping `vertexMain` where glslang writes `main` needs no change. The
 target builds for `spirv_1_0` because the renderer asks for Vulkan 1.0.
 
+**Resolved.** `-DVIO_GUI_FETCH_SLANG=ON` fetches slangc 2026.21's release archive for the host
+through cmake-dep (one package per host system and processor, since the archives are prebuilt;
+off by default, so neither the lockfile nor CI fetches it), and `ui_spirv.h` is now its output.
+It found one difference the transcription hid: Slang's `SV_VertexID` is zero-based as in
+Direct3D, so it subtracts `BaseVertex`, which needs `DrawParameters` and silently raised the
+vertex module to SPIR-V 1.3 -- invalid on a Vulkan 1.0 device. The shader uses
+`SV_VulkanVertexID` instead; every draw starts at vertex 0, so the value is the same. slangc
+still warns that 1.0 is "too old"; it is advisory and both modules are 1.0. The tests and the
+counter example draw the same through it as through the stopgap.
+
 ## G34. A run's origin is a push constant, not an index into a buffer
 
 G29 planned a buffer of chunk origins indexed per instance. One `vkCmdDraw` per run with the origin

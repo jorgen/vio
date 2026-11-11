@@ -395,8 +395,9 @@ M4 decimation (first, last, min, max per pixel column) once a series has more po
 
 **Shaders** (G25, G33): `src/shaders/ui.slang` is the source. `src/shaders/ui_spirv.h` is the
 compiled SPIR-V, committed, so building vio needs no shader compiler; `cmake --build <dir> --target
-vio_gui_shaders` regenerates it when `slangc` is on `PATH`. The header in the tree was not made by
-slangc -- see G33 before trusting it.
+vio_gui_shaders` regenerates it. `-DVIO_GUI_FETCH_SLANG=ON` has cmake-dep fetch a prebuilt slangc
+2026.21 for the host and the target uses that; otherwise it looks for `slangc` on `PATH`. The
+header in the tree is slangc output (G33).
 
 **Vulkan** (G30, G31, G34). `src/ui_vulkan.cpp`: the loader is opened at run time, Vulkan 1.0, a
 classic render pass, an sRGB swapchain with FIFO present, two frames in flight, one host-visible

@@ -68,7 +68,14 @@ if(NOT WIN32)
 endif()
 
 # Regenerates src/shaders/ui_spirv.h from ui.slang (G25). Not part of any build: the header is
-# committed, and only someone changing a shader needs slangc.
+# committed, and only someone changing a shader needs slangc. -DVIO_GUI_FETCH_SLANG=ON uses the
+# prebuilt one cmake-dep fetched for this host; otherwise slangc is looked for on PATH.
+foreach(_slang slang_windows_x86_64 slang_windows_aarch64 slang_macos_x86_64 slang_macos_aarch64
+        slang_linux_x86_64 slang_linux_aarch64)
+    if(VIO_GUI_FETCH_SLANG AND ${_slang}_SOURCE_DIR)
+        find_program(VIO_SLANGC slangc PATHS ${${_slang}_SOURCE_DIR}/bin NO_DEFAULT_PATH REQUIRED)
+    endif()
+endforeach()
 find_program(VIO_SLANGC slangc)
 if(VIO_SLANGC)
     set(shader_dir ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -80,8 +87,8 @@ if(VIO_SLANGC)
                 -entry fragmentMain -stage fragment -o ${shader_dir}/ui.frag.spv
         COMMAND ${CMAKE_COMMAND} -DOUTPUT=${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/ui_spirv.h
                 "-DCOMPILER=slangc from ui.slang"
-                "-DNAMES=ui_vertex\\;ui_fragment"
-                "-DFILES=${shader_dir}/ui.vert.spv\\;${shader_dir}/ui.frag.spv"
+                "-DNAMES=ui_vertex$<SEMICOLON>ui_fragment"
+                "-DFILES=${shader_dir}/ui.vert.spv$<SEMICOLON>${shader_dir}/ui.frag.spv"
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake
         COMMENT "Compiling the UI shaders with slangc"
         VERBATIM)
