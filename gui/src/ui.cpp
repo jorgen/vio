@@ -81,6 +81,12 @@ struct slot_t
   behaviour_t (*behave)(void *, scope_t &) = nullptr;
   std::unique_ptr<scope_t> scope;
   node_t output;
+  // Its mount's scale (mount_t::scale): a scaled slot always holds its own chunk.
+  float scale = 1;
+  // The mounts in `output`, found when the view ran.
+  std::vector<const mount_t *> mounts;
+  // Boxes in this subtree a press can be aimed at; a subtree with none is skipped by hit testing.
+  std::size_t targets = 0;
   // Its view must run again.
   bool dirty = true;
   // It or something below it changed since the last frame, so its layout, entries and chunk are
@@ -244,6 +250,7 @@ class runtime_t
 public:
   runtime_t(window_t &window, run_config_t config)
     : _window(window)
+    , _loop(window.impl()->display.loop)
     , _core(window.impl()->display.core)
     , _config(std::move(config))
   {
@@ -264,14 +271,24 @@ public:
     _core.unpost(_finish);
   }
 
+  // Kept from construction: a behaviour woken by its own timer after the window closed, before
+  // the frame loop has noticed, still asks for the loop, and the closed window no longer has it.
   [[nodiscard]] vio::event_loop_t &loop() const noexcept
   {
-    return *_window.impl()->display.loop;
+    return *_loop;
   }
 
   [[nodiscard]] window_t &window() const noexcept
   {
     return _window;
+  }
+  [[nodiscard]] extent_t viewport() const noexcept
+  {
+    return _logical;
+  }
+  frame_stats_t &stats() noexcept
+  {
+    return _stats;
   }
 
   [[nodiscard]] const run_config_t &config() const noexcept
@@ -354,6 +371,11 @@ public:
   // chunks those subtrees fall in; then the display list and the hit-test list, assembled whole.
   void step(const frame_t &frame)
   {
+    using clock = std::chrono::steady_clock;
+    const auto started = clock::now();
+    _stats = {};
+    _stats.interval = _last_frame.time_since_epoch().count() ? started - _last_frame : clock::duration{};
+    _last_frame = started;
     _changed = false;
     // The renderer has drawn the previous list, so what it uploaded is no longer new.
     _text.clear_dirty();
@@ -369,6 +391,7 @@ public:
     for (auto &[component, slot] : _slots)
       slot->reached = false;
     build(*_root);
+    _stats.views = clock::now() - started;
 
     std::vector<slot_t *> leaving;
     for (auto it = _slots.begin(); it != _slots.end();)
@@ -385,6 +408,7 @@ public:
     for (auto *slot : leaving)
       unmount(*slot);
 
+    const auto laying = clock::now();
     _measured.clear();
     lay_out(*_root, _logical);
     if (_text.take_reset())
@@ -396,15 +420,22 @@ public:
       _measured.clear();
       lay_out(*_root, _logical);
     }
+    const auto emitting = clock::now();
+    _stats.layout = emitting - laying;
     _prims.clear();
     _runs.clear();
     _root->holder = true;
-    emit(*_root, 0, 0);
+    emit(*_root, 0, 0, 1);
     for (auto *slot : std::exchange(_touched, {}))
       slot->subtree_dirty = false;
 
     _items.clear();
-    collect_items(*_root, 0, 0);
+    collect_items(*_root, 0, 0, 1);
+    _stats.display_list = clock::now() - emitting;
+    _stats.prims = _prims.size();
+    _stats.runs = _runs.size();
+    _stats.items = _items.size();
+    _stats.components = _slots.size();
     if (_has_pointer)
       hover(_pointer);
     if (_config.on_layout)
@@ -528,11 +559,13 @@ private:
     return _scale != previous;
   }
 
+public:
   [[nodiscard]] point_t to_logical(point_t position) const noexcept
   {
     return {position.x * _input_x, position.y * _input_y};
   }
 
+private:
   slot_t *make_slot(const mount_t &mount)
   {
     auto slot = std::make_unique<slot_t>();
@@ -541,6 +574,7 @@ private:
     slot->behave = mount.behave;
     slot->scope = std::make_unique<scope_t>(*this, slot.get());
     slot->keep = mount.keep;
+    slot->scale = mount.scale > 0 ? mount.scale : 1;
     if (mount.props)
       mount.apply_props(slot->component, mount.props.get());
     auto *raw = slot.get();
@@ -572,41 +606,50 @@ private:
     if (slot.dirty)
     {
       slot.dirty = false;
+      ++_stats.views_run;
       slot.output = slot.view(slot.component);
+      slot.mounts.clear();
+      find_mounts(slot.output, slot.mounts);
       changed = true;
     }
-    if (visit_mounts(slot.output))
-      changed = true;
+    // Only the mounts, found once when the view ran: walking a clean view's whole tree every frame
+    // to find them cost as much as a frame of a large scene (G45).
+    for (const auto *mount : slot.mounts)
+    {
+      if (visit_mount(*mount))
+        changed = true;
+    }
     if (changed || !slot.laid_out)
       mark(slot);
     return slot.subtree_dirty;
   }
 
-  bool visit_mounts(const node_t &node)
+  static void find_mounts(const node_t &node, std::vector<const mount_t *> &out)
   {
     if (const auto *mount = std::get_if<mount_t>(&node))
     {
-      auto *child = slot_for(*mount);
-      if (mount->keep && child->keep != mount->keep)
-        child->keep = mount->keep;
-      if (mount->props && !mount->props_equal(child->component, mount->props.get()))
-      {
-        mount->apply_props(child->component, mount->props.get());
-        child->dirty = true;
-      }
-      return !child->reached && build(*child);
+      out.push_back(mount);
+      return;
     }
-    const std::vector<node_t> *children = children_of(node);
-    bool changed = false;
-    if (children)
+    if (const auto *children = children_of(node))
     {
       for (const auto &child : *children)
-      {
-        if (visit_mounts(child))
-          changed = true;
-      }
+        find_mounts(child, out);
     }
-    return changed;
+  }
+
+  bool visit_mount(const mount_t &mount)
+  {
+    auto *child = slot_for(mount);
+    if (mount.keep && child->keep != mount.keep)
+      child->keep = mount.keep;
+    child->scale = mount.scale > 0 ? mount.scale : 1;
+    if (mount.props && !mount.props_equal(child->component, mount.props.get()))
+    {
+      mount.apply_props(child->component, mount.props.get());
+      child->dirty = true;
+    }
+    return !child->reached && build(*child);
   }
 
   void mark(slot_t &slot)
@@ -633,6 +676,14 @@ private:
     slot.size = place(slot, slot.output, 0, 0, ordinal, want).size;
     slot.want = want;
     slot.laid_out = true;
+    slot.targets = 0;
+    for (const auto &entry : slot.entries)
+    {
+      if (entry.child)
+        slot.targets += entry.child->targets;
+      else if (entry.box && (entry.box->events.source || entry.box->on_press))
+        ++slot.targets;
+    }
     if (want == unconstrained)
     {
       slot.natural = slot.size;
@@ -693,7 +744,7 @@ private:
     if (const auto *mount = std::get_if<mount_t>(&node))
     {
       if (auto *child = existing(*mount); child && child->natural_valid && !child->subtree_dirty)
-        return {child->natural};
+        return {scaled(child->natural, child->scale)};
     }
     if (auto it = _measured.find(&node); it != _measured.end())
       return it->second;
@@ -766,7 +817,9 @@ private:
       auto *child = existing(*mount);
       if (!child)
         return {};
-      lay_out(*child, want);
+      // A scaled child is laid out in its own units and takes up its scaled size.
+      const float s = child->scale;
+      lay_out(*child, s == 1 ? want : extent_t{want.width >= 0 ? int(float(want.width) / s) : -1, want.height >= 0 ? int(float(want.height) / s) : -1});
       entry_t entry;
       entry.child = child;
       entry.x = x;
@@ -774,7 +827,7 @@ private:
       slot.entries.push_back(entry);
       slot.subtree_prims += child->subtree_prims;
       // A component's baseline is not kept between frames, so a mounted child has none.
-      return {child->size};
+      return {scaled(child->size, s)};
     }
     if (const auto *row = std::get_if<row_t>(&node))
       return place_line(slot, row->children, true, row->gap, row->align, row->padding, x, y, ordinal, want);
@@ -1072,10 +1125,18 @@ private:
 
   // ---- chunks (G29). The root always holds one. Any other subtree holds one from the threshold
   // up and gives it back below half of it, so a subtree near the limit does not switch every frame.
+  static extent_t scaled(extent_t size, float s) noexcept
+  {
+    if (s == 1)
+      return size;
+    return {int(std::ceil(float(size.width) * s - 1e-3f)), int(std::ceil(float(size.height) * s - 1e-3f))};
+  }
+
   bool decide_holder(slot_t &slot)
   {
     const std::size_t threshold = std::max<std::size_t>(_config.chunk_threshold, 1);
-    const bool now = slot.holder ? slot.subtree_prims >= std::max<std::size_t>(threshold / 2, 1) : slot.subtree_prims >= threshold;
+    // A scaled subtree is drawn as runs of its own, since the scale is a run's.
+    const bool now = slot.scale != 1 || (slot.holder ? slot.subtree_prims >= std::max<std::size_t>(threshold / 2, 1) : slot.subtree_prims >= threshold);
     if (now != slot.holder)
     {
       slot.holder = now;
@@ -1122,7 +1183,28 @@ private:
   }
 
   // Concatenate the chunks into this frame's prims, one run per segment. A clean chunk is a copy.
-  void emit(slot_t &holder, float x, float y)
+  // Whether a subtree laid out at (x, y) can reach the window. Its size bounds its layout, not
+  // everything it draws -- a shadow spreads past its box -- so the window is taken a margin larger.
+  [[nodiscard]] bool visible(const slot_t &slot, float x, float y, float s) const noexcept
+  {
+    constexpr float margin = 64;
+    return x + float(slot.size.width) * s + margin > 0 && y + float(slot.size.height) * s + margin > 0 && x - margin < float(_logical.width) && y - margin < float(_logical.height);
+  }
+
+  // A holder skipped while something below it changed: its chunk, and those of the holders below
+  // it on the changed path, no longer match their entries. They are flattened again when next drawn.
+  void forget_chunks(slot_t &slot)
+  {
+    slot.chunk.valid = false;
+    for (const auto &entry : slot.entries)
+    {
+      if (entry.child && entry.child->subtree_dirty)
+        forget_chunks(*entry.child);
+    }
+  }
+
+  // `s` is the scale the holder is drawn at: its own times its ancestors'.
+  void emit(slot_t &holder, float x, float y, float s)
   {
     if (holder.subtree_dirty || !holder.chunk.valid)
       flatten(holder);
@@ -1130,29 +1212,45 @@ private:
     {
       if (segment.child)
       {
-        emit(*segment.child, x + segment.x, y + segment.y);
+        const float cx = x + segment.x * s;
+        const float cy = y + segment.y * s;
+        const float cs = s * segment.child->scale;
+        // A chunk wholly outside the window is not drawn (G45).
+        if (!visible(*segment.child, cx, cy, cs))
+        {
+          if (segment.child->subtree_dirty)
+            forget_chunks(*segment.child);
+          continue;
+        }
+        emit(*segment.child, cx, cy, cs);
         continue;
       }
       const auto first = std::uint32_t(_prims.size());
       _prims.insert(_prims.end(), holder.chunk.prims.begin() + segment.begin, holder.chunk.prims.begin() + segment.end);
-      _runs.push_back(run_t{first, segment.end - segment.begin, x, y});
+      _runs.push_back(run_t{first, segment.end - segment.begin, x, y, s});
     }
   }
 
   // The hit-test list, from the entries as they stand: no view runs for it.
-  void collect_items(slot_t &slot, float x, float y)
+  void collect_items(slot_t &slot, float x, float y, float s)
   {
+    // Only what a press can be aimed at, unless someone asked for every box.
+    const bool every_box = bool(_config.on_layout);
+    if (!every_box && slot.targets == 0)
+      return;
     for (const auto &entry : slot.entries)
     {
       if (entry.child)
       {
-        collect_items(*entry.child, x + entry.x, y + entry.y);
+        const float cs = s * entry.child->scale;
+        if (visible(*entry.child, x + entry.x * s, y + entry.y * s, cs))
+          collect_items(*entry.child, x + entry.x * s, y + entry.y * s, cs);
         continue;
       }
-      if (!entry.box)
+      if (!entry.box || (!every_box && !entry.box->events.source && !entry.box->on_press))
         continue;
       const auto &box = *entry.box;
-      const rect_t rect{int(std::lround(x + entry.x)), int(std::lround(y + entry.y)), int(entry.prim.width), int(entry.prim.height)};
+      const rect_t rect{int(std::lround(x + entry.x * s)), int(std::lround(y + entry.y * s)), int(std::lround(entry.prim.width * s)), int(std::lround(entry.prim.height * s))};
       _items.push_back(draw_item_t{rect, box.color, &box, &slot, entry.ordinal});
     }
   }
@@ -1250,6 +1348,7 @@ private:
   }
 
   window_t &_window;
+  vio::event_loop_t *_loop;
   loop_core_t &_core;
   run_config_t _config;
   posted_t _beat;
@@ -1286,6 +1385,8 @@ private:
   text_engine_t _text;
   std::vector<prim_t> _glyphs;
   std::unordered_map<const node_t *, placed_t> _measured;
+  frame_stats_t _stats;
+  std::chrono::steady_clock::time_point _last_frame;
   font_t _default_font;
   bool _looked_for_font = false;
 
@@ -1358,10 +1459,10 @@ public:
         const auto &prim = list.prims[i];
         if (prim.blur > 0 || prim.kind != prim_kind_t::shape)
           continue;
-        const int x0 = int((run.x + prim.x) * sx + 0.5);
-        const int x1 = int((run.x + prim.x + prim.width) * sx + 0.5);
-        const int y0 = int((run.y + prim.y) * sy + 0.5);
-        const int y1 = int((run.y + prim.y + prim.height) * sy + 0.5);
+        const int x0 = int((run.x + prim.x * run.scale) * sx + 0.5);
+        const int x1 = int((run.x + (prim.x + prim.width) * run.scale) * sx + 0.5);
+        const int y0 = int((run.y + prim.y * run.scale) * sy + 0.5);
+        const int y1 = int((run.y + (prim.y + prim.height) * run.scale) * sy + 0.5);
         _scissor(x0, height - y1, x1 - x0, y1 - y0);
         _clear_color(prim.fill.r, prim.fill.g, prim.fill.b, prim.fill.a);
         _clear(gl_color_buffer_bit);
@@ -1486,8 +1587,12 @@ vio::task_t<void> run_root(window_t &window, mount_t root, run_config_t config)
     if (!frame)
       break;
     runtime.step(*frame);
+    const auto rendering = std::chrono::steady_clock::now();
     if (renderer && !renderer->render(runtime.display_list()))
       renderer.reset();
+    runtime.stats().render = std::chrono::steady_clock::now() - rendering;
+    if (runtime.config().on_stats)
+      runtime.config().on_stats(runtime.stats());
   }
   renderer.reset();
   runtime.shutdown();
@@ -1577,6 +1682,16 @@ vio::event_loop_t &scope_t::loop() const noexcept
 gui::window_t &scope_t::window() const noexcept
 {
   return _runtime->window();
+}
+
+point_t scope_t::to_logical(point_t position) const noexcept
+{
+  return _runtime->to_logical(position);
+}
+
+extent_t scope_t::viewport() const noexcept
+{
+  return _runtime->viewport();
 }
 
 void scope_t::cancel()

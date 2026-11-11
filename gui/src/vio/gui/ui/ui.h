@@ -640,6 +640,16 @@ struct mount_t
   std::shared_ptr<const void> props;
   bool (*props_equal)(const void *component, const void *props) = nullptr;
   void (*apply_props)(void *component, const void *props) = nullptr;
+  // Draw the child this many times its size without laying it out again: zoom. Its layout, hit
+  // testing and what it takes up in its parent all scale with it; its text keeps its pixel size.
+  float scale = 1;
+
+  // `ui::mount(child).scaled(2)`
+  [[nodiscard]] mount_t scaled(float factor) &&
+  {
+    scale = factor;
+    return std::move(*this);
+  }
 };
 
 struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t, at_t, polyline_t, spacer_t, heatmap_t>
@@ -1085,8 +1095,13 @@ public:
   void invalidate() noexcept;
 
   [[nodiscard]] vio::event_loop_t &loop() const noexcept;
-  // The window the component is shown in, for what the toolkit does not wrap: keys, text.
+  // The window the component is shown in, for what the toolkit does not wrap: keys, text, the
+  // pointer itself. Its positions are in the window system's units; to_logical() makes them layout
+  // units, which is what everything in a view is in.
   [[nodiscard]] gui::window_t &window() const noexcept;
+  [[nodiscard]] point_t to_logical(point_t position) const noexcept;
+  // The window's size in layout units, as of the last frame.
+  [[nodiscard]] extent_t viewport() const noexcept;
 
   // Pass to operations a behaviour starts, so unmounting resolves them as cancelled.
   [[nodiscard]] vio::cancellation_t *token() noexcept
@@ -1615,6 +1630,9 @@ struct run_t
   std::uint32_t count = 0;
   float x = 0;
   float y = 0;
+  // Drawn this many times its layout size about its origin: a scaled mount (G45). Glyphs keep
+  // their pixel size and move with their anchor.
+  float scale = 1;
 };
 
 // One frame's worth of drawing, in painter's order. `prims` is assembled afresh every frame from
@@ -1651,6 +1669,23 @@ enum class render_api_t : std::uint8_t
   gl,
 };
 
+// What one frame cost, for a program measuring itself. Times are CPU time on the loop thread:
+// `render` is recording and submitting, not the GPU's own time.
+struct frame_stats_t
+{
+  std::chrono::nanoseconds views{0};
+  std::chrono::nanoseconds layout{0};
+  std::chrono::nanoseconds display_list{0};
+  std::chrono::nanoseconds render{0};
+  // From the start of the previous frame to the start of this one.
+  std::chrono::nanoseconds interval{0};
+  std::size_t prims = 0;
+  std::size_t runs = 0;
+  std::size_t items = 0;
+  std::size_t components = 0;
+  std::size_t views_run = 0;
+};
+
 struct run_config_t
 {
   color_t background = {0.12f, 0.12f, 0.14f, 1};
@@ -1670,6 +1705,8 @@ struct run_config_t
   std::function<void(const display_list_t &)> on_display_list;
   // Called once, with which renderer was chosen ("vulkan: <device>", "gl") or why none was.
   std::function<void(std::string_view)> on_renderer;
+  // Called after every frame with what it cost.
+  std::function<void(const frame_stats_t &)> on_stats;
 };
 
 namespace detail

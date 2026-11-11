@@ -495,3 +495,49 @@ TEST_CASE("ui merge: presses, a timer and a socket's lines arrive in one loop, a
   CHECK(mixer.lines == std::vector<std::string>{"alpha", "beta", "gamma", "last"});
   CHECK(mixer.closed);
 }
+
+namespace
+{
+struct scaled_child_t
+{
+  ui::pressable_t press;
+  int presses = 0;
+  ui::node_t view() const
+  {
+    return ui::at_t{.x = 5, .y = 5, .children = {ui::box_t{.size = {10, 10}, .color = green, .events = press}}};
+  }
+  ui::behaviour_t behave(ui::scope_t &)
+  {
+    auto presses_of = ui::subscribe<ui::press_event_t>(press);
+    while (co_await presses_of)
+      ++presses;
+  }
+};
+
+struct scaled_parent_t
+{
+  scaled_child_t child;
+  ui::node_t view() const
+  {
+    return ui::row_t{.children = {ui::box_t{.size = {10, 10}, .color = red}, ui::mount(child).scaled(2), ui::box_t{.size = {4, 4}, .color = red}}};
+  }
+};
+} // namespace
+
+TEST_CASE("ui scale: a scaled mount takes up, draws and is hit at its scaled size, without a relayout")
+{
+  scaled_parent_t parent;
+  std::vector<ui::rect_t> rects;
+  drive(parent, rects,
+        [](vio::event_loop_t &loop, gui::window_t &window) -> vio::task_t<void>
+        {
+          // Inside the scaled box (20..40 across, 10..30 down), outside what its unscaled size would be.
+          click(window, {37, 27});
+          co_await settle(loop);
+        });
+  REQUIRE(rects.size() == 3);
+  // The child is 15 units square laid out, 30 drawn: the box after it starts at 10 + 30.
+  CHECK(rects[1] == ui::rect_t{10 + 10, 10, 20, 20});
+  CHECK(rects[2].x == 40);
+  CHECK(parent.child.presses == 1);
+}

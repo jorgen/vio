@@ -26,10 +26,16 @@ struct Push
     float2 scale;       // framebuffer pixels per logical unit
     float2 target;      // framebuffer size in pixels
     float encode_srgb;  // 1 when the target is UNORM and the shader must encode
-    float pad;
+    float zoom;         // the run's own scale: what is drawn is this many times its layout size
 };
 
 [[vk::push_constant]] ConstantBuffer<Push> push;
+// A point of a prim, logical units in its run, to framebuffer pixels.
+float2 at(float2 p)
+{
+    return (push.origin + p * push.zoom) * push.scale;
+}
+
 // The glyph atlas: one channel of coverage, read with Load, so no sampler.
 [[vk::binding(0, 0)]] Texture2D<float> atlas;
 
@@ -75,7 +81,8 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VulkanVertexID)
     {
         // Coverage: the anchor on a whole pixel, the rectangle at its offset from it, one texel per
         // pixel. Rounding the shared anchor rather than each glyph keeps the spacing.
-        const float2 anchor = floor((push.origin + prim.rect.xy) * scale + 0.5);
+        // A glyph keeps its pixel size in a scaled run; only its anchor moves (G45).
+        const float2 anchor = floor(at(prim.rect.xy) + 0.5);
         const float2 top_left = anchor + prim.radii.zw;
         out.position = float4((top_left + corner * prim.rect.zw) / push.target * 2.0 - 1.0, 0.0, 1.0);
         out.box = float4(0.0);
@@ -90,9 +97,9 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VulkanVertexID)
     {
         // A segment: a quad along it, reaching a pixel past its sides, past a round end, and past
         // a mitred end as far as the join plane can lean -- which the mitre limit bounds.
-        const float2 a = (push.origin + prim.rect.xy) * scale;
-        const float2 b = (push.origin + prim.radii.xy) * scale;
-        const float half_width = 0.5 * prim.params.x * scale.x;
+        const float2 a = at(prim.rect.xy);
+        const float2 b = at(prim.radii.xy);
+        const float half_width = 0.5 * prim.params.x * push.zoom * scale.x;
         const float2 d = b - a;
         const float len = length(d);
         const float2 along = len > 1e-4 ? d / len : float2(1.0, 0.0);
@@ -119,11 +126,11 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VulkanVertexID)
     {
         // An area: a pixel wider than x0 to x1 on either side, and a pixel above the line's higher
         // end for its antialiased edge. Which pixels are its own the fragment shader decides.
-        const float x0 = (push.origin.x + prim.rect.x) * scale.x;
-        const float x1 = (push.origin.x + prim.radii.x) * scale.x;
-        const float y0 = (push.origin.y + prim.rect.y) * scale.y;
-        const float y1 = (push.origin.y + prim.radii.y) * scale.y;
-        const float bottom = (push.origin.y + prim.radii.z) * scale.y;
+        const float x0 = at(prim.rect.xy).x;
+        const float x1 = at(prim.radii.xy).x;
+        const float y0 = at(prim.rect.xy).y;
+        const float y1 = at(prim.radii.xy).y;
+        const float bottom = at(float2(0.0, prim.radii.z)).y;
         const float2 pixel = float2(corner.x < 0.5 ? x0 - 1.0 : x1 + 1.0, corner.y < 0.5 ? min(y0, y1) - 1.0 : bottom);
         out.position = float4(pixel / push.target * 2.0 - 1.0, 0.0, 1.0);
         out.box = float4(x0, y0, x1, y1);
@@ -139,8 +146,8 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VulkanVertexID)
     if (prim.kind == 4)
     {
         // A heatmap: its rectangle, and where its cells are in the atlas.
-        const float2 low = (push.origin + prim.rect.xy) * scale;
-        const float2 pixel = low + corner * prim.rect.zw * scale;
+        const float2 low = at(prim.rect.xy);
+        const float2 pixel = low + corner * prim.rect.zw * push.zoom * scale;
         out.position = float4(pixel / push.target * 2.0 - 1.0, 0.0, 1.0);
         out.box = float4(0.0);
         out.radii = prim.radii;
@@ -150,20 +157,20 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VulkanVertexID)
         out.glyph = float4(0.0, 0.0, 4.0, 0.0);
         return out;
     }
-    const float sigma = prim.params.y * scale.x;
+    const float sigma = prim.params.y * push.zoom * scale.x;
     // A pixel of room for the antialiased edge, three sigmas for a shadow's tail.
     const float pad = 1.0 + 3.0 * sigma;
-    const float2 low = (push.origin + prim.rect.xy) * scale;
-    const float2 size = prim.rect.zw * scale;
+    const float2 low = at(prim.rect.xy);
+    const float2 size = prim.rect.zw * push.zoom * scale;
     const float2 pixel = low - pad + corner * (size + 2.0 * pad);
 
     out.position = float4(pixel / push.target * 2.0 - 1.0, 0.0, 1.0);
     const float2 half_size = size * 0.5;
     out.box = float4(low + half_size, half_size);
-    out.radii = min(prim.radii * scale.x, min(half_size.x, half_size.y));
+    out.radii = min(prim.radii * push.zoom * scale.x, min(half_size.x, half_size.y));
     out.fill = premultiplied_linear(prim.fill);
     out.border = premultiplied_linear(prim.border_color);
-    out.params = float2(prim.params.x * scale.x, sigma);
+    out.params = float2(prim.params.x * push.zoom * scale.x, sigma);
     out.glyph = float4(0.0);
     return out;
 }
@@ -216,7 +223,7 @@ float4 fragmentMain(Varyings v) : SV_Target
     if (v.glyph.z > 3.5)
     {
         // A heatmap cell, nearest-sampled: which cell this pixel's centre is in, in logical units.
-        const float2 q = v.position.xy / push.scale - push.origin;
+        const float2 q = (v.position.xy / push.scale - push.origin) / push.zoom;
         const float2 cell = clamp(floor((q - v.border.xy) / v.border.zw * v.radii.zw), float2(0.0), v.radii.zw - 1.0);
         const float t = atlas.Load(int3(int2(v.radii.xy + cell), 0));
         color = float4(to_linear(saturate(viridis(t))), 1.0) * v.fill.a;
@@ -231,7 +238,7 @@ float4 fragmentMain(Varyings v) : SV_Target
         // the line the distance is measured square to it, so a steep stretch is as soft as a flat
         // one.
         const float2 p = v.position.xy;
-        const float across = p.x / push.scale.x - push.origin.x;
+        const float across = (p.x / push.scale.x - push.origin.x) / push.zoom;
         if (across < v.radii.y || across >= v.radii.z)
             discard;
         const float run = v.box.z - v.box.x;
@@ -251,8 +258,8 @@ float4 fragmentMain(Varyings v) : SV_Target
         const bool has_end = v.radii.z != 0.0 || v.radii.w != 0.0;
         if (has_start || has_end)
         {
-            precise float qx = p.x / push.scale.x - push.origin.x;
-            precise float qy = p.y / push.scale.y - push.origin.y;
+            precise float qx = (p.x / push.scale.x - push.origin.x) / push.zoom;
+            precise float qy = (p.y / push.scale.y - push.origin.y) / push.zoom;
             const float2 q = float2(qx, qy);
             if (has_start && plane_side(q, v.border.xy, v.radii.xy) < 0.0)
                 discard;

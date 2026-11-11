@@ -448,7 +448,7 @@ struct push_t
   float scale[2];
   float target[2];
   float encode_srgb;
-  float pad;
+  float zoom;
 };
 static_assert(sizeof(push_t) == 32);
 
@@ -834,8 +834,10 @@ public:
       _d.vkCmdPushConstants(cmd, _layout, stages, 0, sizeof(push), &push);
       for (const auto &run : list.runs)
       {
-        const float origin[2] = {run.x, run.y};
-        _d.vkCmdPushConstants(cmd, _layout, stages, 0, sizeof(origin), origin);
+        push.origin[0] = run.x;
+        push.origin[1] = run.y;
+        push.zoom = run.scale;
+        _d.vkCmdPushConstants(cmd, _layout, stages, 0, sizeof(push), &push);
         _d.vkCmdDraw(cmd, 6, run.count, 0, run.first);
       }
     }
