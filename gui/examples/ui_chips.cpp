@@ -164,6 +164,86 @@ std::string shown(const chip_t &chip)
   return text.substr(cut);
 }
 
+constexpr ui::color_t silver{0.78f, 0.78f, 0.82f, 1};
+constexpr ui::color_t clear{0, 0, 0, 0};
+
+// One chip at a zoom step, as a DIP package: silver pins along its top and bottom edges, a body in
+// the chip's colour with a notch at its left end, a darker die with the label, and -- close up -- a
+// model number in one corner and a serial number in the other. Less of it the further out: a plain
+// box, then the body's border, then pins and die, then the label, notch and shadow, then the small
+// print. Pins are drawn first so the body covers their inner ends.
+std::vector<ui::node_t> chip_parts(const chip_t &chip, float z, int w, int h, bool selected)
+{
+  const float fw = float(w);
+  const float fh = float(h);
+  const ui::color_t edge = selected ? selected_border : shade(chip.color, 0.5f);
+  if (z < 1.6f)
+  {
+    ui::box_t body{.size = {w, h}, .color = chip.color, .radius = z >= 1 ? 0.06f * fw : 0, .border_width = z >= 1 || selected ? std::max(selected ? 1.0f : 0.5f, 0.05f * fw) : 0, .border_color = edge};
+    return {std::move(body)};
+  }
+
+  std::vector<ui::node_t> parts;
+  // Pins: eight a side, reaching under a third of the gap to the next row, tucked under the body.
+  constexpr int pins = 8;
+  const int pin_w = std::max(1, int(std::lround(0.045f * fw)));
+  const float reach = 0.6f * z;
+  const int pin_h = std::max(1, int(std::lround(reach + 0.15f * fh)));
+  const float first = 0.1f * fw;
+  const float step = (0.8f * fw - float(pin_w)) / float(pins - 1);
+  for (int i = 0; i < pins; ++i)
+  {
+    const float x = first + step * float(i);
+    parts.push_back(ui::at_t{.x = x, .y = -reach, .children = {ui::box_t{.size = {pin_w, pin_h}, .color = silver, .radius = 0.3f * float(pin_w)}}});
+    parts.push_back(ui::at_t{.x = x, .y = fh - 0.15f * fh, .children = {ui::box_t{.size = {pin_w, pin_h}, .color = silver, .radius = 0.3f * float(pin_w)}}});
+  }
+
+  ui::box_t body{.size = {w, h},
+                 .color = chip.color,
+                 .radius = 0.06f * fw,
+                 .border_width = std::max(selected ? 1.5f : 0.5f, (selected ? 0.07f : 0.035f) * fw),
+                 .border_color = edge,
+                 .align_x = ui::align_t::start,
+                 .align_y = ui::align_t::start};
+  if (z >= 2.5f)
+    body.shadow = {.x = 0, .y = 0.25f * z, .blur = 0.35f * z, .color = {0, 0, 0, 0.55f}};
+
+  // The die, and on it the label.
+  ui::box_t die{.size = {int(0.6f * fw), int(0.56f * fh)}, .color = shade(chip.color, 0.45f), .radius = 0.03f * fw, .border_width = std::max(0.5f, 0.015f * fw), .border_color = shade(chip.color, 0.3f)};
+  if (z >= 2.5f)
+    die.children.push_back(ui::text_t{.text = shown(chip), .size = 1.35f * z, .color = ink});
+  body.children.push_back(ui::at_t{.x = 0.2f * fw, .y = 0.22f * fh, .children = {std::move(die)}});
+
+  if (z >= 2.5f)
+  {
+    // The notch that marks pin 1's end: a half circle let into the body's left edge.
+    const float notch = 0.18f * fh;
+    body.children.push_back(ui::at_t{.x = -notch / 2, .y = (fh - notch) / 2, .children = {ui::box_t{.size = {int(notch), int(notch)}, .color = shade(chip.color, 0.35f), .radius = notch / 2}}});
+  }
+
+  // The small print, close up: in the bands above and below the die.
+  if (z >= 5.5f)
+  {
+    char serial[24];
+    std::snprintf(serial, sizeof serial, "S/N %08X", unsigned(chip.id * 2654435761u));
+    const ui::color_t print{0.95f, 0.95f, 0.97f, 0.8f};
+    const struct
+    {
+      int x, y;
+    } pad{int(0.05f * fw), int(0.03f * fh)};
+    body.children.push_back(ui::box_t{.size = {w, h},
+                                      .color = clear,
+                                      .padding = {pad.x, pad.y},
+                                      .align_x = ui::align_t::start,
+                                      .align_y = ui::align_t::start,
+                                      .children = {ui::text_t{.text = "VC-" + std::to_string(1000 + chip.id % 9000) + "  rev " + std::to_string(1 + chip.id % 7), .size = 0.6f * z, .color = print}}});
+    body.children.push_back(
+      ui::box_t{.size = {w, h}, .color = clear, .padding = {pad.x, pad.y}, .align_x = ui::align_t::end, .align_y = ui::align_t::end, .children = {ui::text_t{.text = serial, .size = 0.5f * z, .color = print}}});
+  }
+  parts.push_back(std::move(body));
+  return parts;
+}
+
 struct tile_t
 {
   struct props_t
@@ -191,33 +271,7 @@ struct tile_t
     for (const auto &chip : chips)
     {
       const bool selected = chip.id == props.selected;
-      ui::box_t box{.size = {w, h},
-                    .color = chip.color,
-                    .radius = z >= 1.5f ? 0.08f * float(w) : 0,
-                    .border_width = z >= 1 ? std::max(0.5f, 0.06f * float(w)) : 0,
-                    .border_color = selected ? selected_border : shade(chip.color, 0.55f)};
-      if (selected && z < 1)
-      {
-        box.border_width = 1;
-        box.border_color = selected_border;
-      }
-      // More detail as it grows, as Qt's chip does: a die and pins, then a label.
-      if (z >= 1.6f)
-      {
-        std::vector<ui::node_t> inside;
-        const int pin = std::max(1, int(0.07f * float(w)));
-        std::vector<ui::node_t> pins;
-        for (int i = 0; i < 4; ++i)
-          pins.push_back(ui::box_t{.size = {pin, pin * 2}, .color = shade(chip.color, 0.35f)});
-        inside.push_back(ui::row_t{.gap = pin * 2, .children = std::move(pins)});
-        if (z >= 2.5f)
-          inside.push_back(ui::text_t{.text = shown(chip), .size = 1.2f * z, .color = ink});
-        box.children.push_back(ui::box_t{.size = {int(0.7f * float(w)), int(0.62f * float(h))},
-                                         .color = shade(chip.color, 0.7f),
-                                         .radius = 0.05f * float(w),
-                                         .children = {ui::column_t{.gap = 1, .align = ui::align_t::center, .children = std::move(inside)}}});
-      }
-      nodes.push_back(ui::at_t{.x = (chip.x - origin_x) * z, .y = (chip.y - origin_y) * z, .children = {std::move(box)}});
+      nodes.push_back(ui::at_t{.x = (chip.x - origin_x) * z, .y = (chip.y - origin_y) * z, .children = chip_parts(chip, z, w, h, selected)});
     }
     return ui::at_t{.children = std::move(nodes)};
   }
@@ -431,7 +485,7 @@ struct scene_t
 
   void zoom_about(gui::point_t p, float to)
   {
-    to = std::clamp(to, 0.1f, 12.0f);
+    to = std::clamp(to, 0.1f, 24.0f);
     pan_x = float(p.x) - (float(p.x) - pan_x) * to / zoom;
     pan_y = float(p.y) - (float(p.y) - pan_y) * to / zoom;
     zoom = to;
@@ -646,9 +700,11 @@ struct scene_t
 int main(int argc, char **argv)
 {
   const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
-  const auto limit = std::chrono::milliseconds(!bench && argc > 1 ? std::atoi(argv[1]) : 0);
+  // `--zoom 12` starts that far in, at the middle of the grid.
+  const float start_zoom = argc > 2 && std::strcmp(argv[1], "--zoom") == 0 ? float(std::atof(argv[2])) : 0;
+  const auto limit = std::chrono::milliseconds(!bench && start_zoom == 0 && argc > 1 ? std::atoi(argv[1]) : 0);
   return vio::run(
-    [bench, limit](vio::event_loop_t &loop) -> vio::task_t<int>
+    [bench, limit, start_zoom](vio::event_loop_t &loop) -> vio::task_t<int>
     {
       auto display = gui::display_t::open(loop);
       if (!display)
@@ -671,6 +727,12 @@ int main(int argc, char **argv)
         }(*window, limit);
         auto scene = std::make_unique<scene_t>();
         scene->bench = bench;
+        if (start_zoom > 0)
+        {
+          scene->zoom = std::clamp(start_zoom, 0.1f, 24.0f);
+          scene->pan_x = 900 - columns * pitch_x / 2 * scene->zoom;
+          scene->pan_y = 500 - rows * pitch_y / 2 * scene->zoom;
+        }
         ui::run_config_t config;
         config.on_renderer = [](std::string_view what) { std::fprintf(stderr, "renderer: %.*s\n", int(what.size()), what.data()); };
         config.on_stats = [](const ui::frame_stats_t &s) { stats.add(s); };
