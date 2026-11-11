@@ -47,8 +47,8 @@ struct entry_t
   prim_t prim;
   slot_t *child = nullptr;
   const box_t *box = nullptr;
-  int x = 0;
-  int y = 0;
+  float x = 0;
+  float y = 0;
   int ordinal = 0;
 };
 
@@ -60,8 +60,8 @@ struct segment_t
   std::uint32_t begin = 0;
   std::uint32_t end = 0;
   slot_t *child = nullptr;
-  int x = 0;
-  int y = 0;
+  float x = 0;
+  float y = 0;
 };
 
 struct chunk_t
@@ -113,13 +113,13 @@ struct target_t
 
 namespace
 {
-prim_t box_prim(const box_t &box, int x, int y)
+prim_t box_prim(const box_t &box, float x, float y, extent_t size)
 {
   prim_t prim;
-  prim.x = float(x);
-  prim.y = float(y);
-  prim.width = float(box.size.width);
-  prim.height = float(box.size.height);
+  prim.x = x;
+  prim.y = y;
+  prim.width = float(size.width);
+  prim.height = float(size.height);
   for (auto &radius : prim.radii)
     radius = box.radius;
   prim.fill = box.color;
@@ -133,9 +133,9 @@ bool has_shadow(const box_t &box) noexcept
   return box.shadow.color.a > 0 && (box.shadow.blur > 0 || box.shadow.x != 0 || box.shadow.y != 0);
 }
 
-prim_t shadow_prim(const box_t &box, int x, int y)
+prim_t shadow_prim(const box_t &box, float x, float y, extent_t size)
 {
-  prim_t prim = box_prim(box, x, y);
+  prim_t prim = box_prim(box, x, y, size);
   prim.x += box.shadow.x;
   prim.y += box.shadow.y;
   prim.fill = box.shadow.color;
@@ -143,6 +143,53 @@ prim_t shadow_prim(const box_t &box, int x, int y)
   prim.border_width = 0;
   prim.blur = box.shadow.blur;
   return prim;
+}
+
+// Move a prim by (dx, dy). A segment's and an area's far ends are positions too. Every prim moves
+// by the same additions, so two areas that share an x still share it bit for bit after any move.
+void move_prim(prim_t &prim, float dx, float dy) noexcept
+{
+  prim.x += dx;
+  prim.y += dy;
+  if (prim.kind == prim_kind_t::segment)
+  {
+    prim.radii[0] += dx;
+    prim.radii[1] += dy;
+  }
+  else if (prim.kind == prim_kind_t::area)
+  {
+    prim.radii[0] += dx;
+    prim.radii[1] += dy;
+    prim.radii[2] += dy;
+  }
+}
+
+// The nodes inside a container, or null.
+const std::vector<node_t> *children_of(const node_t &node) noexcept
+{
+  if (const auto *row = std::get_if<row_t>(&node))
+    return &row->children;
+  if (const auto *column = std::get_if<column_t>(&node))
+    return &column->children;
+  if (const auto *box = std::get_if<box_t>(&node))
+    return &box->children;
+  if (const auto *at = std::get_if<at_t>(&node))
+    return &at->children;
+  return nullptr;
+}
+
+// Where a child of `size` starts in `room`, by alignment. Baseline is resolved by the row itself.
+int aligned(align_t align, int room, int size) noexcept
+{
+  switch (align)
+  {
+  case align_t::center:
+    return (room - size) / 2;
+  case align_t::end:
+    return room - size;
+  default:
+    return 0;
+  }
 }
 } // namespace
 
@@ -486,11 +533,7 @@ private:
       auto *child = slot_for(*mount);
       return !child->reached && build(*child);
     }
-    const std::vector<node_t> *children = nullptr;
-    if (const auto *row = std::get_if<row_t>(&node))
-      children = &row->children;
-    else if (const auto *column = std::get_if<column_t>(&node))
-      children = &column->children;
+    const std::vector<node_t> *children = children_of(node);
     bool changed = false;
     if (children)
     {
@@ -521,32 +564,84 @@ private:
     slot.entries.clear();
     slot.subtree_prims = 0;
     int ordinal = 0;
-    slot.size = place(slot, slot.output, 0, 0, ordinal);
+    slot.size = place(slot, slot.output, 0, 0, ordinal).size;
     slot.laid_out = true;
   }
 
-  extent_t place(slot_t &slot, const node_t &node, int x, int y, int &ordinal)
+  // What placing a node produced: its size, and its first baseline below its top if it has one.
+  struct placed_t
+  {
+    extent_t size;
+    float baseline = -1;
+    [[nodiscard]] bool has_baseline() const noexcept
+    {
+      return baseline >= 0;
+    }
+  };
+
+  // A child a container has placed at its start position: the range of entries it produced, so
+  // that moving it into position reaches all of them.
+  struct placed_child_t
+  {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    placed_t placed;
+  };
+
+  placed_child_t place_child(slot_t &slot, const node_t &node, float x, float y, int &ordinal)
+  {
+    placed_child_t child;
+    child.begin = slot.entries.size();
+    child.placed = place(slot, node, x, y, ordinal);
+    child.end = slot.entries.size();
+    return child;
+  }
+
+  void shift(slot_t &slot, const placed_child_t &child, float dx, float dy)
+  {
+    if (dx == 0 && dy == 0)
+      return;
+    for (std::size_t i = child.begin; i < child.end; ++i)
+    {
+      auto &entry = slot.entries[i];
+      entry.x += dx;
+      entry.y += dy;
+      if (!entry.child)
+        move_prim(entry.prim, dx, dy);
+    }
+  }
+
+  // Layout is one pass, children first. A container places each child at its start position, and
+  // moves it once its own size is known -- which is only once every child has been placed.
+  placed_t place(slot_t &slot, const node_t &node, float x, float y, int &ordinal)
   {
     if (const auto *box = std::get_if<box_t>(&node))
-    {
-      if (has_shadow(*box))
-      {
-        slot.entries.push_back(entry_t{shadow_prim(*box, x, y)});
-        ++slot.subtree_prims;
-      }
-      entry_t entry{box_prim(*box, x, y)};
-      entry.box = box;
-      entry.x = x;
-      entry.y = y;
-      entry.ordinal = ordinal++;
-      slot.entries.push_back(entry);
-      ++slot.subtree_prims;
-      return box->size;
-    }
+      return place_box(slot, *box, x, y, ordinal);
     if (const auto *text = std::get_if<text_t>(&node))
-      return place_glyphs(slot, _text.add_text(*text, default_font(), x, y, _glyphs));
+    {
+      const auto laid = _text.add_text(*text, default_font(), x, y, _glyphs);
+      place_glyphs(slot);
+      return {laid.size, laid.baseline};
+    }
     if (const auto *icon = std::get_if<icon_t>(&node))
-      return place_glyphs(slot, _text.add_icon(*icon, x, y, _glyphs));
+    {
+      const auto size = _text.add_icon(*icon, x, y, _glyphs);
+      place_glyphs(slot);
+      return {size};
+    }
+    if (const auto *line = std::get_if<polyline_t>(&node))
+      return place_polyline(slot, *line, x, y);
+    if (const auto *at = std::get_if<at_t>(&node))
+    {
+      extent_t size;
+      for (const auto &child : at->children)
+      {
+        const auto placed = place(slot, child, x + at->x, y + at->y, ordinal);
+        size.width = std::max(size.width, int(std::ceil(at->x + float(placed.size.width))));
+        size.height = std::max(size.height, int(std::ceil(at->y + float(placed.size.height))));
+      }
+      return {size};
+    }
     if (const auto *mount = std::get_if<mount_t>(&node))
     {
       auto *child = existing(*mount);
@@ -559,38 +654,190 @@ private:
       entry.y = y;
       slot.entries.push_back(entry);
       slot.subtree_prims += child->subtree_prims;
-      return child->size;
+      // A component's baseline is not kept between frames, so a mounted child has none.
+      return {child->size};
     }
-    const bool horizontal = std::holds_alternative<row_t>(node);
-    const auto &children = horizontal ? std::get<row_t>(node).children : std::get<column_t>(node).children;
-    const int gap = horizontal ? std::get<row_t>(node).gap : std::get<column_t>(node).gap;
-    extent_t total;
-    for (std::size_t i = 0; i < children.size(); ++i)
-    {
-      const int spacing = i > 0 ? gap : 0;
-      if (horizontal)
-      {
-        const auto size = place(slot, children[i], x + total.width + spacing, y, ordinal);
-        total.width += size.width + spacing;
-        total.height = std::max(total.height, size.height);
-      }
-      else
-      {
-        const auto size = place(slot, children[i], x, y + total.height + spacing, ordinal);
-        total.height += size.height + spacing;
-        total.width = std::max(total.width, size.width);
-      }
-    }
-    return total;
+    if (const auto *row = std::get_if<row_t>(&node))
+      return place_line(slot, row->children, true, row->gap, row->align, row->padding, x, y, ordinal);
+    const auto &column = std::get<column_t>(node);
+    return place_line(slot, column.children, false, column.gap, column.align, column.padding, x, y, ordinal);
   }
 
-  extent_t place_glyphs(slot_t &slot, extent_t size)
+  placed_t place_box(slot_t &slot, const box_t &box, float x, float y, int &ordinal)
+  {
+    // The box is drawn before its children, so its entries go in first and are filled in once the
+    // children have given it its size.
+    const bool shadowed = has_shadow(box);
+    if (shadowed)
+    {
+      slot.entries.push_back(entry_t{});
+      ++slot.subtree_prims;
+    }
+    const std::size_t index = slot.entries.size();
+    slot.entries.push_back(entry_t{});
+    ++slot.subtree_prims;
+    const int box_ordinal = ordinal++;
+
+    const auto &pad = box.padding;
+    std::vector<placed_child_t> children;
+    children.reserve(box.children.size());
+    extent_t content;
+    for (const auto &node : box.children)
+    {
+      children.push_back(place_child(slot, node, x + float(pad.left), y + float(pad.top), ordinal));
+      content.width = std::max(content.width, children.back().placed.size.width);
+      content.height = std::max(content.height, children.back().placed.size.height);
+    }
+    const extent_t size{std::max(box.size.width, content.width + pad.left + pad.right), std::max(box.size.height, content.height + pad.top + pad.bottom)};
+    const extent_t room{size.width - pad.left - pad.right, size.height - pad.top - pad.bottom};
+    float baseline = -1;
+    for (const auto &child : children)
+    {
+      const int dx = aligned(box.align_x, room.width, child.placed.size.width);
+      const int dy = aligned(box.align_y, room.height, child.placed.size.height);
+      shift(slot, child, float(dx), float(dy));
+      if (baseline < 0 && child.placed.has_baseline())
+        baseline = float(pad.top + dy) + child.placed.baseline;
+    }
+
+    if (shadowed)
+      slot.entries[index - 1].prim = shadow_prim(box, x, y, size);
+    auto &entry = slot.entries[index];
+    entry.prim = box_prim(box, x, y, size);
+    entry.box = &box;
+    entry.x = x;
+    entry.y = y;
+    entry.ordinal = box_ordinal;
+    return {size, baseline};
+  }
+
+  placed_t place_line(slot_t &slot, const std::vector<node_t> &nodes, bool horizontal, int gap, align_t align, const edges_t &pad, float x, float y, int &ordinal)
+  {
+    std::vector<placed_child_t> children;
+    children.reserve(nodes.size());
+    // Where each child starts along the line, from the content's edge.
+    std::vector<int> starts;
+    starts.reserve(nodes.size());
+    int along = 0;
+    for (std::size_t i = 0; i < nodes.size(); ++i)
+    {
+      if (i > 0)
+        along += gap;
+      starts.push_back(along);
+      const float cx = x + float(pad.left + (horizontal ? along : 0));
+      const float cy = y + float(pad.top + (horizontal ? 0 : along));
+      children.push_back(place_child(slot, nodes[i], cx, cy, ordinal));
+      const auto &size = children.back().placed.size;
+      along += horizontal ? size.width : size.height;
+    }
+
+    int across = 0;
+    float baseline = -1;
+    if (horizontal && align == align_t::baseline)
+    {
+      // Above the shared baseline, the tallest ascent; below it, the deepest descent. A child with
+      // no baseline stands on it. Text moves by a fraction of a unit here, and that is exact: each
+      // baseline is a whole number of pixels below its anchor, so all of them land on one pixel row.
+      const auto baseline_of = [](const placed_t &placed) { return placed.has_baseline() ? placed.baseline : float(placed.size.height); };
+      float above = 0;
+      float below = 0;
+      for (const auto &child : children)
+      {
+        above = std::max(above, baseline_of(child.placed));
+        below = std::max(below, float(child.placed.size.height) - baseline_of(child.placed));
+      }
+      for (const auto &child : children)
+        shift(slot, child, 0, above - baseline_of(child.placed));
+      across = int(std::ceil(above + below - 1e-3f));
+      if (!children.empty())
+        baseline = float(pad.top) + above;
+    }
+    else
+    {
+      for (const auto &child : children)
+        across = std::max(across, horizontal ? child.placed.size.height : child.placed.size.width);
+      for (std::size_t i = 0; i < children.size(); ++i)
+      {
+        const auto &child = children[i];
+        const auto &size = child.placed.size;
+        const int d = aligned(align, across, horizontal ? size.height : size.width);
+        shift(slot, child, horizontal ? 0.0f : float(d), horizontal ? float(d) : 0.0f);
+        if (baseline < 0 && child.placed.has_baseline())
+          baseline = float(pad.top + (horizontal ? d : starts[i])) + child.placed.baseline;
+      }
+    }
+    const extent_t content = horizontal ? extent_t{along, across} : extent_t{across, along};
+    return {{content.width + pad.left + pad.right, content.height + pad.top + pad.bottom}, baseline};
+  }
+
+  // Areas first, so the line covers the antialiased top edge of its own fill; then the segments;
+  // then the markers over both.
+  placed_t place_polyline(slot_t &slot, const polyline_t &line, float x, float y)
+  {
+    const auto &points = line.points;
+    const auto push = [&](const prim_t &prim)
+    {
+      slot.entries.push_back(entry_t{prim});
+      ++slot.subtree_prims;
+    };
+    if (line.fill.a > 0)
+    {
+      const float bottom = y + float(line.size.height);
+      for (std::size_t i = 1; i < points.size(); ++i)
+      {
+        if (!(points[i].x > points[i - 1].x))
+          continue;
+        prim_t prim;
+        prim.kind = prim_kind_t::area;
+        prim.x = x + points[i - 1].x;
+        prim.y = y + points[i - 1].y;
+        prim.radii[0] = x + points[i].x;
+        prim.radii[1] = y + points[i].y;
+        prim.radii[2] = bottom;
+        prim.fill = line.fill;
+        push(prim);
+      }
+    }
+    if (line.width > 0 && line.color.a > 0)
+    {
+      for (std::size_t i = 1; i < points.size(); ++i)
+      {
+        prim_t prim;
+        prim.kind = prim_kind_t::segment;
+        prim.x = x + points[i - 1].x;
+        prim.y = y + points[i - 1].y;
+        prim.radii[0] = x + points[i].x;
+        prim.radii[1] = y + points[i].y;
+        prim.border_width = line.width;
+        prim.fill = line.color;
+        push(prim);
+      }
+    }
+    if (line.marker > 0 && line.color.a > 0)
+    {
+      const float r = line.marker * 0.5f;
+      for (const auto &point : points)
+      {
+        prim_t prim;
+        prim.x = x + point.x - r;
+        prim.y = y + point.y - r;
+        prim.width = line.marker;
+        prim.height = line.marker;
+        for (auto &radius : prim.radii)
+          radius = r;
+        prim.fill = line.color;
+        push(prim);
+      }
+    }
+    return {line.size};
+  }
+
+  void place_glyphs(slot_t &slot)
   {
     for (const auto &prim : _glyphs)
       slot.entries.push_back(entry_t{prim});
     slot.subtree_prims += _glyphs.size();
     _glyphs.clear();
-    return size;
   }
 
   // The font for text that names none, looked up on first use.
@@ -633,14 +880,14 @@ private:
         chunk.segments.push_back(segment_t{begin, end});
       begin = end;
     };
-    auto walk = [&](auto &self, const slot_t &slot, int dx, int dy) -> void {
+    auto walk = [&](auto &self, const slot_t &slot, float dx, float dy) -> void
+    {
       for (const auto &entry : slot.entries)
       {
         if (!entry.child)
         {
           prim_t prim = entry.prim;
-          prim.x += float(dx);
-          prim.y += float(dy);
+          move_prim(prim, dx, dy);
           chunk.prims.push_back(prim);
           continue;
         }
@@ -659,7 +906,7 @@ private:
   }
 
   // Concatenate the chunks into this frame's prims, one run per segment. A clean chunk is a copy.
-  void emit(slot_t &holder, int x, int y)
+  void emit(slot_t &holder, float x, float y)
   {
     if (holder.subtree_dirty || !holder.chunk.valid)
       flatten(holder);
@@ -672,12 +919,12 @@ private:
       }
       const auto first = std::uint32_t(_prims.size());
       _prims.insert(_prims.end(), holder.chunk.prims.begin() + segment.begin, holder.chunk.prims.begin() + segment.end);
-      _runs.push_back(run_t{first, segment.end - segment.begin, float(x), float(y)});
+      _runs.push_back(run_t{first, segment.end - segment.begin, x, y});
     }
   }
 
   // The hit-test list, from the entries as they stand: no view runs for it.
-  void collect_items(slot_t &slot, int x, int y)
+  void collect_items(slot_t &slot, float x, float y)
   {
     for (const auto &entry : slot.entries)
     {
@@ -689,7 +936,8 @@ private:
       if (!entry.box)
         continue;
       const auto &box = *entry.box;
-      _items.push_back(draw_item_t{{x + entry.x, y + entry.y, box.size.width, box.size.height}, box.color, &box, &slot, entry.ordinal});
+      const rect_t rect{int(std::lround(x + entry.x)), int(std::lround(y + entry.y)), int(entry.prim.width), int(entry.prim.height)};
+      _items.push_back(draw_item_t{rect, box.color, &box, &slot, entry.ordinal});
     }
   }
 

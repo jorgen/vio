@@ -55,9 +55,16 @@ public:
   // Glyphs are rasterized at size * scale pixels. A new scale empties the atlas.
   void set_scale(float scale);
 
-  // Append the glyphs of `text` anchored at (x, y), in logical units, and return its size.
-  extent_t add_text(const text_t &text, const font_t &fallback, int x, int y, std::vector<prim_t> &out);
-  extent_t add_icon(const icon_t &icon, int x, int y, std::vector<prim_t> &out);
+  // Append the glyphs of `text` anchored at (x, y), in logical units, and return its size and its
+  // baseline below the top: in logical units, and exactly a whole number of pixels, so moving the
+  // anchor by the difference of two baselines lines them up to the pixel (G41).
+  struct laid_out_t
+  {
+    extent_t size;
+    float baseline = 0;
+  };
+  laid_out_t add_text(const text_t &text, const font_t &fallback, float x, float y, std::vector<prim_t> &out);
+  extent_t add_icon(const icon_t &icon, float x, float y, std::vector<prim_t> &out);
 
   // True once after the atlas filled at its largest size and was emptied: prims made before that
   // name rectangles that are gone, so the caller lays everything out again.

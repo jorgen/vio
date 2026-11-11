@@ -91,6 +91,59 @@ struct rect_t
   }
 };
 
+// A point in logical units, for geometry a node carries: a polyline's points.
+struct vec2_t
+{
+  float x = 0;
+  float y = 0;
+  friend bool operator==(const vec2_t &, const vec2_t &) = default;
+};
+
+// Space inside a container's edge, in logical units. `.padding = 8` is all four sides, `{12, 6}`
+// horizontal then vertical, `{l, t, r, b}` each.
+struct edges_t
+{
+  int left = 0;
+  int top = 0;
+  int right = 0;
+  int bottom = 0;
+
+  constexpr edges_t() = default;
+  constexpr edges_t(int all) noexcept // NOLINT(google-explicit-constructor)
+    : left(all)
+    , top(all)
+    , right(all)
+    , bottom(all)
+  {
+  }
+  constexpr edges_t(int horizontal, int vertical) noexcept
+    : left(horizontal)
+    , top(vertical)
+    , right(horizontal)
+    , bottom(vertical)
+  {
+  }
+  constexpr edges_t(int left_, int top_, int right_, int bottom_) noexcept
+    : left(left_)
+    , top(top_)
+    , right(right_)
+    , bottom(bottom_)
+  {
+  }
+  friend bool operator==(const edges_t &, const edges_t &) = default;
+};
+
+// Where a child sits across the space it was given. `baseline` lines up the first baseline of each
+// child of a row -- text's, or the first text inside a container -- and a child with none sits on
+// it by its bottom edge. Anywhere else baseline means start.
+enum class align_t : std::uint8_t
+{
+  start,
+  center,
+  end,
+  baseline,
+};
+
 // ---------------------------------------------------------------------------------------------
 // Event sources
 
@@ -365,6 +418,13 @@ struct box_t
   // A one-line handler. It runs when the box is pressed, and its component is rebuilt after it.
   // For anything that spans several events, subscribe in behave() instead.
   std::function<void()> on_press;
+  // Children are drawn on the box, each placed inside the padding by the two alignments; they
+  // overlap, so a box holding several usually holds one row or column. With children, `size` is a
+  // minimum: the box grows to fit them and its padding.
+  edges_t padding;
+  align_t align_x = align_t::center;
+  align_t align_y = align_t::center;
+  std::vector<node_t> children;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -462,16 +522,50 @@ struct icon_t
   color_t color = {1, 1, 1, 1};
 };
 
+// Children side by side, left to right. `align` places each across the row's height.
 struct row_t
 {
   int gap = 0;
+  align_t align = align_t::start;
+  edges_t padding;
   std::vector<node_t> children;
 };
 
+// Children top to bottom. `align` places each across the column's width.
 struct column_t
 {
   int gap = 0;
+  align_t align = align_t::start;
+  edges_t padding;
   std::vector<node_t> children;
+};
+
+// Children at an offset from where this node is placed, overlapping. The offset may be fractional:
+// what is drawn moves smoothly, which is what a scrolling plot needs; hit testing rounds. Its size
+// reaches from its own origin to the far edge of its farthest child.
+struct at_t
+{
+  float x = 0;
+  float y = 0;
+  std::vector<node_t> children;
+};
+
+// A line through `points`, in logical units from the top left of `size`, which is the room it
+// takes in layout. Joins and ends are round. Drawn on the GPU per segment (G41): a translucent line
+// darkens where segments meet, so draw lines opaque.
+struct polyline_t
+{
+  extent_t size;
+  std::vector<vec2_t> points;
+  // Line width in logical units; 0 draws no line.
+  float width = 1.5f;
+  color_t color = {1, 1, 1, 1};
+  // With alpha above 0, the area between the line and the bottom of `size` is filled. Where x
+  // runs backwards between two points that stretch is not filled.
+  color_t fill = {0, 0, 0, 0};
+  // With a diameter above 0, a round marker in `color` at every point: a scatter plot when
+  // `width` is 0.
+  float marker = 0;
 };
 
 // A child component in its parent's output. It refers to the child; it does not hold its nodes, so
@@ -483,7 +577,7 @@ struct mount_t
   behaviour_t (*behave)(void *component, scope_t &scope) = nullptr;
 };
 
-struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t>
+struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t, at_t, polyline_t>
 {
   using variant::variant;
 };
@@ -813,6 +907,13 @@ enum class prim_kind_t : std::uint32_t
   // offset of its top left from the rounded anchor (2, 3). Every glyph of one text node shares the
   // anchor, so they all round the same way and the spacing HarfBuzz gave them survives.
   coverage = 1,
+  // A line segment with round ends: from (x, y) to (radii[0], radii[1]), `border_width` wide, in
+  // `fill`; all logical units. A polyline is one per segment (G41).
+  segment = 2,
+  // The area under a segment: from x to radii[0] across, below the line from (x, y) to
+  // (radii[0], radii[1]) and down to radii[2]. Antialiased along the line only, so the areas of
+  // neighbouring segments, which share an x exactly, meet without a seam or an overlap.
+  area = 3,
 };
 
 // One primitive: an instanced quad whose shape the fragment shader computes. Relative to the origin

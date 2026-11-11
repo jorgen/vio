@@ -495,7 +495,7 @@ void text_engine_t::set_scale(float scale)
     _impl->empty_atlas();
 }
 
-extent_t text_engine_t::add_text(const text_t &text, const font_t &fallback, int x, int y, std::vector<prim_t> &out)
+text_engine_t::laid_out_t text_engine_t::add_text(const text_t &text, const font_t &fallback, float x, float y, std::vector<prim_t> &out)
 {
   auto &impl = *_impl;
   const font_t &font = text.font ? text.font : fallback;
@@ -531,8 +531,8 @@ extent_t text_engine_t::add_text(const text_t &text, const font_t &fallback, int
       continue;
     prim_t prim;
     prim.kind = prim_kind_t::coverage;
-    prim.x = float(x);
-    prim.y = float(y);
+    prim.x = x;
+    prim.y = y;
     prim.width = float(cached.width);
     prim.height = float(cached.height);
     prim.radii[0] = float(cached.x);
@@ -544,10 +544,10 @@ extent_t text_engine_t::add_text(const text_t &text, const font_t &fallback, int
   }
   const int width_px = int(ceil_div(int(std::max<std::int64_t>(pen, 0)), 64));
   const int height_px = baseline + below;
-  return {int(std::ceil(width_px / scale - 1e-3f)), int(std::ceil(height_px / scale - 1e-3f))};
+  return {{int(std::ceil(width_px / scale - 1e-3f)), int(std::ceil(height_px / scale - 1e-3f))}, float(baseline) / scale};
 }
 
-extent_t text_engine_t::add_icon(const icon_t &icon, int x, int y, std::vector<prim_t> &out)
+extent_t text_engine_t::add_icon(const icon_t &icon, float x, float y, std::vector<prim_t> &out)
 {
   auto &impl = *_impl;
   const int logical = int(std::ceil(icon.size - 1e-3f));
@@ -561,8 +561,8 @@ extent_t text_engine_t::add_icon(const icon_t &icon, int x, int y, std::vector<p
   {
     prim_t prim;
     prim.kind = prim_kind_t::coverage;
-    prim.x = float(x);
-    prim.y = float(y);
+    prim.x = x;
+    prim.y = y;
     prim.width = float(cached.width);
     prim.height = float(cached.height);
     prim.radii[0] = float(cached.x);

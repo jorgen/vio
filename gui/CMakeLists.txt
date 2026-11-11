@@ -95,7 +95,7 @@ if(VIO_SLANGC)
 endif()
 
 if(VIO_BUILD_TESTS)
-    set(VIO_GUI_TEST_SOURCES test/test_main.cpp test/test_gui.cpp test/test_ui.cpp test/test_ui_render.cpp test/test_ui_text.cpp)
+    set(VIO_GUI_TEST_SOURCES test/test_main.cpp test/test_gui.cpp test/test_ui.cpp test/test_ui_render.cpp test/test_ui_text.cpp test/test_ui_layout.cpp)
     if(WIN32)
         list(APPEND VIO_GUI_TEST_SOURCES test/test_win32.cpp)
     elseif(APPLE)

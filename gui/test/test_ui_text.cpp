@@ -27,6 +27,7 @@ Copyright (c) 2026 Jørgen Lind
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -244,6 +245,66 @@ TEST_CASE("ui text: a label lays out the same at 1x and 2x and is rasterized at 
   for (const auto &glyph : glyphs_two)
     CHECK(two.coverage(glyph) > 0);
   CHECK(one.view.generation != two.view.generation);
+}
+
+TEST_CASE("ui text: a row aligned on baselines puts every text's baseline on one pixel row")
+{
+  struct line_t
+  {
+    ui::font_t font;
+
+    ui::node_t view() const
+    {
+      constexpr ui::color_t black{0, 0, 0, 1};
+      return ui::row_t{.gap = 4,
+                       .align = ui::align_t::baseline,
+                       .children = {
+                         ui::text_t{.text = "H", .size = 12, .color = black, .font = font},
+                         ui::text_t{.text = "H", .size = 30, .color = black, .font = font},
+                         ui::box_t{.size = {10, 10}, .color = {1, 0, 0, 1}},
+                         // Inside a padded box, which passes its child's baseline on.
+                         ui::box_t{.color = {0, 0, 1, 1}, .padding = {3, 5}, .children = {ui::text_t{.text = "H", .size = 17, .color = black, .font = font}}},
+                       }};
+    }
+  };
+  // At 1.5 every baseline is a fraction of a unit below its text's top, and the fractions differ.
+  snapshot_t seen;
+  vio::event_loop_t loop;
+  run_gui_test(loop,
+               [](vio::event_loop_t &loop, snapshot_t &seen) -> vio::task_t<void>
+               {
+                 gui::display_config_t display_config;
+                 display_config.backend = "null";
+                 display_config.frame_interval_ns = std::chrono::nanoseconds(2ms).count();
+                 auto display = gui::display_t::open(loop, display_config);
+                 REQUIRE(display.has_value());
+                 {
+                   auto window = gui::window_t::create(*display, {.size = {200, 100}});
+                   line_t line{roboto()};
+                   ui::run_config_t config;
+                   config.on_display_list = [&seen](const ui::display_list_t &list) { seen.take(list); };
+                   auto running = ui::run(*window, line, std::move(config));
+                   window->impl()->on_resize({200, 100}, {300, 150}, 1.5f);
+                   (void)co_await vio::sleep(loop, 40ms);
+                   window->close();
+                   co_await std::move(running);
+                 }
+                 loop.stop();
+               }(loop, seen));
+  REQUIRE(seen.scale == 1.5f);
+  const auto glyphs = seen.of(ui::prim_kind_t::coverage);
+  REQUIRE(glyphs.size() == 3);
+  // An H stands on the baseline, so the bottom row of its bitmap is the baseline's pixel row: the
+  // anchor rounded as the shader rounds it, plus the bitmap's offset and height.
+  const auto bottom = [](const ui::prim_t &glyph) { return int(std::floor(glyph.y * 1.5f + 0.5f)) + int(glyph.radii[3]) + int(glyph.height); };
+  CHECK(bottom(glyphs[0]) == bottom(glyphs[1]));
+  CHECK(bottom(glyphs[2]) == bottom(glyphs[1]));
+  // Different sizes: the anchors really did move by different fractions.
+  CHECK(glyphs[0].y != glyphs[1].y);
+  // The box has no baseline and stands on it, within the half pixel its own edge is antialiased on.
+  const auto shapes = seen.of(ui::prim_kind_t::shape);
+  REQUIRE(shapes.size() == 2);
+  CHECK(std::abs((shapes[0].y + 10) * 1.5f - float(bottom(glyphs[1]))) <= 0.5f);
 }
 
 TEST_CASE("ui text: a full atlas is emptied and says so once")
