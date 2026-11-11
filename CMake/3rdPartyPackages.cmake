@@ -43,4 +43,14 @@ if(VIO_BUILD_GUI)
     CmDepFetchPackage(vulkan_headers 1.4.350.1
         https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz
         SHA256=6d1bb65e49520344cc0a48af3dc02e993781efff14c7ebdcb8ae9fa23ddf7e83)
+
+    # Text (gui/DECISIONS.md G27, G39): HarfBuzz shapes, FreeType rasterizes. FreeType is built
+    # without HarfBuzz, zlib, bzip2, PNG or Brotli, so the two never see each other. HarfBuzz is
+    # compiled from its single-file amalgamation, and its test fonts are what the text tests use.
+    CmDepFetchPackage(freetype 2.15.0
+        https://github.com/freetype/freetype/archive/refs/tags/VER-2-15-0.tar.gz
+        SHA256=87c7f1f8699b91e89f773f7dcfa505b044e1dae67f62a55d4e29c3afdcac4fb8)
+    CmDepFetchPackage(harfbuzz 15.1.0
+        https://github.com/harfbuzz/harfbuzz/releases/download/15.1.0/harfbuzz-15.1.0.tar.xz
+        SHA256=0fc7c565443a5f4be7da65ac5ee5bd737d9b158dc908708b7689a0a5796b0c8d)
 endif()
