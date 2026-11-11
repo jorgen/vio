@@ -29,6 +29,7 @@ Copyright (c) 2026 Jørgen Lind
 #include <vio/event_loop.h>
 
 #include "ui_renderer.h"
+#include "ui_text.h"
 #include "vio/gui/context.h"
 
 namespace vio::gui::ui
@@ -256,7 +257,15 @@ public:
   void step(const frame_t &frame)
   {
     _changed = false;
-    set_units(frame);
+    // The renderer has drawn the previous list, so what it uploaded is no longer new.
+    _text.clear_dirty();
+    if (set_units(frame))
+    {
+      // Text is rasterized at its size in pixels, so a new scale lays everything out again.
+      _text.set_scale(_scale);
+      for (auto &[component, slot] : _slots)
+        slot->laid_out = false;
+    }
     if (!_root)
       _root = make_slot(_root_mount);
     for (auto &[component, slot] : _slots)
@@ -279,6 +288,14 @@ public:
       unmount(*slot);
 
     lay_out(*_root);
+    if (_text.take_reset())
+    {
+      // The atlas filled and was emptied part way through: whatever was laid out before that names
+      // rectangles that are gone. Once more, from an empty atlas (G39).
+      for (auto &[component, slot] : _slots)
+        mark(*slot);
+      lay_out(*_root);
+    }
     _prims.clear();
     _runs.clear();
     _root->holder = true;
@@ -298,7 +315,7 @@ public:
 
   [[nodiscard]] display_list_t display_list() const noexcept
   {
-    return {_prims, _runs, _config.background, _logical, _framebuffer, _scale};
+    return {_prims, _runs, _config.background, _logical, _framebuffer, _scale, _text.atlas()};
   }
 
   // ---- input. Pointer positions arrive in the window system's units (G9) and are kept in layout
@@ -399,13 +416,16 @@ public:
 private:
   // Layout is in logical units: the framebuffer divided by the scale, which is the window's size on
   // Wayland and macOS and its size divided by the UI scale on Windows and X11 (G9).
-  void set_units(const frame_t &frame)
+  // Returns whether the scale changed.
+  bool set_units(const frame_t &frame)
   {
     _framebuffer = frame.framebuffer;
+    const float previous = _scale;
     _scale = frame.scale > 0 ? frame.scale : 1.0f;
     _logical = {int(std::lround(frame.framebuffer.width / _scale)), int(std::lround(frame.framebuffer.height / _scale))};
     _input_x = frame.size.width > 0 ? double(_logical.width) / frame.size.width : 1.0;
     _input_y = frame.size.height > 0 ? double(_logical.height) / frame.size.height : 1.0;
+    return _scale != previous;
   }
 
   [[nodiscard]] point_t to_logical(point_t position) const noexcept
@@ -523,6 +543,10 @@ private:
       ++slot.subtree_prims;
       return box->size;
     }
+    if (const auto *text = std::get_if<text_t>(&node))
+      return place_glyphs(slot, _text.add_text(*text, default_font(), x, y, _glyphs));
+    if (const auto *icon = std::get_if<icon_t>(&node))
+      return place_glyphs(slot, _text.add_icon(*icon, x, y, _glyphs));
     if (const auto *mount = std::get_if<mount_t>(&node))
     {
       auto *child = existing(*mount);
@@ -558,6 +582,29 @@ private:
       }
     }
     return total;
+  }
+
+  extent_t place_glyphs(slot_t &slot, extent_t size)
+  {
+    for (const auto &prim : _glyphs)
+      slot.entries.push_back(entry_t{prim});
+    slot.subtree_prims += _glyphs.size();
+    _glyphs.clear();
+    return size;
+  }
+
+  // The font for text that names none, looked up on first use.
+  const font_t &default_font()
+  {
+    if (!_default_font && !_looked_for_font)
+    {
+      _looked_for_font = true;
+      if (_config.font)
+        _default_font = _config.font;
+      else if (auto font = font_t::system_default())
+        _default_font = std::move(*font);
+    }
+    return _default_font;
   }
 
   // ---- chunks (G29). The root always holds one. Any other subtree holds one from the threshold
@@ -772,6 +819,10 @@ private:
   std::vector<draw_item_t> _items;
   std::vector<prim_t> _prims;
   std::vector<run_t> _runs;
+  text_engine_t _text;
+  std::vector<prim_t> _glyphs;
+  font_t _default_font;
+  bool _looked_for_font = false;
 
   extent_t _logical;
   extent_t _framebuffer;
@@ -789,8 +840,8 @@ private:
   target_t _held;
 };
 
-// ---- the GL stopgap (G23): every primitive is a scissored clear. Corners stay square, borders and
-// shadows are not drawn. It stays until Vulkan has run on every platform CI covers (G32).
+// ---- the GL stopgap (G23): every primitive is a scissored clear. Corners stay square; borders,
+// shadows and text are not drawn. It stays until Vulkan has run on every platform CI covers (G32).
 namespace
 {
 constexpr unsigned gl_color_buffer_bit = 0x4000;
@@ -840,7 +891,7 @@ public:
       for (std::uint32_t i = run.first; i < run.first + run.count; ++i)
       {
         const auto &prim = list.prims[i];
-        if (prim.blur > 0)
+        if (prim.blur > 0 || prim.kind != prim_kind_t::shape)
           continue;
         const int x0 = int((run.x + prim.x) * sx + 0.5);
         const int x1 = int((run.x + prim.x + prim.width) * sx + 0.5);

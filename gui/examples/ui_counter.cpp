@@ -21,12 +21,16 @@ Copyright (c) 2026 Jørgen Lind
 */
 
 // Two counters and a clock. Press the green square to count up and the red one to count down; the
-// grey bar shows the count. The clock's bar grows once a second, driven by vio::sleep rather than by
-// the ui, which is enough to rebuild its view. Each component is one struct: state, view, behaviour.
+// grey bar and the label show the count. The clock's bar grows once a second, driven by vio::sleep
+// rather than by the ui, which is enough to rebuild its view. Each component is one struct: state,
+// view, behaviour. Text is drawn in the system font; the title's star is an icon from a path.
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <string>
 #include <string_view>
 
 #include <vio/event_loop.h>
@@ -51,6 +55,27 @@ constexpr ui::color_t grey{0.6f, 0.6f, 0.65f, 1};
 constexpr ui::color_t blue{0.3f, 0.5f, 0.9f, 1};
 
 constexpr ui::color_t outline{0.85f, 0.85f, 0.9f, 1};
+constexpr ui::color_t ink{0.92f, 0.92f, 0.95f, 1};
+constexpr ui::color_t gold{1.0f, 0.8f, 0.25f, 1};
+
+// A five-pointed star in the unit square.
+std::shared_ptr<const ui::path_t> star()
+{
+  auto path = std::make_shared<ui::path_t>();
+  for (int i = 0; i < 10; ++i)
+  {
+    const float angle = -1.5707963f + float(i) * 0.6283185f;
+    const float radius = i % 2 ? 0.2f : 0.5f;
+    const float x = 0.5f + radius * std::cos(angle);
+    const float y = 0.53f + radius * std::sin(angle);
+    if (i == 0)
+      path->move_to(x, y);
+    else
+      path->line_to(x, y);
+  }
+  path->close();
+  return path;
+}
 
 ui::color_t shade(const ui::pressable_t &p, ui::color_t normal, ui::color_t hover, ui::color_t held)
 {
@@ -77,6 +102,7 @@ struct counter_t
                        ui::box_t{.size = {60, 60}, .color = shade(dec, red, light_red, dark_red), .radius = 12, .shadow = lift(dec), .events = dec},
                        ui::box_t{.size = {60, 60}, .color = shade(inc, green, light_green, dark_green), .radius = 12, .shadow = lift(inc), .events = inc},
                        ui::box_t{.size = {4 + 16 * std::max(count, 0), 60}, .color = grey, .radius = 6, .border_width = 2, .border_color = outline},
+                       ui::text_t{.text = "count: " + std::to_string(count), .size = 16, .color = ink},
                      }};
   }
 
@@ -94,7 +120,11 @@ struct clock_bar_t
 
   ui::node_t view() const
   {
-    return ui::box_t{.size = {4 + 8 * (seconds % 60), 20}, .color = blue, .radius = 10};
+    return ui::row_t{.gap = 8,
+                     .children = {
+                       ui::box_t{.size = {4 + 8 * (seconds % 60), 20}, .color = blue, .radius = 10},
+                       ui::text_t{.text = std::to_string(seconds) + " s", .size = 14, .color = ink},
+                     }};
   }
 
   ui::behaviour_t behave(ui::scope_t &scope)
@@ -109,10 +139,21 @@ struct app_t
   counter_t top;
   counter_t bottom;
   clock_bar_t clock;
+  std::shared_ptr<const ui::path_t> icon = star();
 
   ui::node_t view() const
   {
-    return ui::column_t{.gap = 16, .children = {ui::mount(top), ui::mount(bottom), ui::mount(clock)}};
+    return ui::column_t{.gap = 16,
+                        .children = {
+                          ui::row_t{.gap = 8, .children = {ui::icon_t{.path = icon, .size = 24, .color = gold}, ui::text_t{.text = "vio ui: counters", .size = 20, .color = ink}}},
+                          ui::mount(top),
+                          ui::mount(bottom),
+                          ui::mount(clock),
+                          // Shaped by HarfBuzz: joined Arabic letters, right to left. One direction per text node (G40).
+                          ui::row_t{.gap = 8,
+                                    .children = {ui::text_t{.text = "Arabic:", .size = 16, .color = grey},
+                                                 ui::text_t{.text = "\xD9\x85\xD8\xB1\xD8\xAD\xD8\xA8\xD8\xA7\x20\xD8\xA8\xD8\xA7\xD9\x84\xD8\xB9\xD8\xA7\xD9\x84\xD9\x85", .size = 18, .color = ink}}},
+                        }};
   }
 };
 } // namespace
@@ -128,7 +169,7 @@ int main(int argc, char **argv)
       co_return 1;
     }
     {
-      auto window = gui::window_t::create(*display, {.title = "vio ui: counters", .size = {640, 260}});
+      auto window = gui::window_t::create(*display, {.title = "vio ui: counters", .size = {640, 440}});
       if (!window)
         co_return 1;
       auto closing = [](gui::window_t &window, std::chrono::milliseconds limit) -> vio::task_t<void> {

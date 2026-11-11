@@ -1,6 +1,7 @@
-// The toolkit's primitive pipeline (gui/PLAN.md, "Rendering"; G26). One instanced quad per
-// primitive, the shape computed analytically per pixel: a rounded rectangle with per-corner radii
-// and an optional border, or with blur > 0 a Gaussian-blurred one, which is a shadow.
+// The toolkit's primitive pipeline (gui/PLAN.md, "Rendering"; G26, G39). One instanced quad per
+// primitive. A shape is computed analytically per pixel: a rounded rectangle with per-corner radii
+// and an optional border, or with blur > 0 a Gaussian-blurred one, which is a shadow. Coverage --
+// glyphs and icons -- is read from the atlas texel for texel, one texel per pixel.
 //
 // The compiled SPIR-V is committed as ui_spirv.h (G25); `cmake --build <dir> --target
 // vio_gui_shaders` regenerates it, and needs slangc only then. The interface below -- attribute
@@ -14,6 +15,7 @@ struct Prim
     [[vk::location(2)]] float4 fill : FILL;          // sRGB, straight alpha
     [[vk::location(3)]] float4 border_color : BORDER;
     [[vk::location(4)]] float2 params : PARAMS;      // border width, blur sigma
+    [[vk::location(5)]] uint kind : KIND;            // 0 shape, 1 coverage (prim_kind_t)
 };
 
 struct Push
@@ -26,6 +28,8 @@ struct Push
 };
 
 [[vk::push_constant]] ConstantBuffer<Push> push;
+// The glyph atlas: one channel of coverage, read with Load, so no sampler.
+[[vk::binding(0, 0)]] Texture2D<float> atlas;
 
 struct Varyings
 {
@@ -35,6 +39,7 @@ struct Varyings
     nointerpolation float4 fill : FILL;      // linear, premultiplied
     nointerpolation float4 border : BORDER;  // linear, premultiplied
     nointerpolation float2 params : PARAMS;  // border width and blur, pixels
+    nointerpolation float4 glyph : GLYPH;    // atlas texel minus pixel (xy); 1 for coverage (z)
 };
 
 float3 to_linear(float3 c)
@@ -60,6 +65,22 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VertexID)
     const float2 corner = float2(float(corner_index & 1), float(corner_index >> 1));
 
     const float2 scale = push.scale;
+    Varyings out;
+    if (prim.kind == 1)
+    {
+        // Coverage: the anchor on a whole pixel, the rectangle at its offset from it, one texel per
+        // pixel. Rounding the shared anchor rather than each glyph keeps the spacing.
+        const float2 anchor = floor((push.origin + prim.rect.xy) * scale + 0.5);
+        const float2 top_left = anchor + prim.radii.zw;
+        out.position = float4((top_left + corner * prim.rect.zw) / push.target * 2.0 - 1.0, 0.0, 1.0);
+        out.box = float4(0.0);
+        out.radii = float4(0.0);
+        out.fill = premultiplied_linear(prim.fill);
+        out.border = float4(0.0);
+        out.params = float2(0.0);
+        out.glyph = float4(prim.radii.xy - top_left, 1.0, 0.0);
+        return out;
+    }
     const float sigma = prim.params.y * scale.x;
     // A pixel of room for the antialiased edge, three sigmas for a shadow's tail.
     const float pad = 1.0 + 3.0 * sigma;
@@ -67,7 +88,6 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VertexID)
     const float2 size = prim.rect.zw * scale;
     const float2 pixel = low - pad + corner * (size + 2.0 * pad);
 
-    Varyings out;
     out.position = float4(pixel / push.target * 2.0 - 1.0, 0.0, 1.0);
     const float2 half_size = size * 0.5;
     out.box = float4(low + half_size, half_size);
@@ -75,6 +95,7 @@ Varyings vertexMain(Prim prim, uint vertex : SV_VertexID)
     out.fill = premultiplied_linear(prim.fill);
     out.border = premultiplied_linear(prim.border_color);
     out.params = float2(prim.params.x * scale.x, sigma);
+    out.glyph = float4(0.0);
     return out;
 }
 
@@ -98,16 +119,22 @@ float erf_approx(float x)
 [shader("fragment")]
 float4 fragmentMain(Varyings v) : SV_Target
 {
-    const float2 p = v.position.xy - v.box.xy;
-    const float d = rounded_box(p, v.box.zw, v.radii);
     float4 color;
-    if (v.params.y > 0.0)
+    if (v.glyph.z > 0.5)
+    {
+        // Coverage blended in linear space (G27).
+        const int2 texel = int2(floor(v.position.xy) + v.glyph.xy);
+        color = v.fill * atlas.Load(int3(texel, 0));
+    }
+    else if (v.params.y > 0.0)
     {
         // A shadow: the box's coverage convolved with a Gaussian, approximated through the distance.
+        const float d = rounded_box(v.position.xy - v.box.xy, v.box.zw, v.radii);
         color = v.fill * (0.5 - 0.5 * erf_approx(d / (1.41421356 * v.params.y)));
     }
     else
     {
+        const float d = rounded_box(v.position.xy - v.box.xy, v.box.zw, v.radii);
         const float outer = saturate(0.5 - d);
         const float inner = v.params.x > 0.0 ? saturate(0.5 - (d + v.params.x)) : 1.0;
         color = lerp(v.border, v.fill, inner) * outer;

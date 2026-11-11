@@ -50,13 +50,18 @@ public:
 std::unique_ptr<renderer_t> make_vulkan_renderer(window_t &window, const std::optional<vulkan_device_t> &shared, std::string &why);
 std::unique_ptr<renderer_t> make_gl_renderer(window_t &window, std::string &why);
 
-// For tests: draw one display list into an image with no window and read it back, sRGB-encoded
-// RGBA8, rows top to bottom. Runs wherever a Vulkan device does, lavapipe included.
+// For tests: draw display lists in order into an image with no window, through one pipeline as a
+// window would, and read back the last, sRGB-encoded RGBA8, rows top to bottom. Runs wherever a
+// Vulkan device does, lavapipe included.
 struct offscreen_image_t
 {
   std::vector<std::uint8_t> rgba;
   extent_t extent;
   std::string device;
 };
-std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &list, std::string &why);
+std::optional<offscreen_image_t> render_offscreen_vulkan(std::span<const display_list_t> lists, std::string &why);
+inline std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &list, std::string &why)
+{
+  return render_offscreen_vulkan(std::span<const display_list_t>(&list, 1), why);
+}
 } // namespace vio::gui::ui::detail

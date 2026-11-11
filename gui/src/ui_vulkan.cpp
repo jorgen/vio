@@ -135,8 +135,10 @@ PFN_vkGetInstanceProcAddr load_loader()
   X(vkCmdPushConstants)                                                                                                                                                                                                    \
   X(vkCmdDraw)                                                                                                                                                                                                             \
   X(vkCmdCopyImageToBuffer)                                                                                                                                                                                                \
-  X(vkCmdPipelineBarrier) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkQueueWaitIdle) X(vkCreateBuffer) X(vkDestroyBuffer)       \
-    X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkUnmapMemory)
+  X(vkCmdCopyBufferToImage) X(vkCmdBindDescriptorSets) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets)                     \
+    X(vkUpdateDescriptorSets) X(vkCmdPipelineBarrier) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkQueueWaitIdle)                \
+      X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkAllocateMemory)              \
+        X(vkFreeMemory) X(vkMapMemory) X(vkUnmapMemory)
 
 #define VIO_VK_SWAPCHAIN_FUNCTIONS(X)                                                                                                                                                                                      \
   X(vkCreateSwapchainKHR)                                                                                                                                                                                                  \
@@ -515,6 +517,11 @@ public:
   pipeline_t &operator=(const pipeline_t &) = delete;
   ~pipeline_t()
   {
+    destroy_atlas();
+    if (_descriptors)
+      _d.vkDestroyDescriptorPool(_d.device, _descriptors, nullptr);
+    if (_set_layout)
+      _d.vkDestroyDescriptorSetLayout(_d.device, _set_layout, nullptr);
     if (_pipeline)
       _d.vkDestroyPipeline(_d.device, _pipeline, nullptr);
     if (_layout)
@@ -559,8 +566,35 @@ public:
       return false;
     }
 
+    // One descriptor: the glyph atlas, read with OpImageFetch, so a sampled image and no sampler.
+    VkDescriptorSetLayoutBinding binding_info{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set_info.bindingCount = 1;
+    set_info.pBindings = &binding_info;
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1};
+    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    if (_d.vkCreateDescriptorSetLayout(_d.device, &set_info, nullptr, &_set_layout) != VK_SUCCESS || _d.vkCreateDescriptorPool(_d.device, &pool_info, nullptr, &_descriptors) != VK_SUCCESS)
+    {
+      why = "the atlas descriptor could not be made";
+      return false;
+    }
+    VkDescriptorSetAllocateInfo set_allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    set_allocate.descriptorPool = _descriptors;
+    set_allocate.descriptorSetCount = 1;
+    set_allocate.pSetLayouts = &_set_layout;
+    if (_d.vkAllocateDescriptorSets(_d.device, &set_allocate, &_set) != VK_SUCCESS)
+    {
+      why = "vkAllocateDescriptorSets failed";
+      return false;
+    }
+
     VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_t)};
     VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &_set_layout;
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &range;
     if (_d.vkCreatePipelineLayout(_d.device, &layout_info, nullptr, &_layout) != VK_SUCCESS)
@@ -599,7 +633,7 @@ public:
       const VkVertexInputAttributeDescription attributes[] = {
         {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(prim_t, x)},      {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(prim_t, radii)},
         {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(prim_t, fill)},   {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(prim_t, border_color)},
-        {4, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(prim_t, border_width)},
+        {4, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(prim_t, border_width)}, {5, 0, VK_FORMAT_R32_UINT, offsetof(prim_t, kind)},
       };
       VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
       input.vertexBindingDescriptionCount = 1;
@@ -679,9 +713,94 @@ public:
     return true;
   }
 
-  // Record one frame: clear, then one instanced draw per run with the run's origin pushed.
-  void record(VkCommandBuffer cmd, VkFramebuffer framebuffer, VkExtent2D extent, const buffer_t &prims, const display_list_t &list, bool encode_srgb)
+  // The atlas as the next frame needs it. Called outside a render pass: it records the copy of
+  // what changed, through `staging`, which belongs to the frame and is free once its fence is.
+  bool prepare_atlas(VkCommandBuffer cmd, buffer_t &staging, const atlas_view_t &atlas)
   {
+    const bool empty = atlas.extent.width <= 0 || atlas.extent.height <= 0 || atlas.pixels.empty();
+    const VkExtent2D wanted = empty ? VkExtent2D{1, 1} : VkExtent2D{std::uint32_t(atlas.extent.width), std::uint32_t(atlas.extent.height)};
+    bool whole = !_atlas_current || atlas.generation != _atlas_generation;
+    if (!_atlas_image || wanted.width != _atlas_extent.width || wanted.height != _atlas_extent.height)
+    {
+      // Replaced only when it grows, which is rare: waiting for the GPU to finish with the old
+      // one is simpler than keeping it alive per frame.
+      if (_atlas_image)
+        _d.vkDeviceWaitIdle(_d.device);
+      destroy_atlas();
+      if (!create_atlas(wanted))
+        return false;
+      whole = true;
+    }
+    const rect_t region = whole ? rect_t{0, 0, int(wanted.width), int(wanted.height)} : atlas.dirty;
+    if (region.width <= 0 || region.height <= 0)
+      return true;
+
+    const VkDeviceSize bytes = VkDeviceSize(region.width) * region.height;
+    if (staging.capacity < bytes)
+    {
+      release(_d, staging);
+      VkDeviceSize capacity = 64 * 1024;
+      while (capacity < bytes)
+        capacity *= 2;
+      if (!make_buffer(_d, staging, capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+        return false;
+    }
+    auto *out = static_cast<std::uint8_t *>(staging.mapped);
+    if (empty)
+      std::memset(out, 0, std::size_t(bytes));
+    else
+    {
+      for (int row = 0; row < region.height; ++row)
+        std::memcpy(out + std::size_t(row) * region.width, &atlas.pixels[std::size_t(region.y + row) * atlas.extent.width + region.x], std::size_t(region.width));
+    }
+
+    VkImageMemoryBarrier to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_copy.oldLayout = _atlas_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_copy.srcAccessMask = 0;
+    to_copy.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_copy.image = _atlas_image;
+    to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // The previous frame may still be reading it: a barrier's first scope is everything submitted
+    // to this queue before it, so waiting on the fragment stage covers that frame too.
+    const VkPipelineStageFlags after = _atlas_ready ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    _d.vkCmdPipelineBarrier(cmd, after, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_copy);
+    VkBufferImageCopy copy{};
+    copy.bufferRowLength = std::uint32_t(region.width);
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageOffset = {region.x, region.y, 0};
+    copy.imageExtent = {std::uint32_t(region.width), std::uint32_t(region.height), 1};
+    _d.vkCmdCopyBufferToImage(cmd, staging.buffer, _atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    VkImageMemoryBarrier to_read = to_copy;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    // Waits on every stage, not only transfer, which ought to be enough: on the RX 5700 XT, with a
+    // frame still in flight, a copy whose rows were not 4-byte aligned was not there when this
+    // frame's fragments read it. Waiting on all commands, waiting for idle, or aligning the copy
+    // each fixed it; this costs nothing measurable, since it runs only on frames that upload (G39).
+    _d.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_read);
+    _atlas_ready = true;
+    _atlas_current = true;
+    _atlas_generation = atlas.generation;
+    return true;
+  }
+
+  // A frame was skipped, so a dirty rectangle went by unseen: upload the whole atlas next time.
+  void forget_atlas() noexcept
+  {
+    _atlas_current = false;
+  }
+
+  // Record one frame: the atlas's changes, a clear, then one instanced draw per run with the run's
+  // origin pushed.
+  bool record(VkCommandBuffer cmd, VkFramebuffer framebuffer, VkExtent2D extent, const buffer_t &prims, buffer_t &staging, const display_list_t &list, bool encode_srgb)
+  {
+    if (!prepare_atlas(cmd, staging, list.atlas))
+      return false;
     const auto &bg = list.background;
     VkClearValue clear{};
     if (encode_srgb)
@@ -698,6 +817,7 @@ public:
     if (!list.runs.empty())
     {
       _d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+      _d.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _layout, 0, 1, &_set, 0, nullptr);
       VkViewport viewport{0, 0, float(extent.width), float(extent.height), 0, 1};
       VkRect2D scissor{{0, 0}, extent};
       _d.vkCmdSetViewport(cmd, 0, 1, &viewport);
@@ -720,6 +840,7 @@ public:
       }
     }
     _d.vkCmdEndRenderPass(cmd);
+    return true;
   }
 
   [[nodiscard]] VkRenderPass pass() const noexcept
@@ -732,6 +853,66 @@ public:
   }
 
 private:
+  bool create_atlas(VkExtent2D extent)
+  {
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R8_UNORM;
+    info.extent = {extent.width, extent.height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (_d.vkCreateImage(_d.device, &info, nullptr, &_atlas_image) != VK_SUCCESS)
+      return false;
+    VkMemoryRequirements requirements;
+    _d.vkGetImageMemoryRequirements(_d.device, _atlas_image, &requirements);
+    auto type = _d.memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!type)
+      type = _d.memory_type(requirements.memoryTypeBits, 0);
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = type.value_or(0);
+    if (!type || _d.vkAllocateMemory(_d.device, &allocate, nullptr, &_atlas_memory) != VK_SUCCESS)
+      return false;
+    _d.vkBindImageMemory(_d.device, _atlas_image, _atlas_memory, 0);
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = _atlas_image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_R8_UNORM;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (_d.vkCreateImageView(_d.device, &view_info, nullptr, &_atlas_view) != VK_SUCCESS)
+      return false;
+    VkDescriptorImageInfo image_info{VK_NULL_HANDLE, _atlas_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = _set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &image_info;
+    _d.vkUpdateDescriptorSets(_d.device, 1, &write, 0, nullptr);
+    _atlas_extent = extent;
+    _atlas_ready = false;
+    return true;
+  }
+
+  void destroy_atlas()
+  {
+    if (_atlas_view)
+      _d.vkDestroyImageView(_d.device, _atlas_view, nullptr);
+    if (_atlas_image)
+      _d.vkDestroyImage(_d.device, _atlas_image, nullptr);
+    if (_atlas_memory)
+      _d.vkFreeMemory(_d.device, _atlas_memory, nullptr);
+    _atlas_view = VK_NULL_HANDLE;
+    _atlas_image = VK_NULL_HANDLE;
+    _atlas_memory = VK_NULL_HANDLE;
+    _atlas_extent = {};
+    _atlas_ready = false;
+  }
+
   // The name in the module's first OpEntryPoint: glslang writes "main", slangc may keep the
   // function's own name, and reading it means neither has to be configured to match.
   static std::string entry_point(std::span<const std::uint32_t> code)
@@ -755,6 +936,18 @@ private:
   VkPipelineLayout _layout = VK_NULL_HANDLE;
   VkPipeline _pipeline = VK_NULL_HANDLE;
   VkFormat _format = VK_FORMAT_UNDEFINED;
+  VkDescriptorSetLayout _set_layout = VK_NULL_HANDLE;
+  VkDescriptorPool _descriptors = VK_NULL_HANDLE;
+  VkDescriptorSet _set = VK_NULL_HANDLE;
+  VkImage _atlas_image = VK_NULL_HANDLE;
+  VkDeviceMemory _atlas_memory = VK_NULL_HANDLE;
+  VkImageView _atlas_view = VK_NULL_HANDLE;
+  VkExtent2D _atlas_extent{};
+  // In SHADER_READ_ONLY_OPTIMAL, i.e. written at least once.
+  bool _atlas_ready = false;
+  // Holds generation `_atlas_generation` with every dirty rectangle since applied.
+  bool _atlas_current = false;
+  std::uint64_t _atlas_generation = 0;
 };
 
 bool is_srgb(VkFormat format)
@@ -777,6 +970,7 @@ public:
     for (auto &frame : _frames)
     {
       release(_d, frame.prims);
+      release(_d, frame.staging);
       if (frame.acquired)
         _d.vkDestroySemaphore(_d.device, frame.acquired, nullptr);
       if (frame.fence)
@@ -856,6 +1050,17 @@ public:
 
   bool render(const display_list_t &list) override
   {
+    // Whatever path leaves without recording a frame has not uploaded the atlas's changes.
+    struct skipped_t
+    {
+      vulkan_renderer_t &self;
+      bool recorded = false;
+      ~skipped_t()
+      {
+        if (!recorded && self._pipeline)
+          self._pipeline->forget_atlas();
+      }
+    } skipped{*this};
     if (list.framebuffer.width <= 0 || list.framebuffer.height <= 0)
       return true;
     for (int attempt = 0; attempt < 2; ++attempt)
@@ -886,8 +1091,10 @@ public:
       VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
       begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
       _d.vkBeginCommandBuffer(frame.cmd, &begin);
-      _pipeline->record(frame.cmd, _framebuffers[image], _extent, frame.prims, list, !is_srgb(_pipeline->format()));
+      skipped.recorded = _pipeline->record(frame.cmd, _framebuffers[image], _extent, frame.prims, frame.staging, list, !is_srgb(_pipeline->format()));
       _d.vkEndCommandBuffer(frame.cmd);
+      if (!skipped.recorded)
+        return false;
 
       const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
       VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -924,6 +1131,7 @@ private:
     VkSemaphore acquired = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     buffer_t prims;
+    buffer_t staging;
   };
 
   // Returns false only on a failure that ends the renderer (`_lost`); a surface with no area leaves
@@ -1092,14 +1300,24 @@ std::unique_ptr<renderer_t> make_vulkan_renderer(window_t &window, const std::op
   return renderer;
 }
 
-// Render one display list into an image of our own and read it back: no window, no surface, which
-// is what lets the pipeline be tested headless on lavapipe.
-std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &list, std::string &why)
+// Render display lists one after another into an image of our own, through one pipeline as a window
+// renderer would, and read back the last: no window, no surface, which is what lets the pipeline be
+// tested headless on lavapipe.
+std::optional<offscreen_image_t> render_offscreen_vulkan(std::span<const display_list_t> lists, std::string &why)
 {
-  if (list.framebuffer.width <= 0 || list.framebuffer.height <= 0)
+  if (lists.empty() || lists.back().framebuffer.width <= 0 || lists.back().framebuffer.height <= 0)
   {
     why = "empty framebuffer";
     return std::nullopt;
+  }
+  const display_list_t &list = lists.back();
+  for (const auto &each : lists)
+  {
+    if (each.framebuffer != list.framebuffer)
+    {
+      why = "the lists differ in size";
+      return std::nullopt;
+    }
   }
   device_t d;
   if (!create_instance(d, {}, why) || !create_device(d, VK_NULL_HANDLE, why))
@@ -1119,6 +1337,7 @@ std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &l
   VkCommandPool pool = VK_NULL_HANDLE;
   VkFence fence = VK_NULL_HANDLE;
   buffer_t prims;
+  buffer_t staging;
   buffer_t readback;
   std::optional<offscreen_image_t> result;
   [&]
@@ -1168,13 +1387,14 @@ std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &l
     d.vkCreateFramebuffer(d.device, &fb_info, nullptr, &framebuffer);
 
     const VkDeviceSize bytes = VkDeviceSize(extent.width) * extent.height * 4;
-    if (!pipeline.upload(prims, list.prims) || !make_buffer(d, readback, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+    if (!make_buffer(d, readback, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
     {
       why = "buffers could not be made";
       return;
     }
 
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool_info.queueFamilyIndex = d.family;
     d.vkCreateCommandPool(d.device, &pool_info, nullptr, &pool);
     VkCommandBufferAllocateInfo allocate_cmd{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1183,10 +1403,37 @@ std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &l
     allocate_cmd.commandBufferCount = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     d.vkAllocateCommandBuffers(d.device, &allocate_cmd, &cmd);
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    d.vkCreateFence(d.device, &fence_info, nullptr, &fence);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    // Every list but the last is drawn and waited for, so the atlas sees each one's dirty rectangle.
+    for (std::size_t i = 0; i + 1 < lists.size(); ++i)
+    {
+      d.vkBeginCommandBuffer(cmd, &begin);
+      if (!pipeline.upload(prims, lists[i].prims) || !pipeline.record(cmd, framebuffer, extent, prims, staging, lists[i], false))
+      {
+        why = "an earlier frame could not be recorded";
+        return;
+      }
+      d.vkEndCommandBuffer(cmd);
+      if (d.vkQueueSubmit(d.queue, 1, &submit, fence) != VK_SUCCESS)
+      {
+        why = "vkQueueSubmit failed";
+        return;
+      }
+      d.vkWaitForFences(d.device, 1, &fence, VK_TRUE, UINT64_MAX);
+      d.vkResetFences(d.device, 1, &fence);
+    }
     d.vkBeginCommandBuffer(cmd, &begin);
-    pipeline.record(cmd, framebuffer, extent, prims, list, false);
+    if (!pipeline.upload(prims, list.prims) || !pipeline.record(cmd, framebuffer, extent, prims, staging, list, false))
+    {
+      why = "the frame could not be recorded";
+      return;
+    }
     // The pass leaves the image in TRANSFER_SRC_OPTIMAL, but its implicit dependency to what follows
     // makes no writes visible to a transfer: the copy needs its own barrier, and the host read
     // after the fence another.
@@ -1203,11 +1450,6 @@ std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &l
     copied.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     d.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &copied, 0, nullptr, 0, nullptr);
     d.vkEndCommandBuffer(cmd);
-    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    d.vkCreateFence(d.device, &fence_info, nullptr, &fence);
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
     if (d.vkQueueSubmit(d.queue, 1, &submit, fence) != VK_SUCCESS)
     {
       why = "vkQueueSubmit failed";
@@ -1227,6 +1469,7 @@ std::optional<offscreen_image_t> render_offscreen_vulkan(const display_list_t &l
   if (pool)
     d.vkDestroyCommandPool(d.device, pool, nullptr);
   release(d, prims);
+  release(d, staging);
   release(d, readback);
   if (framebuffer)
     d.vkDestroyFramebuffer(d.device, framebuffer, nullptr);

@@ -52,9 +52,10 @@ target_link_libraries(vio_gui PUBLIC ${VIO_GUI_LIBRARIES})
 target_compile_definitions(vio_gui PRIVATE ${VIO_GUI_DEFINITIONS})
 
 # The declarative toolkit, on top of the window layer and kept out of it (PLAN.md, "UI toolkit").
-add_library(vio_gui_ui STATIC src/ui.cpp src/ui_vulkan.cpp)
+add_library(vio_gui_ui STATIC src/ui.cpp src/ui_text.cpp src/ui_vulkan.cpp)
 add_library(vio::gui_ui ALIAS vio_gui_ui)
-target_link_libraries(vio_gui_ui PUBLIC vio_gui)
+# FreeType and HarfBuzz stay private: nothing in ui.h names them (G27).
+target_link_libraries(vio_gui_ui PUBLIC vio_gui PRIVATE vio::freetype vio::harfbuzz)
 # Vulkan declarations only: the loader is opened at run time (G6, G31), so nothing is linked.
 if(vulkan_headers_USE_SYSTEM)
     find_package(VulkanHeaders CONFIG REQUIRED)
@@ -87,7 +88,7 @@ if(VIO_SLANGC)
 endif()
 
 if(VIO_BUILD_TESTS)
-    set(VIO_GUI_TEST_SOURCES test/test_main.cpp test/test_gui.cpp test/test_ui.cpp test/test_ui_render.cpp)
+    set(VIO_GUI_TEST_SOURCES test/test_main.cpp test/test_gui.cpp test/test_ui.cpp test/test_ui_render.cpp test/test_ui_text.cpp)
     if(WIN32)
         list(APPEND VIO_GUI_TEST_SOURCES test/test_win32.cpp)
     elseif(APPLE)
@@ -103,6 +104,10 @@ if(VIO_BUILD_TESTS)
         target_link_libraries(vio_gui_tests PRIVATE doctest::doctest)
     else()
         target_include_directories(vio_gui_tests PRIVATE ${doctest_SOURCE_DIR})
+    endif()
+    # The text tests use fonts from HarfBuzz's own test suite, so they need its source tree.
+    if(DEFINED harfbuzz_SOURCE_DIR AND NOT harfbuzz_USE_SYSTEM)
+        target_compile_definitions(vio_gui_tests PRIVATE "VIO_GUI_TEST_FONTS=\"${harfbuzz_SOURCE_DIR}\"")
     endif()
     add_test(NAME vio_gui_tests COMMAND vio_gui_tests)
 endif()

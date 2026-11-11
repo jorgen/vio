@@ -31,13 +31,16 @@ Copyright (c) 2026 Jørgen Lind
 #include <cassert>
 #include <concepts>
 #include <coroutine>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -59,6 +62,7 @@ namespace detail
 {
 class runtime_t;
 struct slot_t;
+struct font_data_t;
 using gui::detail::value_waiter_t;
 using gui::detail::waiter_list_t;
 using gui::detail::waiter_t;
@@ -363,6 +367,101 @@ struct box_t
   std::function<void()> on_press;
 };
 
+// ---------------------------------------------------------------------------------------------
+// Text and icons (gui/PLAN.md, "Rendering"; G27, G39)
+
+// A loaded font: a TrueType or OpenType file, or the first face of a collection. Cheap to copy and
+// safe to share between threads; what is not (FreeType faces, the atlas) is kept per window.
+class font_t
+{
+public:
+  font_t() = default;
+
+  static std::expected<font_t, std::string> from_file(const std::string &path);
+  static std::expected<font_t, std::string> from_memory(std::vector<std::byte> bytes);
+  // The platform's UI font, found at a known path: Segoe UI on Windows, the system font on macOS,
+  // DejaVu Sans, Noto Sans or Liberation Sans on Linux. No fontconfig lookup (G40).
+  static std::expected<font_t, std::string> system_default();
+
+  explicit operator bool() const noexcept
+  {
+    return bool(_data);
+  }
+  [[nodiscard]] const detail::font_data_t *data() const noexcept
+  {
+    return _data.get();
+  }
+  friend bool operator==(const font_t &, const font_t &) = default;
+
+private:
+  explicit font_t(std::shared_ptr<const detail::font_data_t> data) noexcept
+    : _data(std::move(data))
+  {
+  }
+  std::shared_ptr<const detail::font_data_t> _data;
+};
+
+// One line of text, shaped as a single run: HarfBuzz picks the direction and script from the text
+// itself, so a line of Arabic or Devanagari is right, but a line mixing directions is not (G40).
+// `size` is the font size in logical units.
+struct text_t
+{
+  std::string text;
+  float size = 14;
+  color_t color = {1, 1, 1, 1};
+  // Empty: run_config_t::font, else font_t::system_default().
+  font_t font;
+};
+
+// A vector shape for an icon, in a unit square with (0, 0) at the top left. Contours close
+// themselves. Filled non-zero unless `even_odd`.
+class path_t
+{
+public:
+  path_t &move_to(float x, float y);
+  path_t &line_to(float x, float y);
+  path_t &quad_to(float cx, float cy, float x, float y);
+  path_t &cubic_to(float c1x, float c1y, float c2x, float c2y, float x, float y);
+  path_t &close();
+
+  bool even_odd = false;
+
+  enum class tag_t : std::uint8_t
+  {
+    on,
+    quad_control,
+    cubic_control,
+  };
+  struct point_t
+  {
+    float x = 0;
+    float y = 0;
+    tag_t tag = tag_t::on;
+  };
+  [[nodiscard]] std::span<const point_t> points() const noexcept
+  {
+    return _points;
+  }
+  // The index one past each contour's last point.
+  [[nodiscard]] std::span<const std::size_t> ends() const noexcept
+  {
+    return _ends;
+  }
+
+private:
+  std::vector<point_t> _points;
+  std::vector<std::size_t> _ends;
+};
+
+// A path drawn `size` logical units square, rasterized into the glyph atlas like a glyph. The
+// pointer is the cache key: share one path_t between every icon showing it.
+struct icon_t
+{
+  std::shared_ptr<const path_t> path;
+  float size = 16;
+  color_t color = {1, 1, 1, 1};
+};
+
 struct row_t
 {
   int gap = 0;
@@ -384,7 +483,7 @@ struct mount_t
   behaviour_t (*behave)(void *component, scope_t &scope) = nullptr;
 };
 
-struct node_t : std::variant<box_t, row_t, column_t, mount_t>
+struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t>
 {
   using variant::variant;
 };
@@ -703,25 +802,48 @@ struct draw_item_t
 // ---------------------------------------------------------------------------------------------
 // The display list (gui/PLAN.md, "Rendering")
 
-// One primitive: an instanced quad whose shape the fragment shader computes. A rounded rectangle
-// with an optional border, or with `blur` > 0 a Gaussian-blurred one, which is a shadow. The rect
-// is in logical units relative to the origin of the run it is drawn in. 80 bytes, laid out for a
-// vertex buffer read at instance rate.
+enum class prim_kind_t : std::uint32_t
+{
+  // A rounded rectangle with an optional border, or with `blur` > 0 a Gaussian-blurred one, which
+  // is a shadow. x, y, width and height are logical units.
+  shape = 0,
+  // A rectangle of the glyph atlas, copied texel for texel and tinted with `fill`: a glyph or an
+  // icon (G39). x and y are a logical anchor, which the shader rounds to a whole pixel; width and
+  // height are pixels; radii are the atlas texel the rectangle starts at (0, 1) and the pixel
+  // offset of its top left from the rounded anchor (2, 3). Every glyph of one text node shares the
+  // anchor, so they all round the same way and the spacing HarfBuzz gave them survives.
+  coverage = 1,
+};
+
+// One primitive: an instanced quad whose shape the fragment shader computes. Relative to the origin
+// of the run it is drawn in. 80 bytes, laid out for a vertex buffer read at instance rate.
 struct prim_t
 {
   float x = 0;
   float y = 0;
   float width = 0;
   float height = 0;
-  // Top-left, top-right, bottom-right, bottom-left.
+  // Top-left, top-right, bottom-right, bottom-left; for coverage, see prim_kind_t.
   float radii[4] = {0, 0, 0, 0};
   color_t fill;
   color_t border_color = {0, 0, 0, 0};
   float border_width = 0;
   float blur = 0;
-  float reserved[2] = {0, 0};
+  prim_kind_t kind = prim_kind_t::shape;
+  float reserved = 0;
 };
 static_assert(sizeof(prim_t) == 80);
+
+// The glyph atlas as a renderer sees it: one byte of coverage per texel, rows top to bottom. A
+// renderer that last saw `generation` uploads only `dirty`; any other generation is a new atlas and
+// is uploaded whole.
+struct atlas_view_t
+{
+  std::span<const std::uint8_t> pixels;
+  extent_t extent;
+  rect_t dirty;
+  std::uint64_t generation = 0;
+};
 
 // A range of prims drawn at one origin. Moving a chunk changes its origin and nothing else (G29).
 struct run_t
@@ -743,6 +865,7 @@ struct display_list_t
   extent_t logical;
   extent_t framebuffer;
   float scale = 1;
+  atlas_view_t atlas;
 };
 
 // A Vulkan device the program already has, for the renderer to share rather than create its own
@@ -776,6 +899,8 @@ struct run_config_t
   std::optional<vulkan_device_t> vulkan_device;
   // Commands per chunk before a subtree holds its own (G29). Tests lower it.
   std::size_t chunk_threshold = 128;
+  // The font for text that names none. Empty: font_t::system_default(), looked up once.
+  font_t font;
   // Called after every layout with the hit-test list it produced.
   std::function<void(std::span<const draw_item_t>)> on_layout;
   // Called after every layout with the display list, whether or not anything draws it.
