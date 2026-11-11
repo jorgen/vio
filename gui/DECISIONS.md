@@ -486,3 +486,21 @@ awaiting a spawned job, are exempt from the refusal a cancelled scope gives ever
 because both are bounded by the cancellation itself and refusing them would end the owner while
 what it owns still runs. `job_t<T>` keeps its result outside its frame, since the scope destroys the
 frame a beat after it ends.
+
+## G43. A merge is one waiter watching several queues
+
+`ui::merge(scope, a, b, c)` does not put a waiter into each subscription's queue: several waiters for
+one coroutine could each be readied in the same turn and resume it twice, and whichever lost would
+have taken an event out of its queue for nobody. Instead each queue gets a watcher pointer. An event
+that no direct awaiter takes is queued as before and readies the watcher, at most once -- a waiter
+already readied is skipped -- and the merge, when it runs, stops watching every queue and takes from
+the first non-empty one, starting after the one it took from last so a busy source cannot starve a
+quiet one. Events are never removed from a queue until the merge consumes them, so none is lost or
+seen twice. The result is a variant indexed by argument position, so two subscriptions of one event
+type stay distinguishable.
+
+`ui::every` and `ui::lines` are behaviours in the scope feeding a source the subscription reads.
+They mark themselves quiet: their own wake-ups do not rebuild the component, which a ticker at
+16 ms would otherwise do every period whether or not anything consumed the tick. A stream's end is
+an event (`line_t::closed`), not the source going away, which would leave a waiting merge waiting.
+Tested against a real loopback TCP connection with a line split across writes and a CRLF.

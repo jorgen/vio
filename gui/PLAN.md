@@ -499,7 +499,7 @@ Open:
 | 5 | Cocoa backend, NSOpenGL and Metal | macOS CI |
 | 6 | UI: components, `behaviour_t` with dirty marking, scopes with `spawn` and unmount cancellation, `box`/`row`/`column`, mount, hit testing, scissor-clear drawing | a counter and a sleep-driven clock example; unit tests for scope teardown |
 | 7 | UI: `list_t`, props, child scopes, `spawned_t<T>`; flex. **In on Windows** (G42) | a dynamic list example; unmount tests |
-| 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
+| 8 | UI: `merge` and the source adapters. **In on Windows** (G43): `ui::merge`, `ui::every`, `ui::lines` | a component mixing presses, a timer and a socket |
 | 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint. **In on Windows**; Linux and macOS not yet run | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons. **In on Windows**; Linux and macOS not yet run | labels at 1x and 2x scale; a shaping test with a non-Latin script |
 | 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation. **First slice in on Windows** (G41): round-joined segments, area fills, markers | thick translucent zigzag lines; a million-point series panned at frame rate |

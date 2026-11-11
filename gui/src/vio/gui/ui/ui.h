@@ -42,12 +42,14 @@ Copyright (c) 2026 Jørgen Lind
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include <vio/cancellation.h>
+#include <vio/operation/sleep.h>
 #include <vio/task.h>
 
 #include "vio/gui/gui.h"
@@ -179,6 +181,9 @@ public:
   std::vector<source_t<E> *> sources;
   std::deque<E> queue;
   waiter_list_t waiters;
+  // A merge waiting on this queue among others (ui::merge). It is woken, at most once, by an event
+  // that no direct awaiter took, and takes the event from the queue itself.
+  waiter_t *watcher = nullptr;
 };
 
 template <typename E>
@@ -247,6 +252,10 @@ void subscription_core_t<E>::push(const E &event, runtime_t &runtime)
     return;
   }
   queue.push_back(event);
+  // A merge watching several queues is one waiter: woken by the first, ignored by the rest until it
+  // has run, when it stops watching all of them.
+  if (watcher && !watcher->list)
+    ready(runtime, *std::exchange(watcher, nullptr));
 }
 
 template <typename E>
@@ -360,6 +369,11 @@ public:
   [[nodiscard]] detail::subscription_awaitable_t<E> operator co_await() noexcept
   {
     return detail::subscription_awaitable_t<E>(_core.get());
+  }
+
+  [[nodiscard]] detail::subscription_core_t<E> *core() const noexcept
+  {
+    return _core.get();
   }
 
 private:
@@ -641,6 +655,12 @@ void scope_woke(scope_t &scope) noexcept;
 void scope_refused(scope_t &scope, std::coroutine_handle<> frame) noexcept;
 void scope_finished(scope_t &scope, std::coroutine_handle<> frame) noexcept;
 
+// `co_await detail::quiet_t{}` at the top of a behaviour: its later wake-ups do not rebuild the
+// component. For the toolkit's own adapters, whose consumers are woken -- and rebuilt -- anyway.
+struct quiet_t
+{
+};
+
 // Every co_await in a behaviour goes through this. Resuming marks the component dirty -- a
 // behaviour that woke up rebuilds its view. A cancelled scope is refused at the suspension point:
 // the operation is never armed, nothing else holds the frame, and the scope destroys it later.
@@ -666,6 +686,7 @@ public:
   template <typename Promise>
   std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> frame)
   {
+    _quiet = frame.promise().quiet;
     if (!ui_uninterruptible<Awaiter> && scope_cancelled(*_scope))
     {
       scope_refused(*_scope, frame);
@@ -698,13 +719,15 @@ public:
   decltype(auto) await_resume()
   {
     _cancel.reset();
-    scope_woke(*_scope);
+    if (!_quiet)
+      scope_woke(*_scope);
     return _inner.await_resume();
   }
 
 private:
   Awaiter _inner;
   scope_t *_scope;
+  bool _quiet = false;
   vio::registration_t _cancel;
 };
 
@@ -765,8 +788,14 @@ struct promise_base_t
   {
     return guarded_t(std::forward<A>(awaitable), *scope);
   }
+  std::suspend_never await_transform(quiet_t) noexcept
+  {
+    quiet = true;
+    return {};
+  }
 
   scope_t *scope;
+  bool quiet = false;
 };
 
 // Where a job's result waits for whoever awaits it. Outside the frame, because the scope destroys
@@ -1290,6 +1319,201 @@ public:
 private:
   items_t _items;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Several sources at once (gui/PLAN.md, "Several events at once"; G43)
+
+namespace detail
+{
+template <typename... Es>
+class merge_awaitable_t : public waiter_t
+{
+public:
+  using value_type = std::variant<Es...>;
+
+  merge_awaitable_t(std::tuple<subscription_core_t<Es> *...> cores, std::size_t &next, runtime_t &runtime) noexcept
+    : _cores(cores)
+    , _next(&next)
+    , _runtime(&runtime)
+  {
+  }
+  merge_awaitable_t(const merge_awaitable_t &) = delete;
+  merge_awaitable_t &operator=(const merge_awaitable_t &) = delete;
+  ~merge_awaitable_t()
+  {
+    unwatch();
+  }
+
+  [[nodiscard]] bool await_ready()
+  {
+    return take();
+  }
+  void await_suspend(std::coroutine_handle<> continuation) noexcept
+  {
+    handle = continuation;
+    std::apply([this](auto *...core) { ((core ? (void)(core->watcher = this) : void()), ...); }, _cores);
+  }
+  std::optional<value_type> await_resume()
+  {
+    unwatch();
+    if (!_value && !_cancelled)
+      take();
+    return std::move(_value);
+  }
+
+  // The scope was cancelled: wake with nothing.
+  void cancel_wait(runtime_t &runtime) noexcept
+  {
+    if (list)
+      return;
+    unwatch();
+    _cancelled = true;
+    ready(runtime, *this);
+  }
+
+private:
+  void unwatch() noexcept
+  {
+    std::apply([this](auto *...core) { ((core && core->watcher == this ? (void)(core->watcher = nullptr) : void()), ...); }, _cores);
+  }
+
+  // The first queue with something in it, starting after the one taken from last, so a busy
+  // source cannot starve a quiet one.
+  bool take()
+  {
+    constexpr std::size_t n = sizeof...(Es);
+    for (std::size_t k = 0; k < n && !_value; ++k)
+    {
+      const std::size_t i = (*_next + k) % n;
+      take_from(i, std::index_sequence_for<Es...>{});
+      if (_value)
+        *_next = i + 1;
+    }
+    return bool(_value);
+  }
+  template <std::size_t... I>
+  void take_from(std::size_t i, std::index_sequence<I...>)
+  {
+    ((I == i ? take_at<I>() : void()), ...);
+  }
+  template <std::size_t I>
+  void take_at()
+  {
+    auto *core = std::get<I>(_cores);
+    if (!core || core->queue.empty() || !core->waiters.empty())
+      return;
+    _value.emplace(std::in_place_index<I>, std::move(core->queue.front()));
+    core->queue.pop_front();
+  }
+
+  std::tuple<subscription_core_t<Es> *...> _cores;
+  std::size_t *_next;
+  runtime_t *_runtime;
+  std::optional<value_type> _value;
+  bool _cancelled = false;
+};
+} // namespace detail
+
+// The first event from any of several subscriptions, as a variant indexed by argument position:
+// `while (auto event = co_await merged) switch (event->index()) ...`. Over sources only, which queue
+// what arrives while nobody waits; a one-shot operation joins through an adapter (every, lines).
+// The subscriptions must outlive it. Yields std::nullopt once the awaiting scope is cancelled.
+template <typename... Es>
+class merged_t
+{
+public:
+  explicit merged_t(scope_t &scope, subscription_t<Es> &...subscriptions) noexcept
+    : _cores(subscriptions.core()...)
+    , _runtime(&detail::scope_runtime(scope))
+  {
+  }
+  [[nodiscard]] detail::merge_awaitable_t<Es...> operator co_await() noexcept
+  {
+    return detail::merge_awaitable_t<Es...>(_cores, _next, *_runtime);
+  }
+
+private:
+  std::tuple<detail::subscription_core_t<Es> *...> _cores;
+  std::size_t _next = 0;
+  detail::runtime_t *_runtime;
+};
+
+template <typename... Es>
+[[nodiscard]] merged_t<Es...> merge(scope_t &scope, subscription_t<Es> &...subscriptions) noexcept
+{
+  return merged_t<Es...>(scope, subscriptions...);
+}
+
+// One tick of ui::every: how many periods have passed.
+struct tick_t
+{
+  std::uint64_t count = 0;
+};
+
+// One line of ui::lines, without its line ending. The last event of a stream has `closed` set and
+// carries whatever followed the last line ending, which may be nothing.
+struct line_t
+{
+  std::string text;
+  bool closed = false;
+};
+
+namespace detail
+{
+inline behaviour_t ticker(scope_t &scope, std::shared_ptr<source_t<tick_t>> source, std::chrono::nanoseconds period)
+{
+  co_await quiet_t{};
+  std::uint64_t count = 0;
+  while (co_await vio::sleep(scope.loop(), period, scope.token()))
+    source->emit(tick_t{++count}, scope_runtime(scope));
+}
+
+template <typename Reader>
+behaviour_t line_reader(scope_t &scope, std::shared_ptr<source_t<line_t>> source, Reader &reader)
+{
+  co_await quiet_t{};
+  auto bound = scope.bind(reader);
+  std::string pending;
+  for (;;)
+  {
+    auto chunk = co_await reader;
+    if (!chunk || chunk->size() == 0)
+      break;
+    pending.append(chunk->chars(), chunk->size());
+    std::size_t start = 0;
+    for (std::size_t end; (end = pending.find('\n', start)) != std::string::npos; start = end + 1)
+    {
+      std::size_t stop = end;
+      if (stop > start && pending[stop - 1] == '\r')
+        --stop;
+      source->emit(line_t{pending.substr(start, stop - start)}, scope_runtime(scope));
+    }
+    pending.erase(0, start);
+  }
+  source->emit(line_t{std::move(pending), true}, scope_runtime(scope));
+}
+} // namespace detail
+
+// A timer as a source: a tick every `period` for as long as the scope lives. Ticks arriving while
+// nothing awaits queue up, so a slow consumer sees each one.
+[[nodiscard]] inline subscription_t<tick_t> every(scope_t &scope, std::chrono::nanoseconds period)
+{
+  auto source = std::make_shared<detail::source_t<tick_t>>();
+  auto subscription = subscribe<tick_t>(*source);
+  scope.spawn(detail::ticker(scope, source, period));
+  return subscription;
+}
+
+// A byte stream as a source of lines: anything whose `co_await reader` gives an expected buffer with
+// chars() and size(), a TCP or TLS reader. The reader must outlive the scope; it is cancelled with it.
+template <typename Reader>
+[[nodiscard]] subscription_t<line_t> lines(scope_t &scope, Reader &reader)
+{
+  auto source = std::make_shared<detail::source_t<line_t>>();
+  auto subscription = subscribe<line_t>(*source);
+  scope.spawn(detail::line_reader(scope, source, reader));
+  return subscription;
+}
 
 // What layout produced: a box, where it is, and whom it reports to. This is the hit-test list,
 // one entry per box in logical units; a renderer reads display_list_t instead (G24).

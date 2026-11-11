@@ -25,6 +25,7 @@ Copyright (c) 2026 Jørgen Lind
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -34,6 +35,8 @@ Copyright (c) 2026 Jørgen Lind
 #include <vio/gui/gui.h>
 #include <vio/gui/ui/ui.h>
 #include <vio/operation/sleep.h>
+#include <vio/operation/tcp.h>
+#include <vio/operation/tcp_server.h>
 #include <vio/task.h>
 
 #include "gui_test_helpers.h"
@@ -364,4 +367,131 @@ TEST_CASE("ui scope: a spawned job gives back its result, and a cancelled child 
   CHECK((!worker.cancelled_answer.has_value() || *worker.cancelled_answer == -1));
   CHECK(worker.joined);
   CHECK(worker.after);
+}
+
+namespace
+{
+// Presses, a timer and a socket in one loop (phase 8).
+struct mixer_t
+{
+  vio::tcp_reader_t *reader = nullptr;
+  ui::pressable_t press;
+  int presses = 0;
+  int ticks = 0;
+  std::vector<std::string> lines;
+  bool closed = false;
+  bool finished = false;
+
+  ui::node_t view() const
+  {
+    return ui::box_t{.size = {10, 10}, .color = red, .events = press};
+  }
+
+  ui::behaviour_t behave(ui::scope_t &scope)
+  {
+    auto pressed = ui::subscribe<ui::press_event_t>(press);
+    auto ticked = ui::every(scope, 5ms);
+    auto read = ui::lines(scope, *reader);
+    auto events = ui::merge(scope, pressed, ticked, read);
+    while (auto event = co_await events)
+    {
+      switch (event->index())
+      {
+      case 0:
+        ++presses;
+        break;
+      case 1:
+        ++ticks;
+        break;
+      default:
+        auto &line = std::get<2>(*event);
+        if (!line.text.empty())
+          lines.push_back(line.text);
+        closed = closed || line.closed;
+        break;
+      }
+      if (closed && presses > 0 && ticks >= 3)
+        break;
+    }
+    finished = true;
+  }
+};
+
+std::expected<std::pair<vio::tcp_server_t, int>, vio::error_t> listener(vio::event_loop_t &loop)
+{
+  auto address = vio::ip4_addr("127.0.0.1", 0);
+  if (!address)
+    return std::unexpected(address.error());
+  auto server = vio::tcp_create_server(loop);
+  if (!server)
+    return std::unexpected(server.error());
+  if (auto bound = vio::tcp_bind(server.value(), reinterpret_cast<const sockaddr *>(&address.value())); !bound)
+    return std::unexpected(bound.error());
+  auto name = vio::sockname(server->tcp);
+  if (!name)
+    return std::unexpected(name.error());
+  sockaddr_storage storage = name.value();
+  return std::make_pair(std::move(server.value()), int(ntohs(reinterpret_cast<sockaddr_in *>(&storage)->sin_port)));
+}
+} // namespace
+
+TEST_CASE("ui merge: presses, a timer and a socket's lines arrive in one loop, and none is lost")
+{
+  vio::event_loop_t loop;
+  mixer_t mixer;
+  run_gui_test(loop,
+               [](vio::event_loop_t &loop, mixer_t &mixer) -> vio::task_t<void>
+               {
+                 gui::display_config_t display_config;
+                 display_config.backend = "null";
+                 display_config.frame_interval_ns = std::chrono::nanoseconds(2ms).count();
+                 auto display = gui::display_t::open(loop, display_config);
+                 REQUIRE(display.has_value());
+                 {
+                   auto server = listener(loop);
+                   REQUIRE(server.has_value());
+                   auto address = vio::ip4_addr("127.0.0.1", server->second);
+                   REQUIRE(address.has_value());
+                   auto listening = vio::tcp_listen(server->first, 4);
+                   std::optional<vio::tcp_t> client;
+                   {
+                     auto created = vio::tcp_create(loop);
+                     REQUIRE(created.has_value());
+                     client.emplace(std::move(created.value()));
+                   }
+                   auto connected = co_await vio::tcp_connect(*client, reinterpret_cast<const sockaddr *>(&address.value()));
+                   REQUIRE(connected.has_value());
+                   REQUIRE((co_await std::move(listening)).has_value());
+                   auto accepted = vio::tcp_accept(server->first);
+                   REQUIRE(accepted.has_value());
+                   auto reader = vio::tcp_create_reader(accepted.value());
+                   REQUIRE(reader.has_value());
+                   mixer.reader = &reader.value();
+                   {
+                     auto window = gui::window_t::create(*display, {.size = {100, 100}});
+                     auto running = ui::run(*window, mixer);
+                     // A line split across writes, a CRLF, and an unterminated tail the close ends.
+                     const std::string first = "alpha\nbeta\r\ngam";
+                     (void)co_await vio::write_tcp(*client, reinterpret_cast<const uint8_t *>(first.data()), first.size());
+                     (void)co_await vio::sleep(loop, 20ms);
+                     const std::string second = "ma\nlast";
+                     (void)co_await vio::write_tcp(*client, reinterpret_cast<const uint8_t *>(second.data()), second.size());
+                     window->impl()->on_input(gui::pointer_move_event_t{{5, 5}});
+                     window->impl()->on_input(gui::pointer_button_event_t{gui::button_t::left, true, {5, 5}});
+                     window->impl()->on_input(gui::pointer_button_event_t{gui::button_t::left, false, {5, 5}});
+                     (void)co_await vio::sleep(loop, 20ms);
+                     client.reset();
+                     for (int i = 0; i < 50 && !mixer.finished; ++i)
+                       (void)co_await vio::sleep(loop, 10ms);
+                     window->close();
+                     co_await std::move(running);
+                   }
+                 }
+                 loop.stop();
+               }(loop, mixer));
+  CHECK(mixer.finished);
+  CHECK(mixer.presses == 1);
+  CHECK(mixer.ticks >= 3);
+  CHECK(mixer.lines == std::vector<std::string>{"alpha", "beta", "gamma", "last"});
+  CHECK(mixer.closed);
 }
