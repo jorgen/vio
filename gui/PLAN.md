@@ -328,8 +328,8 @@ Layout is fixed sizes and row/column stacking. Flex-style grow and shrink comes 
 
 ### Rendering
 
-The renderer reads the display list and never reaches into the component layer. Phase 9 built what
-this section describes except where it says otherwise; G24-G38 hold the reasons.
+The renderer reads the display list and never reaches into the component layer. Phases 9 and 10
+built what this section describes except where it says otherwise; G24-G40 hold the reasons.
 
 **Two lists, not one.** `draw_item_t` stays what it is: one entry per hit-testable box, walked
 backwards for input. Layout also emits a `display_list_t` in painter's order, which is what the
@@ -365,17 +365,27 @@ skipped (G29). They wait for a profile that asks for them -- plots are the likel
 window's size on Wayland and macOS and its size divided by the UI scale on Windows and X11. The
 renderer scales by framebuffer / logical. On a 144 DPI Windows display a 60-unit box is 90 pixels.
 
-**One pipeline so far** (G26). One instanced quad per primitive, its shape computed per pixel: a
-rounded rectangle with per-corner radii and a border, or a blurred one, which is a shadow (G37).
-Antialiasing is half a pixel either side of the exact distance; no MSAA. Colours are authored in
-sRGB and blended in linear space (G38). Still to come in later phases: circles, arcs, capsules,
-markers, polyline segments and glyphs in the same pipeline, and the triangle-mesh pipeline for
-fills.
+**One pipeline so far** (G26). One instanced quad per primitive, of two kinds (`prim_kind_t`). A
+shape is computed per pixel: a rounded rectangle with per-corner radii and a border, or a blurred
+one, which is a shadow (G37). Antialiasing is half a pixel either side of the exact distance; no
+MSAA. Coverage -- a glyph or an icon -- is a rectangle of the atlas copied texel for texel and tinted
+(G39). Colours are authored in sRGB and blended in linear space (G38). Still to come in later
+phases: circles, arcs, capsules, markers and polyline segments in the same pipeline, and the
+triangle-mesh pipeline for fills.
 
-**Text** (G27): HarfBuzz shapes, FreeType rasterizes at the exact pixel size into a coverage atlas
-keyed by font, size, glyph and one of four horizontal subpixel offsets. Blending is in linear
-space. Icons are FreeType outline renders of vector paths into the same atlas, so general paths are
-not needed on the GPU.
+**Text** (G27, G39, G40). `text_t` is one line in one `font_t` at a size in logical units; a
+`font_t` is a file's bytes and HarfBuzz's face over them, shared freely. Layout shapes it with
+HarfBuzz and gets back its size and one coverage prim per inked glyph; FreeType rasterizes each at
+size x scale pixels, light hinting, at one of four horizontal subpixel offsets, into an R8 atlas
+keyed by font, pixel size, glyph and offset. All of a text's glyphs share one anchor, which the
+shader rounds to a whole pixel, so the spacing HarfBuzz gave them survives any scale and any chunk
+origin. A new scale empties the atlas and lays everything out again; so does an atlas that fills at
+4096 square. `icon_t` is a `path_t` in a unit square, rasterized by FreeType's outline renderer
+into the same atlas, so general paths are not needed on the GPU. Shaping runs where layout does,
+so only for changed subtrees. Text with no font named uses `run_config_t::font`, else
+`font_t::system_default()`. `src/ui_text.cpp` is all of it; nothing in `ui.h` names FreeType or
+HarfBuzz. Not yet: bidirectional text, font fallback, wrapping, baseline alignment in a row (a row
+aligns tops), colour glyphs -- G40.
 
 **Plots** (G28): polyline segments expanded in the vertex shader from a point buffer with miter
 joins (bevel past a limit), so translucent lines do not double-blend at joints; fills as triangle
@@ -396,10 +406,16 @@ program's. `run_config_t::api` picks Vulkan, GL or automatic (Vulkan, then GL), 
 reports which was chosen and why the others were not.
 
 **GL** stays as the fallback (G32): the scissor-clear stopgap of G23, now reading the display list.
-Corners are square and shadows are skipped.
+Corners are square; shadows, text and icons are skipped.
 
 **Damage** (G36). An expose -- `expose_event_t`, new in the window layer -- wakes the frame loop,
 and the frame that follows reuses every chunk and runs no view.
+
+**The atlas on the GPU** (G39). The display list carries an `atlas_view_t`: the pixels, a
+generation, and the rectangle changed since the previous list. Vulkan keeps one `R8_UNORM` image,
+read with `OpImageFetch` (no sampler), and copies only the dirty rectangle through a per-frame
+staging buffer before the render pass; a new generation, a grown atlas, or a frame that was skipped
+is a whole upload.
 
 **Backend seam.** Per graphics API the renderer needs about five operations: upload a buffer,
 upload a texture region, set a scissor, draw instanced, present. It is not a general rendering
@@ -408,9 +424,15 @@ hardware interface and must not grow into one. APIs are loaded at run time as G6
 **Verified so far.** Windows, MSVC, AMD Radeon RX 5700 XT: `test/test_ui_render.cpp` (display list,
 chunks, hysteresis, expose, and an offscreen Vulkan render read back pixel by pixel), and
 `vio_gui_ui_counter` drawn through the swapchain at 144 DPI and checked by a screen capture. The
-chunk-hysteresis and expose tests were each confirmed to fail with their fix reverted. **Not run:**
-Linux (lavapipe, X11, Wayland) and macOS (MoltenVK) -- Docker was down; clang-cl `-fsyntax-only`
-over the new sources is the only check beyond MSVC.
+chunk-hysteresis and expose tests were each confirmed to fail with their fix reverted. Phase 10:
+`test/test_ui_text.cpp` -- Devanagari reordering and Arabic joining from HarfBuzz's own test fonts,
+a label and an icon at 1x and 2x, an atlas filling and emptying, and two offscreen renders, one of
+which draws a glyph that reaches the GPU only through a dirty rectangle (confirmed to fail with
+partial uploads switched off). `vio_gui_ui_counter` now shows labels, a star icon and a line of
+Arabic, captured at 144 DPI; that capture is what found the barrier problem in G39, which no test
+reproduces. **Not run:** Linux (lavapipe, X11, Wayland) and macOS (MoltenVK) -- Docker was down;
+clang-cl `-fsyntax-only` over the phase 9 sources is the only check beyond MSVC. No validation
+layer is installed on the machine that ran this, so `VIO_VULKAN_VALIDATION=1` checked nothing.
 
 Open:
 
@@ -422,6 +444,11 @@ Open:
   below it changed. G29 records both and the fix for each.
 - Device loss is handled by giving up: `render` returns false and the frame loop stops drawing. A
   recreate would be better and is not written.
+- The atlas never evicts: glyphs no longer shown stay until it fills at 4096 square and is emptied
+  whole, which relays out everything once. Fine for UI text; a plot labelling at many sizes may want
+  per-size eviction.
+- Boxes have no children, so a label cannot sit on a button yet; that is padding and alignment,
+  the flex work after phase 10.
 
 ## Phases
 
@@ -436,6 +463,6 @@ Open:
 | 7 | UI: `list_t`, props, child scopes, `spawned_t<T>` | a dynamic list example; unmount tests |
 | 8 | UI: `merge` and the source adapters | a component mixing presses, a timer and a socket |
 | 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint. **In on Windows**; Linux and macOS not yet run | rounded rects, borders and shadows on screen; an expose with no change repaints |
-| 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons | labels at 1x and 2x scale; a shaping test with a non-Latin script |
+| 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons. **In on Windows**; Linux and macOS not yet run | labels at 1x and 2x scale; a shaping test with a non-Latin script |
 | 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation | thick translucent zigzag lines; a million-point series panned at frame rate |
 | 12 | D3D12 and Metal backends | the phase 9 to 11 examples on each |

@@ -368,3 +368,49 @@ linear and premultiplies; blending is `ONE, ONE_MINUS_SRC_ALPHA`; the swapchain 
 so the hardware encodes on write. Where a surface offers no sRGB format the shader encodes itself
 (`encode_srgb` in the push constants). The clear colour is converted on the CPU to match. This is
 what G27 asks of text, set up before text arrives.
+
+## G39. Glyphs and icons are coverage prims into one R8 atlas, rounded at a shared anchor
+
+A coverage prim is a rectangle of the atlas copied texel for texel: no sampler, no filtering, one
+texel per pixel. That holds only if the rectangle lands on whole pixels, and layout cannot place it
+there itself -- a run's origin and a non-holder's offset are logical units, which at 1.5x are half
+pixels. So a glyph carries a logical anchor (its text node's position) and an integer pixel offset
+from it, and the vertex shader rounds the anchor. Every glyph of a text shares the anchor and rounds
+the same way, so HarfBuzz's spacing is kept exactly; rounding each glyph would shift them by
+different amounts. The subpixel offset (one of four) is chosen from the pen position relative to the
+anchor, which is what the rounding preserves.
+
+FreeType renders with light hinting -- vertical only -- because HarfBuzz's advances are unhinted and
+full hinting would change widths under them. Both are fetched by cmake-dep: FreeType 2.15.0 with
+HarfBuzz, zlib, bzip2, PNG and Brotli off; HarfBuzz 15.1.0 compiled from its `harfbuzz.cc`
+amalgamation with its own OpenType font functions, so neither sees the other. Both are private to
+`vio_gui_ui`.
+
+The atlas is shelf-packed, starts at 512 square and doubles to 4096; full at that size it is emptied
+and the frame lays everything out again once, since what was laid out before names rectangles that
+are gone. A new scale empties it too, because every glyph's pixel size changes. One atlas per
+runtime: FreeType faces are not thread-safe and a window's loop owns its runtime, so nothing is
+locked. `font_t` itself -- the bytes and an `hb_face_t` -- is immutable and shared.
+
+Uploads are the dirty rectangle since the previous display list, through a per-frame staging buffer,
+before the render pass. The barrier after the copy waits on all commands, not only transfer, and
+that is empirical: on an RX 5700 XT with a frame in flight, a copy whose rows were not 4-byte
+aligned was not there when the same frame's fragments read it, so new glyphs (the clock's digits in
+the counter example) did not appear. Waiting for idle after each frame, aligning the copy, or
+widening the barrier's source stage each fixed it; the offscreen test, which waits between frames,
+never showed it. The spec reading is that `TRANSFER -> FRAGMENT_SHADER` suffices; no validation layer
+was available to say otherwise, so treat this as a driver workaround until one does. It costs
+nothing measurable: it runs only on frames that upload.
+
+## G40. A text node is one line, one font, one direction
+
+`text_t` is shaped as a single HarfBuzz run whose direction, script and language HarfBuzz guesses
+from the text. A line of Arabic, Hebrew or Devanagari is right; a line mixing directions is not,
+because that needs the Unicode bidirectional algorithm to split it into runs first. Missing glyphs
+draw as the font's .notdef: there is no fallback list. No wrapping, and a row aligns tops, not
+baselines. Each of those is real work with a library or an algorithm behind it (SheenBidi or
+fribidi, fontconfig or a fallback table, line breaking per UAX 14), and none is needed to put a
+label on a UI. The default font is found by path -- Segoe UI, the macOS system font, DejaVu, Noto or
+Liberation Sans -- rather than through fontconfig, which would be a third dependency loaded at run
+time for one lookup; `run_config_t::font` overrides it. Colour glyphs (emoji) are not drawn: the
+atlas is one channel.
