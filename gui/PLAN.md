@@ -502,4 +502,30 @@ Open:
 | 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint. **In on Windows**; Linux and macOS not yet run | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons. **In on Windows**; Linux and macOS not yet run | labels at 1x and 2x scale; a shaping test with a non-Latin script |
 | 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation. **In on Windows** (G41, G44); no mesh pipeline | thick translucent zigzag lines; a million-point series panned at frame rate |
-| 12 | D3D12 and Metal backends | the phase 9 to 11 examples on each |
+| 12 | D3D12 and Metal backends. **On hold** | the phase 9 to 11 examples on each |
+| -- | Stress test: Qt's chip demo five times over, 200,000 movable, editable chips (`vio_gui_ui_chips`). **Holds at 60 fps on Windows** (G45) | `vio_gui_ui_chips --bench` |
+
+## Stress test
+
+`examples/ui_chips.cpp` is Qt's 40,000-chip graphics view demo five times over: 200,000 chips in a
+500 x 400 grid, each movable by dragging and editable by typing, with pan, zoom about the pointer and
+more detail as it zooms in. The chips are data in 400 tiles of 500; a tile is a component whose props
+are a zoom step, whether it is in view and a version its chips bump. `--bench` drives five workloads
+for three seconds each and prints a table. Release, MSVC, Windows 11, RX 5700 XT, 3840x2160 at
+150 %, a 60 Hz display; CPU is the loop thread's time per frame (views + layout + display list +
+recording), averaged:
+
+| workload | fps | CPU ms | prims |
+|---|---|---|---|
+| all 200,000 in view, panning | 63 | 4.0 | 200,070 |
+| zoomed in to labels, panning | 62 | 1.1 | 22,918 |
+| zooming, all in view | 64 | 6.3 | 200,068 |
+| dragging a chip, all in view | 64 | 4.2 | 200,068 |
+| typing into a label, zoomed in | 63 | 4.6 | 26,083 |
+
+Every workload holds the display's rate. The first run did not: panning everything cost 18.6 ms
+and zooming 81 ms, and G45 records what changed. The p95 frame interval is two refreshes in every
+workload, the light ones included, which points at the benchmark's pacing (a 1 ms sleep racing the
+frame) rather than load; GPU time is not measured. What remains proportional to what is in view: a
+frame with all 200,000 chips copies 16 MB of prims into the display list and again into the frame's
+vertex buffer (about 1.7 and 1.9 ms) -- uploading only the chunks that changed would remove both.

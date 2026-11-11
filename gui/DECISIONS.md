@@ -534,3 +534,35 @@ buffer or descriptor for one feature, and the prim was enough:
 Not built: pan and zoom as a uniform. A plot that pans rebuilds its prims, which at a few thousand
 per plot after decimation is cheap; a million-point series is decimated per rebuild, which costs
 the walk over a million points.
+
+## G45. What a 200,000-chip scene needed: mount lists, culling, and zoom as a run scale
+
+The chip stress test (PLAN.md, "Stress test") was measured first and changed after, and each change
+is what a profile of that build pointed at:
+
+- **A clean view's mounts are kept, not searched for.** Finding the mounted children of a component
+  walked its whole cached node tree every frame, so a scene whose 400 tiles had not changed still
+  walked 200,000 chip nodes: 8 ms a frame of panning with no view run. Each slot now records its
+  mounts when its view runs. Panning everything went from 18.6 to 4.0 ms.
+- **Hit testing collects only what a press can be aimed at,** and skips subtrees with none, unless
+  `on_layout` asks for every box; the chips have no pressables, so their 200,000 boxes cost nothing.
+- **Chunks and hit-test items wholly outside the window are skipped** (with a margin for shadows). A
+  chunk skipped while it changed is flattened again when it next comes into view, and so is every
+  holder below it on the changed path, since the per-frame dirty marks are cleared either way.
+- **Zoom is a scale on the run, applied by the GPU.** `mount_t::scale` draws a component that many
+  times its layout size without laying it out again; positions, sizes, radii, borders and line
+  widths scale in the shader, glyphs keep their pixel size and move with their anchor (they are
+  texel-exact), and layout and hit testing see the scaled size. A scaled mount is always a holder,
+  since the scale belongs to a run. The scene lays tiles out at zoom steps a factor of the square
+  root of two apart and scales between them, so a zoom gesture rebuilds nothing until it crosses a
+  step: zooming with everything in view went from 81 to 6.3 ms. This is the "pan and zoom as a
+  uniform" G28 planned, at the level of a mount rather than a plot.
+- **`run_config_t::on_stats`** reports each frame's cost by phase, which is how all of the above
+  was found.
+
+The stress test also found a shutdown race the examples had always had: the runtime read the event
+loop through the window, and a behaviour woken by its own timer after the window closed -- before
+the frame loop noticed -- asked for the loop through a window that no longer had one. The runtime
+now keeps the loop from construction. `vio_gui_ui_counter`'s timed exit failed about two runs in
+five before and none in twenty after; a unit test on the null backend did not reproduce it, so
+there is none.
