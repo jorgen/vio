@@ -567,6 +567,29 @@ struct column_t
   std::vector<node_t> children;
 };
 
+// The values of a heatmap: `columns * rows` of them, row by row from the top. Shared, because a
+// heatmap is uploaded into the glyph atlas once and found again by this object's address: after
+// changing `values`, bump `version` so the next layout uploads them again (G44).
+struct heatmap_data_t
+{
+  int columns = 0;
+  int rows = 0;
+  std::vector<float> values;
+  std::uint64_t version = 0;
+};
+
+// A grid of values drawn `size` logical units large, each cell coloured through viridis from
+// `low` (dark blue) to `high` (yellow): a spectrogram, an occupancy map. Cells are 256 levels
+// between low and high, nearest-sampled, so a cell is a sharp rectangle at any size.
+struct heatmap_t
+{
+  extent_t size;
+  std::shared_ptr<const heatmap_data_t> data;
+  float low = 0;
+  float high = 1;
+  float opacity = 1;
+};
+
 // Empty space that grows: `row_t{.children = {label, ui::spacer_t{}, button}}` puts the button at
 // the far end of a row that was given more room than it needs.
 struct spacer_t
@@ -619,7 +642,7 @@ struct mount_t
   void (*apply_props)(void *component, const void *props) = nullptr;
 };
 
-struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t, at_t, polyline_t, spacer_t>
+struct node_t : std::variant<box_t, row_t, column_t, mount_t, text_t, icon_t, at_t, polyline_t, spacer_t, heatmap_t>
 {
   using variant::variant;
 };
@@ -1540,13 +1563,19 @@ enum class prim_kind_t : std::uint32_t
   // offset of its top left from the rounded anchor (2, 3). Every glyph of one text node shares the
   // anchor, so they all round the same way and the spacing HarfBuzz gave them survives.
   coverage = 1,
-  // A line segment with round ends: from (x, y) to (radii[0], radii[1]), `border_width` wide, in
-  // `fill`; all logical units. A polyline is one per segment (G41).
+  // A line segment: from (x, y) to (radii[0], radii[1]), `border_width` wide, in `fill`; all logical
+  // units. At each end either a join plane -- its normal in radii[2..3] at the start and in
+  // border_color[0..1] at the end, pointing along the line -- which the neighbouring segment shares
+  // exactly, so every pixel of a mitred joint is drawn once; or a zero normal, for a round end. A
+  // polyline is one per segment (G41, G44).
   segment = 2,
   // The area under a segment: from x to radii[0] across, below the line from (x, y) to
   // (radii[0], radii[1]) and down to radii[2]. Antialiased along the line only, so the areas of
   // neighbouring segments, which share an x exactly, meet without a seam or an overlap.
   area = 3,
+  // A heatmap's cells: x, y, width and height in logical units; radii[0..1] the atlas texel of its
+  // first cell and radii[2..3] its columns and rows; `fill`'s alpha its opacity (G44).
+  heatmap = 4,
 };
 
 // One primitive: an instanced quad whose shape the fragment shader computes. Relative to the origin

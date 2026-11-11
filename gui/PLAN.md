@@ -408,19 +408,17 @@ row aligned on baselines lines up. `tight` measures a text by its ink rather tha
 symbol centred on a button (G41). Not yet: bidirectional text, font fallback, wrapping, colour
 glyphs -- G40.
 
-**Plots, first slice** (G41): `polyline_t` is a line through points in a box of a given size, with
-round joins, an optional fill down to the box's bottom and optional round markers -- one segment
-prim per segment, one area prim per segment of fill, one shape per marker, all through the one
-pipeline. With rules, bars as boxes under `at_t`, and text for the labels, that is enough for the
-scrolling line, bar and scatter plots in `vio_gui_ui_counter`. The plot rebuilds its prims whenever
-its data changes; that is a few thousand prims and fine at UI rates, and it is what the rest below
-replaces.
-
-**Plots, the rest** (G28): polyline segments expanded in the vertex shader from a point buffer with miter
-joins (bevel past a limit), so translucent lines do not double-blend at joints; fills as triangle
-strips; heatmaps as an `R32F` data texture plus a colormap lookup texture; series uploaded in plot
-coordinates relative to a per-series origin subtracted in `double`, with pan and zoom as a uniform;
-M4 decimation (first, last, min, max per pixel column) once a series has more points than pixels.
+**Plots** (G28, G41, G44): `polyline_t` is a line through points in a box of a given size, mitred at
+its joints (round past a mitre limit of 4, and at its ends), with an optional fill down to the box's
+bottom and optional round markers -- one segment prim per segment, one area prim per segment of
+fill, one shape per marker, all through the one pipeline. A segment carries the join plane at each
+end, shared bit for bit with its neighbour, so a translucent line is drawn once at every joint.
+Past four points a pixel column a line is M4-decimated where it is placed. `heatmap_t` is a grid
+of values quantized to 256 levels into a region of the glyph atlas and coloured through viridis in
+the shader, re-uploaded when its data's version changes. With rules, bars as boxes under `at_t`, and
+text for the labels, that makes the scrolling line, bar, scatter and spectrogram plots in
+`vio_gui_ui_counter`. A plot rebuilds its prims whenever its data changes. Departures from G28, and
+why, are in G44: no point buffer or pan uniform, no triangle-strip fills, no float texture.
 
 **Shaders** (G25, G33): `src/shaders/ui.slang` is the source. `src/shaders/ui_spirv.h` is the
 compiled SPIR-V, committed, so building vio needs no shader compiler; `cmake --build <dir> --target
@@ -485,8 +483,9 @@ Open:
 - The atlas never evicts: glyphs no longer shown stay until it fills at 4096 square and is emptied
   whole, which relays out everything once. Fine for UI text; a plot labelling at many sizes may want
   per-size eviction.
-- A translucent polyline darkens where its segments overlap at each point (G41). Phase 11's joined
-  segments (G28) fix it; until then plot lines are opaque.
+- A translucent line still darkens where it overlaps itself away from a joint, and at a joint past
+  the mitre limit, which is round (G44).
+- A heatmap's region of the atlas is never freed until the atlas fills and is emptied (G44).
 
 ## Phases
 
@@ -502,5 +501,5 @@ Open:
 | 8 | UI: `merge` and the source adapters. **In on Windows** (G43): `ui::merge`, `ui::every`, `ui::lines` | a component mixing presses, a timer and a socket |
 | 9 | Renderer: display list with per-slot commands, dirty propagation and chunks, cached layout, logical-unit layout, Slang shaders, the primitive pipeline on Vulkan, damage repaint. **In on Windows**; Linux and macOS not yet run | rounded rects, borders and shadows on screen; an expose with no change repaints |
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons. **In on Windows**; Linux and macOS not yet run | labels at 1x and 2x scale; a shaping test with a non-Latin script |
-| 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation. **First slice in on Windows** (G41): round-joined segments, area fills, markers | thick translucent zigzag lines; a million-point series panned at frame rate |
+| 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation. **In on Windows** (G41, G44); no mesh pipeline | thick translucent zigzag lines; a million-point series panned at frame rate |
 | 12 | D3D12 and Metal backends | the phase 9 to 11 examples on each |

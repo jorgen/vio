@@ -228,10 +228,10 @@ std::vector<ui::node_t> rules(std::initializer_list<double> values, double low, 
 
 // A titled panel around a plot: the title and the current value on one baseline, the plot, and the
 // time axis under it, labelled at its ends and its middle.
-ui::node_t plot_panel(std::string title, std::string value, ui::color_t accent, std::vector<ui::node_t> layers, int span)
+ui::node_t plot_panel(std::string title, std::string value, ui::color_t accent, std::vector<ui::node_t> layers, int span, int width = plot_width)
 {
-  const auto axis_label = [](std::string text, ui::align_t align)
-  { return ui::box_t{.size = {plot_width / 3, 14}, .color = clear, .align_x = align, .children = {ui::text_t{.text = std::move(text), .size = 11, .color = grey}}}; };
+  const auto axis_label = [width](std::string text, ui::align_t align)
+  { return ui::box_t{.size = {width / 3, 14}, .color = clear, .align_x = align, .children = {ui::text_t{.text = std::move(text), .size = 11, .color = grey}}}; };
   return ui::box_t{
     .color = panel,
     .radius = 8,
@@ -245,7 +245,7 @@ ui::node_t plot_panel(std::string title, std::string value, ui::color_t accent, 
       .children = {
         ui::row_t{.gap = 8, .align = ui::align_t::baseline, .children = {ui::text_t{.text = std::move(title), .size = 13, .color = grey}, ui::text_t{.text = std::move(value), .size = 20, .color = accent}}},
         // The layers overlap at the plot's top left.
-        ui::box_t{.size = {plot_width, plot_height}, .color = clear, .align_x = ui::align_t::start, .align_y = ui::align_t::start, .children = std::move(layers)},
+        ui::box_t{.size = {width, plot_height}, .color = clear, .align_x = ui::align_t::start, .align_y = ui::align_t::start, .children = std::move(layers)},
         ui::row_t{.children = {axis_label("-" + std::to_string(span) + " s", ui::align_t::start), axis_label("-" + std::to_string(span / 2) + " s", ui::align_t::center), axis_label("now", ui::align_t::end)}},
       }}}};
 }
@@ -388,6 +388,56 @@ struct temperature_plot_t
   }
 };
 
+// A spectrogram: a column of frequency bins ten times a second, the newest at the right, drawn as a
+// heatmap. Two tones wander and a burst of broadband noise comes and goes. The values change in
+// place and the version is bumped, so only the heatmap's region of the atlas is uploaded again.
+struct spectrum_plot_t
+{
+  static constexpr int columns = 100;
+  static constexpr int bins = 32;
+  static constexpr int width = 230;
+  std::shared_ptr<ui::heatmap_data_t> data = std::make_shared<ui::heatmap_data_t>(ui::heatmap_data_t{columns, bins, std::vector<float>(std::size_t(columns) * bins, 0.0f), 0});
+  float peak = 0;
+
+  ui::node_t view() const
+  {
+    return plot_panel("spectrum", "peak bin " + fixed(peak, 0), cyan, {ui::heatmap_t{.size = {width, plot_height}, .data = data, .low = 0, .high = 1.2f}}, columns / 10, width);
+  }
+
+  ui::behaviour_t behave(ui::scope_t &scope)
+  {
+    const auto start = std::chrono::steady_clock::now();
+    std::mt19937 random(4);
+    std::uniform_real_distribution<float> noise(0, 0.15f);
+    auto &values = data->values;
+    while (co_await vio::sleep(scope.loop(), 100ms, scope.token()))
+    {
+      const double now = seconds_since(start);
+      const float tone = float(bins / 2 + (bins / 3) * std::sin(now * 0.6));
+      const float overtone = tone * 0.5f + 4;
+      const bool burst = std::fmod(now, 7.0) < 1.0;
+      float loudest = 0;
+      for (int bin = 0; bin < bins; ++bin)
+      {
+        // Row 0 is the top: high frequencies up, as a spectrogram is read.
+        const float f = float(bins - 1 - bin);
+        float v = std::exp(-(f - tone) * (f - tone) / 3.0f) + 0.6f * std::exp(-(f - overtone) * (f - overtone) / 2.0f) + noise(random);
+        if (burst)
+          v += 0.5f;
+        auto *row = &values[std::size_t(bin) * columns];
+        std::move(row + 1, row + columns, row);
+        row[columns - 1] = v;
+        if (v > loudest)
+        {
+          loudest = v;
+          peak = f;
+        }
+      }
+      ++data->version;
+    }
+  }
+};
+
 struct app_t
 {
   counter_t top;
@@ -396,6 +446,7 @@ struct app_t
   intensity_plot_t intensity;
   events_plot_t events;
   temperature_plot_t temperature;
+  spectrum_plot_t spectrum;
   std::shared_ptr<const ui::path_t> icon = star();
 
   ui::node_t view() const
@@ -421,6 +472,7 @@ struct app_t
                                                    .align = ui::align_t::baseline,
                                                    .children = {ui::text_t{.text = "Arabic:", .size = 13, .color = grey},
                                                                 ui::text_t{.text = "\xD9\x85\xD8\xB1\xD8\xAD\xD8\xA8\xD8\xA7\x20\xD8\xA8\xD8\xA7\xD9\x84\xD8\xB9\xD8\xA7\xD9\x84\xD9\x85", .size = 20, .color = ink}}},
+                                         ui::mount(spectrum),
                                        }},
                         ui::column_t{.gap = 12, .children = {ui::mount(intensity), ui::mount(events), ui::mount(temperature)}},
                       }},

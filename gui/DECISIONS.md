@@ -504,3 +504,33 @@ They mark themselves quiet: their own wake-ups do not rebuild the component, whi
 16 ms would otherwise do every period whether or not anything consumed the tick. A stream's end is
 an event (`line_t::closed`), not the source going away, which would leave a waiting merge waiting.
 Tested against a real loopback TCP connection with a line split across writes and a CRLF.
+
+## G44. Plot lines are mitred segments in the one pipeline; heatmaps live in the atlas
+
+G28 planned a point buffer read by the vertex shader, a pan-and-zoom uniform, triangle strips for
+fills and an R32F texture for heatmaps. What was built keeps everything in the instanced-prim
+pipeline the rest of the toolkit uses, because each of those would have been a second pipeline,
+buffer or descriptor for one feature, and the prim was enough:
+
+- **Joins.** A segment carries, at each end, the plane its neighbour shares: through the joint,
+  square to the sum of the two directions, which is the mitre line. The CPU writes the same floats
+  into both segments; the shader tests the pixel against it in logical units with `precise`
+  arithmetic (SPIR-V `NoContraction`), so the two compute the same answer and exactly one draws the
+  pixel -- the lesson of the area seams in G41, applied before the stripes showed this time. Inside
+  its planes a segment is a band square to its line, which is the mitre; a zero normal is a round
+  end, used at the line's ends and past a mitre limit of 4, where a mitre would spike. A test
+  renders a half-transparent zigzag and finds no pixel blended twice; with the joins turned round
+  it finds some.
+- **Decimation** is M4 on the CPU where the line is placed: per pixel column the first, lowest,
+  highest and last point. A million points become about four hundred segments, and the extremes
+  survive (a one-point spike is tested for). Lines whose x goes backwards are not decimated.
+- **Heatmaps** are quantized to 256 levels into a region of the R8 glyph atlas, keyed by the data's
+  address and re-quantized only when its `version` or range changes, so an updating spectrogram
+  uploads only its own rectangle through the dirty-rect path G39 already had. The colormap is a
+  polynomial fit of viridis in the shader. 256 levels is below what a colormap can show; the cost
+  is that a heatmap's region is never freed until the atlas fills, and that a heatmap is at most
+  4096 cells a side.
+
+Not built: pan and zoom as a uniform. A plot that pans rebuilds its prims, which at a few thousand
+per plot after decimation is cheap; a million-point series is decimated per rebuild, which costs
+the walk over a million points.

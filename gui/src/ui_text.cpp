@@ -264,6 +264,20 @@ struct text_engine_t::impl_t
   std::unordered_map<icon_key_t, cached_t, key_hash_t> icons;
   std::vector<std::shared_ptr<const path_t>> icon_paths; // keep the keys' addresses from being reused
 
+  // Heatmaps, by their data's address, held so the address is not reused while the region is.
+  struct heatmap_region_t
+  {
+    std::shared_ptr<const heatmap_data_t> data;
+    int x = 0;
+    int y = 0;
+    int columns = 0;
+    int rows = 0;
+    std::uint64_t version = 0;
+    float low = 0;
+    float high = 0;
+  };
+  std::unordered_map<const heatmap_data_t *, heatmap_region_t> heatmaps;
+
   impl_t()
   {
     FT_Init_FreeType(&library);
@@ -318,6 +332,7 @@ struct text_engine_t::impl_t
     glyphs.clear();
     icons.clear();
     icon_paths.clear();
+    heatmaps.clear();
     dirty = {};
     ++generation;
   }
@@ -390,17 +405,22 @@ struct text_engine_t::impl_t
       std::memcpy(&pixels[std::size_t(into.y + row) * width + into.x], source + std::ptrdiff_t(row) * pitch, std::size_t(w));
     into.width = w;
     into.height = h;
-    const rect_t added{into.x, into.y, w, h};
+    touched({into.x, into.y, w, h});
+  }
+
+  // Grow the rectangle the renderer uploads next to cover `added`.
+  void touched(const rect_t &added)
+  {
     if (dirty.width == 0 || dirty.height == 0)
-      dirty = added;
-    else
     {
-      const int x0 = std::min(dirty.x, added.x);
-      const int y0 = std::min(dirty.y, added.y);
-      const int x1 = std::max(dirty.x + dirty.width, added.x + added.width);
-      const int y1 = std::max(dirty.y + dirty.height, added.y + added.height);
-      dirty = {x0, y0, x1 - x0, y1 - y0};
+      dirty = added;
+      return;
     }
+    const int x0 = std::min(dirty.x, added.x);
+    const int y0 = std::min(dirty.y, added.y);
+    const int x1 = std::max(dirty.x + dirty.width, added.x + added.width);
+    const int y1 = std::max(dirty.y + dirty.height, added.y + added.height);
+    dirty = {x0, y0, x1 - x0, y1 - y0};
   }
 
   // ---- rasterizing
@@ -594,6 +614,57 @@ extent_t text_engine_t::add_icon(const icon_t &icon, float x, float y, std::vect
     out.push_back(prim);
   }
   return {logical, logical};
+}
+
+void text_engine_t::add_heatmap(const heatmap_t &map, float x, float y, std::vector<prim_t> &out)
+{
+  auto &impl = *_impl;
+  const auto *data = map.data.get();
+  if (!data || data->columns <= 0 || data->rows <= 0 || data->values.size() < std::size_t(data->columns) * std::size_t(data->rows))
+    return;
+  auto it = impl.heatmaps.find(data);
+  if (it == impl.heatmaps.end() || it->second.columns != data->columns || it->second.rows != data->rows)
+  {
+    impl_t::heatmap_region_t region;
+    if (!impl.allocate(data->columns, data->rows, region.x, region.y))
+      return;
+    region.data = map.data;
+    region.columns = data->columns;
+    region.rows = data->rows;
+    // Never matches a real version, so the values are written below.
+    region.version = ~data->version;
+    // Allocating may have emptied the atlas, and the map with it.
+    it = impl.heatmaps.insert_or_assign(data, std::move(region)).first;
+  }
+  auto &region = it->second;
+  if (region.version != data->version || region.low != map.low || region.high != map.high)
+  {
+    const float span = map.high - map.low;
+    const float to_level = span != 0 ? 255.0f / span : 0.0f;
+    for (int row = 0; row < data->rows; ++row)
+    {
+      auto *line = &impl.pixels[std::size_t(region.y + row) * impl.width + region.x];
+      const float *values = &data->values[std::size_t(row) * data->columns];
+      for (int column = 0; column < data->columns; ++column)
+        line[column] = std::uint8_t(std::clamp((values[column] - map.low) * to_level + 0.5f, 0.0f, 255.0f));
+    }
+    region.version = data->version;
+    region.low = map.low;
+    region.high = map.high;
+    impl.touched({region.x, region.y, data->columns, data->rows});
+  }
+  prim_t prim;
+  prim.kind = prim_kind_t::heatmap;
+  prim.x = x;
+  prim.y = y;
+  prim.width = float(map.size.width);
+  prim.height = float(map.size.height);
+  prim.radii[0] = float(region.x);
+  prim.radii[1] = float(region.y);
+  prim.radii[2] = float(data->columns);
+  prim.radii[3] = float(data->rows);
+  prim.fill = {1, 1, 1, map.opacity};
+  out.push_back(prim);
 }
 
 bool text_engine_t::take_reset() noexcept

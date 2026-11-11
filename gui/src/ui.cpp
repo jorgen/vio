@@ -171,6 +171,43 @@ void move_prim(prim_t &prim, float dx, float dy) noexcept
   }
 }
 
+// M4 decimation for a line whose x never decreases: per pixel column the first, lowest, highest
+// and last point, in their original order. Empty when x does decrease somewhere, which M4 cannot
+// keep the look of.
+std::vector<vec2_t> decimate_m4(const std::vector<vec2_t> &points, float scale)
+{
+  std::vector<vec2_t> out;
+  const std::size_t n = points.size();
+  std::size_t i = 0;
+  while (i < n)
+  {
+    const float column = std::floor(points[i].x * scale);
+    std::size_t first = i;
+    std::size_t low = i;
+    std::size_t high = i;
+    std::size_t last = i;
+    for (++i; i < n; ++i)
+    {
+      if (points[i].x < points[i - 1].x)
+        return {};
+      if (std::floor(points[i].x * scale) != column)
+        break;
+      if (points[i].y < points[low].y)
+        low = i;
+      if (points[i].y > points[high].y)
+        high = i;
+      last = i;
+    }
+    const std::size_t picks[4] = {first, std::min(low, high), std::max(low, high), last};
+    for (std::size_t k = 0; k < 4; ++k)
+    {
+      if (k == 0 || picks[k] != picks[k - 1])
+        out.push_back(points[picks[k]]);
+    }
+  }
+  return out;
+}
+
 // The nodes inside a container, or null.
 const std::vector<node_t> *children_of(const node_t &node) noexcept
 {
@@ -705,6 +742,12 @@ private:
     }
     if (const auto *line = std::get_if<polyline_t>(&node))
       return place_polyline(slot, *line, x, y);
+    if (const auto *map = std::get_if<heatmap_t>(&node))
+    {
+      _text.add_heatmap(*map, x, y, _glyphs);
+      place_glyphs(slot);
+      return {map->size};
+    }
     if (const auto *spacer = std::get_if<spacer_t>(&node))
       return {{std::max(spacer->size.width, want.width), std::max(spacer->size.height, want.height)}};
     if (const auto *at = std::get_if<at_t>(&node))
@@ -917,7 +960,13 @@ private:
   // then the markers over both.
   placed_t place_polyline(slot_t &slot, const polyline_t &line, float x, float y)
   {
-    const auto &points = line.points;
+    // Past four points a pixel column, M4 decimation: what is drawn is the same, and a million
+    // points become a few thousand segments (G28, G44). Markers are each drawn, so never decimated.
+    std::vector<vec2_t> decimated;
+    const float columns = float(line.size.width) * _scale;
+    if (line.marker <= 0 && columns > 0 && float(line.points.size()) > 4 * columns + 8)
+      decimated = decimate_m4(line.points, _scale);
+    const auto &points = decimated.empty() ? line.points : decimated;
     const auto push = [&](const prim_t &prim)
     {
       slot.entries.push_back(entry_t{prim});
@@ -943,6 +992,27 @@ private:
     }
     if (line.width > 0 && line.color.a > 0)
     {
+      // The join plane at each inner point: through it, square to the sum of the two directions --
+      // the mitre line. Both segments meeting there carry the same normal, so they split the joint's
+      // pixels exactly. Sharper than the mitre limit, or where the line doubles back, the joint is
+      // round instead: a zero normal, and the two segments' round ends overlap there (G44).
+      constexpr float mitre_limit = 4;
+      std::vector<vec2_t> joins(points.size());
+      for (std::size_t i = 1; i + 1 < points.size(); ++i)
+      {
+        const vec2_t d0{points[i].x - points[i - 1].x, points[i].y - points[i - 1].y};
+        const vec2_t d1{points[i + 1].x - points[i].x, points[i + 1].y - points[i].y};
+        const float l0 = std::hypot(d0.x, d0.y);
+        const float l1 = std::hypot(d1.x, d1.y);
+        if (l0 <= 0 || l1 <= 0)
+          continue;
+        const vec2_t sum{d0.x / l0 + d1.x / l1, d0.y / l0 + d1.y / l1};
+        const float length = std::hypot(sum.x, sum.y);
+        // length / 2 is the cosine of half the turn, and the mitre is 1 / that times the width.
+        if (length * 0.5f < 1.0f / mitre_limit)
+          continue;
+        joins[i] = {sum.x / length, sum.y / length};
+      }
       for (std::size_t i = 1; i < points.size(); ++i)
       {
         prim_t prim;
@@ -951,6 +1021,9 @@ private:
         prim.y = y + points[i - 1].y;
         prim.radii[0] = x + points[i].x;
         prim.radii[1] = y + points[i].y;
+        prim.radii[2] = joins[i - 1].x;
+        prim.radii[3] = joins[i - 1].y;
+        prim.border_color = {joins[i].x, joins[i].y, 0, 0};
         prim.border_width = line.width;
         prim.fill = line.color;
         push(prim);

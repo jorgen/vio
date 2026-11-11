@@ -65,6 +65,9 @@ public:
   };
   laid_out_t add_text(const text_t &text, const font_t &fallback, float x, float y, std::vector<prim_t> &out);
   extent_t add_icon(const icon_t &icon, float x, float y, std::vector<prim_t> &out);
+  // A heatmap's values, quantized into the atlas -- again only when its data or range changed --
+  // and the prim that draws them.
+  void add_heatmap(const heatmap_t &map, float x, float y, std::vector<prim_t> &out);
 
   // True once after the atlas filled at its largest size and was emptied: prims made before that
   // name rectangles that are gone, so the caller lays everything out again.

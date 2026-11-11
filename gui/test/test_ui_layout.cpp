@@ -418,3 +418,222 @@ TEST_CASE("vulkan: many thin areas at a fractional scale and origin cover every 
   }
   CHECK(odd == 0);
 }
+
+namespace
+{
+// Every display list a run produced, copied with the atlas, so it can be rendered afterwards.
+struct frame_copy_t
+{
+  std::vector<ui::prim_t> prims;
+  std::vector<ui::run_t> runs;
+  std::vector<std::uint8_t> atlas;
+  ui::atlas_view_t view;
+  gui::extent_t logical;
+  gui::extent_t framebuffer;
+  float scale = 1;
+
+  explicit frame_copy_t(const ui::display_list_t &list)
+    : prims(list.prims.begin(), list.prims.end())
+    , runs(list.runs.begin(), list.runs.end())
+    , atlas(list.atlas.pixels.begin(), list.atlas.pixels.end())
+    , view(list.atlas)
+    , logical(list.logical)
+    , framebuffer(list.framebuffer)
+    , scale(list.scale)
+  {
+  }
+  [[nodiscard]] ui::display_list_t list() const
+  {
+    ui::display_list_t out;
+    out.prims = prims;
+    out.runs = runs;
+    out.background = {1, 1, 1, 1};
+    out.logical = logical;
+    out.framebuffer = framebuffer;
+    out.scale = scale;
+    out.atlas = view;
+    out.atlas.pixels = atlas;
+    return out;
+  }
+};
+
+// Run `root` in a 200x100 null window and keep every display list; `poke` is pressed once after
+// the first settle if given.
+template <typename C>
+std::vector<frame_copy_t> frames_of(C &root, std::optional<gui::point_t> poke = std::nullopt)
+{
+  std::vector<frame_copy_t> frames;
+  vio::event_loop_t loop;
+  run_gui_test(loop,
+               [](vio::event_loop_t &loop, C &root, std::vector<frame_copy_t> &frames, std::optional<gui::point_t> poke) -> vio::task_t<void>
+               {
+                 gui::display_config_t display_config;
+                 display_config.backend = "null";
+                 display_config.frame_interval_ns = std::chrono::nanoseconds(2ms).count();
+                 auto display = gui::display_t::open(loop, display_config);
+                 REQUIRE(display.has_value());
+                 {
+                   auto window = gui::window_t::create(*display, {.size = {200, 100}});
+                   ui::run_config_t config;
+                   config.on_display_list = [&frames](const ui::display_list_t &list) { frames.emplace_back(list); };
+                   auto running = ui::run(*window, root, std::move(config));
+                   (void)co_await vio::sleep(loop, 40ms);
+                   if (poke)
+                   {
+                     window->impl()->on_input(gui::pointer_move_event_t{*poke});
+                     window->impl()->on_input(gui::pointer_button_event_t{gui::button_t::left, true, *poke});
+                     window->impl()->on_input(gui::pointer_button_event_t{gui::button_t::left, false, *poke});
+                     (void)co_await vio::sleep(loop, 40ms);
+                   }
+                   window->close();
+                   co_await std::move(running);
+                 }
+                 loop.stop();
+               }(loop, root, frames, poke));
+  return frames;
+}
+} // namespace
+
+TEST_CASE("vulkan: a translucent polyline is drawn once at every joint, mitred")
+{
+  // A zigzag with a sharp turn, a gentle one and a doubling-back (which falls back to round).
+  struct zigzag_t
+  {
+    ui::node_t view() const
+    {
+      return ui::polyline_t{.size = {200, 100}, .points = {{20, 80}, {60, 20}, {100, 80}, {140, 70}, {180, 75}, {150, 75}}, .width = 12, .color = {1, 0, 0, 0.5f}};
+    }
+  } root;
+  auto frames = frames_of(root);
+  REQUIRE(!frames.empty());
+  const auto list = frames.back().list();
+  std::vector<ui::prim_t> segments;
+  for (const auto &prim : list.prims)
+  {
+    if (prim.kind == ui::prim_kind_t::segment)
+      segments.push_back(prim);
+  }
+  // The sharp turn is mitred, and both segments carry the same plane; the doubling-back is round.
+  REQUIRE(segments.size() == 5);
+  CHECK((segments[0].border_color.r != 0 || segments[0].border_color.g != 0));
+  CHECK(segments[1].radii[2] == segments[0].border_color.r);
+  CHECK(segments[1].radii[3] == segments[0].border_color.g);
+  CHECK(segments[4].radii[2] == 0);
+  CHECK(segments[4].radii[3] == 0);
+
+  std::string why;
+  auto image = ui::detail::render_offscreen_vulkan(list, why);
+  if (!image)
+  {
+    MESSAGE("no Vulkan here, skipped: " << why);
+    return;
+  }
+  MESSAGE("rendered on " << image->device);
+  // Half red over white is one value of green; drawn twice it would be darker. Away from the
+  // round joint at the right, green is never below the single blend.
+  const int single = pixel(*image, 40, 50)[1];
+  CHECK(single > 100);
+  CHECK(single < 230);
+  int doubled = 0;
+  for (int y = 0; y < 100; ++y)
+  {
+    for (int x = 0; x < 135; ++x)
+    {
+      if (pixel(*image, x, y)[1] < single - 2)
+        ++doubled;
+    }
+  }
+  CHECK(doubled == 0);
+  // The mitre reaches past where a round joint would stop: the round cap's top is y = 14, and the
+  // mitre's point is higher.
+  CHECK(pixel(*image, 60, 11)[1] < 250);
+}
+
+TEST_CASE("ui plot: a million points are decimated to four a pixel column, keeping the extremes")
+{
+  struct dense_t
+  {
+    std::vector<ui::vec2_t> points;
+    ui::node_t view() const
+    {
+      return ui::polyline_t{.size = {200, 100}, .points = points, .width = 1, .color = {0, 0, 0, 1}};
+    }
+  } root;
+  root.points.reserve(1'000'000);
+  for (int i = 0; i < 1'000'000; ++i)
+  {
+    const float x = 200.0f * float(i) / 1'000'000.0f;
+    root.points.push_back({x, 50 + 40 * std::sin(float(i) * 0.37f)});
+  }
+  // One spike that must survive.
+  root.points[543'210].y = 99.5f;
+  auto frames = frames_of(root);
+  REQUIRE(!frames.empty());
+  std::size_t segments = 0;
+  float lowest = 1e9f;
+  float highest = -1e9f;
+  for (const auto &prim : frames.back().prims)
+  {
+    if (prim.kind != ui::prim_kind_t::segment)
+      continue;
+    ++segments;
+    lowest = std::min({lowest, prim.y, prim.radii[1]});
+    highest = std::max({highest, prim.y, prim.radii[1]});
+  }
+  CHECK(segments <= 4 * 200);
+  CHECK(segments >= 2 * 200);
+  CHECK(highest == 99.5f);
+  CHECK(lowest < 10.5f);
+}
+
+namespace
+{
+struct heat_t
+{
+  std::shared_ptr<ui::heatmap_data_t> data = std::make_shared<ui::heatmap_data_t>(ui::heatmap_data_t{4, 2, {0, 0.25f, 0.5f, 1, 1, 0.5f, 0.25f, 0}, 0});
+  ui::pressable_t poke;
+
+  ui::node_t view() const
+  {
+    return ui::row_t{.children = {ui::heatmap_t{.size = {80, 40}, .data = data}, ui::box_t{.size = {10, 10}, .color = {0, 0, 0, 1}, .events = poke}}};
+  }
+
+  ui::behaviour_t behave(ui::scope_t &)
+  {
+    auto presses = ui::subscribe<ui::press_event_t>(poke);
+    while (co_await presses)
+    {
+      data->values[0] = 1;
+      ++data->version;
+    }
+  }
+};
+} // namespace
+
+TEST_CASE("vulkan: a heatmap's cells are coloured through viridis, and a changed value reaches the screen")
+{
+  heat_t root;
+  auto frames = frames_of(root, gui::point_t{85, 5});
+  REQUIRE(frames.size() >= 2);
+  // The update went through the atlas's dirty rectangle, not a new atlas.
+  CHECK(frames.front().view.generation == frames.back().view.generation);
+  std::vector<ui::display_list_t> lists{frames.front().list(), frames.back().list()};
+  std::string why;
+  auto before = ui::detail::render_offscreen_vulkan(std::span(lists).first(1), why);
+  if (!before)
+  {
+    MESSAGE("no Vulkan here, skipped: " << why);
+    return;
+  }
+  auto after = ui::detail::render_offscreen_vulkan(lists, why);
+  REQUIRE(after.has_value());
+  // Cells are 20x20: the first is 0 (viridis' dark purple, about 68, 1, 84), the fourth 1 (yellow,
+  // about 253, 231, 37).
+  CHECK(close_to(pixel(*before, 10, 10), {68, 1, 84, 255}, 6));
+  CHECK(close_to(pixel(*before, 70, 10), {253, 231, 37, 255}, 6));
+  // A cell is a sharp rectangle: the second cell starts at x = 20.
+  CHECK(!close_to(pixel(*before, 19, 10), pixel(*before, 21, 10), 6));
+  // After the press the first cell is 1 too, and the second is unchanged.
+  CHECK(close_to(pixel(*after, 10, 10), {253, 231, 37, 255}, 6));
+  CHECK(close_to(pixel(*after, 30, 10), pixel(*before, 30, 10), 1));
+}
