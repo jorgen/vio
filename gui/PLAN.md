@@ -397,7 +397,8 @@ into the same atlas, so general paths are not needed on the GPU. Shaping runs wh
 so only for changed subtrees. Text with no font named uses `run_config_t::font`, else
 `font_t::system_default()`. `src/ui_text.cpp` is all of it; nothing in `ui.h` names FreeType or
 HarfBuzz. A text reports its baseline, a whole number of pixels below its anchor, which is what a
-row aligned on baselines lines up. Not yet: bidirectional text, font fallback, wrapping, colour
+row aligned on baselines lines up. `tight` measures a text by its ink rather than its line, for a
+symbol centred on a button (G41). Not yet: bidirectional text, font fallback, wrapping, colour
 glyphs -- G40.
 
 **Plots, first slice** (G41): `polyline_t` is a line through points in a box of a given size, with

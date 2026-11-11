@@ -104,7 +104,7 @@ ui::shadow_t lift(const ui::pressable_t &p)
 // A square button with its label centred on it.
 ui::node_t button(const ui::pressable_t &p, std::string label, ui::color_t normal, ui::color_t hover, ui::color_t held)
 {
-  return ui::box_t{.size = {60, 60}, .color = shade(p, normal, hover, held), .radius = 12, .shadow = lift(p), .events = p, .children = {ui::text_t{.text = std::move(label), .size = 28, .color = ink}}};
+  return ui::box_t{.size = {60, 60}, .color = shade(p, normal, hover, held), .radius = 12, .shadow = lift(p), .events = p, .children = {ui::text_t{.text = std::move(label), .size = 28, .color = ink, .tight = true}}};
 }
 
 struct counter_t

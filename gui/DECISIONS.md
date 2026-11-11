@@ -457,3 +457,11 @@ run's logical x, lies in [x0, x1) -- bounds passed through from the attributes w
 compared against a value computed the same way for that pixel in either prim, so exactly one of
 two neighbours keeps it. A test of three hundred thin areas at 1.5x on a fractional origin failed
 on 174 pixels of one row before that, and passes after.
+
+Centring a text centres its line -- ascent plus descent -- as CSS does, and a "+" or "-" sits on
+the font's maths axis, below the middle of that line: in Segoe UI the example's button labels were
+5.5 px low at 1.5x. `text_t::tight` measures a text by its ink instead, moving its glyphs by whole
+pixels so they stay texel-exact; it is opt-in, because a line of text must keep its line's height
+or neighbouring lines of different content would not match. A centred offset is also snapped to the
+nearest pixel rather than floored to a whole unit, which at 1.5x is worth up to three quarters of a
+pixel. The labels are now within half a pixel of centre.

@@ -519,6 +519,7 @@ text_engine_t::laid_out_t text_engine_t::add_text(const text_t &text, const font
   const auto *positions = hb_buffer_get_glyph_positions(impl.buffer, &count);
 
   // Glyphs come back in visual order, left to right, whatever the direction.
+  const std::size_t first = out.size();
   std::int64_t pen = 0;
   for (unsigned i = 0; i < count; ++i)
   {
@@ -541,6 +542,28 @@ text_engine_t::laid_out_t text_engine_t::add_text(const text_t &text, const font
     prim.radii[3] = float(baseline + cached.top - int(std::lround(positions[i].y_offset / 64.0)));
     prim.fill = text.color;
     out.push_back(prim);
+  }
+  if (text.tight && out.size() > first)
+  {
+    // The ink's bounds in pixels from the anchor, and every glyph moved by whole pixels so they
+    // start at the anchor: still one texel per pixel.
+    float left = out[first].radii[2];
+    float top = out[first].radii[3];
+    float right = left;
+    float bottom = top;
+    for (std::size_t i = first; i < out.size(); ++i)
+    {
+      left = std::min(left, out[i].radii[2]);
+      top = std::min(top, out[i].radii[3]);
+      right = std::max(right, out[i].radii[2] + out[i].width);
+      bottom = std::max(bottom, out[i].radii[3] + out[i].height);
+    }
+    for (std::size_t i = first; i < out.size(); ++i)
+    {
+      out[i].radii[2] -= left;
+      out[i].radii[3] -= top;
+    }
+    return {{int(std::ceil((right - left) / scale - 1e-3f)), int(std::ceil((bottom - top) / scale - 1e-3f))}, (float(baseline) - top) / scale};
   }
   const int width_px = int(ceil_div(int(std::max<std::int64_t>(pen, 0)), 64));
   const int height_px = baseline + below;

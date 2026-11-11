@@ -178,15 +178,17 @@ const std::vector<node_t> *children_of(const node_t &node) noexcept
   return nullptr;
 }
 
-// Where a child of `size` starts in `room`, by alignment. Baseline is resolved by the row itself.
-int aligned(align_t align, int room, int size) noexcept
+// Where a child of `size` starts in `room`, by alignment. Baseline is resolved by the row itself. A
+// centred child is snapped to the nearest pixel rather than floored to a whole unit: at 1.5x a unit
+// is a pixel and a half, and flooring left a centred label visibly off (G41).
+float aligned(align_t align, int room, int size, float scale) noexcept
 {
   switch (align)
   {
   case align_t::center:
-    return (room - size) / 2;
+    return std::round(float(room - size) * 0.5f * scale) / scale;
   case align_t::end:
-    return room - size;
+    return float(room - size);
   default:
     return 0;
   }
@@ -693,11 +695,11 @@ private:
     float baseline = -1;
     for (const auto &child : children)
     {
-      const int dx = aligned(box.align_x, room.width, child.placed.size.width);
-      const int dy = aligned(box.align_y, room.height, child.placed.size.height);
-      shift(slot, child, float(dx), float(dy));
+      const float dx = aligned(box.align_x, room.width, child.placed.size.width, _scale);
+      const float dy = aligned(box.align_y, room.height, child.placed.size.height, _scale);
+      shift(slot, child, dx, dy);
       if (baseline < 0 && child.placed.has_baseline())
-        baseline = float(pad.top + dy) + child.placed.baseline;
+        baseline = float(pad.top) + dy + child.placed.baseline;
     }
 
     if (shadowed)
@@ -760,10 +762,10 @@ private:
       {
         const auto &child = children[i];
         const auto &size = child.placed.size;
-        const int d = aligned(align, across, horizontal ? size.height : size.width);
-        shift(slot, child, horizontal ? 0.0f : float(d), horizontal ? float(d) : 0.0f);
+        const float d = aligned(align, across, horizontal ? size.height : size.width, _scale);
+        shift(slot, child, horizontal ? 0.0f : d, horizontal ? d : 0.0f);
         if (baseline < 0 && child.placed.has_baseline())
-          baseline = float(pad.top + (horizontal ? d : starts[i])) + child.placed.baseline;
+          baseline = float(pad.top) + (horizontal ? d : float(starts[i])) + child.placed.baseline;
       }
     }
     const extent_t content = horizontal ? extent_t{along, across} : extent_t{across, along};

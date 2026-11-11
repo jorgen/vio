@@ -307,6 +307,58 @@ TEST_CASE("ui text: a row aligned on baselines puts every text's baseline on one
   CHECK(std::abs((shapes[0].y + 10) * 1.5f - float(bottom(glyphs[1]))) <= 0.5f);
 }
 
+TEST_CASE("ui text: a tight label is centred on its box by its ink, not by its line")
+{
+  struct buttons_t
+  {
+    ui::font_t font;
+
+    ui::node_t view() const
+    {
+      constexpr ui::color_t black{0, 0, 0, 1};
+      const auto button = [&](bool tight) { return ui::box_t{.size = {60, 60}, .color = {1, 0, 0, 1}, .children = {ui::text_t{.text = ".", .size = 28, .color = black, .font = font, .tight = tight}}}; };
+      return ui::row_t{.children = {button(false), button(true)}};
+    }
+  };
+  snapshot_t seen;
+  vio::event_loop_t loop;
+  run_gui_test(loop,
+               [](vio::event_loop_t &loop, snapshot_t &seen) -> vio::task_t<void>
+               {
+                 gui::display_config_t display_config;
+                 display_config.backend = "null";
+                 display_config.frame_interval_ns = std::chrono::nanoseconds(2ms).count();
+                 auto display = gui::display_t::open(loop, display_config);
+                 REQUIRE(display.has_value());
+                 {
+                   auto window = gui::window_t::create(*display, {.size = {200, 100}});
+                   buttons_t buttons{roboto()};
+                   ui::run_config_t config;
+                   config.on_display_list = [&seen](const ui::display_list_t &list) { seen.take(list); };
+                   auto running = ui::run(*window, buttons, std::move(config));
+                   window->impl()->on_resize({200, 100}, {300, 150}, 1.5f);
+                   (void)co_await vio::sleep(loop, 40ms);
+                   window->close();
+                   co_await std::move(running);
+                 }
+                 loop.stop();
+               }(loop, seen));
+  REQUIRE(seen.scale == 1.5f);
+  const auto glyphs = seen.of(ui::prim_kind_t::coverage);
+  REQUIRE(glyphs.size() == 2);
+  // The ink's centre in pixels, as the shader places it, against the box's centre: 30 units down.
+  const auto ink_middle = [](const ui::prim_t &glyph) { return std::floor(glyph.y * 1.5f + 0.5f) + glyph.radii[3] + glyph.height / 2; };
+  const auto ink_centre = [](const ui::prim_t &glyph, float box_x) { return std::floor(glyph.x * 1.5f + 0.5f) + glyph.radii[2] + glyph.width / 2 - box_x * 1.5f; };
+  const float box_middle = 30 * 1.5f;
+  // By its line, a full stop sits far below the middle: it is on the baseline. (A "+" is low by
+  // how far the font's maths axis is below the middle of its line, which depends on the font: a
+  // few pixels in Segoe UI, none in Roboto.)
+  CHECK(ink_middle(glyphs[0]) - box_middle > 5.0f);
+  // By its ink, it is centred to within the half unit alignment rounds to, both ways.
+  CHECK(std::abs(ink_middle(glyphs[1]) - box_middle) <= 1.0f);
+  CHECK(std::abs(ink_centre(glyphs[1], 60) - box_middle) <= 1.0f);
+}
+
 TEST_CASE("ui text: a full atlas is emptied and says so once")
 {
   ui::detail::text_engine_t engine;

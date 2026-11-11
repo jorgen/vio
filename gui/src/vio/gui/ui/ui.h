@@ -471,6 +471,11 @@ struct text_t
   color_t color = {1, 1, 1, 1};
   // Empty: run_config_t::font, else font_t::system_default().
   font_t font;
+  // Measure by the ink rather than the line: the size is the bounds of the glyphs as drawn, not the
+  // font's ascent and descent, so a symbol centred on a button is centred by what is seen. A "+"
+  // sits on the maths axis, well below the middle of its line, and looks low without this. The
+  // baseline moves with the top.
+  bool tight = false;
 };
 
 // A vector shape for an icon, in a unit square with (0, 0) at the top left. Contours close
