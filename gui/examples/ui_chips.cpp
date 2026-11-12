@@ -22,7 +22,7 @@ Copyright (c) 2026 Jørgen Lind
 
 // A stress test after Qt's 40,000-chip graphics view demo, five times over: 200,000 chips, each one
 // movable and editable. Scroll to zoom about the pointer, drag the background to pan, drag a chip to
-// move it, click one to select it and type to change its label (Backspace deletes, Escape lets go).
+// move it, click one to select it and bring it to the top, and type to change its label (Backspace deletes, Escape lets go).
 // Zoomed in, chips show a die and pins, then a label.
 //
 // The chips are plain data in 400 tiles of 500. Each tile is a component whose props are a zoom
@@ -382,12 +382,21 @@ struct scene_t
     const float level = layout_zoom(zoom);
     std::vector<ui::node_t> placed;
     placed.reserve(tiles.size());
-    for (std::size_t i = 0; i < tiles.size(); ++i)
+    const auto place = [&](std::size_t i)
     {
       const auto &tile = tiles[i];
       const tile_t::props_t props{level, tile_visible(int(i)), versions[i], int(i) == selected_tile ? selected : 0};
       placed.push_back(ui::at_t{.x = tile.origin_x * zoom, .y = tile.origin_y * zoom, .children = {ui::mount(tile, props).scaled(zoom / level)}});
+    };
+    // The selected chip's tile last: the chip is last in its tile, and drawing its tile after the
+    // others puts it over the neighbours it overhangs too. Reordering moves chunks, not chips.
+    for (std::size_t i = 0; i < tiles.size(); ++i)
+    {
+      if (int(i) != selected_tile)
+        place(i);
     }
+    if (selected_tile >= 0)
+      place(std::size_t(selected_tile));
     return ui::box_t{.color = background, .align_x = ui::align_t::stretch, .align_y = ui::align_t::start, .children = {ui::at_t{.x = pan_x, .y = pan_y, .children = std::move(placed)}, ui::mount(bar)}};
   }
 
@@ -407,25 +416,35 @@ struct scene_t
     const float sy = (float(p.y) - pan_y) / zoom;
     const int tx = std::clamp(int(std::floor(sx / tile_w)), 0, tiles_across - 1);
     const int ty = std::clamp(int(std::floor(sy / tile_h)), 0, tiles_down - 1);
+    // Topmost first, in the reverse of drawing order: the selected chip's tile, which is drawn
+    // last, then the rest from the latest drawn.
+    const auto search = [&](int index) -> bool
+    {
+      const auto &chips = tiles[std::size_t(index)].chips;
+      for (std::size_t i = chips.size(); i-- > 0;)
+      {
+        const auto &c = chips[i];
+        if (sx >= c.x && sy >= c.y && sx < c.x + chip_w && sy < c.y + chip_h)
+        {
+          tile_index = index;
+          chip_index = i;
+          return true;
+        }
+      }
+      return false;
+    };
+    if (selected_tile >= 0 && std::abs(selected_tile % tiles_across - tx) <= 1 && std::abs(selected_tile / tiles_across - ty) <= 1 && search(selected_tile))
+      return true;
     for (int dy = 1; dy >= -1; --dy)
     {
       for (int dx = 1; dx >= -1; --dx)
       {
         const int x = tx + dx;
         const int y = ty + dy;
-        if (x < 0 || y < 0 || x >= tiles_across || y >= tiles_down)
+        if (x < 0 || y < 0 || x >= tiles_across || y >= tiles_down || y * tiles_across + x == selected_tile)
           continue;
-        const auto &chips = tiles[std::size_t(y * tiles_across + x)].chips;
-        for (std::size_t i = chips.size(); i-- > 0;)
-        {
-          const auto &c = chips[i];
-          if (sx >= c.x && sy >= c.y && sx < c.x + chip_w && sy < c.y + chip_h)
-          {
-            tile_index = y * tiles_across + x;
-            chip_index = i;
-            return true;
-          }
-        }
+        if (search(y * tiles_across + x))
+          return true;
       }
     }
     return false;
@@ -548,7 +567,15 @@ struct scene_t
         std::size_t index = 0;
         if (hit(p, tile, index))
         {
-          const auto &chip = tiles[std::size_t(tile)].chips[index];
+          // Bring it to the top: last in its tile, and its tile drawn last.
+          auto &chips = tiles[std::size_t(tile)].chips;
+          if (index + 1 != chips.size())
+          {
+            auto raised = std::move(chips[index]);
+            chips.erase(chips.begin() + std::ptrdiff_t(index));
+            chips.push_back(std::move(raised));
+          }
+          const auto &chip = chips.back();
           if (selected_tile >= 0)
             ++versions[std::size_t(selected_tile)];
           selected = chip.id;
