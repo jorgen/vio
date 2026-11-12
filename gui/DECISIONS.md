@@ -606,3 +606,31 @@ worked example and kept the toolkit changes to the two things a combobox could n
 Not yet: a theme as props or inherited (one dark `theme_t` for now), type-to-search in a combobox,
 flipping a menu above its field when there is no room below (it is moved up into the window
 instead), focus that follows the pointer into a menu, and text input.
+
+## G47. A live resize draws before WM_SIZE returns; what is left is the driver's
+
+Content trailed the border while a window was dragged larger on Windows. Traced on an RX 5700 XT,
+Release, dragging `vio_gui_ui_widgets` by its right edge:
+
+- **Every other resize was drawn a refresh late.** `WM_SIZE` ran one nested turn, but a UI's frame
+  loop waits on its own change signal, which wakes through the loop's deferred queue, and a turn
+  drains that queue before the hook that hands out frames. So the frame for a new size was often
+  only reached on the next turn -- the next `WM_TIMER`, about 16 ms later -- after Windows had
+  already shown the window at that size. 50 of 80 frames were drawn inside `WM_SIZE`. Now
+  `WM_SIZE` and `WM_PAINT` run turns until a frame has been taken or none is due, at most three:
+  73 of 74, the other being the first frame.
+- **A resize costs a new swapchain, and that is the driver's time:** `vkCreateSwapchainKHR` took a
+  median 8.4 ms, against under 0.3 ms for everything else in a frame. Vulkan on Win32 requires the
+  image size to equal the window's, so there is no reusing a larger one. Asking for the minimum
+  image count made creation 5.5 ms but acquire then waited for vertical blank, 15 ms in all.
+- **Present mode stays FIFO.** IMMEDIATE and MAILBOX (the latter not offered by this driver)
+  showed more stretched frames mid-drag, not fewer.
+
+What is left: a frame presented through a Vulkan swapchain reaches the screen on its own schedule,
+not in the same composition as the border Windows moves, and while it is late Windows shows the
+previous image stretched to the new size. `VK_EXT_swapchain_maintenance1` can ask for that image
+to be shown unscaled at the top left instead, which is how a GDI window looks while it is resized;
+this driver does not offer it. Drawing in step with the border needs DXGI with DirectComposition,
+the D3D12 backend of phase 12. Mid-drag screen captures did not separate the builds before and
+after the first fix -- a GDI capture does not sample what DWM shows at a given refresh -- so the
+evidence for it is the trace above, not a picture.

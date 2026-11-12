@@ -377,6 +377,7 @@ private:
   [[nodiscard]] float scale() const;
   [[nodiscard]] RECT outer_rect(extent_t client) const;
   void report_size();
+  void turn_until_drawn();
   void button(button_t which, bool pressed, LPARAM lparam);
 
   win32_display_t &_display;
@@ -614,6 +615,25 @@ void win32_window_t::report_size()
   _window.on_resize(size, size, scale());
 }
 
+// Inside a size loop Windows shows the window at its new size as soon as WM_SIZE or WM_PAINT returns,
+// so the frame for that size has to be drawn before then. It is often more than one turn away: a
+// UI wakes its frame loop through the deferred queue, which a turn drains before the hook that
+// hands out frames, so with a single turn every other resize was drawn only on the next WM_TIMER,
+// a refresh later (G47). Turns run until a frame has been taken or none is due, at most three.
+void win32_window_t::turn_until_drawn()
+{
+  auto &thread = *_display.thread;
+  if (thread.modal == 0)
+    return;
+  const auto before = _window.frames;
+  for (int turn = 0; turn < 3; ++turn)
+  {
+    thread.nested_turn();
+    if (_window.frames != before || !_window.frame_ready_now())
+      break;
+  }
+}
+
 void win32_window_t::button(button_t which, bool pressed, LPARAM lparam)
 {
   if (pressed)
@@ -647,8 +667,7 @@ LRESULT win32_window_t::procedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM
         _window.on_visible(true);
       report_size();
     }
-    if (thread.modal > 0)
-      thread.nested_turn();
+    turn_until_drawn();
     return 0;
   case WM_SHOWWINDOW:
     _window.on_visible(wparam != 0);
@@ -659,8 +678,7 @@ LRESULT win32_window_t::procedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM
     BeginPaint(hwnd, &paint);
     EndPaint(hwnd, &paint);
     _window.on_damage();
-    if (thread.modal > 0)
-      thread.nested_turn();
+    turn_until_drawn();
     return 0;
   }
   case WM_ERASEBKGND:
