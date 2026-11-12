@@ -566,3 +566,43 @@ the frame loop noticed -- asked for the loop through a window that no longer had
 now keeps the loop from construction. `vio_gui_ui_counter`'s timed exit failed about two runs in
 five before and none in twenty after; a unit test on the null backend did not reproduce it, so
 there is none.
+
+## G46. Widgets are controlled components; focus and popups are the runtime's
+
+`vio/gui/ui/widgets.h` has the first widgets: `button_t`, `checkbox_t` and `combobox_t`. Each is an
+ordinary component built only from what `ui.h` offers any program, which keeps them honest as a
+worked example and kept the toolkit changes to the two things a combobox could not do without.
+
+- **Controlled, not self-owned.** A widget's value comes down as props and a change comes up as an
+  event (`toggle_event_t`, `select_event_t`) on a public `event_source_t` member, which the parent
+  applies to its own state. PLAN.md's rule that a view reads only its own component already forces
+  this: a parent reading `box.checked` would not be rebuilt when it changed. It also makes setting
+  a value from code nothing more than assigning the parent's member. What the widget keeps is only
+  what no parent cares about: whether the menu is open, the keyboard's row. The cost is a frame of
+  latency between asking and being told, so two presses in one loop turn both read the old props;
+  a widget remembers what it last asked for until its next view runs, which is after the parent
+  answered. The test of two arrow keys in one turn is what found this.
+- **Focus is a property of a pressable**, `pressable_t{ui::focusable}`. A press focuses it; Tab and
+  Shift+Tab walk the focusable boxes in hit-test order, which is drawing order and so the order a
+  view lists them in. The focused pressable is also a `source_t<key_event_t>` and is sent every key,
+  Tab included, before focus moves -- a combobox closes on it. Space holds and then presses it, so a
+  widget that reacts to presses works from the keyboard without code of its own. `focus_visible()`
+  is set by a key and cleared by a click, for a ring only keyboard users see. Focus is dropped when
+  its box leaves the hit-test list, so a disabled button cannot be pressed with Space.
+- **A popup is a mount flag**, `ui::mount(menu).on_top(dismiss)`. It is placed where its parent puts
+  it but takes no room there, always holds its own chunk, and is drawn and hit-tested after
+  everything else, moved to fit the window. With a dismiss source, a whole-window hit-test entry
+  sits under it, so a press outside reaches that source and nothing under it. Being a mount means
+  the popup is its own component: the combobox creates its menu when it opens and drops it when it
+  closes, shared through `mount_t::keep`, so the menu's row pressables outlive the frame in which
+  the runtime still has them as hovered.
+- **The keyboard's row and the pointer's are kept apart** in the menu: accent for the row Enter
+  picks, a tint for the one under the pointer. Letting hover move the keyboard's row made a pointer
+  that happened to rest where the menu opened take over the arrow keys.
+- **A combobox is as wide as its widest option**, by drawing every option and its placeholder
+  invisibly under the one shown, so it does not change width with the choice. The menu does the
+  same with the placeholder; its padding adds up to the field's so both are the same width.
+
+Not yet: a theme as props or inherited (one dark `theme_t` for now), type-to-search in a combobox,
+flipping a menu above its field when there is no room below (it is moved up into the window
+instead), focus that follows the pointer into a menu, and text input.

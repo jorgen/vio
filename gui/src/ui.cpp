@@ -83,6 +83,9 @@ struct slot_t
   node_t output;
   // Its mount's scale (mount_t::scale): a scaled slot always holds its own chunk.
   float scale = 1;
+  // A popup (mount_t::popup): it holds its own chunk too, which is drawn after everything else.
+  bool popup = false;
+  const pressable_t *dismiss = nullptr;
   // The mounts in `output`, found when the view ran.
   std::vector<const mount_t *> mounts;
   // Boxes in this subtree a press can be aimed at; a subtree with none is skipped by hit testing.
@@ -257,7 +260,8 @@ public:
     _beat.owner = this;
     _beat.run = [](posted_t *node) { static_cast<runtime_t *>(node->owner)->beat(); };
     _finish.owner = this;
-    _finish.run = [](posted_t *node) {
+    _finish.run = [](posted_t *node)
+    {
       auto *self = static_cast<runtime_t *>(node->owner);
       if (auto handle = std::exchange(self->_drained_waiter, {}))
         handle.resume();
@@ -425,12 +429,34 @@ public:
     _prims.clear();
     _runs.clear();
     _root->holder = true;
+    _popups.clear();
     emit(*_root, 0, 0, 1);
+    // Popups last, each moved inside the window; one may open another, which lands behind it in
+    // the list and so is drawn over it.
+    for (std::size_t i = 0; i < _popups.size(); ++i)
+    {
+      auto &popup = _popups[i];
+      const float w = float(popup.slot->size.width) * popup.s;
+      const float h = float(popup.slot->size.height) * popup.s;
+      popup.x = std::max(0.0f, std::min(popup.x, float(_logical.width) - w));
+      popup.y = std::max(0.0f, std::min(popup.y, float(_logical.height) - h));
+      emit(*popup.slot, popup.x, popup.y, popup.s);
+    }
     for (auto *slot : std::exchange(_touched, {}))
       slot->subtree_dirty = false;
 
     _items.clear();
     collect_items(*_root, 0, 0, 1);
+    for (auto &popup : _popups)
+    {
+      // Under the popup and over everything else: the whole window, reporting to its dismiss.
+      if (popup.slot->dismiss)
+      {
+        popup.backdrop.events = *popup.slot->dismiss;
+        _items.push_back(draw_item_t{rect_t{0, 0, _logical.width, _logical.height}, {}, &popup.backdrop, popup.slot, -1});
+      }
+      collect_items(*popup.slot, popup.x, popup.y, popup.s);
+    }
     _stats.display_list = clock::now() - emitting;
     _stats.prims = _prims.size();
     _stats.runs = _runs.size();
@@ -475,6 +501,8 @@ public:
       _held = target_at(position);
       if (_held.source)
         set_flag(_held.source, &pressable_t::_held, true);
+      if (_held.source && _held.source->focusable())
+        set_focus(_held.source, false);
       return;
     }
     auto held = std::exchange(_held, {});
@@ -484,7 +512,7 @@ public:
       return;
     const auto *item = find(held);
     if (held.source)
-      const_cast<pressable_t *>(held.source)->emit(press_event_t{held.source, position}, *this);
+      press(held.source, position);
     if (item && item->box->on_press)
     {
       // The handler mutates its component, so that component is rebuilt. Copied first: the
@@ -495,6 +523,79 @@ public:
       handler();
       invalidate(*slot);
     }
+  }
+
+  // ---- the keyboard (G46). Every key goes to the focused pressable; Tab then moves focus, and
+  // Space presses it -- held while down, pressed on release.
+  void key(const key_event_t &event)
+  {
+    if (_focused && !owner_of(_focused))
+      set_focus(nullptr, false);
+    if (_focused)
+    {
+      if (event.pressed)
+        set_flag(_focused, &pressable_t::_focus_visible, true);
+      auto &keys = static_cast<detail::source_t<key_event_t> &>(*const_cast<pressable_t *>(_focused));
+      keys.emit(event, *this);
+    }
+    if (event.pressed && event.key == gui::key_t::tab)
+    {
+      move_focus(has(event.modifiers, modifier_t::shift));
+      return;
+    }
+    if (!_focused || event.key != gui::key_t::space || event.repeat)
+      return;
+    if (event.pressed)
+    {
+      set_flag(_focused, &pressable_t::_held, true);
+      return;
+    }
+    if (!_focused->held())
+      return;
+    set_flag(_focused, &pressable_t::_held, false);
+    const auto *item = find(target_t{_focused, nullptr, -1});
+    press(_focused, item ? point_t{item->rect.x + item->rect.width / 2.0, item->rect.y + item->rect.height / 2.0} : point_t{});
+  }
+
+  // The focusable boxes in the order they are drawn, which is the order a view lists them in.
+  void move_focus(bool back)
+  {
+    std::vector<const pressable_t *> order;
+    for (const auto &item : _items)
+    {
+      const auto *source = item.box->events.source;
+      if (source && source->focusable() && std::find(order.begin(), order.end(), source) == order.end())
+        order.push_back(source);
+    }
+    if (order.empty())
+      return;
+    const auto n = order.size();
+    const auto at = std::size_t(std::find(order.begin(), order.end(), _focused) - order.begin());
+    const std::size_t next = at == n ? (back ? n - 1 : 0) : (back ? (at + n - 1) % n : (at + 1) % n);
+    set_focus(order[next], true);
+  }
+
+  void set_focus(const pressable_t *source, bool visible)
+  {
+    if (_focused != source)
+    {
+      if (_focused)
+      {
+        set_flag(_focused, &pressable_t::_focused, false);
+        set_flag(_focused, &pressable_t::_focus_visible, false);
+      }
+      _focused = source;
+      if (source)
+        set_flag(source, &pressable_t::_focused, true);
+    }
+    if (source)
+      set_flag(source, &pressable_t::_focus_visible, visible);
+  }
+
+  void press(const pressable_t *source, point_t position)
+  {
+    auto &presses = static_cast<detail::source_t<press_event_t> &>(*const_cast<pressable_t *>(source));
+    presses.emit(press_event_t{source, position}, *this);
   }
 
   // ---- teardown
@@ -509,6 +610,7 @@ public:
     _slots.clear();
     _root = nullptr;
     _items.clear();
+    _popups.clear();
     _prims.clear();
     _runs.clear();
     for (auto *slot : leaving)
@@ -575,6 +677,8 @@ private:
     slot->scope = std::make_unique<scope_t>(*this, slot.get());
     slot->keep = mount.keep;
     slot->scale = mount.scale > 0 ? mount.scale : 1;
+    slot->popup = mount.popup;
+    slot->dismiss = mount.dismiss;
     if (mount.props)
       mount.apply_props(slot->component, mount.props.get());
     auto *raw = slot.get();
@@ -644,6 +748,8 @@ private:
     if (mount.keep && child->keep != mount.keep)
       child->keep = mount.keep;
     child->scale = mount.scale > 0 ? mount.scale : 1;
+    child->popup = mount.popup;
+    child->dismiss = mount.dismiss;
     if (mount.props && !mount.props_equal(child->component, mount.props.get()))
     {
       mount.apply_props(child->component, mount.props.get());
@@ -817,6 +923,18 @@ private:
       auto *child = existing(*mount);
       if (!child)
         return {};
+      if (child->popup)
+      {
+        // Laid out for its own content, placed here, and taking no room (G46).
+        lay_out(*child);
+        entry_t entry;
+        entry.child = child;
+        entry.x = x;
+        entry.y = y;
+        slot.entries.push_back(entry);
+        slot.subtree_prims += child->subtree_prims;
+        return {};
+      }
       // A scaled child is laid out in its own units and takes up its scaled size.
       const float s = child->scale;
       lay_out(*child, s == 1 ? want : extent_t{want.width >= 0 ? int(float(want.width) / s) : -1, want.height >= 0 ? int(float(want.height) / s) : -1});
@@ -1136,7 +1254,7 @@ private:
   {
     const std::size_t threshold = std::max<std::size_t>(_config.chunk_threshold, 1);
     // A scaled subtree is drawn as runs of its own, since the scale is a run's.
-    const bool now = slot.scale != 1 || (slot.holder ? slot.subtree_prims >= std::max<std::size_t>(threshold / 2, 1) : slot.subtree_prims >= threshold);
+    const bool now = slot.scale != 1 || slot.popup || (slot.holder ? slot.subtree_prims >= std::max<std::size_t>(threshold / 2, 1) : slot.subtree_prims >= threshold);
     if (now != slot.holder)
     {
       slot.holder = now;
@@ -1151,7 +1269,8 @@ private:
     chunk.prims.clear();
     chunk.segments.clear();
     std::uint32_t begin = 0;
-    auto close_run = [&] {
+    auto close_run = [&]
+    {
       const auto end = std::uint32_t(chunk.prims.size());
       if (end > begin)
         chunk.segments.push_back(segment_t{begin, end});
@@ -1215,6 +1334,12 @@ private:
         const float cx = x + segment.x * s;
         const float cy = y + segment.y * s;
         const float cs = s * segment.child->scale;
+        // A popup is drawn after everything else, from step().
+        if (segment.child->popup)
+        {
+          _popups.push_back(popup_t{segment.child, cx, cy, cs});
+          continue;
+        }
         // A chunk wholly outside the window is not drawn (G45).
         if (!visible(*segment.child, cx, cy, cs))
         {
@@ -1242,6 +1367,8 @@ private:
     {
       if (entry.child)
       {
+        if (entry.child->popup)
+          continue;
         const float cs = s * entry.child->scale;
         if (visible(*entry.child, x + entry.x * s, y + entry.y * s, cs))
           collect_items(*entry.child, x + entry.x * s, y + entry.y * s, cs);
@@ -1327,6 +1454,8 @@ private:
   {
     if (_hovered && owner_of(_hovered) == &slot)
       _hovered = nullptr;
+    if (_focused && owner_of(_focused) == &slot)
+      _focused = nullptr;
     if (_held.slot == &slot || (_held.source && owner_of(_held.source) == &slot))
       _held = {};
     std::erase(_touched, &slot);
@@ -1404,6 +1533,19 @@ private:
   bool _has_pointer = false;
   const pressable_t *_hovered = nullptr;
   target_t _held;
+  const pressable_t *_focused = nullptr;
+
+  // This frame's popups, where they are drawn, in drawing order. `backdrop` is the box a dismissing
+  // popup's whole-window hit-test entry points at.
+  struct popup_t
+  {
+    slot_t *slot = nullptr;
+    float x = 0;
+    float y = 0;
+    float s = 1;
+    box_t backdrop;
+  };
+  std::vector<popup_t> _popups;
 };
 
 // ---- the GL stopgap (G23): every primitive is a scissored clear. Corners stay square; borders,
@@ -1504,7 +1646,8 @@ namespace
 {
 std::unique_ptr<renderer_t> choose_renderer(window_t &window, const run_config_t &config)
 {
-  auto report = [&config](std::string_view what) {
+  auto report = [&config](std::string_view what)
+  {
     if (config.on_renderer)
       config.on_renderer(what);
   };
@@ -1561,6 +1704,13 @@ vio::task_t<void> pointer_loop(window_t &window, runtime_t &runtime)
   }
 }
 
+vio::task_t<void> key_loop(window_t &window, runtime_t &runtime)
+{
+  auto events = window.subscribe<key_event_t>();
+  while (auto event = co_await events)
+    runtime.key(*event);
+}
+
 // A resize or an expose needs a new frame although no view changed; an expose redraws the display
 // list as it stands, since the chunks are clean. The end of this subscription is how the frame loop
 // learns the window closed while it was waiting for a change.
@@ -1579,6 +1729,7 @@ vio::task_t<void> run_root(window_t &window, mount_t root, run_config_t config)
   runtime.set_root(root);
   auto renderer = choose_renderer(window, runtime.config());
   auto pointer = pointer_loop(window, runtime);
+  auto keys = key_loop(window, runtime);
   auto repaints = repaint_loop(window, runtime);
   while (window)
   {
@@ -1597,6 +1748,7 @@ vio::task_t<void> run_root(window_t &window, mount_t root, run_config_t config)
   renderer.reset();
   runtime.shutdown();
   co_await std::move(pointer);
+  co_await std::move(keys);
   co_await std::move(repaints);
   co_await runtime.drained();
 }

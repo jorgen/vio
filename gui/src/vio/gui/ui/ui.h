@@ -317,20 +317,42 @@ private:
 };
 } // namespace detail
 
+// `ui::pressable_t button{ui::focusable}`: one that takes keyboard focus.
+struct focusable_t
+{
+};
+inline constexpr focusable_t focusable{};
+
 // Something that can be pressed. It is a member of a component and its identity is its address, so
 // the box that shows it may be rebuilt freely. It also carries what the pointer is doing to it, for a
 // view to draw.
-class pressable_t : public detail::source_t<press_event_t>
+//
+// A focusable one also takes keyboard focus (G46): a press on it, or Tab and Shift+Tab through the
+// focusable boxes in the order they are drawn. The focused one is sent every key, as a source of
+// key_event_t -- `ui::subscribe<key_event_t>(field)` -- and Space presses it, so whatever a press
+// does the keyboard does too.
+class pressable_t : public detail::source_t<press_event_t>, public detail::source_t<key_event_t>
 {
+  using presses_t = detail::source_t<press_event_t>;
+  using keys_t = detail::source_t<key_event_t>;
+
 public:
   pressable_t() = default;
+  explicit pressable_t(focusable_t) noexcept
+    : _focusable(true)
+  {
+  }
   pressable_t(pressable_t &&other) noexcept
-    : source_t(std::move(other))
+    : presses_t(std::move(other))
+    , keys_t(std::move(other))
+    , _focusable(other._focusable)
   {
   }
   pressable_t &operator=(pressable_t &&other) noexcept
   {
-    source_t::operator=(std::move(other));
+    presses_t::operator=(std::move(other));
+    keys_t::operator=(std::move(other));
+    _focusable = other._focusable;
     return *this;
   }
 
@@ -345,11 +367,29 @@ public:
   {
     return _held;
   }
+  [[nodiscard]] bool focusable() const noexcept
+  {
+    return _focusable;
+  }
+  // It has keyboard focus.
+  [[nodiscard]] bool focused() const noexcept
+  {
+    return _focused;
+  }
+  // It has focus and the keyboard has been used since it got it: when to draw a focus ring. A
+  // button clicked with the mouse is focused but shows no ring until a key is pressed.
+  [[nodiscard]] bool focus_visible() const noexcept
+  {
+    return _focus_visible;
+  }
 
 private:
   friend class detail::runtime_t;
+  bool _focusable = false;
   bool _hovered = false;
   bool _held = false;
+  bool _focused = false;
+  bool _focus_visible = false;
 };
 
 // `while (auto event = co_await presses)` -- yields std::nullopt once the awaiting behaviour's scope
@@ -386,13 +426,37 @@ template <typename E, typename... Sources>
 {
   auto core = std::make_unique<detail::subscription_core_t<E>>();
   (
-    [&](detail::source_t<E> &source) {
+    [&](detail::source_t<E> &source)
+    {
       source.add(core.get());
       core->sources.push_back(&source);
     }(sources),
     ...);
   return subscription_t<E>(std::move(core));
 }
+
+// Over a container of sources: the rows of a menu, a deque of pressables.
+template <typename E, typename Range>
+  requires requires(Range &range) {
+    { *std::begin(range) } -> std::convertible_to<detail::source_t<E> &>;
+  }
+[[nodiscard]] subscription_t<E> subscribe(Range &sources)
+{
+  auto core = std::make_unique<detail::subscription_core_t<E>>();
+  for (auto &source : sources)
+  {
+    detail::source_t<E> &as_source = source;
+    as_source.add(core.get());
+    core->sources.push_back(&as_source);
+  }
+  return subscription_t<E>(std::move(core));
+}
+
+// A component's own events, for data flowing up: a member the parent subscribes to,
+// `ui::subscribe<toggle_event_t>(remember.changed)`, and the component's behaviour emits on with
+// ui::emit. Identity is its address, as for a pressable.
+template <typename E>
+using event_source_t = detail::source_t<E>;
 
 // ---------------------------------------------------------------------------------------------
 // Nodes
@@ -643,12 +707,28 @@ struct mount_t
   // Draw the child this many times its size without laying it out again: zoom. Its layout, hit
   // testing and what it takes up in its parent all scale with it; its text keeps its pixel size.
   float scale = 1;
+  // A popup (G46): placed where the parent puts it, but taking no room there, drawn and hit-tested
+  // after everything else, and moved to stay inside the window. With `dismiss`, a press anywhere
+  // outside it goes to that pressable instead of to what lies under it -- how a menu closes.
+  bool popup = false;
+  const pressable_t *dismiss = nullptr;
 
   // `ui::mount(child).scaled(2)`
   [[nodiscard]] mount_t scaled(float factor) &&
   {
     scale = factor;
     return std::move(*this);
+  }
+  // `ui::mount(menu).on_top(close)`
+  [[nodiscard]] mount_t on_top(const pressable_t *dismiss_ = nullptr) &&
+  {
+    popup = true;
+    dismiss = dismiss_;
+    return std::move(*this);
+  }
+  [[nodiscard]] mount_t on_top(const pressable_t &dismiss_) &&
+  {
+    return std::move(*this).on_top(&dismiss_);
   }
 };
 
@@ -1197,6 +1277,30 @@ template <has_props C>
   node.props = std::make_shared<const props_t>(std::move(props));
   node.props_equal = [](const void *component, const void *p) -> bool { return static_cast<const C *>(component)->props == *static_cast<const props_t *>(p); };
   node.apply_props = [](void *component, const void *p) { static_cast<C *>(component)->props = *static_cast<const props_t *>(p); };
+  return node;
+}
+
+// Send `event` to whatever subscribes to `source`, from a behaviour of the component that owns it.
+template <typename E>
+void emit(event_source_t<E> &source, const E &event, scope_t &scope)
+{
+  source.emit(event, detail::scope_runtime(scope));
+}
+
+// Mount a child the parent shares ownership of, like a list_t item: it lives until its behaviours
+// have ended, even after the parent drops it. For a popup the parent creates when it opens.
+template <component C>
+[[nodiscard]] mount_t mount(const std::shared_ptr<C> &child)
+{
+  mount_t node = mount(*child);
+  node.keep = child;
+  return node;
+}
+template <has_props C>
+[[nodiscard]] mount_t mount(const std::shared_ptr<C> &child, typename C::props_t props)
+{
+  mount_t node = mount(*child, std::move(props));
+  node.keep = child;
   return node;
 }
 

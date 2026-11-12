@@ -229,6 +229,26 @@ size, or wrapping.
 
 Field order is API, since designated initializers must follow it.
 
+### Widgets
+
+`vio/gui/ui/widgets.h` (G46) holds `button_t`, `checkbox_t` and `combobox_t`, written as ordinary
+components. They are controlled: the parent holds the value, mounts the widget with it as props, and
+applies the change the widget asks for through an event.
+
+```cpp
+ui::mount(quality_box, {.options = {"Low", "High"}, .selected = quality})
+...
+auto picks = ui::subscribe<ui::select_event_t>(quality_box.changed);
+while (auto pick = co_await picks)
+  quality = int(pick->index);
+```
+
+Two things in the runtime exist for them. **Focus**: a `pressable_t{ui::focusable}` is focused by a
+press or by Tab, is sent every key as a source of `key_event_t`, and is pressed by Space. **Popups**:
+`ui::mount(menu).on_top(dismiss)` is placed by its parent but takes no room, is drawn and hit-tested
+over everything, is kept inside the window, and sends a press anywhere outside it to `dismiss`.
+`examples/ui_widgets.cpp` is a settings form using all three.
+
 ### Two trees
 
 - The **component tree** is retained. `ui::run` owns the root, children are members of their
@@ -503,6 +523,7 @@ Open:
 | 10 | Text: FreeType and HarfBuzz through cmake-dep, glyph atlas, label component, icons. **In on Windows**; Linux and macOS not yet run | labels at 1x and 2x scale; a shaping test with a non-Latin script |
 | 11 | Plots: polylines with joins, mesh pipeline, markers, heatmaps, M4 decimation. **In on Windows** (G41, G44); no mesh pipeline | thick translucent zigzag lines; a million-point series panned at frame rate |
 | 12 | D3D12 and Metal backends. **On hold** | the phase 9 to 11 examples on each |
+| -- | Widgets: `button_t`, `checkbox_t`, `combobox_t`; keyboard focus; popups. **In on Windows** (G46) | `vio_gui_ui_widgets`; `test/test_ui_widgets.cpp` |
 | -- | Stress test: Qt's chip demo five times over, 200,000 movable, editable chips (`vio_gui_ui_chips`). **Holds at 60 fps on Windows** (G45) | `vio_gui_ui_chips --bench` |
 
 ## Stress test
