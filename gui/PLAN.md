@@ -108,7 +108,7 @@ stale content.
 vio runs turns from inside those loops. On macOS the descriptor source and a deadline timer are
 registered in the common run-loop modes, so they also fire during live resize. On Windows the
 forwarder's message reaches the hidden window inside the modal loop too, and a `SetTimer` started
-on `WM_ENTERSIZEMOVE` covers deadlines. Each runs `loop_core_t::run_nested()`, one turn that never
+on `WM_ENTERSIZEMOVE` covers deadlines. Each runs `vio::loop_run_nested()`, one turn that never
 blocks and skips any stage already on the stack.
 
 ### Resuming coroutines

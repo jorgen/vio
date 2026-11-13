@@ -22,9 +22,12 @@ Copyright (c) 2026 Jørgen Lind
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -32,7 +35,8 @@ Copyright (c) 2026 Jørgen Lind
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "fd_watch.h"
+#include <vio/operation/fd_watch.h>
+
 #include "vio/gui/backends.h"
 #include "vio/gui/gui.h"
 
@@ -288,7 +292,7 @@ public:
   void finish(std::expected<std::string, int> result);
 
   wayland_display_t &display;
-  std::unique_ptr<fd_watch_t> watch;
+  std::optional<vio::fd_watch_t> watch;
   std::string text;
   int fd;
   bool done = false;
@@ -299,16 +303,16 @@ class wayland_display_t final : public display_backend_t
 public:
   explicit wayland_display_t(display_impl_t &display)
     : impl(display)
-    , _watch(std::make_unique<fd_watch_t>(display.core, "wayland display"))
+    , _repeat(make_timer(*display.loop))
+    , _reap(*display.loop, [this] { std::erase_if(reads, [](const auto &read) { return read->done; }); })
   {
-    _repeat.owner = this;
-    _repeat.fire = &wayland_display_t::on_repeat;
-    _repeat.keeps_alive = false;
+    vio::timer_set_keeps_loop_alive(_repeat, false);
+    vio::timer_on_fire(_repeat, [this] { on_repeat(); });
   }
 
   ~wayland_display_t() override
   {
-    impl.core.remove_timer(_repeat);
+    _watch.reset();
     reads.clear();
     if (_source)
       wl_data_source_destroy(_source);
@@ -362,8 +366,12 @@ public:
     if (!compositor || !wm_base)
       return errc::not_supported;
     _xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if (int result = _watch->open(wl_display_get_fd(display)); result < 0)
-      return result;
+    auto watch = vio::fd_watch_create(*impl.loop, wl_display_get_fd(display));
+    if (!watch)
+      return watch.error().code;
+    _watch.emplace(std::move(*watch));
+    vio::fd_watch_set_keeps_loop_alive(*_watch, false);
+    vio::fd_watch_arm(*_watch, vio::fd_interest::read);
     return 0;
   }
 
@@ -387,7 +395,6 @@ public:
 
   void dispatch() override
   {
-    _watch->take_readable();
     wl_display_dispatch_pending(display);
     for (;;)
     {
@@ -404,7 +411,7 @@ public:
         break;
       wl_display_dispatch_pending(display);
     }
-    _watch->park();
+    vio::fd_watch_arm(*_watch, vio::fd_interest::read);
   }
 
   bool dispatch_queued() override
@@ -461,20 +468,14 @@ public:
     return display;
   }
 
-  void close(loop_core_t &core, posted_t &done) override
+  void close() noexcept override
   {
-    _done = &done;
-    _core = &core;
-    _pending_closes = 1;
     for (auto &read : reads)
     {
-      ++_pending_closes;
-      if (read->watch->closing())
-        continue;
       read->done = true;
-      read->watch->close(&wayland_display_t::on_watch_closed, this);
+      read->watch.reset();
     }
-    _watch->close(&wayland_display_t::on_watch_closed, this);
+    _watch.reset();
   }
 
   void remove(wayland_window_t *window)
@@ -485,7 +486,7 @@ public:
     if (_keyboard_window == window)
     {
       _keyboard_window = nullptr;
-      impl.core.remove_timer(_repeat);
+      vio::timer_disarm(_repeat);
     }
   }
 
@@ -539,14 +540,9 @@ public:
     wl_surface_commit(_cursor_surface);
   }
 
-  void read_finished(clipboard_read_t *read)
+  void read_finished() noexcept
   {
-    if (_done)
-    {
-      on_watch_closed(this);
-      return;
-    }
-    std::erase_if(reads, [read](const auto &entry) { return entry.get() == read; });
+    _reap.schedule();
   }
 
   display_impl_t &impl;
@@ -786,7 +782,7 @@ private:
   static void on_keyboard_leave(void *data, wl_keyboard *, std::uint32_t, wl_surface *)
   {
     auto *self = static_cast<wayland_display_t *>(data);
-    self->impl.core.remove_timer(self->_repeat);
+    vio::timer_disarm(self->_repeat);
     if (self->_keyboard_window)
       self->_keyboard_window->window.on_input(focus_event_t{false});
     self->_keyboard_window = nullptr;
@@ -802,11 +798,11 @@ private:
     if (pressed && self->_repeat_rate > 0 && self->_xkb_keymap && xkb_keymap_key_repeats(self->_xkb_keymap, code + 8))
     {
       self->_repeat_code = code;
-      self->impl.core.add_timer(self->_repeat, loop_core_t::deadline_after(std::int64_t(self->_repeat_delay) * 1'000'000));
+      (void)vio::timer_rearm(self->_repeat, std::chrono::milliseconds(self->_repeat_delay));
     }
     else if (!pressed && code == self->_repeat_code)
     {
-      self->impl.core.remove_timer(self->_repeat);
+      vio::timer_disarm(self->_repeat);
     }
   }
   static void on_modifiers(void *data, wl_keyboard *, std::uint32_t, std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked, std::uint32_t group)
@@ -838,13 +834,12 @@ private:
     self->_repeat_delay = delay;
   }
 
-  static void on_repeat(timer_node_t *node)
+  void on_repeat()
   {
-    auto *self = static_cast<wayland_display_t *>(node->owner);
-    if (!self->_keyboard_window || self->_repeat_rate <= 0)
+    if (!_keyboard_window || _repeat_rate <= 0)
       return;
-    self->emit_key(self->_repeat_code, true, true);
-    self->impl.core.add_timer(self->_repeat, loop_core_t::deadline_after(1'000'000'000 / self->_repeat_rate));
+    emit_key(_repeat_code, true, true);
+    (void)vio::timer_rearm(_repeat, std::chrono::nanoseconds(1'000'000'000 / _repeat_rate));
   }
 
   void emit_key(std::uint32_t code, bool pressed, bool repeat)
@@ -944,13 +939,6 @@ private:
   {
   }
 
-  static void on_watch_closed(void *context)
-  {
-    auto *self = static_cast<wayland_display_t *>(context);
-    if (--self->_pending_closes == 0)
-      self->_core->defer(*self->_done);
-  }
-
   static constexpr wl_registry_listener registry_listener{&on_global, &on_global_remove};
   static constexpr xdg_wm_base_listener wm_base_listener{&on_ping};
   static constexpr wl_output_listener output_listener{&on_output_geometry, &on_output_mode, &on_output_done, &on_output_scale};
@@ -961,7 +949,7 @@ private:
   static constexpr wl_data_offer_listener offer_listener{&on_offer_mime, &on_offer_actions, &on_offer_action};
   static constexpr wl_data_source_listener source_listener{&on_source_target, &on_source_send, &on_source_cancelled, &on_source_dnd_drop, &on_source_dnd_finished, &on_source_action};
 
-  std::unique_ptr<fd_watch_t> _watch;
+  std::optional<vio::fd_watch_t> _watch;
   wl_registry *_registry = nullptr;
   wl_shm *_shm = nullptr;
   wl_seat *_seat = nullptr;
@@ -980,11 +968,9 @@ private:
   wayland_window_t *_keyboard_window = nullptr;
   point_t _pointer_position;
   modifier_t _modifiers = modifier_t::none;
-  timer_node_t _repeat;
+  vio::timer_t _repeat;
+  deferred_call_t _reap;
   std::string _clipboard_text;
-  posted_t *_done = nullptr;
-  loop_core_t *_core = nullptr;
-  std::size_t _pending_closes = 0;
   std::uint32_t _serial = 0;
   std::uint32_t _pointer_serial = 0;
   std::uint32_t _repeat_code = 0;
@@ -995,17 +981,23 @@ private:
 
 clipboard_read_t::clipboard_read_t(wayland_display_t &display, int fd)
   : display(display)
-  , watch(std::make_unique<fd_watch_t>(display.impl.core, "wayland clipboard", &clipboard_read_t::on_readable, this))
   , fd(fd)
 {
-  if (int result = watch->open(fd); result < 0)
-    finish(std::unexpected(result));
-  else
-    on_readable(this);
+  auto created = vio::fd_watch_create(*display.impl.loop, fd);
+  if (!created)
+  {
+    finish(std::unexpected(created.error().code));
+    return;
+  }
+  watch.emplace(std::move(*created));
+  vio::fd_watch_set_keeps_loop_alive(*watch, false);
+  vio::fd_watch_on_ready(*watch, [this](vio::fd_interest) { on_readable(this); });
+  on_readable(this);
 }
 
 clipboard_read_t::~clipboard_read_t()
 {
+  watch.reset();
   ::close(fd);
 }
 
@@ -1032,7 +1024,7 @@ void clipboard_read_t::on_readable(void *context)
       continue;
     if (errno == EAGAIN)
     {
-      self->watch->park();
+      vio::fd_watch_arm(*self->watch, vio::fd_interest::read);
       return;
     }
     self->finish(std::unexpected(errc::io_error));
@@ -1044,16 +1036,14 @@ void clipboard_read_t::finish(std::expected<std::string, int> result)
 {
   done = true;
   display.impl.clipboard_arrived(std::move(result));
-  watch->close([](void *context) {
-    auto *self = static_cast<clipboard_read_t *>(context);
-    self->display.read_finished(self);
-  }, this);
+  watch.reset();
+  display.read_finished();
 }
 
 wayland_window_t::wayland_window_t(wayland_display_t &display, window_impl_t &window)
   : window(window)
   , _display(display)
-  , _clock(window.display.core, window.display.config.frame_interval_ns, &wayland_window_t::tick, this)
+  , _clock(*window.display.loop, window.display.config.frame_interval_ns, &wayland_window_t::tick, this)
 {
 }
 
@@ -1233,14 +1223,14 @@ void wayland_window_t::on_frame_done(void *data, wl_callback *callback, std::uin
   auto *self = static_cast<wayland_window_t *>(data);
   wl_callback_destroy(callback);
   self->_frame_callback = nullptr;
-  self->window.on_frame(loop_core_t::now());
+  self->window.on_frame(now_ns(self->window));
 }
 
 void wayland_window_t::tick(void *context)
 {
   auto *self = static_cast<wayland_window_t *>(context);
   if (!self->_frame_callback)
-    self->window.on_frame(loop_core_t::now());
+    self->window.on_frame(now_ns(self->window));
 }
 
 void wayland_window_t::frame_wanted()

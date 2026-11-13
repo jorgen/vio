@@ -36,8 +36,6 @@ namespace vio::gui::ui
 {
 namespace detail
 {
-using vio::detail::loop_core_t;
-using vio::detail::posted_t;
 
 // One laid-out piece of a component's own output: a primitive in the component's coordinates, or a
 // mounted child placed at an offset. `box` is set on the primitive that draws a box, which is what
@@ -254,26 +252,18 @@ public:
   runtime_t(window_t &window, run_config_t config)
     : _window(window)
     , _loop(window.impl()->display.loop)
-    , _core(window.impl()->display.core)
     , _config(std::move(config))
+    , _beat(*_loop, [this] { beat(); })
+    , _finish(*_loop,
+              [this]
+              {
+                if (auto handle = std::exchange(_drained_waiter, {}))
+                  handle.resume();
+              })
   {
-    _beat.owner = this;
-    _beat.run = [](posted_t *node) { static_cast<runtime_t *>(node->owner)->beat(); };
-    _finish.owner = this;
-    _finish.run = [](posted_t *node)
-    {
-      auto *self = static_cast<runtime_t *>(node->owner);
-      if (auto handle = std::exchange(self->_drained_waiter, {}))
-        handle.resume();
-    };
   }
   runtime_t(const runtime_t &) = delete;
   runtime_t &operator=(const runtime_t &) = delete;
-  ~runtime_t()
-  {
-    _core.unpost(_beat);
-    _core.unpost(_finish);
-  }
 
   // Kept from construction: a behaviour woken by its own timer after the window closed, before
   // the frame loop has noticed, still asks for the loop, and the closed window no longer has it.
@@ -314,7 +304,7 @@ public:
   }
   void schedule() noexcept
   {
-    _core.defer(_beat);
+    _beat.schedule();
   }
 
   void beat()
@@ -1473,15 +1463,14 @@ private:
   {
     if (!_drained_waiter || !_dying.empty() || !_slots.empty())
       return;
-    _core.defer(_finish);
+    _finish.schedule();
   }
 
   window_t &_window;
   vio::event_loop_t *_loop;
-  loop_core_t &_core;
   run_config_t _config;
-  posted_t _beat;
-  posted_t _finish;
+  deferred_call_t _beat;
+  deferred_call_t _finish;
   waiter_list_t _ready;
   std::vector<std::coroutine_handle<>> _dead;
 

@@ -585,8 +585,9 @@ that exercises vio's own `retry_token.h`.
   `window.subscribe<key_event_t, text_event_t>()`, each with its own queue so every subscriber sees
   every event of its types (G19). Every await yields `std::nullopt` once the window closes.
   Window-system callbacks only record; a before-block hook resumes the waiters. On macOS and
-  Windows the loop blocks in a *host wait* (`loop_core_t::set_host_wait`) and runs `run_nested()`
-  turns inside modal resize loops. GL contexts (EGL, WGL, NSOpenGL), Vulkan surfaces, a
+  Windows the loop blocks in a *host wait* (`loop_set_host_wait`) and runs `loop_run_nested()`
+  turns inside modal resize loops. The gui uses only vio's public API -- nothing under
+  `vio/loop/` and nothing in `vio::detail` (G48) -- so it can live in a repository of its own. GL contexts (EGL, WGL, NSOpenGL), Vulkan surfaces, a
   `CAMetalLayer`, a Direct3D 12 swap chain, and the OpenCL and CUDA matching handles are in
   `vio/gui/context.h`; no graphics library is linked. Tests: `gui/test/run_linux.sh
   build/gui/vio_gui_tests` starts Xvfb and headless weston and runs both Linux backends. On

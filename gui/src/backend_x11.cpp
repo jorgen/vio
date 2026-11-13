@@ -24,12 +24,15 @@ Copyright (c) 2026 Jørgen Lind
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
-#include "fd_watch.h"
+#include <vio/operation/fd_watch.h>
+
 #include "vio/gui/backends.h"
 #include "vio/gui/gui.h"
 
@@ -216,12 +219,12 @@ class x11_display_t final : public display_backend_t
 public:
   explicit x11_display_t(display_impl_t &display)
     : impl(display)
-    , _watch(std::make_unique<fd_watch_t>(display.core, "x11 display"))
   {
   }
 
   ~x11_display_t() override
   {
+    _watch.reset();
     for (auto cursor : _cursors)
     {
       if (cursor)
@@ -272,8 +275,13 @@ public:
     attributes.event_mask = PropertyChangeMask;
     _helper = XCreateWindow(display, root, -1, -1, 1, 1, 0, 0, InputOnly, CopyFromParent, CWEventMask, &attributes);
 
-    if (int result = _watch->open(ConnectionNumber(display)); result < 0)
-      return result;
+    auto watch = vio::fd_watch_create(*impl.loop, ConnectionNumber(display));
+    if (!watch)
+      return watch.error().code;
+    _watch.emplace(std::move(*watch));
+    vio::fd_watch_set_keeps_loop_alive(*_watch, false);
+    vio::fd_watch_on_ready(*_watch, [this](vio::fd_interest) { _readable = true; });
+    vio::fd_watch_arm(*_watch, vio::fd_interest::read);
     XFlush(display);
     return 0;
   }
@@ -297,14 +305,14 @@ public:
 
   void dispatch() override
   {
-    if (!_watch->take_readable() && XEventsQueued(display, QueuedAlready) == 0)
+    if (!std::exchange(_readable, false) && XEventsQueued(display, QueuedAlready) == 0)
     {
-      _watch->park();
+      vio::fd_watch_arm(*_watch, vio::fd_interest::read);
       return;
     }
     while (XPending(display) > 0)
       next_event();
-    _watch->park();
+    vio::fd_watch_arm(*_watch, vio::fd_interest::read);
   }
 
   bool dispatch_queued() override
@@ -348,11 +356,9 @@ public:
     return display;
   }
 
-  void close(loop_core_t &core, posted_t &done) override
+  void close() noexcept override
   {
-    _done = &done;
-    _core = &core;
-    _watch->close(&x11_display_t::on_watch_closed, this);
+    _watch.reset();
   }
 
   Cursor cursor(cursor_t shape)
@@ -417,12 +423,6 @@ public:
   Atom incr = 0;
 
 private:
-  static void on_watch_closed(void *context)
-  {
-    auto *self = static_cast<x11_display_t *>(context);
-    self->_core->defer(*self->_done);
-  }
-
   float read_scale()
   {
     const char *resources = XResourceManagerString(display);
@@ -525,19 +525,18 @@ private:
     }
   }
 
-  std::unique_ptr<fd_watch_t> _watch;
+  std::optional<vio::fd_watch_t> _watch;
+  bool _readable = false;
   std::unordered_map<Window, x11_window_t *> _windows;
   std::array<Cursor, static_cast<std::size_t>(cursor_t::hidden) + 1> _cursors{};
   std::string _clipboard_text;
   Window _helper = 0;
-  posted_t *_done = nullptr;
-  loop_core_t *_core = nullptr;
 };
 
 x11_window_t::x11_window_t(x11_display_t &display, window_impl_t &window)
   : _display(display)
   , _window(window)
-  , _clock(window.display.core, window.display.config.frame_interval_ns, &x11_window_t::tick, this)
+  , _clock(*window.display.loop, window.display.config.frame_interval_ns, &x11_window_t::tick, this)
 {
 }
 
@@ -899,7 +898,8 @@ void x11_window_t::frame_wanted()
 
 void x11_window_t::tick(void *context)
 {
-  static_cast<x11_window_t *>(context)->_window.on_frame(loop_core_t::now());
+  auto *self = static_cast<x11_window_t *>(context);
+  self->_window.on_frame(now_ns(self->_window));
 }
 
 native_window_t x11_window_t::native() const

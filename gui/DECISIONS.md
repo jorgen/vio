@@ -634,3 +634,19 @@ this driver does not offer it. Drawing in step with the border needs DXGI with D
 the D3D12 backend of phase 12. Mid-drag screen captures did not separate the builds before and
 after the first fix -- a GDI capture does not sample what DWM shows at a given refresh -- so the
 evidence for it is the trace above, not a picture.
+
+## G48. The gui uses vio's public API only
+
+The gui used to reach into `vio::detail` for six things: watching the display server's descriptor,
+handing the blocking step to a Win32 or Cocoa message pump, before-block hooks, the deferred queue,
+intrusive timers and the loop clock. Two of those had public equivalents (`timer_t`, `loop_now`).
+The other four were capabilities vio did not expose, and are public now: `fd_watch_t` and
+`host_loop.h` (core D57), `before_block_hook_t` and `deferred_call_t` (core D58). The rule matters
+because the gui is moving to a repository of its own, where an internal header is one vio may
+change without notice.
+
+Display teardown is shorter for it. The gui's private fd watch was owned by the display, so the
+display could not be freed until the watch's close had finished on a later turn, and every backend
+reported that through a completion. A `vio::fd_watch_t` keeps its storage until vio is done with
+it, and no callback arrives once the handle is dropped, so a backend's `close()` drops its watches
+and returns, and the display is freed one posted turn later.

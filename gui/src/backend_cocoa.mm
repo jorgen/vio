@@ -266,14 +266,14 @@ enum class wait_state_t
 class cocoa_thread_t final : public vio::host_wait_t
 {
 public:
-  explicit cocoa_thread_t(loop_core_t &core)
-    : core(core)
+  explicit cocoa_thread_t(event_loop_t &loop)
+    : loop(loop)
   {
   }
 
   ~cocoa_thread_t() override
   {
-    core.set_host_wait(nullptr);
+    (void)vio::loop_set_host_wait(loop, nullptr);
     if (_observer)
     {
       CFRunLoopObserverInvalidate(_observer);
@@ -300,7 +300,7 @@ public:
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     if (![[NSRunningApplication currentApplication] isFinishedLaunching])
       [NSApp finishLaunching];
-    const auto handle = core.backend().native_handle();
+    const auto handle = vio::loop_native_handle(loop);
     if (handle < 0)
       return errc::not_supported;
     CFRunLoopAddCommonMode(CFRunLoopGetMain(), (__bridge CFStringRef)NSEventTrackingRunLoopMode);
@@ -315,13 +315,14 @@ public:
     CFRunLoopObserverContext observer_context{0, this, nullptr, nullptr, nullptr};
     _observer = CFRunLoopObserverCreate(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0, &cocoa_thread_t::on_before_waiting, &observer_context);
     CFRunLoopAddObserver(CFRunLoopGetMain(), _observer, kCFRunLoopCommonModes);
-    core.set_host_wait(this);
+    if (auto installed = vio::loop_set_host_wait(loop, this); !installed)
+      return installed.error().code;
     return 0;
   }
 
   void wait(std::optional<std::chrono::nanoseconds> timeout) override
   {
-    const std::int64_t timeout_ns = timeout ? timeout->count() : -1;
+    const std::int64_t timeout_ns = detail::timeout_ns(timeout);
     arm_timer();
     if (timeout_ns == 0)
       return;
@@ -359,11 +360,11 @@ public:
   {
     if (_state != wait_state_t::idle)
       return;
-    core.run_nested();
+    vio::loop_run_nested(loop);
     arm_timer();
   }
 
-  loop_core_t &core;
+  event_loop_t &loop;
   std::size_t displays = 0;
 
 private:
@@ -388,7 +389,7 @@ private:
 
   void arm_timer(bool now = false)
   {
-    const std::int64_t next = core.next_timeout();
+    const std::int64_t next = detail::timeout_ns(vio::loop_next_timeout(loop));
     if (next < 0 && !now)
     {
       drop_timer();
@@ -428,7 +429,7 @@ private:
   static void on_before_waiting(CFRunLoopObserverRef, CFRunLoopActivity, void *info)
   {
     auto *self = static_cast<cocoa_thread_t *>(info);
-    pollfd descriptor{static_cast<int>(self->core.backend().native_handle()), POLLIN, 0};
+    pollfd descriptor{static_cast<int>(vio::loop_native_handle(self->loop)), POLLIN, 0};
     self->arm_timer(self->_in_descriptor > 0 && ::poll(&descriptor, 1, 0) > 0);
   }
 
@@ -529,12 +530,12 @@ public:
     thread = current_thread.lock();
     if (!thread)
     {
-      thread = std::make_shared<cocoa_thread_t>(impl.core);
+      thread = std::make_shared<cocoa_thread_t>(*impl.loop);
       if (int result = thread->start(); result < 0)
         return result;
       current_thread = thread;
     }
-    else if (&thread->core != &impl.core)
+    else if (&thread->loop != impl.loop)
     {
       return errc::busy;
     }
@@ -582,10 +583,6 @@ public:
     return (__bridge void *)NSApp;
   }
 
-  void close(loop_core_t &core, posted_t &done) override
-  {
-    core.defer(done);
-  }
 
   display_impl_t &impl;
   std::shared_ptr<cocoa_thread_t> thread;
@@ -594,7 +591,7 @@ public:
 cocoa_window_t::cocoa_window_t(cocoa_display_t &display, window_impl_t &window)
   : window(window)
   , display(display)
-  , _clock(window.display.core, refresh_interval(window.display.config.frame_interval_ns), &cocoa_window_t::tick, this)
+  , _clock(*window.display.loop, refresh_interval(window.display.config.frame_interval_ns), &cocoa_window_t::tick, this)
 {
 }
 
@@ -819,7 +816,8 @@ void cocoa_window_t::frame_wanted()
 
 void cocoa_window_t::tick(void *context)
 {
-  static_cast<cocoa_window_t *>(context)->window.on_frame(loop_core_t::now());
+  auto *self = static_cast<cocoa_window_t *>(context);
+  self->window.on_frame(now_ns(self->window));
 }
 
 native_window_t cocoa_window_t::native() const

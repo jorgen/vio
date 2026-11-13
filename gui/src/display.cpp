@@ -53,34 +53,23 @@ value_waiter_t<T> &as(waiter_t &waiter) noexcept
 }
 } // namespace
 
-frame_clock_t::frame_clock_t(loop_core_t &core, std::int64_t interval_ns, void (*fire)(void *), void *context) noexcept
-  : _core(core)
+frame_clock_t::frame_clock_t(event_loop_t &loop, std::int64_t interval_ns, void (*fire)(void *), void *context)
+  : _loop(loop)
+  , _timer(make_timer(loop))
   , _interval(interval_ns > 0 ? interval_ns : default_frame_interval)
   , _fire(fire)
   , _context(context)
 {
-  _timer.owner = this;
-  _timer.fire = &frame_clock_t::on_fire;
-  _timer.keeps_alive = false;
-}
-
-frame_clock_t::~frame_clock_t()
-{
-  _core.remove_timer(_timer);
+  vio::timer_set_keeps_loop_alive(_timer, false);
+  vio::timer_on_fire(_timer, [this] { _fire(_context); });
 }
 
 void frame_clock_t::request() noexcept
 {
-  if (_timer.armed())
+  if (vio::timer_is_armed(_timer))
     return;
-  const auto now = loop_core_t::now();
-  _core.add_timer(_timer, now - now % _interval + _interval);
-}
-
-void frame_clock_t::on_fire(timer_node_t *node)
-{
-  auto *self = static_cast<frame_clock_t *>(node->owner);
-  self->_fire(self->_context);
+  const auto now = vio::loop_now(_loop).since_origin().count();
+  (void)vio::timer_rearm(_timer, std::chrono::nanoseconds(_interval - now % _interval));
 }
 
 window_impl_t::window_impl_t(display_impl_t &display) noexcept
@@ -241,7 +230,7 @@ bool window_impl_t::frame_ready_now() const noexcept
 
 frame_t window_impl_t::take_frame() noexcept
 {
-  frame_t frame{size, framebuffer, scale, ++frames, frame_tick ? frame_time : loop_core_t::now(), damaged};
+  frame_t frame{size, framebuffer, scale, ++frames, frame_tick ? frame_time : now_ns(*this), damaged};
   damaged = false;
   frame_tick = false;
   backend->frame_delivered();
@@ -290,18 +279,13 @@ void window_impl_t::deliver() noexcept
   }
 }
 
-display_impl_t::display_impl_t(loop_core_t &core, const display_config_t &config) noexcept
-  : core(core)
+display_impl_t::display_impl_t(event_loop_t &loop, const display_config_t &config)
+  : loop(&loop)
   , config(config)
+  , _dispatch_hook(loop, [this] { backend->dispatch(); })
+  , _pump_hook(loop, [this] { pump(); })
+  , _finish(loop, [this] { finish(); })
 {
-  _dispatch_hook.owner = this;
-  _dispatch_hook.run = &display_impl_t::on_dispatch;
-  _pump_hook.owner = this;
-  _pump_hook.run = &display_impl_t::on_pump;
-  _finish.owner = this;
-  _finish.run = &display_impl_t::on_finish;
-  _closed.owner = this;
-  _closed.run = &display_impl_t::on_closed;
 }
 
 display_impl_t::~display_impl_t() = default;
@@ -312,8 +296,8 @@ int display_impl_t::start(backend_factory_t factory)
   if (!made)
     return made.error();
   backend = std::move(*made);
-  core.add_hook(_dispatch_hook);
-  core.add_hook(_pump_hook);
+  _dispatch_hook.start();
+  _pump_hook.start();
   _started = true;
   return 0;
 }
@@ -330,23 +314,18 @@ void display_impl_t::release() noexcept
     delete this;
     return;
   }
-  core.remove_hook(_dispatch_hook);
-  core.remove_hook(_pump_hook);
-  core.defer(_finish);
+  _dispatch_hook.stop();
+  _pump_hook.stop();
+  _finish.schedule();
 }
 
-void display_impl_t::on_finish(posted_t *node)
+void display_impl_t::finish()
 {
-  auto *self = static_cast<display_impl_t *>(node->owner);
-  cancel_all(self->_clipboard_waiters, *self);
-  while (auto *waiter = self->_ready.pop_front())
+  cancel_all(_clipboard_waiters, *this);
+  while (auto *waiter = _ready.pop_front())
     waiter->handle.resume();
-  self->backend->close(self->core, self->_closed);
-}
-
-void display_impl_t::on_closed(posted_t *node)
-{
-  delete static_cast<display_impl_t *>(node->owner);
+  backend->close();
+  loop->run_in_loop([this] { delete this; });
 }
 
 void display_impl_t::mark_dirty(window_impl_t &window)
@@ -384,17 +363,6 @@ void display_impl_t::clipboard_arrived(std::expected<std::string, int> text) noe
   }
 }
 
-void display_impl_t::on_dispatch(hook_t *hook)
-{
-  auto *self = static_cast<display_impl_t *>(hook->owner);
-  self->backend->dispatch();
-}
-
-void display_impl_t::on_pump(hook_t *hook)
-{
-  static_cast<display_impl_t *>(hook->owner)->pump();
-}
-
 void display_impl_t::pump()
 {
   for (;;)
@@ -424,7 +392,7 @@ class null_window_t final : public window_backend_t
 public:
   null_window_t(window_impl_t &window, const window_config_t &config)
     : _window(window)
-    , _clock(window.display.core, window.display.config.frame_interval_ns, &null_window_t::tick, this)
+    , _clock(*window.display.loop, window.display.config.frame_interval_ns, &null_window_t::tick, this)
     , _title(config.title)
   {
   }
@@ -492,7 +460,8 @@ public:
 private:
   static void tick(void *context)
   {
-    static_cast<null_window_t *>(context)->_window.on_frame(loop_core_t::now());
+    auto *self = static_cast<null_window_t *>(context);
+    self->_window.on_frame(now_ns(self->_window));
   }
 
   window_impl_t &_window;
@@ -538,11 +507,6 @@ public:
   {
     return nullptr;
   }
-  void close(loop_core_t &core, posted_t &done) override
-  {
-    core.defer(done);
-  }
-
 private:
   display_impl_t &_display;
   std::string _clipboard;
@@ -604,17 +568,14 @@ std::expected<display_t, error_t> display_t::open(event_loop_t &loop, const disp
   auto factory = detail::choose_backend(config.backend, error);
   if (!factory)
     return std::unexpected(make_error(error));
-  auto &core = vio::detail::core(loop);
   display_t display;
-  display._impl.reset(new detail::display_impl_t(core, config));
-  display._impl->loop = &loop;
+  display._impl.reset(new detail::display_impl_t(loop, config));
   if (int result = display._impl->start(factory); result < 0)
   {
 #if defined(VIO_GUI_HAVE_WAYLAND) && defined(VIO_GUI_HAVE_X11)
     if (factory == &detail::make_wayland_backend && config.backend.empty() && !std::getenv("VIO_GUI_BACKEND"))
     {
-      display._impl.reset(new detail::display_impl_t(core, config));
-      display._impl->loop = &loop;
+      display._impl.reset(new detail::display_impl_t(loop, config));
       if (display._impl->start(&detail::make_x11_backend) == 0)
         return display;
     }

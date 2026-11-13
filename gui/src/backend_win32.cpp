@@ -184,8 +184,8 @@ class win32_display_t;
 class win32_thread_t final : public vio::host_wait_t
 {
 public:
-  explicit win32_thread_t(loop_core_t &core)
-    : core(core)
+  explicit win32_thread_t(event_loop_t &loop)
+    : loop(loop)
   {
   }
 
@@ -202,7 +202,7 @@ public:
 
   int start()
   {
-    _port = reinterpret_cast<HANDLE>(core.backend().native_handle());
+    _port = reinterpret_cast<HANDLE>(vio::loop_native_handle(loop));
     if (!_port || _port == INVALID_HANDLE_VALUE)
       return errc::not_supported;
     helper = CreateWindowExW(0, helper_class, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), this);
@@ -216,13 +216,14 @@ public:
       forward();
       SetEvent(_finished);
     });
-    core.set_host_wait(this);
+    if (auto installed = vio::loop_set_host_wait(loop, this); !installed)
+      return installed.error().code;
     return 0;
   }
 
   void wait(std::optional<std::chrono::nanoseconds> timeout) override
   {
-    const std::int64_t timeout_ns = timeout ? timeout->count() : -1;
+    const std::int64_t timeout_ns = detail::timeout_ns(timeout);
     if (timeout_ns == 0)
       return;
     DWORD milliseconds = INFINITE;
@@ -261,12 +262,12 @@ public:
 
   void nested_turn()
   {
-    core.run_nested();
+    vio::loop_run_nested(loop);
     if (modal > 0)
       arm_modal_timer();
   }
 
-  loop_core_t &core;
+  event_loop_t &loop;
   HWND helper = nullptr;
   int modal = 0;
   std::size_t displays = 0;
@@ -274,7 +275,7 @@ public:
 private:
   void arm_modal_timer()
   {
-    const std::int64_t next = core.next_timeout();
+    const std::int64_t next = detail::timeout_ns(vio::loop_next_timeout(loop));
     UINT milliseconds = USER_TIMER_MINIMUM;
     if (next > 0)
       milliseconds = static_cast<UINT>(std::clamp<std::int64_t>(next / 1'000'000, USER_TIMER_MINIMUM, 1000));
@@ -312,7 +313,7 @@ private:
   {
     if (!_forwarder.joinable())
       return;
-    core.set_host_wait(nullptr);
+    (void)vio::loop_set_host_wait(loop, nullptr);
     _exiting.store(true, std::memory_order_release);
     for (;;)
     {
@@ -437,12 +438,12 @@ public:
     thread = current_thread.lock();
     if (!thread)
     {
-      thread = std::make_shared<win32_thread_t>(impl.core);
+      thread = std::make_shared<win32_thread_t>(*impl.loop);
       if (int result = thread->start(); result < 0)
         return result;
       current_thread = thread;
     }
-    else if (&thread->core != &impl.core)
+    else if (&thread->loop != impl.loop)
     {
       return errc::busy;
     }
@@ -516,10 +517,6 @@ public:
     return GetModuleHandleW(nullptr);
   }
 
-  void close(loop_core_t &core, posted_t &done) override
-  {
-    core.defer(done);
-  }
 
   static LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
   {
@@ -543,7 +540,7 @@ public:
 win32_window_t::win32_window_t(win32_display_t &display, window_impl_t &window)
   : _display(display)
   , _window(window)
-  , _clock(window.display.core, refresh_interval(window.display.config.frame_interval_ns), &win32_window_t::tick, this)
+  , _clock(*window.display.loop, refresh_interval(window.display.config.frame_interval_ns), &win32_window_t::tick, this)
 {
 }
 
@@ -927,7 +924,8 @@ void win32_window_t::frame_wanted()
 
 void win32_window_t::tick(void *context)
 {
-  static_cast<win32_window_t *>(context)->_window.on_frame(loop_core_t::now());
+  auto *self = static_cast<win32_window_t *>(context);
+  self->_window.on_frame(now_ns(self->_window));
 }
 
 native_window_t win32_window_t::native() const

@@ -22,6 +22,7 @@ Copyright (c) 2026 Jørgen Lind
 
 #pragma once
 
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -38,15 +39,11 @@ Copyright (c) 2026 Jørgen Lind
 
 #include <vio/error.h>
 #include <vio/errc.h>
-#include <vio/loop/loop_core.h>
-#include <vio/loop/timer_heap.h>
+#include <vio/event_loop.h>
+#include <vio/loop_hooks.h>
+#include <vio/operation/timer.h>
 
 #include "vio/gui/events.h"
-
-namespace vio
-{
-class event_loop_t;
-}
 
 namespace vio::gui
 {
@@ -90,10 +87,15 @@ struct display_config_t
 
 namespace detail
 {
-using vio::detail::hook_t;
-using vio::detail::loop_core_t;
-using vio::detail::posted_t;
-using vio::detail::timer_node_t;
+[[nodiscard]] inline vio::timer_t make_timer(event_loop_t &loop)
+{
+  return std::move(*vio::timer_create(loop));
+}
+
+[[nodiscard]] inline std::int64_t timeout_ns(std::optional<std::chrono::nanoseconds> timeout) noexcept
+{
+  return timeout ? timeout->count() : -1;
+}
 
 class waiter_list_t;
 
@@ -277,7 +279,9 @@ public:
   virtual void set_clipboard_text(std::string text) = 0;
   virtual void request_clipboard_text() = 0;
   [[nodiscard]] virtual void *native_display() const noexcept = 0;
-  virtual void close(loop_core_t &core, posted_t &done) = 0;
+  virtual void close() noexcept
+  {
+  }
 };
 
 using backend_factory_t = std::expected<std::unique_ptr<display_backend_t>, int> (*)(display_impl_t &display);
@@ -285,10 +289,9 @@ using backend_factory_t = std::expected<std::unique_ptr<display_backend_t>, int>
 class frame_clock_t
 {
 public:
-  frame_clock_t(loop_core_t &core, std::int64_t interval_ns, void (*fire)(void *), void *context) noexcept;
+  frame_clock_t(event_loop_t &loop, std::int64_t interval_ns, void (*fire)(void *), void *context);
   frame_clock_t(const frame_clock_t &) = delete;
   frame_clock_t &operator=(const frame_clock_t &) = delete;
-  ~frame_clock_t();
 
   void request() noexcept;
   void set_interval(std::int64_t interval_ns) noexcept
@@ -297,10 +300,8 @@ public:
   }
 
 private:
-  static void on_fire(timer_node_t *node);
-
-  loop_core_t &_core;
-  timer_node_t _timer;
+  event_loop_t &_loop;
+  vio::timer_t _timer;
   std::int64_t _interval;
   void (*_fire)(void *);
   void *_context;
@@ -357,7 +358,7 @@ public:
 class display_impl_t
 {
 public:
-  display_impl_t(loop_core_t &core, const display_config_t &config) noexcept;
+  display_impl_t(event_loop_t &loop, const display_config_t &config);
   display_impl_t(const display_impl_t &) = delete;
   display_impl_t &operator=(const display_impl_t &) = delete;
   ~display_impl_t();
@@ -375,24 +376,19 @@ public:
   void clipboard_arrived(std::expected<std::string, int> text) noexcept;
   void add_clipboard_waiter(value_waiter_t<std::string> &waiter);
 
-  loop_core_t &core;
-  event_loop_t *loop = nullptr;
+  event_loop_t *loop;
   display_config_t config;
   std::unique_ptr<display_backend_t> backend;
   std::shared_ptr<void> gl_state;
   std::size_t windows = 0;
 
 private:
-  static void on_dispatch(hook_t *hook);
-  static void on_pump(hook_t *hook);
-  static void on_closed(posted_t *node);
-  static void on_finish(posted_t *node);
   void pump();
+  void finish();
 
-  hook_t _dispatch_hook;
-  hook_t _pump_hook;
-  posted_t _finish;
-  posted_t _closed;
+  before_block_hook_t _dispatch_hook;
+  before_block_hook_t _pump_hook;
+  deferred_call_t _finish;
   waiter_list_t _ready;
   waiter_list_t _clipboard_waiters;
   std::vector<std::expected<std::string, int>> _clipboard_results;
@@ -400,6 +396,11 @@ private:
   bool _clipboard_requested = false;
   bool _started = false;
 };
+
+[[nodiscard]] inline std::int64_t now_ns(const window_impl_t &window) noexcept
+{
+  return vio::loop_now(*window.display.loop).since_origin().count();
+}
 
 // Awaiting a frame is what asks for one, which is why frames are not a subscription: a subscription
 // would want frames for as long as it lived, and a queued frame is a stale one. Every coroutine
