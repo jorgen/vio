@@ -645,7 +645,8 @@ AFD. On Linux `VIO_BACKEND=epoll|io_uring` picks one at run time; epoll is the d
 `backend_name()` reports which ran. io_uring also runs file reads, writes and `fsync` on the ring.
 A descriptor vio does not own is watched with `vio/operation/fd_watch.h` (one-shot, armed after
 `errc::again`, sockets only on Windows), and a foreign event loop takes over the blocking step
-through `vio/host_loop.h` (refused on io_uring); see D57.
+through `vio/host_loop.h` (refused on io_uring); see D57. `vio/loop_hooks.h` has a hook that runs
+before the loop blocks and a cancellable deferred call that never allocates; see D58.
 Everything else that blocks -- other file work, `getaddrinfo` -- runs on the blocking pool
 (`src/blocking_pool.cpp`), which has separate file and DNS queues (4 and 2 threads,
 `VIO_FILE_THREADS` and `VIO_DNS_THREADS` to change them). A worker spins for 50 µs before it sleeps,

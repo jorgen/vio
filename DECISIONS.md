@@ -379,6 +379,19 @@ a host wait with `errc::not_supported`: its ring descriptor becomes readable onl
 that reached the kernel, and those are submitted from inside its own wait, so a host sleeping on
 the descriptor would sleep through readiness it was never told to watch for.
 
+**D58. A library on the loop gets the loop's own before-block hook and its own deferred queue.**
+vio gui needed both and reached into `loop_core_t` for them. `about_to_block_t` listeners were the
+public alternative and do not serve: they stop running once `stop()` was called, so a library
+cannot drive its coroutines through a shutdown; they are added and removed by posting, so one torn
+down in the same turn may still be called; and a nested turn started by one runs no listeners at
+all, where a Win32 modal loop needs every other hook to run. `before_block_hook_t` is the core's
+hook as an object: it runs every turn before the loop blocks, also while stopping, and a nested
+turn it starts skips only it. `deferred_call_t` is the core's deferred queue as an object:
+scheduling is idempotent and allocates nothing, the call runs later in the same turn or at the
+start of the next without the loop blocking first, and cancelling it, or destroying it, takes it
+out even from a drain already under way. Both are for the loop thread only. `run_in_loop` stays the
+way to reach a loop from another thread, and its allocation per call is the price of that.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared

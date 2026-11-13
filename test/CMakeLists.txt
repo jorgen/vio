@@ -66,6 +66,7 @@ add_executable(vio_tests
     test_errc_range.cpp
     test_fd_watch.cpp
     test_host_loop.cpp
+    test_loop_hooks.cpp
 )
 
 if(TARGET vio_internal_tests)
