@@ -30,13 +30,16 @@ Copyright (c) 2026 Jørgen Lind
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "vio/gui/backends.h"
 #include "vio/gui/gui.h"
+#include "vio/host_loop.h"
 #include "win32_common.h"
 
 #include <windows.h>
@@ -178,7 +181,7 @@ std::int64_t refresh_interval(std::int64_t configured)
 
 class win32_display_t;
 
-class win32_thread_t final : public vio::detail::host_wait_t
+class win32_thread_t final : public vio::host_wait_t
 {
 public:
   explicit win32_thread_t(loop_core_t &core)
@@ -217,8 +220,9 @@ public:
     return 0;
   }
 
-  void wait(std::int64_t timeout_ns) override
+  void wait(std::optional<std::chrono::nanoseconds> timeout) override
   {
+    const std::int64_t timeout_ns = timeout ? timeout->count() : -1;
     if (timeout_ns == 0)
       return;
     DWORD milliseconds = INFINITE;

@@ -38,6 +38,7 @@ Copyright (c) 2025 Jørgen Lind
 namespace vio
 {
 class about_to_block_t;
+class host_wait_t;
 }
 
 namespace vio::detail
@@ -51,13 +52,6 @@ struct hook_t
   using run_fn_t = void (*)(hook_t *hook);
   run_fn_t run = nullptr;
   void *owner = nullptr;
-};
-
-class host_wait_t
-{
-public:
-  virtual ~host_wait_t() = default;
-  virtual void wait(std::int64_t timeout_ns) = 0;
 };
 
 class VIO_EXPORT resource_t
@@ -164,7 +158,7 @@ public:
   void add_hook(hook_t &hook);
   void remove_hook(hook_t &hook) noexcept;
 
-  void set_host_wait(host_wait_t *host) noexcept
+  void set_host_wait(vio::host_wait_t *host) noexcept
   {
     _host_wait = host;
   }
@@ -258,7 +252,7 @@ private:
   std::vector<about_to_block_t *> _listeners;
   std::vector<hook_t *> _hooks;
   std::size_t _alive = 0;
-  host_wait_t *_host_wait = nullptr;
+  vio::host_wait_t *_host_wait = nullptr;
   std::uint8_t _active = 0;
   std::vector<hook_t *> _running_hooks;
 

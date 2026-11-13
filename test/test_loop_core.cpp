@@ -36,6 +36,7 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <vio/event_loop.h>
 #include <vio/event_pipe.h>
+#include <vio/host_loop.h>
 #include <vio/loop/blocking_pool.h>
 #include <vio/loop/socket.h>
 #include <vio/operation/sleep.h>
@@ -2632,11 +2633,12 @@ TEST_CASE("a child that stops an inherited loop and runs it is refused by the fo
 
 TEST_CASE("a host wait replaces the blocking step and the backend is still polled")
 {
-  struct sleeping_host_t final : vio::detail::host_wait_t
+  struct sleeping_host_t final : vio::host_wait_t
   {
     std::vector<std::int64_t> timeouts;
-    void wait(std::int64_t timeout_ns) override
+    void wait(std::optional<std::chrono::nanoseconds> timeout) override
     {
+      const std::int64_t timeout_ns = timeout ? timeout->count() : -1;
       timeouts.push_back(timeout_ns);
       auto cap = std::chrono::nanoseconds(5ms).count();
       std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns < 0 ? cap : std::min(timeout_ns, cap)));

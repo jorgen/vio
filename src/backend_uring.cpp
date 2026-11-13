@@ -179,6 +179,10 @@ public:
   {
     return _ring.fd();
   }
+  [[nodiscard]] bool supports_host_wait() const noexcept override
+  {
+    return false;
+  }
 
   [[nodiscard]] int add_watch(io_watch_t &watch) override
   {

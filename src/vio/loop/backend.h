@@ -109,6 +109,10 @@ public:
   {
     return -1;
   }
+  [[nodiscard]] virtual bool supports_host_wait() const noexcept
+  {
+    return true;
+  }
   [[nodiscard]] virtual int add_watch(io_watch_t &watch) = 0;
   virtual void remove_watch(io_watch_t &watch, posted_t &done) = 0;
   virtual void wake() noexcept = 0;

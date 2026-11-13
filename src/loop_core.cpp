@@ -29,6 +29,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <optional>
 #include <utility>
 
 #if !defined(_WIN32)
@@ -38,6 +39,7 @@ Copyright (c) 2025 Jørgen Lind
 #include "backends.h"
 #include "vio/about_to_block.h"
 #include "vio/errc.h"
+#include "vio/host_loop.h"
 #include "vio/loop/blocking_pool.h"
 
 namespace vio::detail
@@ -423,7 +425,8 @@ int loop_core_t::run()
     run_before_block();
     if (_host_wait)
     {
-      _host_wait->wait(wait_timeout());
+      const std::int64_t timeout = wait_timeout();
+      _host_wait->wait(timeout < 0 ? std::nullopt : std::optional<std::chrono::nanoseconds>(timeout));
       refuse_if_inherited();
       poll_backend(0);
     }

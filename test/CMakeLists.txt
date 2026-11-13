@@ -64,6 +64,8 @@ add_executable(vio_tests
     test_event_pipe_lifetime.cpp
     test_file_crt.cpp
     test_errc_range.cpp
+    test_fd_watch.cpp
+    test_host_loop.cpp
 )
 
 if(TARGET vio_internal_tests)

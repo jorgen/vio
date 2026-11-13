@@ -23,8 +23,10 @@ Copyright (c) 2026 Jørgen Lind
 #define GL_SILENCE_DEPRECATION
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,6 +36,7 @@ Copyright (c) 2026 Jørgen Lind
 #include "vio/gui/backends.h"
 #include "vio/gui/context.h"
 #include "vio/gui/gui.h"
+#include "vio/host_loop.h"
 
 #import <Cocoa/Cocoa.h>
 #import <OpenGL/OpenGL.h>
@@ -260,7 +263,7 @@ enum class wait_state_t
 };
 } // namespace
 
-class cocoa_thread_t final : public vio::detail::host_wait_t
+class cocoa_thread_t final : public vio::host_wait_t
 {
 public:
   explicit cocoa_thread_t(loop_core_t &core)
@@ -316,8 +319,9 @@ public:
     return 0;
   }
 
-  void wait(std::int64_t timeout_ns) override
+  void wait(std::optional<std::chrono::nanoseconds> timeout) override
   {
+    const std::int64_t timeout_ns = timeout ? timeout->count() : -1;
     arm_timer();
     if (timeout_ns == 0)
       return;

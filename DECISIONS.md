@@ -360,6 +360,25 @@ views are copied freely inside one batch, but a copy does not extend what it poi
 queued `*co_await reader` used to own its bytes and now holds a view that the next receive
 overwrites with another sender's payload and address. Copy `data` and `*peer` out to keep them.
 
+**D57. A descriptor someone else owns can be watched, and a host event loop can do the waiting.**
+Both existed only as `vio::detail` machinery that vio gui reached into, which is a shortcut that
+stops working the moment the gui moves to its own repository. `vio/operation/fd_watch.h` watches a
+descriptor vio did not open and does not close -- a display server connection, a D-Bus or
+libinput fd, another library's socket. Arming is one-shot, and the contract is the one vio's own
+sockets keep: arm only after the descriptor said "would block", because epoll and kqueue report
+edges and a watch armed over unread data waits for the next one. On Windows the descriptor must be
+a socket, since AFD polls nothing else. Drop the watch before closing the descriptor. A parked
+watch keeps the loop alive unless told not to, as a parked socket read does.
+
+`vio/host_loop.h` lets a host that insists on owning the blocking call -- a Win32 message pump, a
+Cocoa run loop, modal resize and tracking loops inside either -- take that step over:
+`loop_set_host_wait` installs a `host_wait_t`, `loop_native_handle` is what it must also wake on
+(the epoll or kqueue descriptor, the IOCP port), `loop_next_timeout` is how long it may sleep, and
+`loop_run_nested` runs one non-blocking turn from inside the host's own dispatch. io_uring refuses
+a host wait with `errc::not_supported`: its ring descriptor becomes readable only for submissions
+that reached the kernel, and those are submitted from inside its own wait, so a host sleeping on
+the descriptor would sleep through readiness it was never told to watch for.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared
