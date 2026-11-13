@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <coroutine>
 #include <exception>
+#include <type_traits>
 #include <utility>
 
 namespace vio
@@ -90,6 +91,13 @@ public:
     void return_value(T &&value)
     {
       return_value_holder = std::move(value);
+    }
+    // `co_return local;` should move the local (C++20 implicit move), but MSVC 19.44 passes it as
+    // an lvalue, which the overload above cannot take. Copying is what it gets instead.
+    void return_value(const T &value)
+      requires std::is_copy_assignable_v<T>
+    {
+      return_value_holder = value;
     }
 
     std::suspend_never initial_suspend()
