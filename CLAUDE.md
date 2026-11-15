@@ -581,7 +581,9 @@ that exercises vio's own `retry_token.h`.
 - `test/` - Tests using doctest
 - The window and UI library that used to live in `gui/` is now its own repository, vui
   (github.com/jorgen/vui), built on vio's public API only (D60). Keep `fd_watch.h`, `host_loop.h`,
-  `loop_hooks.h` and `handle_wait.h` working for it: it has no other way into the loop.
+  `loop_hooks.h` and `handle_wait.h` working for it: it has no other way into the loop. vui's CI
+  runs in this repository's `ghcr.io/jorgen/vio-ci` image, so the X11, Wayland, weston, Xvfb and
+  Mesa packages in `Dockerfile` stay even though vio's own tests no longer use them.
 - `3rdparty/` - boringssl, ada, structify, doctest, cmakerc (fetched via cmake-dep)
 
 ## Dependencies (toggles & install)
