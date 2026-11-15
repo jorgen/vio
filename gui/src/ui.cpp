@@ -384,7 +384,9 @@ public:
       _root = make_slot(_root_mount);
     for (auto &[component, slot] : _slots)
       slot->reached = false;
+    const auto owners = tracked_owners();
     build(*_root);
+    _items.clear();
     _stats.views = clock::now() - started;
 
     std::vector<slot_t *> leaving;
@@ -400,7 +402,7 @@ public:
       it = _slots.erase(it);
     }
     for (auto *slot : leaving)
-      unmount(*slot);
+      unmount(*slot, owners);
 
     const auto laying = clock::now();
     _measured.clear();
@@ -603,8 +605,11 @@ public:
     _popups.clear();
     _prims.clear();
     _runs.clear();
+    _hovered = nullptr;
+    _focused = nullptr;
+    _held = {};
     for (auto *slot : leaving)
-      unmount(*slot);
+      unmount(*slot, {});
     reap();
   }
 
@@ -1440,13 +1445,24 @@ private:
       set_flag(source, &pressable_t::_hovered, true);
   }
 
-  void unmount(slot_t &slot)
+  struct tracked_owners_t
   {
-    if (_hovered && owner_of(_hovered) == &slot)
+    slot_t *hovered = nullptr;
+    slot_t *focused = nullptr;
+    slot_t *held = nullptr;
+  };
+  [[nodiscard]] tracked_owners_t tracked_owners() const noexcept
+  {
+    return {_hovered ? owner_of(_hovered) : nullptr, _focused ? owner_of(_focused) : nullptr, _held.source ? owner_of(_held.source) : nullptr};
+  }
+
+  void unmount(slot_t &slot, const tracked_owners_t &owners)
+  {
+    if (owners.hovered == &slot)
       _hovered = nullptr;
-    if (_focused && owner_of(_focused) == &slot)
+    if (owners.focused == &slot)
       _focused = nullptr;
-    if (_held.slot == &slot || (_held.source && owner_of(_held.source) == &slot))
+    if (_held.slot == &slot || owners.held == &slot)
       _held = {};
     std::erase(_touched, &slot);
     slot.scope->cancel();
