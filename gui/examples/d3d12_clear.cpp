@@ -35,6 +35,7 @@ Copyright (c) 2026 Jørgen Lind
 
 #include <vio/gui/context.h>
 #include <vio/gui/gui.h>
+#include <vio/operation/handle_wait.h>
 #include <vio/run.h>
 
 #include <windows.h>
@@ -72,7 +73,8 @@ struct renderer_t
 
   ~renderer_t()
   {
-    wait();
+    if (signal_fence())
+      WaitForSingleObject(event, INFINITE);
     for (auto *&target : targets)
       release(target);
     release(swap_chain);
@@ -139,21 +141,27 @@ struct renderer_t
     }
   }
 
-  void wait()
+  bool signal_fence()
   {
     if (!queue || !fence)
-      return;
+      return false;
     queue->Signal(fence, ++fence_value);
-    if (fence->GetCompletedValue() < fence_value)
-    {
-      fence->SetEventOnCompletion(fence_value, event);
-      WaitForSingleObject(event, INFINITE);
-    }
+    if (fence->GetCompletedValue() >= fence_value)
+      return false;
+    fence->SetEventOnCompletion(fence_value, event);
+    return true;
+  }
+
+  vio::task_t<bool> idle(vio::event_loop_t &loop)
+  {
+    if (!signal_fence())
+      co_return true;
+    auto signalled = co_await vio::wait_for_handle(loop, event);
+    co_return signalled.has_value();
   }
 
   void resize(gui::extent_t framebuffer)
   {
-    wait();
     for (auto *&target : targets)
       release(target);
     if (gui::d3d12::resize_swap_chain(swap_chain, framebuffer))
@@ -188,7 +196,6 @@ struct renderer_t
     ID3D12CommandList *lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
     swap_chain->Present(1, 0);
-    wait();
   }
 };
 } // namespace
@@ -234,6 +241,11 @@ int main(int argc, char **argv)
               renderer.resize(built);
             }
             renderer.clear(static_cast<double>(frame->time_ns) / 1e9);
+            if (!co_await renderer.idle(loop))
+            {
+              status = 1;
+              break;
+            }
             if (frame_limit > 0 && frame->number >= frame_limit)
               break;
           }
