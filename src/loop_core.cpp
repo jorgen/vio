@@ -113,6 +113,64 @@ void backend_t::arm(io_watch_t &, std::uint8_t)
 {
 }
 
+int backend_t::add_handle_watch(handle_watch_t &)
+{
+  return errc::not_supported;
+}
+
+void backend_t::remove_handle_watch(handle_watch_t &, posted_t &done)
+{
+  _loop.defer(done);
+}
+
+int backend_t::arm_handle(handle_watch_t &)
+{
+  return errc::not_supported;
+}
+
+void backend_t::disarm_handle(handle_watch_t &) noexcept
+{
+}
+
+int backend_t::wait_handle(handle_watch_t &watch, io_op_t &op)
+{
+  if (_loop.inherited()) [[unlikely]]
+    _loop.abort_inherited("used to wait on a handle");
+  if (op.parked)
+    return 0;
+  if (watch.waiter)
+    return errc::busy;
+  if (int result = arm_handle(watch); result < 0)
+    return result;
+  op.parked = true;
+  watch.waiter = &op;
+  if (op.keeps_alive)
+    _loop.retain();
+  return 0;
+}
+
+void backend_t::cancel_handle_wait(handle_watch_t &watch, io_op_t &op) noexcept
+{
+  if (!op.parked || watch.waiter != &op)
+    return;
+  watch.waiter = nullptr;
+  op.parked = false;
+  if (op.keeps_alive)
+    _loop.release();
+  disarm_handle(watch);
+}
+
+void backend_t::signal_handle(handle_watch_t &watch)
+{
+  auto *op = std::exchange(watch.waiter, nullptr);
+  if (!op)
+    return;
+  op->parked = false;
+  if (op->keeps_alive)
+    _loop.release();
+  op->complete(op);
+}
+
 int backend_t::open_watch(io_watch_t &watch)
 {
   if (_loop.inherited()) [[unlikely]]

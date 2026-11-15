@@ -68,6 +68,9 @@ add_executable(vio_tests
     test_host_loop.cpp
     test_loop_hooks.cpp
 )
+if(WIN32)
+    target_sources(vio_tests PRIVATE test_handle_wait.cpp)
+endif()
 
 if(TARGET vio_internal_tests)
     target_link_libraries(vio_tests PRIVATE vio_internal_tests)
@@ -96,6 +99,9 @@ endif()
 if(NOT MSVC)
     file(GLOB_RECURSE VIO_PUBLIC_HEADERS CONFIGURE_DEPENDS RELATIVE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/vio/*.h)
     list(FILTER VIO_PUBLIC_HEADERS EXCLUDE REGEX "^vio/platform/wasm/")
+    if(NOT WIN32)
+        list(FILTER VIO_PUBLIC_HEADERS EXCLUDE REGEX "^vio/operation/handle_wait\.h$")
+    endif()
     set(VIO_HEADER_CHECK_SOURCES)
     foreach(header ${VIO_PUBLIC_HEADERS})
         string(MAKE_C_IDENTIFIER ${header} header_id)

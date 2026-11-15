@@ -392,6 +392,22 @@ start of the next without the loop blocking first, and cancelling it, or destroy
 out even from a drain already under way. Both are for the loop thread only. `run_in_loop` stays the
 way to reach a loop from another thread, and its allocation per call is the price of that.
 
+**D59. On Windows the loop waits on kernel objects through wait completion packets.** A GPU fence,
+a process handle or an event set by another library is a waitable object, not a socket, so
+`fd_watch_t` cannot watch it and blocking in `WaitForSingleObject` stalls the loop.
+`vio/operation/handle_wait.h` has `handle_wait_t`, which is one-shot and keeps the loop alive like
+`fd_watch_t`, and `wait_for_handle`, which can be awaited and cancelled like `sleep`. The meaning is
+"signalled", not "ready": the wait satisfies the object as `WaitForSingleObject` would, so an
+auto-reset event is consumed by the wait that reports it. The backend associates an
+`NtCreateWaitCompletionPacket` packet with the IOCP port, so the signal arrives as an ordinary
+completion and costs no thread. `RegisterWaitForSingleObject` would cost a thread-pool wait per
+object and a second hop to the port. Vio requires Windows 10, and these calls exist since Windows
+8, so there is no fallback. Cancelling is the part to get right. A cancel that returns success
+removed the packet. Any other result means the packet is already on its way to the loop -- the gui's
+host-wait forwarder takes packets off the port and posts them back -- so the backend state is kept
+until the packet arrives. A wait armed again in that window gets that signal, because the signal
+has already been consumed for it.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared

@@ -66,6 +66,7 @@ constexpr ULONG write_events = afd_poll_send | afd_poll_connect_fail | afd_poll_
 
 constexpr ULONG_PTR afd_key = 0x41464400;
 constexpr ULONG_PTR wake_key = 0x57414B45;
+constexpr ULONG_PTR handle_key = 0x48444C00;
 constexpr ULONG max_entries = 128;
 constexpr std::size_t max_group_members = 32;
 constexpr int shutdown_drain_rounds = 100;
@@ -118,6 +119,9 @@ using nt_create_file_t = LONG(NTAPI *)(HANDLE *file, ACCESS_MASK access, object_
 using nt_device_io_control_file_t = LONG(NTAPI *)(HANDLE file, HANDLE event, io_apc_routine_t routine, void *context, io_status_block_t *status, ULONG code, void *input, ULONG input_length, void *output, ULONG output_length);
 using nt_cancel_io_file_ex_t = LONG(NTAPI *)(HANDLE file, io_status_block_t *request, io_status_block_t *status);
 using rtl_nt_status_to_dos_error_t = ULONG(NTAPI *)(LONG status);
+using nt_create_wait_completion_packet_t = LONG(NTAPI *)(HANDLE *packet, ACCESS_MASK access, object_attributes_t *attributes);
+using nt_associate_wait_completion_packet_t = LONG(NTAPI *)(HANDLE packet, HANDLE port, HANDLE target, void *key, void *apc_context, LONG status, ULONG_PTR information, BOOLEAN *already_signalled);
+using nt_cancel_wait_completion_packet_t = LONG(NTAPI *)(HANDLE packet, BOOLEAN remove_signalled);
 
 struct nt_api_t
 {
@@ -125,6 +129,9 @@ struct nt_api_t
   nt_device_io_control_file_t device_io_control_file = nullptr;
   nt_cancel_io_file_ex_t cancel_io_file_ex = nullptr;
   rtl_nt_status_to_dos_error_t status_to_dos_error = nullptr;
+  nt_create_wait_completion_packet_t create_wait_completion_packet = nullptr;
+  nt_associate_wait_completion_packet_t associate_wait_completion_packet = nullptr;
+  nt_cancel_wait_completion_packet_t cancel_wait_completion_packet = nullptr;
 };
 
 template <typename function_t>
@@ -144,6 +151,9 @@ const nt_api_t *nt_api() noexcept
     loaded.device_io_control_file = load_function<nt_device_io_control_file_t>(ntdll, "NtDeviceIoControlFile");
     loaded.cancel_io_file_ex = load_function<nt_cancel_io_file_ex_t>(ntdll, "NtCancelIoFileEx");
     loaded.status_to_dos_error = load_function<rtl_nt_status_to_dos_error_t>(ntdll, "RtlNtStatusToDosError");
+    loaded.create_wait_completion_packet = load_function<nt_create_wait_completion_packet_t>(ntdll, "NtCreateWaitCompletionPacket");
+    loaded.associate_wait_completion_packet = load_function<nt_associate_wait_completion_packet_t>(ntdll, "NtAssociateWaitCompletionPacket");
+    loaded.cancel_wait_completion_packet = load_function<nt_cancel_wait_completion_packet_t>(ntdll, "NtCancelWaitCompletionPacket");
     return loaded;
   }();
   if (!api.create_file || !api.device_io_control_file || !api.cancel_io_file_ex || !api.status_to_dos_error)
@@ -340,6 +350,23 @@ private:
   list_id _id;
 };
 
+enum class handle_status : std::uint8_t
+{
+  idle,
+  pending,
+  cancelling
+};
+
+struct handle_state_t
+{
+  handle_watch_t *watch = nullptr;
+  HANDLE packet = nullptr;
+  handle_status status = handle_status::idle;
+  posted_t *done = nullptr;
+  handle_state_t *previous = nullptr;
+  handle_state_t *next = nullptr;
+};
+
 class iocp_backend_t final : public backend_t
 {
 public:
@@ -353,19 +380,15 @@ public:
   ~iocp_backend_t() override
   {
     for (; _entries_next < _entries_count; ++_entries_next)
-    {
-      const auto &entry = _entries[_entries_next];
-      if (entry.lpCompletionKey != afd_key || entry.lpOverlapped == nullptr)
-        continue;
-      auto *state = state_from(entry.lpOverlapped);
-      if (state->status == poll_status::idle)
-        continue;
-      state->status = poll_status::idle;
-      --_outstanding;
-    }
+      forget(_entries[_entries_next]);
     for (auto *state = _all; state; state = state->all_next)
     {
       if (state->status == poll_status::pending)
+        cancel(*state);
+    }
+    for (auto *state = _handles; state; state = state->next)
+    {
+      if (state->status == handle_status::pending)
         cancel(*state);
     }
     drain_outstanding();
@@ -389,6 +412,25 @@ public:
     }
     if (held > 0)
       std::fprintf(stderr, "vio: iocp backend destroyed while the kernel still holds %zu socket poll(s); leaking them\n", held);
+    std::size_t waits = 0;
+    for (auto *state = _handles; state;)
+    {
+      auto *next = state->next;
+      if (state->status == handle_status::idle)
+      {
+        if (state->watch)
+          state->watch->backend_state = nullptr;
+        ::CloseHandle(state->packet);
+        delete state;
+      }
+      else
+      {
+        ++waits;
+      }
+      state = next;
+    }
+    if (waits > 0)
+      std::fprintf(stderr, "vio: iocp backend destroyed while the kernel still holds %zu handle wait(s); leaking them\n", waits);
     ::CloseHandle(_port);
   }
 
@@ -454,6 +496,47 @@ public:
     ::PostQueuedCompletionStatus(_port, 0, wake_key, nullptr);
   }
 
+  [[nodiscard]] int add_handle_watch(handle_watch_t &watch) override
+  {
+    if (!_nt.create_wait_completion_packet || !_nt.associate_wait_completion_packet || !_nt.cancel_wait_completion_packet)
+      return errc::not_supported;
+    if (!watch.object || watch.object == INVALID_HANDLE_VALUE)
+      return errc::invalid_argument;
+    HANDLE packet = nullptr;
+    if (const LONG status = _nt.create_wait_completion_packet(&packet, GENERIC_ALL, nullptr); status < 0)
+      return errc_from_win32(_nt.status_to_dos_error(status));
+    auto *state = new (std::nothrow) handle_state_t{};
+    if (!state)
+    {
+      ::CloseHandle(packet);
+      return errc::out_of_memory;
+    }
+    state->watch = &watch;
+    state->packet = packet;
+    state->next = _handles;
+    if (_handles)
+      _handles->previous = state;
+    _handles = state;
+    watch.backend_state = state;
+    return 0;
+  }
+
+  void remove_handle_watch(handle_watch_t &watch, posted_t &done) override
+  {
+    auto *state = static_cast<handle_state_t *>(std::exchange(watch.backend_state, nullptr));
+    if (!state)
+    {
+      _loop.defer(done);
+      return;
+    }
+    state->watch = nullptr;
+    state->done = &done;
+    if (state->status == handle_status::pending)
+      cancel(*state);
+    if (state->status == handle_status::idle)
+      finish_removal(*state);
+  }
+
   void poll(std::int64_t timeout_ns) override
   {
     release_retired();
@@ -491,6 +574,29 @@ public:
   }
 
 protected:
+  [[nodiscard]] int arm_handle(handle_watch_t &watch) override
+  {
+    auto *state = static_cast<handle_state_t *>(watch.backend_state);
+    if (!state)
+      return errc::bad_descriptor;
+    if (state->status != handle_status::idle)
+      return 0;
+    BOOLEAN already_signalled = FALSE;
+    const LONG status = _nt.associate_wait_completion_packet(state->packet, _port, static_cast<HANDLE>(watch.object), reinterpret_cast<void *>(handle_key), state, 0, 0, &already_signalled);
+    if (status < 0)
+      return errc_from_win32(_nt.status_to_dos_error(status));
+    state->status = handle_status::pending;
+    ++_outstanding;
+    return 0;
+  }
+
+  void disarm_handle(handle_watch_t &watch) noexcept override
+  {
+    auto *state = static_cast<handle_state_t *>(watch.backend_state);
+    if (state && state->status == handle_status::pending)
+      cancel(*state);
+  }
+
   void arm(io_watch_t &watch, std::uint8_t interest) override
   {
     auto *state = static_cast<poll_state_t *>(watch.backend_state);
@@ -584,6 +690,67 @@ private:
     state.submitted = 0;
   }
 
+  void cancel(handle_state_t &state) noexcept
+  {
+    if (_nt.cancel_wait_completion_packet(state.packet, TRUE) == status_success)
+    {
+      state.status = handle_status::idle;
+      --_outstanding;
+      return;
+    }
+    state.status = handle_status::cancelling;
+  }
+
+  void complete(handle_state_t &state)
+  {
+    if (state.status == handle_status::idle)
+      return;
+    --_outstanding;
+    state.status = handle_status::idle;
+    if (state.done)
+    {
+      finish_removal(state);
+      return;
+    }
+    signal_handle(*state.watch);
+  }
+
+  void finish_removal(handle_state_t &state) noexcept
+  {
+    _loop.defer(*std::exchange(state.done, nullptr));
+    if (state.previous)
+      state.previous->next = state.next;
+    else
+      _handles = state.next;
+    if (state.next)
+      state.next->previous = state.previous;
+    ::CloseHandle(state.packet);
+    delete &state;
+  }
+
+  void forget(const OVERLAPPED_ENTRY &entry) noexcept
+  {
+    if (entry.lpOverlapped == nullptr)
+      return;
+    if (entry.lpCompletionKey == handle_key)
+    {
+      auto *state = reinterpret_cast<handle_state_t *>(entry.lpOverlapped);
+      if (state->status != handle_status::idle)
+      {
+        state->status = handle_status::idle;
+        --_outstanding;
+      }
+      return;
+    }
+    if (entry.lpCompletionKey != afd_key)
+      return;
+    auto *state = state_from(entry.lpOverlapped);
+    if (state->status == poll_status::idle)
+      return;
+    state->status = poll_status::idle;
+    --_outstanding;
+  }
+
   void update(poll_state_t &state) noexcept
   {
     auto &watch = *state.watch;
@@ -633,9 +800,12 @@ private:
 
   void handle(const OVERLAPPED_ENTRY &entry)
   {
-    if (entry.lpCompletionKey != afd_key || entry.lpOverlapped == nullptr)
+    if (entry.lpOverlapped == nullptr)
       return;
-    complete(*state_from(entry.lpOverlapped));
+    if (entry.lpCompletionKey == handle_key)
+      complete(*reinterpret_cast<handle_state_t *>(entry.lpOverlapped));
+    else if (entry.lpCompletionKey == afd_key)
+      complete(*state_from(entry.lpOverlapped));
   }
 
   void complete(poll_state_t &state)
@@ -747,15 +917,7 @@ private:
         return;
       }
       for (ULONG i = 0; i < count; ++i)
-      {
-        if (entries[i].lpCompletionKey != afd_key || entries[i].lpOverlapped == nullptr)
-          continue;
-        auto *state = state_from(entries[i].lpOverlapped);
-        if (state->status == poll_status::idle)
-          continue;
-        state->status = poll_status::idle;
-        --_outstanding;
-      }
+        forget(entries[i]);
     }
   }
 
@@ -767,6 +929,7 @@ private:
   state_list_t _failed{list_id::failed};
   state_list_t _retired{list_id::retired};
   poll_state_t *_all = nullptr;
+  handle_state_t *_handles = nullptr;
   std::size_t _outstanding = 0;
   OVERLAPPED_ENTRY _entries[max_entries] = {};
   ULONG _entries_next = 0;

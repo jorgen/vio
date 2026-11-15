@@ -59,6 +59,13 @@ struct io_watch_t
   void *backend_state = nullptr;
 };
 
+struct handle_watch_t
+{
+  void *object = nullptr;
+  io_op_t *waiter = nullptr;
+  void *backend_state = nullptr;
+};
+
 enum class file_op_kind : std::uint8_t
 {
   read,
@@ -131,9 +138,17 @@ public:
   void wait(io_watch_t &watch, std::uint8_t interest, io_op_t &op);
   void cancel_wait(io_watch_t &watch, io_op_t &op) noexcept;
 
+  [[nodiscard]] virtual int add_handle_watch(handle_watch_t &watch);
+  virtual void remove_handle_watch(handle_watch_t &watch, posted_t &done);
+  [[nodiscard]] int wait_handle(handle_watch_t &watch, io_op_t &op);
+  void cancel_handle_wait(handle_watch_t &watch, io_op_t &op) noexcept;
+
 protected:
   virtual void arm(io_watch_t &watch, std::uint8_t interest);
   void dispatch(io_watch_t &watch, bool readable, bool writable);
+  [[nodiscard]] virtual int arm_handle(handle_watch_t &watch);
+  virtual void disarm_handle(handle_watch_t &watch) noexcept;
+  void signal_handle(handle_watch_t &watch);
   void retry_later(io_watch_t &watch, bool readable, bool writable) noexcept;
 
   loop_core_t &_loop;
