@@ -36,36 +36,6 @@ macro(Build3rdParty)
 
     CmDepAddPackage(ada OPTIONS ADA_TESTING=OFF ADA_BENCHMARKS=OFF ADA_TOOLS=OFF)
 
-    # Text for the gui toolkit (gui/DECISIONS.md G27, G39). Both end up as the targets
-    # vio::freetype and vio::harfbuzz whichever way they arrive.
-    if (VIO_BUILD_GUI AND NOT EMSCRIPTEN)
-        CmDepAddPackage(freetype PACKAGE Freetype OPTIONS
-            FT_DISABLE_HARFBUZZ=ON FT_DISABLE_ZLIB=ON FT_DISABLE_BZIP2=ON
-            FT_DISABLE_PNG=ON FT_DISABLE_BROTLI=ON)
-        if (TARGET freetype)
-            add_library(vio::freetype ALIAS freetype)
-        else ()
-            add_library(vio::freetype ALIAS Freetype::Freetype)
-        endif ()
-
-        if (harfbuzz_USE_SYSTEM)
-            find_package(harfbuzz CONFIG REQUIRED)
-            add_library(vio::harfbuzz ALIAS harfbuzz::harfbuzz)
-        else ()
-            # The amalgamation: one translation unit, HarfBuzz's own OpenType font functions and
-            # Unicode data, no FreeType, no threads library, nothing installed.
-            add_library(vio_harfbuzz STATIC "${harfbuzz_SOURCE_DIR}/src/harfbuzz.cc")
-            target_include_directories(vio_harfbuzz SYSTEM PUBLIC "${harfbuzz_SOURCE_DIR}/src")
-            set_target_properties(vio_harfbuzz PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
-            if (MSVC)
-                target_compile_options(vio_harfbuzz PRIVATE /bigobj /w)
-            else ()
-                target_compile_options(vio_harfbuzz PRIVATE -w)
-            endif ()
-            add_library(vio::harfbuzz ALIAS vio_harfbuzz)
-        endif ()
-    endif ()
-
     if (VIO_BUILD_TESTS)
         CmDepAddPackage(doctest OPTIONS DOCTEST_WITH_TESTS=OFF DOCTEST_NO_INSTALL=ON)
     endif ()

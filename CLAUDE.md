@@ -579,19 +579,9 @@ to a vio client is untested. vio sending one is covered, which is the direction
 that exercises vio's own `retry_token.h`.
 
 - `test/` - Tests using doctest
-- `gui/` - vio gui, a window library on the same loop (`gui/PLAN.md`, `gui/DECISIONS.md`). Windows
-  on X11, Wayland, Win32 and Cocoa; `frame()` is awaited, and everything else a window reports --
-  input, `resize_event_t`, `close_request_t` -- through typed subscriptions,
-  `window.subscribe<key_event_t, text_event_t>()`, each with its own queue so every subscriber sees
-  every event of its types (G19). Every await yields `std::nullopt` once the window closes.
-  Window-system callbacks only record; a before-block hook resumes the waiters. On macOS and
-  Windows the loop blocks in a *host wait* (`loop_set_host_wait`) and runs `loop_run_nested()`
-  turns inside modal resize loops. The gui uses only vio's public API -- nothing under
-  `vio/loop/` and nothing in `vio::detail` (G48) -- so it can live in a repository of its own. GL contexts (EGL, WGL, NSOpenGL), Vulkan surfaces, a
-  `CAMetalLayer`, a Direct3D 12 swap chain, and the OpenCL and CUDA matching handles are in
-  `vio/gui/context.h`; no graphics library is linked. Tests: `gui/test/run_linux.sh
-  build/gui/vio_gui_tests` starts Xvfb and headless weston and runs both Linux backends. On
-  Wayland a frame is only delivered after the previous one was committed (G13).
+- The window and UI library that used to live in `gui/` is now its own repository, vui
+  (github.com/jorgen/vui), built on vio's public API only (D60). Keep `fd_watch.h`, `host_loop.h`,
+  `loop_hooks.h` and `handle_wait.h` working for it: it has no other way into the loop.
 - `3rdparty/` - boringssl, ada, structify, doctest, cmakerc (fetched via cmake-dep)
 
 ## Dependencies (toggles & install)

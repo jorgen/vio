@@ -408,6 +408,13 @@ host-wait forwarder takes packets off the port and posts them back -- so the bac
 until the packet arrives. A wait armed again in that window gets that signal, because the signal
 has already been consumed for it.
 
+**D60. The gui moved to its own repository, vui.** Windows, input and the declarative toolkit are
+a library that uses vio; they are not part of it. Keeping them here gave every vio build FreeType,
+HarfBuzz and Vulkan headers to fetch, and made a gui test failure fail vio's CI. D57 to D59 exist
+so the move could happen: vui reaches the loop through public headers only, and pins vio through
+cmake-dep like any other consumer. Its history up to the move came with it, through
+`git subtree split`. Its decisions stay numbered G1 onwards in vui's own `DECISIONS.md`.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared
