@@ -10,6 +10,9 @@
 #include "require_expected.h"
 #include "tls_test_helpers.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <expected>
 #include <string>
 #include <utility>
 
@@ -65,6 +68,37 @@ TEST_SUITE("http_client parse_response")
     std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n";
     auto response = vio::http::detail::parse_response(raw);
     CHECK_FALSE(response.has_value());
+  }
+}
+
+TEST_SUITE("http_client chunked_decoder")
+{
+  // Bytes arrive in arbitrary pieces; feeding one byte at a time crosses every state boundary.
+  TEST_CASE("byte-at-a-time with extensions and trailers stops at the message end")
+  {
+    const std::string wire = "5;name=x\r\nHello\r\nA\r\n, chunked!\r\n0\r\nX-Trailer: 1\r\n\r\nNEXT";
+    vio::http::detail::chunked_decoder_t decoder;
+    std::string decoded;
+    std::size_t consumed = 0;
+    for (std::size_t i = 0; i < wire.size() && !decoder.done(); ++i)
+    {
+      auto r = decoder.feed(std::string_view(wire).substr(i, 1), [&](std::string_view d) -> std::expected<void, vio::error_t> {
+        decoded.append(d);
+        return {};
+      });
+      REQUIRE(r.has_value());
+      consumed += *r;
+    }
+    CHECK(decoder.done());
+    CHECK(decoded == "Hello, chunked!");
+    CHECK(wire.substr(consumed) == "NEXT");
+  }
+
+  TEST_CASE("a non-hex chunk size is an error")
+  {
+    vio::http::detail::chunked_decoder_t decoder;
+    auto r = decoder.feed("zz\r\n", [](std::string_view) -> std::expected<void, vio::error_t> { return {}; });
+    CHECK_FALSE(r.has_value());
   }
 }
 
@@ -290,6 +324,157 @@ TEST_SUITE("http_client keep-alive")
     CHECK(pool.creations == 1); // only the first request opened a socket
     CHECK(pool.reuses == 1);    // the second request rode the pooled connection
     CHECK(pool.discards_stale == 0);
+  }
+}
+
+namespace
+{
+struct stream_result_t
+{
+  std::expected<vio::http::response_t, vio::error_t> response = std::unexpected(vio::error_t{.code = -1, .msg = "not run"});
+  std::string streamed;
+  int starts = 0;
+  long long announced = -2;
+  std::size_t pieces = 0;
+};
+
+// Serve one request with `response`, written in `pieces` separate writes, and fetch it with the streaming
+// callbacks set. `fail_after` > 0 makes on_body fail once that many bytes have been streamed.
+vio::task_t<void> streaming_scenario(vio::event_loop_t &event_loop, std::string response, std::size_t pieces, std::size_t fail_after, stream_result_t &out)
+{
+  auto server_and_port = bound_http_server(event_loop);
+  REQUIRE_EXPECTED(server_and_port);
+  const int port = server_and_port->second;
+
+  auto server_task = [](vio::tcp_server_t s, std::string resp, std::size_t n) -> vio::task_t<void>
+  {
+    auto server = std::move(s);
+    auto listen_result = co_await vio::tcp_listen(server, 10);
+    REQUIRE_EXPECTED(listen_result);
+    auto accepted = vio::tcp_accept(server);
+    REQUIRE_EXPECTED(accepted);
+    auto conn = std::move(accepted.value());
+    auto reader_or = vio::tcp_create_reader(conn);
+    REQUIRE_EXPECTED(reader_or);
+    auto reader = std::move(reader_or.value());
+    std::string request;
+    while (request.find("\r\n\r\n") == std::string::npos)
+    {
+      auto chunk = co_await reader;
+      if (!chunk)
+        co_return;
+      request.append(chunk.value().chars(), chunk.value().size());
+    }
+    const std::size_t step = (resp.size() + n - 1) / n;
+    for (std::size_t off = 0; off < resp.size(); off += step)
+    {
+      auto w = co_await vio::write_tcp(conn, reinterpret_cast<const uint8_t *>(resp.data() + off), std::min(step, resp.size() - off));
+      if (!w)
+        co_return; // the client may abort mid-body
+    }
+  }(std::move(server_and_port->first), std::move(response), pieces);
+
+  co_await [](vio::event_loop_t &el, int p, std::size_t fail_at, stream_result_t &res) -> vio::task_t<void>
+  {
+    vio::http::request_t req;
+    req.url = "http://127.0.0.1:" + std::to_string(p) + "/big";
+    req.allow_plaintext = true;
+    req.on_body_start = [&res](const vio::http::response_t &head, long long length) -> std::expected<void, vio::error_t> {
+      CHECK(head.status / 100 == 2);
+      ++res.starts;
+      res.announced = length;
+      return {};
+    };
+    req.on_body = [&res, fail_at](std::string_view data) -> std::expected<void, vio::error_t> {
+      res.streamed.append(data);
+      ++res.pieces;
+      if (fail_at > 0 && res.streamed.size() >= fail_at)
+        return std::unexpected(vio::error_t{.code = -1, .msg = "sink full"});
+      return {};
+    };
+    res.response = co_await vio::http::fetch_once(el, req);
+  }(event_loop, port, fail_after, out);
+
+  co_await std::move(server_task);
+}
+
+stream_result_t run_streaming(std::string response, std::size_t pieces, std::size_t fail_after = 0)
+{
+  vio::event_loop_t event_loop;
+  stream_result_t result;
+  event_loop.run_in_loop(
+    [&]
+    {
+      return [](vio::event_loop_t &el, std::string resp, std::size_t n, std::size_t fail, stream_result_t &res) -> vio::task_t<void>
+      {
+        co_await streaming_scenario(el, std::move(resp), n, fail, res);
+        el.stop();
+      }(event_loop, std::move(response), pieces, fail_after, result);
+    });
+  event_loop.run();
+  return result;
+}
+
+std::string big_body(std::size_t n)
+{
+  std::string s(n, '\0');
+  for (std::size_t i = 0; i < n; ++i)
+    s[i] = static_cast<char>('a' + (i * 7) % 26);
+  return s;
+}
+} // namespace
+
+TEST_SUITE("http_client streaming body")
+{
+  TEST_CASE("Content-Length body goes to on_body, not response.body")
+  {
+    const std::string body = big_body(1 << 20);
+    auto r = run_streaming("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body, 64);
+    REQUIRE_EXPECTED(r.response);
+    CHECK(r.response->status == 200);
+    CHECK(r.response->body.empty());
+    CHECK(r.starts == 1);
+    CHECK(r.announced == static_cast<long long>(body.size()));
+    CHECK(r.streamed == body);
+    CHECK(r.pieces > 1);
+  }
+
+  TEST_CASE("chunked body is de-chunked into on_body")
+  {
+    const std::string body = big_body(300'000);
+    std::string wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for (std::size_t off = 0; off < body.size(); off += 4093)
+    {
+      const std::size_t n = std::min<std::size_t>(4093, body.size() - off);
+      char size_line[32];
+      std::snprintf(size_line, sizeof size_line, "%zx\r\n", n);
+      wire.append(size_line).append(body, off, n).append("\r\n");
+    }
+    wire.append("0\r\n\r\n");
+    auto r = run_streaming(std::move(wire), 97);
+    REQUIRE_EXPECTED(r.response);
+    CHECK(r.response->body.empty());
+    CHECK(r.announced == -1);
+    CHECK(r.streamed == body);
+  }
+
+  TEST_CASE("a non-2xx body is collected as usual")
+  {
+    auto r = run_streaming("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found", 1);
+    REQUIRE_EXPECTED(r.response);
+    CHECK(r.response->status == 404);
+    CHECK(r.response->body == "not found");
+    CHECK(r.starts == 0);
+    CHECK(r.streamed.empty());
+  }
+
+  TEST_CASE("an on_body error aborts the request with that error")
+  {
+    const std::string body = big_body(1 << 20);
+    auto r = run_streaming("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body, 64, 1000);
+    REQUIRE_FALSE(r.response.has_value());
+    CHECK(r.response.error().msg == std::string("sink full"));
+    CHECK(r.streamed.size() < body.size());
   }
 }
 

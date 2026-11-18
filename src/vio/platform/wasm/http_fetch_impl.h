@@ -178,17 +178,41 @@ struct fetch_awaitable_t
   }
 };
 
+namespace detail
+{
+// emscripten_fetch hands over the whole body at once; pass it to request.on_body (see request_t) so a
+// streaming caller sees the same contract as on native, just in a single piece.
+inline std::expected<response_t, error_t> deliver_streamed(const request_t &request, std::expected<response_t, error_t> result)
+{
+  if (!result || !request.on_body || result->status < 200 || result->status >= 300)
+    return result;
+  std::string body = std::move(result->body);
+  result->body.clear();
+  if (request.on_body_start)
+  {
+    if (auto r = request.on_body_start(*result, static_cast<long long>(body.size())); !r)
+      return std::unexpected(r.error());
+  }
+  if (!body.empty())
+  {
+    if (auto r = request.on_body(body); !r)
+      return std::unexpected(r.error());
+  }
+  return result;
+}
+} // namespace detail
+
 inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &loop, const request_t &request, cancellation_t *cancel = nullptr)
 {
   (void)cancel; // cancellation via emscripten_fetch_close is not wired up in this first cut
-  co_return co_await fetch_awaitable_t(loop, request);
+  co_return detail::deliver_streamed(request, co_await fetch_awaitable_t(loop, request));
 }
 
 inline vio::task_t<std::expected<response_t, error_t>> fetch(event_loop_t &loop, const request_t &request, cancellation_t *cancel = nullptr)
 {
   (void)cancel;
   // The browser's Fetch follows redirects itself, so this matches native fetch()'s redirect-following.
-  co_return co_await fetch_awaitable_t(loop, request);
+  co_return detail::deliver_streamed(request, co_await fetch_awaitable_t(loop, request));
 }
 
 } // namespace vio::http

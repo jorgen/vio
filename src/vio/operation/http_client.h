@@ -22,10 +22,12 @@ Copyright (c) 2025 Jørgen Lind
 
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -74,6 +76,8 @@ inline bool header_name_equals(std::string_view a, std::string_view b)
 }
 } // namespace detail
 
+struct response_t;
+
 struct request_t
 {
   std::string method = "GET";
@@ -87,6 +91,14 @@ struct request_t
   // Verify the https peer against this PEM CA bundle instead of the system trust
   // store (e.g. a private/test ACME CA like Pebble). Unset => the default bundle.
   std::optional<std::vector<uint8_t>> ca_mem;
+
+  // Streaming (optional). With on_body set, the body of a 2xx response is handed to it piece by piece as it
+  // arrives (de-chunked) instead of being collected into response_t::body, which then stays empty, so memory
+  // does not grow with the body. on_body_start runs once before that, when the headers are in, with the
+  // advertised Content-Length (-1 when absent or chunked). An error returned from either callback aborts the
+  // request with that error. Non-2xx responses (errors, redirect hops) are collected into body as usual.
+  std::function<std::expected<void, error_t>(const response_t &head, long long content_length)> on_body_start;
+  std::function<std::expected<void, error_t>(std::string_view data)> on_body;
 };
 
 struct response_t
@@ -114,15 +126,9 @@ inline std::uint64_t monotonic_ms(event_loop_t &loop)
   return static_cast<std::uint64_t>(vio::loop_now(loop).since_origin().count() / 1000000);
 }
 
-inline std::expected<response_t, error_t> parse_response(const std::string &raw)
+// Status line and headers of a response (the block before the blank line); the body is left empty.
+inline std::expected<response_t, error_t> parse_head(std::string_view header_section)
 {
-  auto header_end = raw.find("\r\n\r\n");
-  if (header_end == std::string::npos)
-    return std::unexpected(error_t{.code = -1, .msg = "http: no header terminator"});
-
-  std::string_view header_section(raw.data(), header_end);
-  std::string raw_body = raw.substr(header_end + 4);
-
   response_t response;
   auto first_line_end = header_section.find("\r\n");
   std::string_view status_line = header_section.substr(0, first_line_end);
@@ -150,34 +156,113 @@ inline std::expected<response_t, error_t> parse_response(const std::string &raw)
       break;
     remaining = remaining.substr(line_end + 2);
   }
+  return response;
+}
 
-  if (header_name_equals(response.header("Transfer-Encoding"), "chunked"))
+// Incremental Transfer-Encoding: chunked decoder. feed() takes the body bytes in whatever pieces they arrive,
+// passes the decoded data to `out`, and stops at the end of the trailers; bytes after that are not consumed.
+struct chunked_decoder_t
+{
+  enum class state_t
   {
-    std::string decoded;
-    std::string_view src = raw_body;
-    while (!src.empty())
+    size,      // reading a chunk-size line (hex, optional ;extensions)
+    data,      // `remaining` bytes of chunk data to go
+    data_end,  // the CRLF after the chunk data
+    trailers,  // trailer lines until an empty one
+    done
+  };
+  state_t state = state_t::size;
+  std::string line;
+  std::uint64_t remaining = 0;
+
+  [[nodiscard]] bool done() const { return state == state_t::done; }
+
+  template <typename Out>
+  std::expected<std::size_t, error_t> feed(std::string_view in, Out &&out)
+  {
+    std::size_t i = 0;
+    while (i < in.size() && state != state_t::done)
     {
-      auto nl = src.find("\r\n");
-      if (nl == std::string_view::npos)
-        break;
-      auto chunk_size = std::strtoul(std::string(src.substr(0, nl)).c_str(), nullptr, 16);
-      src = src.substr(nl + 2);
-      if (chunk_size == 0)
-        break;
-      if (src.size() < chunk_size)
-        break;
-      decoded.append(src.data(), chunk_size);
-      src = src.substr(chunk_size);
-      if (src.starts_with("\r\n"))
-        src = src.substr(2);
+      if (state == state_t::data)
+      {
+        const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, in.size() - i));
+        if (auto r = out(in.substr(i, n)); !r)
+          return std::unexpected(r.error());
+        i += n;
+        remaining -= n;
+        if (remaining == 0)
+          state = state_t::data_end;
+        continue;
+      }
+      // Line-oriented states: collect up to LF.
+      const char c = in[i++];
+      if (c != '\n')
+      {
+        if (line.size() >= 4096)
+          return std::unexpected(error_t{.code = -1, .msg = "http: chunk line too long"});
+        line.push_back(c);
+        continue;
+      }
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      if (state == state_t::size)
+      {
+        std::string_view digits = std::string_view(line).substr(0, line.find(';'));
+        while (!digits.empty() && (digits.back() == ' ' || digits.back() == '\t'))
+          digits.remove_suffix(1);
+        if (digits.empty() || digits.size() > 15)
+          return std::unexpected(error_t{.code = -1, .msg = "http: bad chunk size"});
+        std::uint64_t size = 0;
+        for (char d : digits)
+        {
+          const int v = (d >= '0' && d <= '9') ? d - '0' : (d >= 'a' && d <= 'f') ? d - 'a' + 10 : (d >= 'A' && d <= 'F') ? d - 'A' + 10 : -1;
+          if (v < 0)
+            return std::unexpected(error_t{.code = -1, .msg = "http: bad chunk size"});
+          size = size * 16 + static_cast<std::uint64_t>(v);
+        }
+        remaining = size;
+        state = size == 0 ? state_t::trailers : state_t::data;
+      }
+      else if (state == state_t::data_end)
+      {
+        if (!line.empty())
+          return std::unexpected(error_t{.code = -1, .msg = "http: missing CRLF after chunk data"});
+        state = state_t::size;
+      }
+      else if (state == state_t::trailers && line.empty())
+      {
+        state = state_t::done;
+      }
+      line.clear();
     }
-    response.body = std::move(decoded);
+    return i;
+  }
+};
+
+// Parse a complete raw response (headers + body) held in memory, de-chunking the body when needed.
+inline std::expected<response_t, error_t> parse_response(const std::string &raw)
+{
+  auto header_end = raw.find("\r\n\r\n");
+  if (header_end == std::string::npos)
+    return std::unexpected(error_t{.code = -1, .msg = "http: no header terminator"});
+  auto response = parse_head(std::string_view(raw.data(), header_end));
+  if (!response)
+    return response;
+  std::string_view raw_body = std::string_view(raw).substr(header_end + 4);
+  if (header_name_equals(response->header("Transfer-Encoding"), "chunked"))
+  {
+    chunked_decoder_t decoder;
+    auto fed = decoder.feed(raw_body, [&](std::string_view d) -> std::expected<void, error_t> {
+      response->body.append(d);
+      return {};
+    });
+    if (!fed)
+      return std::unexpected(fed.error());
   }
   else
   {
-    response.body = std::move(raw_body);
+    response->body.assign(raw_body);
   }
-
   return response;
 }
 // Minimal HTTP/1.1 response framing + a keep-alive connection pool. Reusing a connection requires stopping
@@ -227,26 +312,6 @@ inline frame_info_t parse_frame_info(std::string_view header_block)
   return fi;
 }
 
-// Has the chunked body that starts at `body` reached its terminating 0-length chunk?
-inline bool chunked_complete(std::string_view body)
-{
-  std::string_view s = body;
-  while (!s.empty())
-  {
-    auto nl = s.find("\r\n");
-    if (nl == std::string_view::npos)
-      return false;
-    unsigned long sz = std::strtoul(std::string(s.substr(0, nl)).c_str(), nullptr, 16);
-    s = s.substr(nl + 2);
-    if (sz == 0)
-      return true; // last chunk seen (trailers ignored)
-    if (s.size() < sz + 2)
-      return false;
-    s = s.substr(sz + 2);
-  }
-  return false;
-}
-
 inline bool is_stream_end(const error_t &e)
 {
   return e.code == errc::eof || e.code == vio_tls_clean_shutdown || e.code == vio_tls_truncated;
@@ -254,62 +319,69 @@ inline bool is_stream_end(const error_t &e)
 
 struct framed_response_t
 {
-  std::string raw;       // headers + body, trimmed to exactly the framed message when length-delimited
+  response_t response;   // status, headers and (unless streamed to request.on_body) the de-chunked body
   bool complete = false; // a full response was read
   bool reusable = false; // the connection is safe to keep alive (self-delimited, no trailing bytes, keep-alive)
 };
 
 // Read one HTTP/1.1 response with correct message framing. Returns as soon as the body boundary is reached
 // (Content-Length / chunked / empty-body status / HEAD) rather than waiting for the peer to close, so the
-// connection can be pooled. Falls back to close-delimited (read-to-end) when no length is advertised.
+// connection can be pooled. Falls back to close-delimited (read-to-end) when no length is advertised. The body
+// is decoded as it arrives, and goes to request.on_body for a 2xx response when that is set (see request_t).
+// `started` is set once response bytes have arrived, so the caller knows a retry would repeat them.
 template <typename Reader>
-inline vio::task_t<std::expected<framed_response_t, error_t>> read_framed(Reader &reader, bool is_head)
+inline vio::task_t<std::expected<framed_response_t, error_t>> read_framed(Reader &reader, const request_t &request, bool &started)
 {
+  const bool is_head = request.method == "HEAD";
   framed_response_t out;
-  std::string &raw = out.raw;
+  std::string head;
   bool have_headers = false;
-  std::size_t body_start = 0;
+  bool streaming = false;
   frame_info_t fi;
+  long long body_seen = 0;
+  chunked_decoder_t decoder;
+
+  auto deliver = [&](std::string_view data) -> std::expected<void, error_t> {
+    if (streaming)
+      return request.on_body(data);
+    out.response.body.append(data);
+    return {};
+  };
+
+  // Feed body bytes; true once the message boundary is reached.
+  auto consume = [&](std::string_view data) -> std::expected<bool, error_t> {
+    if (fi.chunked)
+    {
+      auto fed = decoder.feed(data, deliver);
+      if (!fed)
+        return std::unexpected(fed.error());
+      if (!decoder.done())
+        return false;
+      out.reusable = false; // conservative: never pool chunked responses
+      return true;
+    }
+    if (fi.content_length >= 0)
+    {
+      const auto take = static_cast<std::size_t>(std::min<long long>(fi.content_length - body_seen, static_cast<long long>(data.size())));
+      if (take > 0)
+      {
+        if (auto r = deliver(data.substr(0, take)); !r)
+          return std::unexpected(r.error());
+        body_seen += static_cast<long long>(take);
+      }
+      if (body_seen < fi.content_length)
+        return false;
+      const bool overshoot = data.size() > take;
+      out.reusable = fi.http_1_1 && !fi.conn_close && !overshoot;
+      return true;
+    }
+    if (auto r = deliver(data); !r) // no length advertised: close-delimited, read until the stream ends
+      return std::unexpected(r.error());
+    return false;
+  };
 
   for (;;)
   {
-    if (!have_headers)
-    {
-      if (auto he = raw.find("\r\n\r\n"); he != std::string::npos)
-      {
-        have_headers = true;
-        body_start = he + 4;
-        fi = parse_frame_info(std::string_view(raw).substr(0, he));
-        if (is_head || fi.status == 204 || fi.status == 304)
-          fi.content_length = 0;
-      }
-    }
-    if (have_headers)
-    {
-      if (fi.chunked)
-      {
-        if (chunked_complete(std::string_view(raw).substr(body_start)))
-        {
-          out.complete = true;
-          out.reusable = false; // conservative: never pool chunked responses
-          co_return out;
-        }
-      }
-      else if (fi.content_length >= 0)
-      {
-        const std::size_t want = body_start + static_cast<std::size_t>(fi.content_length);
-        if (raw.size() >= want)
-        {
-          const bool overshoot = raw.size() > want;
-          raw.resize(want); // hand parse_response exactly the framed message
-          out.complete = true;
-          out.reusable = fi.http_1_1 && !fi.conn_close && !overshoot;
-          co_return out;
-        }
-      }
-      // else: no length advertised -> close-delimited; fall through and read until the stream ends.
-    }
-
     auto chunk = co_await reader;
     if (!chunk)
     {
@@ -321,7 +393,43 @@ inline vio::task_t<std::expected<framed_response_t, error_t>> read_framed(Reader
       }
       co_return std::unexpected(chunk.error()); // truncated or a transport error
     }
-    raw.append(chunk.value().chars(), chunk.value().size());
+    started = true;
+    std::string_view data(chunk.value().chars(), chunk.value().size());
+
+    if (!have_headers)
+    {
+      head.append(data);
+      auto he = head.find("\r\n\r\n");
+      if (he == std::string::npos)
+        continue;
+      have_headers = true;
+      auto parsed = parse_head(std::string_view(head).substr(0, he));
+      if (!parsed)
+        co_return std::unexpected(parsed.error());
+      out.response = std::move(*parsed);
+      fi = parse_frame_info(std::string_view(head).substr(0, he));
+      if (is_head || fi.status == 204 || fi.status == 304)
+      {
+        fi.content_length = 0;
+        fi.chunked = false;
+      }
+      streaming = request.on_body && fi.status >= 200 && fi.status < 300 && !is_head;
+      if (streaming && request.on_body_start)
+      {
+        if (auto r = request.on_body_start(out.response, fi.chunked ? -1 : fi.content_length); !r)
+          co_return std::unexpected(r.error());
+      }
+      data = std::string_view(head).substr(he + 4); // whatever body bytes arrived with the headers
+    }
+
+    auto done = consume(data);
+    if (!done)
+      co_return std::unexpected(done.error());
+    if (*done)
+    {
+      out.complete = true;
+      co_return out;
+    }
   }
 }
 } // namespace detail
@@ -442,7 +550,6 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
   wire.append(request.body);
 
   const std::string key = connection_pool_t::make_key(is_https ? "https" : "http", host, port);
-  const bool is_head = request.method == "HEAD";
 
   std::optional<pooled_connection_t> pc;
   bool from_pool = false;
@@ -514,6 +621,7 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
     // it is destroyed (reads disarmed) before the connection may be returned to the pool.
     std::optional<error_t> req_err;
     detail::framed_response_t framed;
+    bool started = false;
     {
       if (pc->tls)
       {
@@ -525,7 +633,7 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
         else
         {
           auto reader = std::move(rr.value());
-          auto fr = co_await detail::read_framed(reader, is_head);
+          auto fr = co_await detail::read_framed(reader, request, started);
           if (!fr)
             req_err = fr.error();
           else
@@ -542,7 +650,7 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
         else
         {
           auto reader = std::move(rr.value());
-          auto fr = co_await detail::read_framed(reader, is_head);
+          auto fr = co_await detail::read_framed(reader, request, started);
           if (!fr)
             req_err = fr.error();
           else
@@ -553,8 +661,9 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
 
     if (req_err)
     {
-      // A pooled connection the server had already half-closed fails here; retry ONCE on a fresh one.
-      if (from_pool && attempt == 0 && !is_cancelled(*req_err))
+      // A pooled connection the server had already half-closed fails here; retry ONCE on a fresh one. Not
+      // once response bytes have arrived: a retry would repeat what a streaming caller already received.
+      if (from_pool && attempt == 0 && !started && !is_cancelled(*req_err))
       {
         if (pool)
           pool->discards_stale++;
@@ -568,18 +677,11 @@ inline vio::task_t<std::expected<response_t, error_t>> fetch_once(event_loop_t &
     if (pool && from_pool)
       pool->reuses++;
 
-    auto response = detail::parse_response(framed.raw);
-    if (!response)
-    {
-      pc.reset();
-      co_return std::unexpected(response.error());
-    }
-
     if (pool && framed.complete && framed.reusable)
       pool->release(loop, std::move(*pc)); // keep alive for the next request
     else
       pc.reset(); // legacy fresh-connection path, or a connection the peer is closing
-    co_return std::move(*response);
+    co_return std::move(framed.response);
   }
 }
 
