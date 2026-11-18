@@ -66,6 +66,27 @@ struct handle_watch_t
   void *backend_state = nullptr;
 };
 
+#if defined(_WIN32)
+struct overlapped_op_t
+{
+  using complete_fn_t = void (*)(overlapped_op_t *op);
+
+  ~overlapped_op_t()
+  {
+    if (in_flight)
+      abort_destroyed_in_flight("overlapped operation");
+  }
+
+  OVERLAPPED overlapped = {};
+  complete_fn_t complete = nullptr;
+  void *owner = nullptr;
+  std::size_t transferred = 0;
+  unsigned long error = 0;
+  bool in_flight = false;
+  bool keeps_alive = true;
+};
+#endif
+
 enum class file_op_kind : std::uint8_t
 {
   read,
@@ -143,12 +164,21 @@ public:
   [[nodiscard]] int wait_handle(handle_watch_t &watch, io_op_t &op);
   void cancel_handle_wait(handle_watch_t &watch, io_op_t &op) noexcept;
 
+#if defined(_WIN32)
+  [[nodiscard]] virtual int associate_handle(void *handle);
+  virtual void begin_overlapped(overlapped_op_t &op) noexcept;
+  virtual void abandon_overlapped(overlapped_op_t &op) noexcept;
+#endif
+
 protected:
   virtual void arm(io_watch_t &watch, std::uint8_t interest);
   void dispatch(io_watch_t &watch, bool readable, bool writable);
   [[nodiscard]] virtual int arm_handle(handle_watch_t &watch);
   virtual void disarm_handle(handle_watch_t &watch) noexcept;
   void signal_handle(handle_watch_t &watch);
+#if defined(_WIN32)
+  void complete_overlapped(overlapped_op_t &op, unsigned long error, std::size_t transferred);
+#endif
   void retry_later(io_watch_t &watch, bool readable, bool writable) noexcept;
 
   loop_core_t &_loop;

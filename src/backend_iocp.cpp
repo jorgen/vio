@@ -67,6 +67,7 @@ constexpr ULONG write_events = afd_poll_send | afd_poll_connect_fail | afd_poll_
 constexpr ULONG_PTR afd_key = 0x41464400;
 constexpr ULONG_PTR wake_key = 0x57414B45;
 constexpr ULONG_PTR handle_key = 0x48444C00;
+constexpr ULONG_PTR overlapped_key = 0x4F564C00;
 constexpr ULONG max_entries = 128;
 constexpr std::size_t max_group_members = 32;
 constexpr int shutdown_drain_rounds = 100;
@@ -290,6 +291,8 @@ struct poll_state_t
 
 static_assert(std::is_standard_layout_v<poll_state_t>);
 static_assert(offsetof(poll_state_t, iosb) == 0);
+static_assert(std::is_standard_layout_v<overlapped_op_t>);
+static_assert(offsetof(overlapped_op_t, overlapped) == 0);
 
 poll_state_t *state_from(OVERLAPPED *overlapped) noexcept
 {
@@ -494,6 +497,31 @@ public:
   void wake() noexcept override
   {
     ::PostQueuedCompletionStatus(_port, 0, wake_key, nullptr);
+  }
+
+  [[nodiscard]] int associate_handle(void *handle) override
+  {
+    if (!handle || handle == INVALID_HANDLE_VALUE)
+      return errc::invalid_argument;
+    if (!::CreateIoCompletionPort(static_cast<HANDLE>(handle), _port, overlapped_key, 0))
+      return errc_from_win32(::GetLastError());
+    if (!::SetFileCompletionNotificationModes(static_cast<HANDLE>(handle), FILE_SKIP_SET_EVENT_ON_HANDLE))
+      return errc_from_win32(::GetLastError());
+    return 0;
+  }
+
+  void begin_overlapped(overlapped_op_t &op) noexcept override
+  {
+    backend_t::begin_overlapped(op);
+    ++_outstanding;
+  }
+
+  void abandon_overlapped(overlapped_op_t &op) noexcept override
+  {
+    if (!op.in_flight)
+      return;
+    backend_t::abandon_overlapped(op);
+    --_outstanding;
   }
 
   [[nodiscard]] int add_handle_watch(handle_watch_t &watch) override
@@ -742,6 +770,11 @@ private:
       }
       return;
     }
+    if (entry.lpCompletionKey == overlapped_key)
+    {
+      --_outstanding;
+      return;
+    }
     if (entry.lpCompletionKey != afd_key)
       return;
     auto *state = state_from(entry.lpOverlapped);
@@ -806,6 +839,18 @@ private:
       complete(*reinterpret_cast<handle_state_t *>(entry.lpOverlapped));
     else if (entry.lpCompletionKey == afd_key)
       complete(*state_from(entry.lpOverlapped));
+    else if (entry.lpCompletionKey == overlapped_key)
+      complete(*reinterpret_cast<overlapped_op_t *>(entry.lpOverlapped));
+  }
+
+  void complete(overlapped_op_t &op)
+  {
+    if (!op.in_flight)
+      return;
+    --_outstanding;
+    const auto status = static_cast<LONG>(op.overlapped.Internal);
+    const unsigned long error = status >= 0 ? 0 : _nt.status_to_dos_error(status);
+    complete_overlapped(op, error, static_cast<std::size_t>(op.overlapped.InternalHigh));
   }
 
   void complete(poll_state_t &state)
@@ -967,6 +1012,7 @@ std::unique_ptr<backend_t> make_iocp_backend(loop_core_t &loop, int &error)
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cwchar>
 #include <functional>
 #include <string>
 #include <thread>
@@ -1345,6 +1391,68 @@ TEST_CASE("iocp: a reader parked on a socket whose peer resets is woken")
   CHECK_FALSE(fixture.timed_out);
   CHECK(reader.completions == 1);
   CHECK(received == errc::connection_reset);
+}
+TEST_CASE("iocp: overlapped reads on a pipe complete on the port, and a closed writer reports a broken pipe")
+{
+  iocp_fixture_t fixture;
+  wchar_t name[128];
+  std::swprintf(name, 128, L"\\\\.\\pipe\\vio-iocp-test-%lu-%p", ::GetCurrentProcessId(), static_cast<void *>(&fixture));
+  HANDLE server = ::CreateNamedPipeW(name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 4096,
+                                     4096, 0, nullptr);
+  REQUIRE(server != INVALID_HANDLE_VALUE);
+  HANDLE client = ::CreateFileW(name, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+  REQUIRE(client != INVALID_HANDLE_VALUE);
+  REQUIRE(fixture.loop.backend().associate_handle(server) == 0);
+
+  struct reader_t
+  {
+    iocp_fixture_t &fixture;
+    HANDLE server;
+    HANDLE client;
+    overlapped_op_t op;
+    char buffer[16] = {};
+    std::size_t first = 0;
+    unsigned long first_error = 1;
+    unsigned long second_error = 0;
+    int completions = 0;
+
+    bool start()
+    {
+      fixture.loop.backend().begin_overlapped(op);
+      if (::ReadFile(server, buffer, sizeof(buffer), nullptr, &op.overlapped) || ::GetLastError() == ERROR_IO_PENDING)
+        return true;
+      second_error = ::GetLastError();
+      fixture.loop.backend().abandon_overlapped(op);
+      return false;
+    }
+  } reader{fixture, server, client};
+  reader.op.owner = &reader;
+  reader.op.complete = [](overlapped_op_t *raw) {
+    auto &self = *static_cast<reader_t *>(raw->owner);
+    if (++self.completions == 1)
+    {
+      self.first = raw->transferred;
+      self.first_error = raw->error;
+      ::CloseHandle(self.client);
+      if (!self.start())
+        self.fixture.finish();
+      return;
+    }
+    self.second_error = raw->error;
+    self.fixture.finish();
+  };
+  fixture.run([&] {
+    REQUIRE(reader.start());
+    DWORD written = 0;
+    CHECK(::WriteFile(client, "hello", 5, &written, nullptr));
+  });
+  CHECK_FALSE(fixture.timed_out);
+  CHECK(reader.first_error == 0);
+  CHECK(reader.first == 5);
+  CHECK(std::string(reader.buffer, 5) == "hello");
+  CHECK(reader.second_error == ERROR_BROKEN_PIPE);
+  CHECK_FALSE(reader.op.in_flight);
+  ::CloseHandle(server);
 }
 } // namespace vio::detail
 #endif

@@ -171,6 +171,46 @@ void backend_t::signal_handle(handle_watch_t &watch)
   op->complete(op);
 }
 
+#if defined(_WIN32)
+int backend_t::associate_handle(void *)
+{
+  return errc::not_supported;
+}
+
+void backend_t::begin_overlapped(overlapped_op_t &op) noexcept
+{
+  if (_loop.inherited()) [[unlikely]]
+    _loop.abort_inherited("used to start overlapped I/O");
+  op.overlapped = OVERLAPPED{};
+  op.transferred = 0;
+  op.error = 0;
+  op.in_flight = true;
+  if (op.keeps_alive)
+    _loop.retain();
+}
+
+void backend_t::abandon_overlapped(overlapped_op_t &op) noexcept
+{
+  if (!op.in_flight)
+    return;
+  op.in_flight = false;
+  if (op.keeps_alive)
+    _loop.release();
+}
+
+void backend_t::complete_overlapped(overlapped_op_t &op, unsigned long error, std::size_t transferred)
+{
+  if (!op.in_flight)
+    return;
+  op.in_flight = false;
+  op.error = error;
+  op.transferred = transferred;
+  if (op.keeps_alive)
+    _loop.release();
+  op.complete(&op);
+}
+#endif
+
 int backend_t::open_watch(io_watch_t &watch)
 {
   if (_loop.inherited()) [[unlikely]]
