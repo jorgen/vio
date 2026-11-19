@@ -23,6 +23,7 @@ Copyright (c) 2025 Jørgen Lind
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <memory>
@@ -147,7 +148,15 @@ public:
     kevent_t changes[2];
     set_change(changes[0], ident, EVFILT_READ, EV_ADD | EV_CLEAR | receipt, 0, &watch);
     set_change(changes[1], ident, EVFILT_WRITE, EV_ADD | EV_CLEAR | receipt, 0, &watch);
-    if (int error = apply(changes); error != 0)
+    int error = apply(changes);
+    if (error == EINVAL)
+    {
+      remove_filters(ident);
+      kevent_t read_only[1];
+      set_change(read_only[0], ident, EVFILT_READ, EV_ADD | EV_CLEAR | receipt, 0, &watch);
+      error = apply(read_only);
+    }
+    if (error != 0)
     {
       remove_filters(ident);
       return errc_from_errno(error);
@@ -244,13 +253,14 @@ public:
   }
 
 private:
-  int apply(kevent_t (&changes)[2]) noexcept
+  template <std::size_t count>
+  int apply(kevent_t (&changes)[count]) noexcept
   {
 #if defined(EV_RECEIPT)
-    kevent_t results[2];
+    kevent_t results[count];
     int received;
     do
-      received = ::kevent(_kqueue_fd, changes, 2, results, 2, &no_wait);
+      received = ::kevent(_kqueue_fd, changes, static_cast<int>(count), results, static_cast<int>(count), &no_wait);
     while (received < 0 && errno == EINTR);
     if (received < 0)
       return errno;
