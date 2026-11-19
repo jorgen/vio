@@ -52,8 +52,9 @@ REST service library), but stands alone as a general-purpose networking toolkit.
 - **Native event loops.** epoll or io_uring on Linux, kqueue on macOS, IOCP on
   Windows. On Linux, `VIO_BACKEND=epoll` or `VIO_BACKEND=io_uring` picks one at
   run time; epoll is the default.
-- **TCP, TLS, UDP, DNS, files, timers, a thread pool, and event pipes** — one
-  uniform coroutine surface on every platform.
+- **TCP, TLS, UDP, DNS, files, timers, a thread pool, event pipes, and child
+  processes on a pseudo terminal** — one uniform coroutine surface on every
+  platform.
 - **TLS** via BoringSSL through a compile-time SSL-backend seam (LibreSSL and
   OpenSSL arms exist in the seam), with ALPN, SNI, OCSP stapling, and session
   resumption.
@@ -178,6 +179,7 @@ value** (the values live in the coroutine frame), or capture by value / a
 | **DNS** | `operation/dns.h` | async `getaddrinfo` |
 | **Files** | `operation/file.h` | open / read / write / stat / close |
 | **Timers** | `operation/sleep.h` | `vio::sleep(loop, ms, cancel?)` |
+| **Child process + pty** | `operation/process.h` | `process_spawn`, `process_create_reader`, `process_write`, `process_resize`, `process_kill`, `process_wait` |
 | **Thread pool** | `thread_pool.h` | `thread_pool_t` — offload blocking work off the loop |
 | **Event pipes** | `awaitable_event_pipe.h` | cross-coroutine / cross-thread signalling |
 | **Addresses** | `operation/tcp.h` | `ip4_addr`, `ip6_addr` |
@@ -226,6 +228,33 @@ for (;;)
 See [`examples/tcp_read_into.cpp`](examples/tcp_read_into.cpp). (TLS readers
 decrypt directly into a caller buffer via `reader.read(std::span<std::byte>)`;
 they can't be truly zero-copy since the socket only ever carries ciphertext.)
+
+### A child process on a pseudo terminal
+
+```cpp
+vio::process_options_t options;
+options.program = "/bin/sh";                     // looked up on PATH when it has no slash
+options.arguments = {"-c", "read line; echo got:$line"};
+options.environment.push_back({"TERM", "xterm-256color"});
+options.size = {.columns = 120, .rows = 40};
+
+auto process = vio::process_spawn(loop, options).value();
+auto reader = vio::process_create_reader(process).value();
+co_await vio::process_write(process, std::string("hello
+"));
+vio::process_resize(process, {.columns = 100, .rows = 30});
+for (;;)
+{
+  auto chunk = co_await reader;                  // std::expected<unique_buf_t, error_t>
+  if (!chunk) break;                             // errc::eof once the child side has closed
+  render(chunk->span());
+}
+auto status = co_await vio::process_wait(process); // exit_code, and signal on POSIX
+```
+
+POSIX uses `posix_openpt` and `fork`/`execve`; Windows uses ConPTY (Windows 10
+1809 or newer) with overlapped pipes completing on the loop's IOCP port. Dropping
+the last handle hangs up the terminal and ends the child (`DECISIONS.md` D61-D67).
 
 ### TLS
 

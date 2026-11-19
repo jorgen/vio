@@ -643,6 +643,15 @@ before the loop blocks and a cancellable deferred call that never allocates; see
 `vio/operation/handle_wait.h` waits for a kernel object to be signalled -- an event, a fence, a
 process -- through a wait completion packet on the IOCP port, as a one-shot `handle_wait_t` or an
 awaitable `wait_for_handle`; see D59.
+`vio/operation/process.h` spawns a child on a pseudo terminal (D61-D67). Its platform code is in
+`src/process_posix.cpp` and `src/process_win.cpp`, behind an exported `process_core_*` interface so
+the header stays free of system headers. On Windows the pty pipes are overlapped named pipes whose
+completions arrive on the IOCP port through `backend_t::associate_handle` / `begin_overlapped`
+(`overlapped_op_t`), a path any overlapped handle can use; `ClosePseudoConsole` runs on the blocking
+pool because before Windows 11 24H2 it can block until its output is read. The child is reaped as
+soon as it exits (Linux `pidfd`, a `waitpid` poll without one, a private kqueue on macOS, a wait
+completion packet on Windows). Dropping the handle hangs the terminal up: `SIGHUP`, then `SIGKILL`
+after two seconds on POSIX; `ClosePseudoConsole` on Windows. The macOS path has never been run.
 Everything else that blocks -- other file work, `getaddrinfo` -- runs on the blocking pool
 (`src/blocking_pool.cpp`), which has separate file and DNS queues (4 and 2 threads,
 `VIO_FILE_THREADS` and `VIO_DNS_THREADS` to change them). A worker spins for 50 µs before it sleeps,

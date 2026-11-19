@@ -415,6 +415,80 @@ so the move could happen: vui reaches the loop through public headers only, and 
 cmake-dep like any other consumer. Its history up to the move came with it, through
 `git subtree split`. Its decisions stay numbered G1 onwards in vui's own `DECISIONS.md`.
 
+**D61. A child process on a pseudo terminal is public API, in `vio/operation/process.h`.** A
+terminal emulator, yat, needs it on all three platforms. `process_spawn(loop, options)` takes the
+program, its arguments, the environment, a working directory and the terminal size, and returns
+`std::expected<process_t, error_t>`. The output is read through `process_create_reader`, whose
+reader is awaited like `tcp_reader_t` and yields `unique_buf_t`; one reader at a time, and
+`reader.cancel()` ends a pending read with `errc::canceled` without spoiling the next one.
+`process_write` is awaited like `write_tcp` and has the same owning overload. `process_resize`,
+`process_kill`, `process_pid`, `process_exit_status` and an awaitable, cancellable `process_wait`
+complete it. The environment is inherited by default; `environment` adds or overrides variables
+(case-insensitively on Windows) and `inherit_environment = false` makes it the whole environment.
+On POSIX a program without a slash is looked up on the child's `PATH` (or `/usr/bin:/bin`); on
+Windows `CreateProcessW` does the lookup and the command line is quoted for `CommandLineToArgvW`.
+The platform code lives in `src/process_posix.cpp` and `src/process_win.cpp` behind a small
+exported interface, so the header carries no system headers and passes `vio_header_check`.
+*Way back:* the header is the only contract; a non-pty pipe mode could be added as an option.
+
+**D62. Windows I/O on a handle that is not a socket completes on the IOCP port.** The pty pipes
+are overlapped named pipes, and their `ReadFile` and `WriteFile` completions arrive through a new
+completion key as `overlapped_op_t` completions (`associate_handle`, `begin_overlapped`,
+`abandon_overlapped` on `backend_t`). Nothing in it knows about pipes, so files (D17) can use it
+later. A reader thread per pipe would have cost a thread per terminal and a hop back to the loop.
+An operation still in flight when its owner is destroyed aborts, as a file operation does (D6).
+ConPTY's ends are opened without `FILE_FLAG_OVERLAPPED`, as it requires, and closed in vio as soon
+as `CreatePseudoConsole` has duplicated them, so an end of stream can arrive at all.
+
+**D63. Process writes are queued in the process, and borrowed bytes are copied.** Overlapped I/O
+keeps the caller's buffer in the kernel after a cancelled await has given it back, so on Windows
+it cannot write from a borrowed span. POSIX copies too, but only what the pty did not take at once,
+and the owning overload never copies. Bytes go out in call order. A cancelled write reports
+`vio_cancelled` and its bytes still go out, the rule of D44. Terminal input is small, so the copy
+costs nothing measurable.
+
+**D64. A child is reaped as soon as it exits, whether or not anyone waits.** That way no zombie is
+left behind and `process_exit_status` answers without an await. The exit is watched without
+keeping the loop alive; a pending `process_wait` keeps it alive. Linux watches a `pidfd`
+(`pidfd_open`, Linux 5.3). Without one (older kernels, a seccomp filter) it polls `waitpid` every
+20 ms rather than install a process-wide `SIGCHLD` handler, which vio has no right to own. macOS
+registers `EVFILT_PROC`/`NOTE_EXIT` on a kqueue of its own and watches that kqueue for readability
+through the normal watch. A kqueue descriptor accepts `EVFILT_READ` only, so the kqueue backend now
+watches a descriptor that refuses `EVFILT_WRITE` for reading alone instead of failing the watch.
+Both are **untested**: no macOS machine was available, and if either fails the process falls back
+to the 20 ms poll rather than failing. Windows uses the wait completion packets of D59. An application
+that sets `SIGCHLD` to `SIG_IGN`, or reaps with `waitpid(-1)`, takes the status away; vio then
+reports exit code -1. A child killed by a signal reports that signal and an exit code of 128 plus
+it, as a shell does; `process_kill` on Windows calls `TerminateProcess` with that same exit code.
+
+**D65. Dropping the last handle hangs up the terminal, and the child goes with it.** On POSIX the
+master is closed, which makes the kernel send `SIGHUP` to the session; vio also sends one to the
+child itself, waits two seconds for it to exit, sends `SIGKILL` if it has not, and reaps it. The
+close finishes only after that, so `run()` after `stop()` can wait up to two seconds for a child
+that ignores the hangup. On Windows `ClosePseudoConsole` sends `CTRL_CLOSE_EVENT` to every client
+and the system ends them; vio does not wait for that, since there is no zombie to reap. Leaving the
+child running detached was rejected: a terminal emulator closing a tab means to end what ran in it,
+and an unreaped child is a leak. A forked child that drops an inherited process handle (D51)
+signals nothing and only closes descriptors.
+
+**D66. `ClosePseudoConsole` runs on the blocking pool, and vio closes the console when the child
+exits.** Before Windows 11 24H2 it waits until the console has delivered its last output, which
+deadlocks a loop that would have read that output itself. On the pool it blocks nothing, and on
+teardown vio closes its end of the output pipe first, so the console never waits on a full pipe.
+Closing the console when the child exits is what makes an end of stream arrive at all on Windows:
+ConPTY keeps the output pipe open after its last client is gone, so without it a reader would
+never see `errc::eof`. With it, the reader gets the final frame and then `errc::eof`, as on POSIX,
+where reading a master whose slave has closed fails with `EIO`, which vio reports as `errc::eof`.
+After that, `process_resize` reports `errc::no_such_process`. The end of stream stays reported.
+
+**D67. ConPTY is loaded at run time; vio still needs only Windows 10.** `CreatePseudoConsole` and
+its two siblings exist from Windows 10 1809. Linking them would stop vio from loading at all on an
+earlier build, so they are looked up in `kernel32.dll` and `process_spawn` fails with
+`errc::not_supported` where they are missing. The SDK only declares them for new enough targets,
+so vio declares the three signatures and `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` itself. The child
+gets `STARTF_USESTDHANDLES` with no handles, so a parent whose own standard handles are redirected
+does not leak them into the console. Pixel sizes have no meaning to ConPTY and are ignored there.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared
