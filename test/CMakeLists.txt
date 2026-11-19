@@ -67,6 +67,7 @@ add_executable(vio_tests
     test_fd_watch.cpp
     test_host_loop.cpp
     test_loop_hooks.cpp
+    test_process.cpp
 )
 if(WIN32)
     target_sources(vio_tests PRIVATE test_handle_wait.cpp)
