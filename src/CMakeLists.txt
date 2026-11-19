@@ -21,6 +21,7 @@ else()
         sys_posix.cpp
         sys_win.cpp
         process_posix.cpp
+        process_win.cpp
         crypto.cpp
         crypto_aead.cpp
         crypto_encoding.cpp
