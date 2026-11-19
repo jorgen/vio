@@ -489,6 +489,15 @@ so vio declares the three signatures and `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` i
 gets `STARTF_USESTDHANDLES` with no handles, so a parent whose own standard handles are redirected
 does not leak them into the console. Pixel sizes have no meaning to ConPTY and are ignored there.
 
+**D68. A `conpty.dll` next to the executable is preferred over the one in Windows.** The ConPTY in
+Windows renders the child's output into its own buffer and sends the terminal a re-encoded copy,
+which caps throughput and drops text that scrolls past between its frames. The one Windows Terminal
+ships (NuGet `Microsoft.Windows.Console.ConPTY`, MIT, `conpty.dll` with `OpenConsole.exe` beside
+it) passes the output through. vio loads it with `LOAD_LIBRARY_SEARCH_APPLICATION_DIR` only, so a
+DLL in the working directory is never picked up, and falls back to `kernel32.dll` (D67). Shipping
+the two files is the application's choice. `process_options_t::glyph_width` tells that ConPTY how
+the terminal measures characters; the Windows one has no such flag and ignores it.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared

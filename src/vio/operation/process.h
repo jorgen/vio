@@ -66,6 +66,13 @@ struct environment_variable_t
   std::string value;
 };
 
+enum class pty_glyph_width_t : std::uint8_t
+{
+  console,
+  wcwidth,
+  graphemes
+};
+
 struct process_options_t
 {
   std::string program;
@@ -74,6 +81,7 @@ struct process_options_t
   std::vector<environment_variable_t> environment;
   std::string working_directory;
   pty_size_t size;
+  pty_glyph_width_t glyph_width = pty_glyph_width_t::console;
 };
 
 struct exit_status_t

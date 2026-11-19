@@ -56,6 +56,7 @@ struct conpty_api_t
   create_pseudo_console_t create = nullptr;
   resize_pseudo_console_t resize = nullptr;
   close_pseudo_console_t close = nullptr;
+  bool bundled = false;
 };
 
 template <typename function_t>
@@ -68,6 +69,18 @@ const conpty_api_t *conpty_api() noexcept
 {
   static const conpty_api_t api = [] {
     conpty_api_t loaded;
+    if (HMODULE bundled = ::LoadLibraryExW(L"conpty.dll", nullptr, LOAD_LIBRARY_SEARCH_APPLICATION_DIR))
+    {
+      loaded.create = load_function<create_pseudo_console_t>(bundled, "ConptyCreatePseudoConsole");
+      loaded.resize = load_function<resize_pseudo_console_t>(bundled, "ConptyResizePseudoConsole");
+      loaded.close = load_function<close_pseudo_console_t>(bundled, "ConptyClosePseudoConsole");
+      if (loaded.create && loaded.resize && loaded.close)
+      {
+        loaded.bundled = true;
+        return loaded;
+      }
+      loaded = {};
+    }
     HMODULE kernel = ::GetModuleHandleW(L"kernel32.dll");
     if (!kernel)
       return loaded;
@@ -79,6 +92,19 @@ const conpty_api_t *conpty_api() noexcept
   if (!api.create || !api.resize || !api.close)
     return nullptr;
   return &api;
+}
+
+DWORD glyph_width_flags(pty_glyph_width_t width) noexcept
+{
+  switch (width)
+  {
+  case pty_glyph_width_t::wcwidth:
+    return 0x10;
+  case pty_glyph_width_t::graphemes:
+    return 0x08;
+  default:
+    return 0;
+  }
 }
 
 int errc_from_hresult(HRESULT result) noexcept
@@ -804,7 +830,7 @@ process_core_t *process_core_spawn(loop_core_t &loop, const process_options_t &o
   }
 
   pseudo_console_t console = nullptr;
-  const HRESULT created = api->create(to_coord(options.size), console_input, console_output, 0, &console);
+  const HRESULT created = api->create(to_coord(options.size), console_input, console_output, api->bundled ? glyph_width_flags(options.glyph_width) : 0, &console);
   close_handle(console_input);
   close_handle(console_output);
   if (FAILED(created))
