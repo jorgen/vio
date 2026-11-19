@@ -20,6 +20,7 @@ else()
         errc.cpp
         sys_posix.cpp
         sys_win.cpp
+        process_posix.cpp
         crypto.cpp
         crypto_aead.cpp
         crypto_encoding.cpp
