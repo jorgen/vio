@@ -36,8 +36,4 @@ struct event_bind_t
 };
 } // namespace vio
 
-#ifdef __EMSCRIPTEN__
-#include "vio/platform/wasm/event_pipe_impl.h"
-#else
 #include "vio/platform/native/event_pipe_impl.h"
-#endif

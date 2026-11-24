@@ -1,6 +1,9 @@
 if(EMSCRIPTEN)
     add_library(vio STATIC
         library_wasm.cpp
+        loop_core.cpp
+        backend_select.cpp
+        backend_browser.cpp
         errc.cpp
         crypto_encoding.cpp
         crypto_sha256.cpp

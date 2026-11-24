@@ -22,8 +22,4 @@
 
 #pragma once
 
-#ifdef __EMSCRIPTEN__
-#include "vio/platform/wasm/sleep_impl.h"
-#else
 #include "vio/platform/native/sleep_impl.h"
-#endif

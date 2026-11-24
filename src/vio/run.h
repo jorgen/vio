@@ -27,6 +27,11 @@ Copyright (c) 2025 Jørgen Lind
 
 #include <type_traits>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/eventloop.h>
+#endif
+
 namespace vio
 {
 
@@ -42,12 +47,70 @@ struct task_result<task_t<T>>
 template <typename T>
 using task_result_t = typename task_result<T>::type;
 
+#ifdef __EMSCRIPTEN__
+namespace detail
+{
+// What vio::run keeps on the heap on the web: main() returns before the loop has run at all.
+template <typename F>
+struct wasm_run_t
+{
+  event_loop_t loop;
+  std::decay_t<F> function;
+  int exit_code = 0;
+
+  static void finished(void *self)
+  {
+    // The loop's turn is still on the stack, so the loop is freed from the next one.
+    emscripten_set_immediate(&wasm_run_t::exit, self);
+  }
+
+  static void exit(void *self)
+  {
+    auto *state = static_cast<wasm_run_t *>(self);
+    const int code = state->exit_code;
+    delete state;
+    emscripten_runtime_keepalive_pop();
+    emscripten_force_exit(code);
+  }
+};
+} // namespace detail
+
+// On the web nothing may block (D69), so run() starts the loop and returns at once, keeping the
+// runtime alive. When the task has finished and the loop with it, the program exits with the
+// task's result when that is an int, else 0. Use it as `return vio::run(...)` in main(), as on
+// native: the value returned there is not the task's result.
 template <typename F>
 inline auto run(F &&f)
 {
-#ifdef __EMSCRIPTEN__
-  static_assert(!sizeof(F *), "vio::run() is not available on WASM. Use event_loop_t::run() directly with run_in_loop().");
-#endif
+  using result_t = task_result_t<std::invoke_result_t<F, event_loop_t &>>;
+  using state_t = detail::wasm_run_t<F>;
+  auto *state = new state_t{.function = std::forward<F>(f)};
+  emscripten_runtime_keepalive_push();
+  detail::core(state->loop).set_on_finished(&state_t::finished, state);
+  state->loop.run_in_loop(
+    [state]() -> task_t<void>
+    {
+      auto *s = state;
+      if constexpr (std::is_void_v<result_t>)
+      {
+        co_await s->function(s->loop);
+      }
+      else
+      {
+        auto result = co_await s->function(s->loop);
+        if constexpr (std::is_convertible_v<result_t, int>)
+          s->exit_code = static_cast<int>(result);
+      }
+      s->loop.stop();
+    });
+  state->loop.run();
+  if constexpr (!std::is_void_v<result_t>)
+    return result_t{};
+}
+#else
+template <typename F>
+inline auto run(F &&f)
+{
   using result_t = task_result_t<std::invoke_result_t<F, event_loop_t &>>;
 
   if constexpr (std::is_void_v<result_t>)
@@ -78,6 +141,7 @@ inline auto run(F &&f)
     return result;
   }
 }
+#endif
 
 } // namespace vio
 

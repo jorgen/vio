@@ -546,7 +546,7 @@ a green build does and does not cover.
 
 **On the native event loop.** CI run 106 (commit `a087e08`) is green on every job: Linux debug,
 ASan, TSan and UBSan, each on epoll and on io_uring, and a shared build; macOS debug and ASan on
-kqueue; Windows debug and ASan on IOCP; the wasm smoke test under Node; and an installed-package
+kqueue; Windows debug and ASan on IOCP; the wasm tests under Node; and an installed-package
 build. `DECISIONS.md` keeps that
 status current. Interop with picoquic has **not** been rerun since the move off libuv, although
 `src/quic_endpoint.cpp` and `operation/quic_endpoint.h` were rewritten for the native loop; treat
@@ -634,7 +634,10 @@ nothing is in flight; run the before-block listeners and hooks; wait in the back
 Backends (`src/backend_*.cpp`) are readiness-first for sockets on every platform: an operation
 tries the system call and parks on the socket's `io_watch_t` only on `errc::again`. epoll is
 edge-triggered, kqueue uses `EV_CLEAR`, io_uring arms a one-shot `POLL_ADD`, and IOCP polls through
-AFD. On Linux `VIO_BACKEND=epoll|io_uring` picks one at run time; epoll is the default, and
+AFD. Under Emscripten the backend is `browser` (`src/backend_browser.cpp`, D69): it never blocks,
+`poll(timeout)` arms a `setTimeout`/`setImmediate` whose callback runs `run_host_turn()`, and
+`run()` returns at once. `test/wasm_smoke.cpp` and `test/wasm_run.cpp` run it under Node; build
+with `emcmake cmake -S . -B build-wasm -G Ninja` and run `node build-wasm/vio_wasm_smoke.js`. On Linux `VIO_BACKEND=epoll|io_uring` picks one at run time; epoll is the default, and
 `backend_name()` reports which ran. io_uring also runs file reads, writes and `fsync` on the ring.
 A descriptor vio does not own is watched with `vio/operation/fd_watch.h` (one-shot, armed after
 `errc::again`, sockets only on Windows), and a foreign event loop takes over the blocking step

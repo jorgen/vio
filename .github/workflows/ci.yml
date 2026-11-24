@@ -255,6 +255,12 @@ jobs:
         run: |
           source ./emsdk/emsdk_env.sh
           node build/vio_wasm_smoke.js
+          # vio::run exits with the task's result; the test returns 7 when it passes.
+          set +e
+          node build/vio_wasm_run.js
+          code=$?
+          set -e
+          test "$code" -eq 7
 
   macos:
     runs-on: macos-15

@@ -40,7 +40,8 @@ enum class backend_kind
   epoll,
   io_uring,
   kqueue,
-  iocp
+  iocp,
+  browser
 };
 
 inline constexpr std::uint8_t interest_read = 1;
@@ -140,6 +141,13 @@ public:
   [[nodiscard]] virtual bool supports_host_wait() const noexcept
   {
     return true;
+  }
+  // A host-driven backend never blocks: poll(timeout) asks the host to call
+  // loop_core_t::run_host_turn() after the timeout instead of waiting for it, and run() starts
+  // the loop and returns at once. The browser backend is the only one (D69).
+  [[nodiscard]] virtual bool host_driven() const noexcept
+  {
+    return false;
   }
   [[nodiscard]] virtual int add_watch(io_watch_t &watch) = 0;
   virtual void remove_watch(io_watch_t &watch, posted_t &done) = 0;

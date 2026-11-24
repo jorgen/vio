@@ -15,7 +15,7 @@ made along the way, with the reason, so each one can be reviewed and reversed.
    per call (`DECISIONS.md` D6 lists them).
 4. Window-system events can join the same loop, so a GUI library can be built on vio.
 5. Linux, macOS and Windows now. Android and iOS should need only a backend and a driver.
-   Emscripten gets a small backend with timers and messaging only.
+   Emscripten runs the same core on a browser backend with timers and messaging only (D69).
 6. libuv disappears from the public API: no `uv_buf_t`, no `uv_loop_t`, no `UV_E*` codes.
 
 ## The shape

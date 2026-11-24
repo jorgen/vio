@@ -42,6 +42,8 @@ static backend_kind kind_from_environment() noexcept
     return backend_kind::kqueue;
   if (std::strcmp(value, "iocp") == 0)
     return backend_kind::iocp;
+  if (std::strcmp(value, "browser") == 0)
+    return backend_kind::browser;
   std::fprintf(stderr, "vio: VIO_BACKEND=%s is not a backend this build knows; using the default\n", value);
   return backend_kind::automatic;
 }
@@ -51,7 +53,9 @@ std::unique_ptr<backend_t> make_backend(loop_core_t &loop, backend_kind kind, in
   error = 0;
   if (kind == backend_kind::automatic)
     kind = kind_from_environment();
-#if defined(__linux__)
+#if defined(__EMSCRIPTEN__)
+  return make_browser_backend(loop, error);
+#elif defined(__linux__)
   if (kind == backend_kind::io_uring)
   {
     auto backend = make_uring_backend(loop, error);

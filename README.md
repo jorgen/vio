@@ -118,8 +118,8 @@ See [`examples/hello_timer.cpp`](examples/hello_timer.cpp).
 
 One per thread. Created once (by `vio::run`, or directly); `run()` blocks until
 `stop()`. `backend_name()` says which mechanism it runs on. Operations take it (or reach it through their handle) to register work.
-On WASM there is no blocking `run()`/`vio::run` — drive the loop with
-`event_loop_t::run_in_loop` instead.
+On WASM nothing may block, so `run()` starts the loop and returns at once; the browser's own
+callbacks run its turns (D69).
 
 ### `task_t<T>`
 
@@ -292,8 +292,12 @@ cmake --preset asan && cmake --build cmake-build-asan && ./cmake-build-asan/test
 
 ### WebAssembly
 
-Builds under Emscripten (`library_wasm.cpp`, no third-party deps). `vio::run` is
-unavailable on WASM — drive `event_loop_t` directly via `run_in_loop`.
+Builds under Emscripten with no third-party dependencies. The loop is the same core as on native,
+on a browser backend that never blocks: `run()` returns at once and `setTimeout`/`setImmediate`
+callbacks run the turns. Timers, sleeps, event pipes, `loop_hooks.h` and `host_loop.h` work as on
+native; sockets, files and processes do not. `vio::run` works too: `return vio::run(...)` from
+main() keeps the runtime alive and exits with the task's result once the loop has finished. A
+browser callback outside a turn calls `vio::loop_run_nested(loop)` to run one on the spot.
 
 ## Dependencies
 

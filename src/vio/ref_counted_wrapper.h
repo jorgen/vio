@@ -4,11 +4,7 @@
 #include <functional>
 #include <type_traits>
 
-#ifdef __EMSCRIPTEN__
-#include "vio/platform/wasm/ref_counted_impl.h"
-#else
 #include "vio/platform/native/ref_counted_impl.h"
-#endif
 
 namespace vio
 {
@@ -170,12 +166,10 @@ public:
     return _storage ? &_storage->ref_count : nullptr;
   }
 
-#ifndef __EMSCRIPTEN__
   void register_resource(detail::resource_t &resource)
   {
     _storage->ref_count.register_closable(resource);
   }
-#endif
 
   void on_destroy(std::function<void()> callback)
   {

@@ -32,7 +32,7 @@ Copyright (c) 2025 Jørgen Lind
 #include <optional>
 #include <utility>
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <pthread.h>
 #endif
 
@@ -371,7 +371,7 @@ loop_core_t::loop_core_t(backend_kind kind)
   : _thread_id(std::this_thread::get_id())
   , _fork_epoch(fork_epoch.load(std::memory_order_relaxed))
 {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
   static const bool fork_watched = ::pthread_atfork(nullptr, nullptr, &loop_core_t::note_fork_in_child) == 0;
   if (!fork_watched)
   {
@@ -513,6 +513,11 @@ int loop_core_t::run()
   refuse_if_inherited();
   set_thread(std::this_thread::get_id());
   _running = true;
+  if (_backend->host_driven())
+  {
+    poll_backend(0);
+    return 0;
+  }
   for (;;)
   {
     run_timers();
@@ -582,7 +587,29 @@ void loop_core_t::run_nested()
   drain_posted();
   drain_deferred();
   run_before_block();
-  poll_backend(0);
+  // A host-driven backend never blocks, so it is told when the next turn is due rather than
+  // polled; otherwise the host would not come back for work this turn queued.
+  poll_backend(_backend->host_driven() ? wait_timeout() : 0);
+}
+
+void loop_core_t::run_host_turn()
+{
+  if (!_running || !in_loop_thread())
+    return;
+  refuse_if_inherited();
+  run_timers();
+  drain_posted();
+  drain_deferred();
+  if (_stopping && !alive())
+  {
+    _running = false;
+    poll_backend(-1);
+    if (auto finished = std::exchange(_on_finished, nullptr))
+      finished(std::exchange(_on_finished_context, nullptr));
+    return;
+  }
+  run_before_block();
+  poll_backend(wait_timeout());
 }
 
 void loop_core_t::stop()

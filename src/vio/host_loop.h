@@ -22,10 +22,6 @@
 
 #pragma once
 
-#ifdef __EMSCRIPTEN__
-#error "vio/host_loop.h needs the native event loop"
-#endif
-
 #include <chrono>
 #include <cstdint>
 #include <expected>

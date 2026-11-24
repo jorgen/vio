@@ -163,6 +163,16 @@ public:
     _host_wait = host;
   }
   void run_nested();
+  // One turn on a host-driven backend (D69): what run() does once round its loop, then the
+  // backend is asked to come back when the next turn is due. Does nothing unless run() started
+  // the loop. When stop() was called and nothing is in flight, the loop finishes instead and
+  // the callback given to set_on_finished runs.
+  void run_host_turn();
+  void set_on_finished(void (*finished)(void *context), void *context) noexcept
+  {
+    _on_finished = finished;
+    _on_finished_context = context;
+  }
   [[nodiscard]] std::int64_t next_timeout() noexcept
   {
     return wait_timeout();
@@ -253,6 +263,8 @@ private:
   std::vector<hook_t *> _hooks;
   std::size_t _alive = 0;
   vio::host_wait_t *_host_wait = nullptr;
+  void (*_on_finished)(void *context) = nullptr;
+  void *_on_finished_context = nullptr;
   std::uint8_t _active = 0;
   std::vector<hook_t *> _running_hooks;
 

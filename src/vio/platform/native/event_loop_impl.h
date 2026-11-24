@@ -58,7 +58,7 @@ public:
   explicit event_loop_t(backend_kind_t kind)
     : _core(kind)
   {
-#if !defined(_WIN32) && !defined(VIO_NO_SIGPIPE_IGNORE)
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && !defined(VIO_NO_SIGPIPE_IGNORE)
     std::signal(SIGPIPE, SIG_IGN);
 #endif
   }
@@ -130,6 +130,24 @@ public:
     return _core.in_loop_thread();
   }
 
+#ifdef __EMSCRIPTEN__
+  // Run one turn now, starting the loop if run() has not (D69). The browser backend runs turns by
+  // itself; this is for a host that wants work settled at a moment of its choosing, such as
+  // vio::wasm::pump() before a frame is drawn.
+  void poll()
+  {
+    if (!_core.running())
+      _core.run();
+    _core.run_host_turn();
+  }
+
+  // Whether a turn would find work queued: something posted or deferred, or a timer due.
+  [[nodiscard]] bool has_pending() noexcept
+  {
+    return _core.next_timeout() == 0;
+  }
+#endif
+
 private:
   friend detail::loop_core_t &detail::core(event_loop_t &loop) noexcept;
   detail::loop_core_t _core;
@@ -143,6 +161,49 @@ inline loop_core_t &core(event_loop_t &loop) noexcept
 }
 } // namespace detail
 
+#ifdef __EMSCRIPTEN__
+// No threads on the web (D69): the loop starts on the browser's thread, runs its own turns, and is
+// also registered with vio::wasm::pump() so a host can settle every loop before drawing. Shared code
+// constructs it exactly as on native.
+class thread_with_event_loop_t
+{
+public:
+  thread_with_event_loop_t(const thread_with_event_loop_t &) = delete;
+  thread_with_event_loop_t(thread_with_event_loop_t &&) = delete;
+  thread_with_event_loop_t &operator=(const thread_with_event_loop_t &) = delete;
+  thread_with_event_loop_t &operator=(thread_with_event_loop_t &&) = delete;
+
+  thread_with_event_loop_t();
+  ~thread_with_event_loop_t()
+  {
+    stop_and_join();
+  }
+
+  // Stops the loop and runs its turns until it finishes, which is what joining the thread waits
+  // for on native. Work that waits on the browser (a timer, a fetch) cannot finish inside this
+  // call; the loop's destructor names it.
+  void stop_and_join();
+
+  [[nodiscard]] event_loop_t &event_loop()
+  {
+    return _event_loop;
+  }
+
+  [[nodiscard]] const event_loop_t &event_loop() const
+  {
+    return _event_loop;
+  }
+
+  [[nodiscard]] std::thread::id thread_id() const
+  {
+    return std::this_thread::get_id();
+  }
+
+private:
+  event_loop_t _event_loop;
+  bool _stopped = false;
+};
+#else
 class thread_with_event_loop_t
 {
 public:
@@ -204,6 +265,7 @@ private:
   event_loop_t _event_loop;
   std::unique_ptr<std::thread> _thread;
 };
+#endif
 
 inline tick_t loop_now(event_loop_t &event_loop)
 {

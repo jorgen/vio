@@ -22,10 +22,6 @@
 
 #pragma once
 
-#ifdef __EMSCRIPTEN__
-#error "vio/operation/fd_watch.h needs the native event loop"
-#endif
-
 #include <cstdint>
 #include <expected>
 #include <functional>

@@ -29,7 +29,7 @@
 //   set_frame_hook(fn)     - run fn each frame after the loops settle (the renderer draws here)
 //   install_main_loop()    - install the single emscripten_set_main_loop driver (idempotent)
 //
-// The definitions are in platform/wasm/event_loop_impl.h (where event_loop_t is complete); this header
+// The definitions are in platform/wasm/cooperative.h; this header
 // just pulls them in via <vio/event_loop.h>, which selects the wasm platform under __EMSCRIPTEN__.
 
 #include <vio/event_loop.h>

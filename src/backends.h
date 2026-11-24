@@ -28,7 +28,9 @@ Copyright (c) 2025 Jørgen Lind
 
 namespace vio::detail
 {
-#if defined(__linux__)
+#if defined(__EMSCRIPTEN__)
+std::unique_ptr<backend_t> make_browser_backend(loop_core_t &loop, int &error);
+#elif defined(__linux__)
 std::unique_ptr<backend_t> make_epoll_backend(loop_core_t &loop, int &error);
 std::unique_ptr<backend_t> make_uring_backend(loop_core_t &loop, int &error);
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)

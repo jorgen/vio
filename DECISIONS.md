@@ -498,6 +498,23 @@ DLL in the working directory is never picked up, and falls back to `kernel32.dll
 the two files is the application's choice. `process_options_t::glyph_width` tells that ConPTY how
 the terminal measures characters; the Windows one has no such flag and ignores it.
 
+**D69. The web build runs the shared loop core on a browser backend.** Until now wasm had a small
+loop of its own, so `loop_hooks.h`, `host_loop.h`, `timer.h` and the resource registry did not
+exist there and vui could not be built for a page. A page may not block, so the backend never
+waits: `poll(timeout)` arms one `setTimeout` or one `setImmediate` and returns, and its callback
+runs `loop_core_t::run_host_turn()`, the same turn `run()` loops over. `run()` starts the loop and
+returns at once. A browser callback that arrives outside a turn (a key press, a frame) records
+what happened and calls `loop_run_nested()`, which runs a turn before the callback returns. There
+are no descriptors: a watch and a host wait are refused with `not_supported`. The blocking pool has
+no threads and runs a job inline when it is submitted; the job finishes on the next turn, as it
+would with a worker. `vio::run` exists on the web now. It keeps the loop and the callable on the
+heap, since main() has returned before the loop runs, and exits with the task's result when the
+loop finishes. The cooperative layer that points and dewfall use (`vio::wasm::pump`, `poll`,
+`has_pending`, `set_wake_hook`, `thread_with_event_loop_t` with no thread) stays, on the core.
+Every loop runs its own turns, so `pump()` only settles work early, before a frame is drawn.
+Emscripten builds with pthreads have not been tried: a wake from another thread is proxied to the
+main runtime thread, so a loop there has to live on the main thread.
+
 ## Process
 
 **D27. CI runs on every branch push**, on ubuntu-24.04 (debug, ASan, TSan, UBSan, and a shared
@@ -547,7 +564,7 @@ in CI.
 | io_uring | readiness through `POLL_ADD` | ring: read, write, `fsync` | `VIO_BACKEND=io_uring` |
 | kqueue | readiness, `EV_CLEAR` | blocking pool | macOS |
 | IOCP | readiness through AFD | blocking pool (D17) | Windows |
-| wasm | none | none | its own small loop; builds, and a smoke test runs under Node in CI |
+| browser | none | inline, on the loop (D69) | the shared core under Emscripten; `test/wasm_smoke.cpp` and `test/wasm_run.cpp` run under Node in CI |
 
 Benchmarks against libuv are in `BASELINE.md`: the socket rows run 1.4 to 2.3 times faster and
 allocate a third to two thirds as much.
@@ -557,10 +574,7 @@ allocate a third to two thirds as much.
 - How clocks treat system sleep, per platform. Windows waits skip time spent suspended, and libuv
   woke every loop on resume. That wake is not reproduced yet.
 - When io_uring becomes the default on Linux (see D13).
-- The wasm backend moves onto the shared core in a later phase. Until then it keeps its own small
-  loop. Building it after the change found two breaks: the HTTP client called the native-only
-  `loop_now`, and the wasm library did not compile `errc.cpp`, so nothing that built an error
-  linked. Both are fixed, and CI now builds the wasm library and runs `test/wasm_smoke.cpp` under
-  Node, so the next break shows up at once.
+- The wasm HTTP fetch (`platform/wasm/http_fetch_impl.h`) ignores its cancellation token, and
+  nothing in the browser build exercises it in CI.
 - Whether application coroutines should run inside Win32 modal loops and Cocoa tracking loops. This
   belongs to the GUI driver work.

@@ -22,10 +22,6 @@
 
 #pragma once
 
-#ifdef __EMSCRIPTEN__
-#error "vio/loop_hooks.h needs the native event loop"
-#endif
-
 #include <functional>
 #include <utility>
 
