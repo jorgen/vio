@@ -234,7 +234,7 @@ jobs:
     runs-on: ubuntu-24.04
     name: wasm
     env:
-      EMSDK_VERSION: 6.0.12
+      EMSDK_VERSION: 7.0.1
     steps:
       - uses: actions/checkout@v4
 
